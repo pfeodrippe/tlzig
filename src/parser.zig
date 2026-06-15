@@ -38,6 +38,12 @@ pub const Token = struct {
         keyword_domain,
         keyword_forall,
         keyword_exists,
+        keyword_let,
+        keyword_in,
+        keyword_case,
+        keyword_other,
+        cartesian,
+        concat,
         lparen,
         rparen,
         lbrace,
@@ -78,6 +84,7 @@ pub const Token = struct {
         subseteq,
         except,
         at,
+        underscore,
         bang,
         prime,
     };
@@ -193,6 +200,14 @@ pub const Lexer = struct {
                     self.skip_line_comment();
                     return self.next();
                 }
+                if (d == 'X' or d == 'x') {
+                    self.advance2();
+                    return self.mk(.cartesian, "\\X", start_line, start_col);
+                }
+                if (d == 'o' or d == 'O') {
+                    self.advance2();
+                    return self.mk(.concat, "\\o", start_line, start_col);
+                }
                 if (d == '\\' or !self.is_ident_char(d)) {
                     self.advance();
                     return self.mk(.setminus, "\\", start_line, start_col);
@@ -225,6 +240,10 @@ pub const Lexer = struct {
                 if (self.peek(1) == '>') {
                     self.advance2();
                     return self.mk(.implies, "=>", start_line, start_col);
+                }
+                if (self.peek(1) == '<') {
+                    self.advance2();
+                    return self.mk(.le, "=<", start_line, start_col);
                 }
                 self.advance();
                 return self.mk(.eq, "=", start_line, start_col);
@@ -273,7 +292,11 @@ pub const Lexer = struct {
             },
             '"' => return self.read_string(start_line, start_col),
             '0'...'9' => return self.read_number(start_line, start_col),
-            'A'...'Z', 'a'...'z', '_' => return self.read_ident_or_keyword(start_line, start_col),
+            '_' => {
+                self.advance();
+                return self.mk(.underscore, "_", start_line, start_col);
+            },
+            'A'...'Z', 'a'...'z' => return self.read_ident_or_keyword(start_line, start_col),
             else => {
                 self.advance();
                 return self.mk(.ident, self.source[self.pos - 1 .. self.pos], start_line, start_col);
@@ -387,7 +410,7 @@ pub const Lexer = struct {
 
     fn is_ident_char(self: Lexer, c: u8) bool {
         _ = self;
-        return std.ascii.isAlphanumeric(c) or c == '_';
+        return std.ascii.isAlphanumeric(c);
     }
 
     fn advance(self: *Lexer) void {
@@ -443,6 +466,10 @@ fn switch_word(word: []const u8) Token.Kind {
         .{ "EXISTS", .keyword_exists },
         .{ "A", .keyword_forall },
         .{ "E", .keyword_exists },
+        .{ "LET", .keyword_let },
+        .{ "IN", .keyword_in },
+        .{ "CASE", .keyword_case },
+        .{ "OTHER", .keyword_other },
         .{ "EXCEPT", .except },
         .{ "in", .in },
         .{ "notin", .notin },
@@ -451,6 +478,9 @@ fn switch_word(word: []const u8) Token.Kind {
         .{ "union", .cup },
         .{ "cap", .cap },
         .{ "intersect", .cap },
+        .{ "leq", .le },
+        .{ "geq", .ge },
+        .{ "div", .slash },
     });
     return map.get(word) orelse .ident;
 }
@@ -460,6 +490,8 @@ pub const Parser = struct {
     lexer: Lexer,
     current: Token,
     next: Token,
+    list_cols: [8]u32,
+    list_cols_len: u32,
 
     pub fn init(arena: *Arena, source: []const u8) Parser {
         var lexer = Lexer.init(source);
@@ -470,6 +502,8 @@ pub const Parser = struct {
             .lexer = lexer,
             .current = first,
             .next = second,
+            .list_cols = undefined,
+            .list_cols_len = 0,
         };
     }
 
@@ -523,6 +557,14 @@ pub const Parser = struct {
         defer definitions.deinit(std.heap.page_allocator);
         while (true) {
             self.skip_dashes();
+            if (self.current.kind == .keyword_theorem or
+                self.current.kind == .keyword_assume or
+                self.current.kind == .lbracket or
+                self.current.kind == .langle)
+            {
+                self.skip_to_next_definition();
+                continue;
+            }
             if (self.current.kind != .ident) break;
             const saved = self.*;
             const def = self.parse_definition() catch {
@@ -564,7 +606,7 @@ pub const Parser = struct {
             try self.expect(.rparen);
         }
         try self.expect(.defeq);
-        const body = try self.parse_expr();
+        const body = try self.parse_definition_body();
         return ast.Definition{
             .name = try self.dup(name),
             .params = try self.dup_slice([]const u8, params.items),
@@ -572,10 +614,55 @@ pub const Parser = struct {
         };
     }
 
+    fn parse_definition_body(self: *Parser) !*ast.Expr {
+        if (self.current.kind == .and_op) return try self.parse_item_list(.and_op);
+        if (self.current.kind == .or_op) return try self.parse_item_list(.or_op);
+        return try self.parse_expr();
+    }
+
+    fn max_list_col(self: *Parser) u32 {
+        var max: u32 = 0;
+        var i: u32 = 0;
+        while (i < self.list_cols_len) : (i += 1) {
+            if (self.list_cols[i] > max) max = self.list_cols[i];
+        }
+        return max;
+    }
+
     fn parse_expr(self: *Parser) anyerror!*ast.Expr {
-        if (self.match(.and_op)) return try self.parse_and();
-        if (self.match(.or_op)) return try self.parse_or();
+        if (self.current.kind == .and_op and self.current.col > self.max_list_col()) {
+            return try self.parse_item_list(.and_op);
+        }
+        if (self.current.kind == .or_op and self.current.col > self.max_list_col()) {
+            return try self.parse_item_list(.or_op);
+        }
         return try self.parse_implies();
+    }
+
+    fn push_list_col(self: *Parser, col: u32) void {
+        std.debug.assert(self.list_cols_len < self.list_cols.len);
+        self.list_cols[self.list_cols_len] = col;
+        self.list_cols_len += 1;
+    }
+
+    fn pop_list_col(self: *Parser) void {
+        std.debug.assert(self.list_cols_len > 0);
+        self.list_cols_len -= 1;
+    }
+
+    fn parse_item_list(self: *Parser, op: ast.BinaryOp) !*ast.Expr {
+        const col = self.current.col;
+        self.push_list_col(col);
+        self.advance();
+        var left = try self.parse_expr();
+        const op_kind: Token.Kind = if (op == .and_op) .and_op else .or_op;
+        while (self.current.kind == op_kind and self.current.col == col) {
+            self.advance();
+            const right = try self.parse_expr();
+            left = try self.expr_binary(op, left, right);
+        }
+        self.pop_list_col();
+        return left;
     }
 
     fn parse_implies(self: *Parser) !*ast.Expr {
@@ -598,7 +685,8 @@ pub const Parser = struct {
 
     fn parse_or(self: *Parser) !*ast.Expr {
         var left = try self.parse_and();
-        while (self.match(.or_op)) {
+        while (self.current.kind == .or_op and !self.is_list_separator()) {
+            self.advance();
             const right = try self.parse_and();
             left = try self.expr_binary(.or_op, left, right);
         }
@@ -607,11 +695,21 @@ pub const Parser = struct {
 
     fn parse_and(self: *Parser) !*ast.Expr {
         var left = try self.parse_not();
-        while (self.match(.and_op)) {
+        while (self.current.kind == .and_op and !self.is_list_separator()) {
+            self.advance();
             const right = try self.parse_not();
             left = try self.expr_binary(.and_op, left, right);
         }
         return left;
+    }
+
+    fn is_list_separator(self: *Parser) bool {
+        if (self.current.kind != .and_op and self.current.kind != .or_op) return false;
+        var i: u32 = 0;
+        while (i < self.list_cols_len) : (i += 1) {
+            if (self.current.col == self.list_cols[i]) return true;
+        }
+        return false;
     }
 
     fn parse_not(self: *Parser) !*ast.Expr {
@@ -622,8 +720,17 @@ pub const Parser = struct {
         return try self.parse_comparison();
     }
 
+    fn parse_cartesian(self: *Parser) !*ast.Expr {
+        var left = try self.parse_concat();
+        while (self.match(.cartesian)) {
+            const right = try self.parse_concat();
+            left = try self.expr_set_binary(.cartesian_op, left, right);
+        }
+        return left;
+    }
+
     fn parse_comparison(self: *Parser) !*ast.Expr {
-        const left = try self.parse_union();
+        const left = try self.parse_cartesian();
         const op: ?ast.BinaryOp = switch (self.current.kind) {
             .eq => .eq,
             .neq => .ne,
@@ -676,6 +783,15 @@ pub const Parser = struct {
         while (self.match(.range)) {
             const right = try self.parse_additive();
             left = try self.expr_binary(.range, left, right);
+        }
+        return left;
+    }
+
+    fn parse_concat(self: *Parser) !*ast.Expr {
+        var left = try self.parse_union();
+        while (self.match(.concat)) {
+            const right = try self.parse_union();
+            left = try self.expr_binary(.concat, left, right);
         }
         return left;
     }
@@ -750,6 +866,10 @@ pub const Parser = struct {
                     const args = try self.parse_expr_list(.rbracket);
                     return try self.expr_apply(try self.expr_ident(name), args);
                 }
+                if (self.match(.dot)) {
+                    const field = try self.expect_ident_text();
+                    return try self.expr_field(try self.expr_ident(name), field);
+                }
                 return try self.expr_ident(name);
             },
             .lparen => {
@@ -770,6 +890,8 @@ pub const Parser = struct {
             .keyword_forall => return try self.parse_quantifier(.forall),
             .keyword_exists => return try self.parse_quantifier(.exists),
             .keyword_unchanged => return try self.parse_unchanged(),
+            .keyword_let => return try self.parse_let_in(),
+            .keyword_case => return try self.parse_case_expr(),
             else => return error.SyntaxError,
         }
     }
@@ -791,19 +913,39 @@ pub const Parser = struct {
 
     fn parse_function_or_record(self: *Parser) !*ast.Expr {
         try self.expect(.lbracket);
+        if (self.match(.rbracket)) {
+            // [] temporal box, or empty bracket grouping.
+            return try self.parse_function_or_record();
+        }
         if (self.current.kind == .ident and self.next.kind == .mapsto) {
             const fields = try self.parse_record_fields();
             try self.expect(.rbracket);
             return try self.expr_record(fields);
         }
+        if (self.current.kind == .ident and self.next.kind == .colon) {
+            const fields = try self.parse_record_set_fields();
+            try self.expect(.rbracket);
+            return try self.expr_record_set(fields);
+        }
         if (self.current.kind == .ident and self.next.kind == .in) {
-            const var_name = try self.expect_ident_text();
+            var names = std.ArrayList([]const u8).empty;
+            defer names.deinit(std.heap.page_allocator);
+            while (true) {
+                const name = try self.expect_ident_text();
+                try names.append(std.heap.page_allocator, try self.dup(name));
+                if (!self.match(.comma)) break;
+            }
             try self.expect(.in);
             const domain = try self.parse_expr();
             try self.expect(.mapsto);
             const body = try self.parse_expr();
             try self.expect(.rbracket);
-            return try self.expr_function_literal(var_name, domain, body);
+            var vars = std.ArrayList(ast.BoundVar).empty;
+            defer vars.deinit(std.heap.page_allocator);
+            for (names.items) |name| {
+                try vars.append(std.heap.page_allocator, .{ .name = name, .domain = domain });
+            }
+            return try self.expr_function_literal(vars.items, body);
         }
         const func = try self.parse_expr();
         if (self.match(.arrow)) {
@@ -812,14 +954,30 @@ pub const Parser = struct {
             return try self.expr_set_of_functions(func, codomain);
         }
         if (self.match(.except)) {
-            const steps = try self.parse_except_steps();
-            try self.expect(.eq);
-            const value = try self.parse_expr();
+            var expr = func;
+            while (true) {
+                const steps = try self.parse_except_steps();
+                try self.expect(.eq);
+                const value = try self.parse_expr();
+                expr = try self.expr_except(expr, steps, value);
+                if (!self.match(.comma)) break;
+            }
             try self.expect(.rbracket);
-            return try self.expr_except(func, steps, value);
+            return expr;
         }
         try self.expect(.rbracket);
+        if (self.match(.underscore)) {
+            const vars_expr = try self.parse_expr();
+            const action_name = try self.box_action_name(func);
+            return try self.expr_box_action(action_name, vars_expr);
+        }
         return func;
+    }
+
+    fn box_action_name(self: *Parser, expr: *ast.Expr) ![]const u8 {
+        _ = self;
+        if (expr.* != .ident) return error.SyntaxError;
+        return expr.*.ident;
     }
 
     fn parse_except_steps(self: *Parser) ![]const ast.AccessStep {
@@ -855,6 +1013,19 @@ pub const Parser = struct {
         return try self.dup_slice(ast.FieldInit, fields.items);
     }
 
+    fn parse_record_set_fields(self: *Parser) ![]const ast.RecordFieldDomain {
+        var fields = std.ArrayList(ast.RecordFieldDomain).empty;
+        defer fields.deinit(std.heap.page_allocator);
+        while (true) {
+            const name = try self.expect_ident_text();
+            try self.expect(.colon);
+            const domain = try self.parse_expr();
+            try fields.append(std.heap.page_allocator, .{ .name = try self.dup(name), .domain = domain });
+            if (!self.match(.comma)) break;
+        }
+        return try self.dup_slice(ast.RecordFieldDomain, fields.items);
+    }
+
     fn parse_tuple(self: *Parser) !*ast.Expr {
         try self.expect(.langle);
         const items = try self.parse_expr_list(.rangle);
@@ -883,18 +1054,62 @@ pub const Parser = struct {
 
     fn parse_quantifier(self: *Parser, kind: ast.QuantifierKind) !*ast.Expr {
         self.advance();
-        var vars = std.ArrayList(ast.BoundVar).empty;
-        defer vars.deinit(std.heap.page_allocator);
+        var names = std.ArrayList([]const u8).empty;
+        defer names.deinit(std.heap.page_allocator);
         while (true) {
             const name = try self.expect_ident_text();
-            try self.expect(.in);
-            const domain = try self.parse_expr();
-            try vars.append(std.heap.page_allocator, .{ .name = try self.dup(name), .domain = domain });
+            try names.append(std.heap.page_allocator, try self.dup(name));
             if (!self.match(.comma)) break;
         }
+        try self.expect(.in);
+        const domain = try self.parse_expr();
         try self.expect(.colon);
         const body = try self.parse_expr();
+        var vars = std.ArrayList(ast.BoundVar).empty;
+        defer vars.deinit(std.heap.page_allocator);
+        for (names.items) |name| {
+            try vars.append(std.heap.page_allocator, .{ .name = name, .domain = domain });
+        }
         return try self.expr_quantifier(kind, vars.items, body);
+    }
+
+    fn parse_let_in(self: *Parser) !*ast.Expr {
+        try self.expect(.keyword_let);
+        var defs = std.ArrayList(ast.Definition).empty;
+        defer defs.deinit(std.heap.page_allocator);
+        while (true) {
+            const def = try self.parse_definition();
+            try defs.append(std.heap.page_allocator, def);
+            if (self.current.kind == .keyword_in) break;
+        }
+        try self.expect(.keyword_in);
+        const body = try self.parse_expr();
+        return try self.expr_let_in(defs.items, body);
+    }
+
+    fn parse_case_expr(self: *Parser) !*ast.Expr {
+        try self.expect(.keyword_case);
+        var arms = std.ArrayList(ast.CaseArm).empty;
+        defer arms.deinit(std.heap.page_allocator);
+        while (true) {
+            const cond = try self.parse_expr();
+            try self.expect(.arrow);
+            const value = try self.parse_expr();
+            try arms.append(std.heap.page_allocator, .{ .cond = cond, .value = value });
+            if (self.current.kind == .lbracket and self.next.kind == .rbracket) {
+                self.advance();
+                self.advance();
+                if (self.current.kind == .keyword_other) break;
+                continue;
+            }
+            break;
+        }
+        var otherwise: ?*ast.Expr = null;
+        if (self.match(.keyword_other)) {
+            try self.expect(.arrow);
+            otherwise = try self.parse_expr();
+        }
+        return try self.expr_case_expr(arms.items, otherwise);
     }
 
     fn parse_unchanged(self: *Parser) !*ast.Expr {
@@ -1042,6 +1257,30 @@ pub const Parser = struct {
         return ptr;
     }
 
+    fn expr_let_in(self: *Parser, defs: []const ast.Definition, body: *ast.Expr) !*ast.Expr {
+        const lptr = try self.arena.alloc_object(ast.LetIn);
+        lptr.* = ast.LetIn{ .defs = try self.dup_slice(ast.Definition, defs), .body = body };
+        const ptr = try self.arena.alloc_object(ast.Expr);
+        ptr.* = ast.Expr{ .let_in = lptr };
+        return ptr;
+    }
+
+    fn expr_case_expr(self: *Parser, arms: []const ast.CaseArm, otherwise: ?*ast.Expr) !*ast.Expr {
+        const cptr = try self.arena.alloc_object(ast.CaseExpr);
+        cptr.* = ast.CaseExpr{ .arms = try self.dup_slice(ast.CaseArm, arms), .otherwise = otherwise };
+        const ptr = try self.arena.alloc_object(ast.Expr);
+        ptr.* = ast.Expr{ .case_expr = cptr };
+        return ptr;
+    }
+
+    fn expr_box_action(self: *Parser, action_name: []const u8, vars: *ast.Expr) !*ast.Expr {
+        const bptr = try self.arena.alloc_object(ast.BoxAction);
+        bptr.* = ast.BoxAction{ .action_name = try self.dup(action_name), .vars = vars };
+        const ptr = try self.arena.alloc_object(ast.Expr);
+        ptr.* = ast.Expr{ .box_action = bptr };
+        return ptr;
+    }
+
     fn expr_except(self: *Parser, func: *ast.Expr, steps: []const ast.AccessStep, value: *ast.Expr) !*ast.Expr {
         const eptr = try self.arena.alloc_object(ast.Except);
         eptr.* = ast.Except{ .func = func, .steps = steps, .value = value };
@@ -1058,9 +1297,18 @@ pub const Parser = struct {
         return ptr;
     }
 
-    fn expr_function_literal(self: *Parser, var_name: []const u8, domain: *ast.Expr, body: *ast.Expr) !*ast.Expr {
+    fn expr_record_set(self: *Parser, fields: []const ast.RecordFieldDomain) !*ast.Expr {
+        const rptr = try self.arena.alloc_object(ast.RecordSet);
+        rptr.* = ast.RecordSet{ .fields = fields };
+        const ptr = try self.arena.alloc_object(ast.Expr);
+        ptr.* = ast.Expr{ .record_set = rptr };
+        return ptr;
+    }
+
+    fn expr_function_literal(self: *Parser, vars: []const ast.BoundVar, body: *ast.Expr) !*ast.Expr {
         const fptr = try self.arena.alloc_object(ast.FunctionLiteral);
-        fptr.* = ast.FunctionLiteral{ .var_name = try self.dup(var_name), .domain = domain, .body = body };
+        const vars_copy = try self.dup_slice(ast.BoundVar, vars);
+        fptr.* = ast.FunctionLiteral{ .vars = vars_copy, .body = body };
         const ptr = try self.arena.alloc_object(ast.Expr);
         ptr.* = ast.Expr{ .function_literal = fptr };
         return ptr;
@@ -1142,8 +1390,18 @@ pub const Parser = struct {
         self.advance(); // skip the definition name that failed
         while (self.current.kind != .eof) {
             if (self.current.kind == .ident and self.current.col == 1) return;
-            if (self.current.kind == .keyword_theorem) return;
+            if (self.current.kind == .keyword_theorem) {
+                self.advance();
+                while (self.current.kind != .eof and !(self.current.kind == .ident and self.current.col == 1)) {
+                    self.advance();
+                }
+                continue;
+            }
             if (self.current.kind == .keyword_module) return;
+            if (self.current.kind == .lbracket or self.current.kind == .langle) {
+                self.advance();
+                continue;
+            }
             self.advance();
         }
     }

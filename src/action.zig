@@ -16,7 +16,9 @@ pub const ActionStep = union(enum(u8)) {
     condition: *ast.Expr,
     choose: Choose,
     branch: Branch,
+    if_branch: IfBranch,
     call: Call,
+    let_bind: LetBind,
     unchanged: []const u8,
 };
 
@@ -42,8 +44,19 @@ pub const Call = struct {
     body_steps: []const ActionStep,
 };
 
+pub const LetBind = struct {
+    name: []const u8,
+    expr: *ast.Expr,
+};
+
 pub const Branch = struct {
     options: []const []const ActionStep,
+};
+
+pub const IfBranch = struct {
+    cond: *ast.Expr,
+    then_steps: []const ActionStep,
+    else_steps: []const ActionStep,
 };
 
 pub const CompiledInit = struct {
@@ -76,6 +89,30 @@ pub const ActionCompiler = struct {
         return CompiledNext{ .steps = try self.dup_slice(ActionStep, steps.items) };
     }
 
+    fn is_action_expr(self: ActionCompiler, expr: *ast.Expr) bool {
+        switch (expr.*) {
+            .primed, .unchanged => return true,
+            .ident => |name| {
+                if (self.evaluator.find_definition(name)) |def| return self.is_action_expr(def.body);
+                return false;
+            },
+            .binary => |b| {
+                if (b.op == .or_op) return self.is_action_expr(b.left) and self.is_action_expr(b.right);
+                return self.is_action_expr(b.left) or self.is_action_expr(b.right);
+            },
+            .let_in => |l| return self.is_action_expr(l.body),
+            .if_then_else => |ite| return self.is_action_expr(ite.then_branch) or self.is_action_expr(ite.else_branch),
+            .apply => |ap| {
+                if (ap.func.* == .ident) {
+                    if (self.evaluator.find_definition(ap.func.*.ident)) |def| return self.is_action_expr(def.body);
+                }
+                return false;
+            },
+            .quantifier => |q| return self.is_action_expr(q.body),
+            else => return false,
+        }
+    }
+
     fn collect_steps(
         self: ActionCompiler,
         expr: *ast.Expr,
@@ -89,7 +126,7 @@ pub const ActionCompiler = struct {
                     try self.collect_steps(b.right, steps, is_init);
                     return;
                 }
-                if (b.op == .or_op) {
+                if (b.op == .or_op and self.is_action_expr(b.left) and self.is_action_expr(b.right)) {
                     var options = std.ArrayList([]const ActionStep).empty;
                     defer options.deinit(std.heap.page_allocator);
                     var left_steps = std.ArrayList(ActionStep).empty;
@@ -126,8 +163,7 @@ pub const ActionCompiler = struct {
                 try steps.append(std.heap.page_allocator, ActionStep{ .condition = expr });
             },
             .ident => |name| {
-                if (self.evaluator.find_definition(name) != null) {
-                    const def = self.evaluator.find_definition(name).?;
+                if (self.evaluator.find_definition(name)) |def| {
                     try self.collect_steps(def.body, steps, is_init);
                 } else {
                     try steps.append(std.heap.page_allocator, ActionStep{ .condition = expr });
@@ -147,6 +183,31 @@ pub const ActionCompiler = struct {
                 }
                 try steps.append(std.heap.page_allocator, ActionStep{ .condition = expr });
             },
+            .if_then_else => |ite| {
+                const then_action = self.is_action_expr(ite.then_branch);
+                const else_action = self.is_action_expr(ite.else_branch);
+                if (then_action or else_action) {
+                    var then_steps = std.ArrayList(ActionStep).empty;
+                    defer then_steps.deinit(std.heap.page_allocator);
+                    try self.collect_steps(ite.then_branch, &then_steps, is_init);
+                    var else_steps = std.ArrayList(ActionStep).empty;
+                    defer else_steps.deinit(std.heap.page_allocator);
+                    try self.collect_steps(ite.else_branch, &else_steps, is_init);
+                    try steps.append(std.heap.page_allocator, ActionStep{ .if_branch = .{
+                        .cond = ite.cond,
+                        .then_steps = try self.dup_slice(ActionStep, then_steps.items),
+                        .else_steps = try self.dup_slice(ActionStep, else_steps.items),
+                    } });
+                    return;
+                }
+                try steps.append(std.heap.page_allocator, ActionStep{ .condition = expr });
+            },
+            .let_in => |l| {
+                for (l.defs) |def| {
+                    try steps.append(std.heap.page_allocator, ActionStep{ .let_bind = .{ .name = def.name, .expr = def.body } });
+                }
+                try self.collect_steps(l.body, steps, is_init);
+            },
             .apply => |ap| {
                 if (ap.func.* == .ident) {
                     if (self.evaluator.find_definition(ap.func.*.ident)) |def| {
@@ -165,7 +226,20 @@ pub const ActionCompiler = struct {
             },
             .unchanged => |vars| {
                 for (vars) |v| {
-                    try steps.append(std.heap.page_allocator, ActionStep{ .unchanged = v });
+                    if (self.evaluator.find_variable(v) != null) {
+                        try steps.append(std.heap.page_allocator, ActionStep{ .unchanged = v });
+                    } else if (self.evaluator.find_definition(v)) |def| {
+                        if (def.params.len == 0 and def.body.* == .tuple) {
+                            for (def.body.*.tuple) |it| {
+                                if (it.* != .ident) return Error.TypeError;
+                                try steps.append(std.heap.page_allocator, ActionStep{ .unchanged = it.*.ident });
+                            }
+                            continue;
+                        }
+                        try steps.append(std.heap.page_allocator, ActionStep{ .unchanged = v });
+                    } else {
+                        try steps.append(std.heap.page_allocator, ActionStep{ .unchanged = v });
+                    }
                 }
             },
             else => {
@@ -223,9 +297,11 @@ pub const ActionExecutor = struct {
                 const val = try self.evaluator.eval_expr(a.expr, ctx, s0, self.eval_pool, &self.state_store.values_pool);
                 if (val == .set_v) {
                     const items = val.set_v.items(self.eval_pool);
+                    const snap = self.eval_pool.snapshot();
                     for (items) |it| {
                         const new_ctx = ctx.extend(a.var_name, it);
                         try self.execute_steps(rest, new_ctx, s0, out_states, is_init);
+                        self.eval_pool.restore(snap);
                     }
                 } else {
                     const new_ctx = ctx.extend(a.var_name, val);
@@ -236,9 +312,11 @@ pub const ActionExecutor = struct {
                 const val = try self.evaluator.eval_expr(a.expr, ctx, s0, self.eval_pool, &self.state_store.values_pool);
                 if (val == .set_v) {
                     const items = val.set_v.items(self.eval_pool);
+                    const snap = self.eval_pool.snapshot();
                     for (items) |it| {
                         const new_ctx = ctx.extend(a.var_name, it);
                         try self.execute_steps(rest, new_ctx, s0, out_states, is_init);
+                        self.eval_pool.restore(snap);
                     }
                 } else {
                     const new_ctx = ctx.extend(a.var_name, val);
@@ -258,10 +336,17 @@ pub const ActionExecutor = struct {
                 defer combined.deinit(std.heap.page_allocator);
                 try combined.appendSlice(std.heap.page_allocator, c.body_steps);
                 try combined.appendSlice(std.heap.page_allocator, rest);
+                const snap = self.eval_pool.snapshot();
                 for (items) |it| {
                     const new_ctx = ctx.extend(c.var_name, it);
                     try self.execute_steps(combined.items, new_ctx, s0, out_states, is_init);
+                    self.eval_pool.restore(snap);
                 }
+            },
+            .let_bind => |l| {
+                const v = try self.evaluator.eval_expr(l.expr, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                const new_ctx = ctx.extend(l.name, v);
+                try self.execute_steps(rest, new_ctx, s0, out_states, is_init);
             },
             .call => |c| {
                 if (c.def.params.len != c.args.len) return Error.TypeError;
@@ -269,7 +354,7 @@ pub const ActionExecutor = struct {
                 for (c.args, 0..) |arg, i| {
                     values[i] = try self.evaluator.eval_expr(arg, ctx, s0, self.eval_pool, &self.state_store.values_pool);
                 }
-                var call_ctx = Context{ .names = undefined, .values = undefined, .len = 0 };
+                var call_ctx = ctx;
                 for (c.def.params, 0..) |p, i| {
                     call_ctx = call_ctx.extend(p, values[i]);
                 }
@@ -277,12 +362,32 @@ pub const ActionExecutor = struct {
                 defer combined.deinit(std.heap.page_allocator);
                 try combined.appendSlice(std.heap.page_allocator, c.body_steps);
                 try combined.appendSlice(std.heap.page_allocator, rest);
+                const snap = self.eval_pool.snapshot();
                 try self.execute_steps(combined.items, call_ctx, s0, out_states, is_init);
+                self.eval_pool.restore(snap);
             },
             .branch => |b| {
+                var combined = std.ArrayList(ActionStep).empty;
+                defer combined.deinit(std.heap.page_allocator);
+                const snap = self.eval_pool.snapshot();
                 for (b.options) |opt| {
-                    try self.execute_steps(opt, ctx, s0, out_states, is_init);
+                    combined.clearRetainingCapacity();
+                    try combined.appendSlice(std.heap.page_allocator, opt);
+                    try combined.appendSlice(std.heap.page_allocator, rest);
+                    try self.execute_steps(combined.items, ctx, s0, out_states, is_init);
+                    self.eval_pool.restore(snap);
                 }
+            },
+            .if_branch => |ib| {
+                const cond_val = try self.evaluator.eval_expr(ib.cond, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                const taken = if (cond_val.is_truthy()) ib.then_steps else ib.else_steps;
+                var combined = std.ArrayList(ActionStep).empty;
+                defer combined.deinit(std.heap.page_allocator);
+                try combined.appendSlice(std.heap.page_allocator, taken);
+                try combined.appendSlice(std.heap.page_allocator, rest);
+                const snap = self.eval_pool.snapshot();
+                try self.execute_steps(combined.items, ctx, s0, out_states, is_init);
+                self.eval_pool.restore(snap);
             },
             .unchanged => |name| {
                 if (s0 == null) return Error.TypeError;

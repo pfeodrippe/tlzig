@@ -222,5 +222,5 @@ test "parse HourClock" {
     try std.testing.expectEqualStrings("HourClock", module.name);
     try std.testing.expectEqual(module.variables.len, 1);
     try std.testing.expectEqualStrings("hr", module.variables[0]);
-    try std.testing.expectEqual(module.definitions.len, 2);
+    try std.testing.expectEqual(module.definitions.len, 3);
 }

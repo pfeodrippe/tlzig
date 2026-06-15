@@ -1,8 +1,9 @@
 const std = @import("std");
 const Arena = @import("arena.zig").Arena;
-const parser = @import("parser.zig");
 const config = @import("config.zig");
 const checker = @import("checker.zig");
+const ModuleLoader = @import("module_loader.zig").ModuleLoader;
+const overrides = @import("overrides.zig");
 
 pub fn main(init: std.process.Init.Minimal) void {
     var it = std.process.Args.Iterator.init(init.args);
@@ -11,7 +12,11 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     var spec_path: ?[]const u8 = null;
     var cfg_path: ?[]const u8 = null;
-    var max_states: u32 = 1_000_000;
+    var max_states: u32 = 100_000;
+    var max_seq_len: u32 = 5;
+    var max_nat: i64 = 10;
+    var min_int: i64 = -10;
+    var max_int: i64 = 10;
 
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--spec")) {
@@ -21,6 +26,22 @@ pub fn main(init: std.process.Init.Minimal) void {
         } else if (std.mem.eql(u8, arg, "--max-states")) {
             if (it.next()) |v| {
                 max_states = std.fmt.parseInt(u32, v, 10) catch 1_000_000;
+            }
+        } else if (std.mem.eql(u8, arg, "--max-seq-len")) {
+            if (it.next()) |v| {
+                max_seq_len = std.fmt.parseInt(u32, v, 10) catch 5;
+            }
+        } else if (std.mem.eql(u8, arg, "--max-nat")) {
+            if (it.next()) |v| {
+                max_nat = std.fmt.parseInt(i64, v, 10) catch 10;
+            }
+        } else if (std.mem.eql(u8, arg, "--min-int")) {
+            if (it.next()) |v| {
+                min_int = std.fmt.parseInt(i64, v, 10) catch -10;
+            }
+        } else if (std.mem.eql(u8, arg, "--max-int")) {
+            if (it.next()) |v| {
+                max_int = std.fmt.parseInt(i64, v, 10) catch 10;
             }
         }
     }
@@ -34,24 +55,30 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     };
 
-    var arena = Arena.init(256 * 1024 * 1024) catch {
+    overrides.set_max_seq_len(max_seq_len);
+    overrides.set_nat_bound(max_nat);
+    overrides.set_int_bounds(min_int, max_int);
+
+    var arena = Arena.init(512 * 1024 * 1024) catch {
         std.debug.print("failed to allocate arena\n", .{});
         std.process.exit(1);
     };
     defer arena.deinit();
 
-    const spec_source = read_file(&arena, spec_path_v) catch {
-        std.debug.print("failed to read spec: {s}\n", .{spec_path_v});
-        std.process.exit(1);
-    };
     const cfg_source = read_file(&arena, cfg_path_v) catch {
         std.debug.print("failed to read cfg: {s}\n", .{cfg_path_v});
         std.process.exit(1);
     };
 
-    var p = parser.Parser.init(&arena, spec_source);
-    const module = p.parse_module() catch {
-        std.debug.print("failed to parse spec\n", .{});
+    const spec_dir = std.fs.path.dirname(spec_path_v) orelse ".";
+    const search_paths = [_][]const u8{
+        spec_dir,
+        "specs/modules",
+        "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = loader.load(spec_path_v) catch {
+        std.debug.print("failed to load spec\n", .{});
         std.process.exit(1);
     };
     const cfg = config.parse(&arena, cfg_source) catch {
@@ -59,15 +86,17 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     };
 
+    const value_cap = @min(@as(u64, max_states) * 16, 2_000_000);
+    const string_cap = @min(@as(u64, max_states) * 2, 200_000);
     var ch = checker.Checker.init(
         &arena,
         module,
         cfg,
         max_states,
-        1_000_000,
-        100_000,
-        1_000_000,
-        100_000,
+        value_cap,
+        string_cap,
+        value_cap,
+        string_cap,
     ) catch |err| {
         std.debug.print("failed to initialize checker: {any}\n", .{err});
         std.process.exit(1);

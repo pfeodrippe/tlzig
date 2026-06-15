@@ -20,8 +20,13 @@ pub fn hash_bytes(fp: Fingerprint, bytes: []const u8) Fingerprint {
     return h;
 }
 
-pub fn hash_value(pool: *const ValuePool, v: Value, fp: Fingerprint) Fingerprint {
-    var h = hash_byte(fp, @intFromEnum(v));
+fn hash_combine(a: Fingerprint, b: Fingerprint) Fingerprint {
+    return a ^ (b +% 0x9e3779b97f4a7c15 +% (a << 6) +% (a >> 2));
+}
+
+fn hash_value_inner(pool: *const ValuePool, v: Value) Fingerprint {
+    var h = hash_init();
+    h = hash_byte(h, @intFromEnum(v));
     switch (v) {
         .bool_v => |b| {
             h = hash_byte(h, if (b) 1 else 0);
@@ -39,34 +44,66 @@ pub fn hash_value(pool: *const ValuePool, v: Value, fp: Fingerprint) Fingerprint
         },
         .set_v => |s| {
             const items = s.items(pool);
-            for (items) |it| {
-                h = hash_value(pool, it, h);
+            var buf: [64]Fingerprint = undefined;
+            if (items.len <= buf.len) {
+                for (items, 0..) |it, i| {
+                    buf[i] = hash_value_inner(pool, it);
+                }
+                std.mem.sort(Fingerprint, buf[0..items.len], {}, std.sort.asc(Fingerprint));
+                for (buf[0..items.len]) |it_h| {
+                    h = hash_combine(h, it_h);
+                }
+            } else {
+                for (items) |it| {
+                    h = hash_combine(h, hash_value_inner(pool, it));
+                }
             }
         },
         .tuple_v => |t| {
             const items = t.items(pool);
             for (items) |it| {
-                h = hash_value(pool, it, h);
+                h = hash_byte(h, 0xab);
+                h = hash_value_inner(pool, it) ^ h;
             }
         },
         .function_v => |f| {
             const keys = f.domain.items(pool);
             const vals = f.entries(pool);
-            for (keys, vals) |k, val| {
-                h = hash_value(pool, k, h);
-                h = hash_value(pool, val, h);
+            var buf: [64]Fingerprint = undefined;
+            if (keys.len <= buf.len) {
+                for (keys, vals, 0..) |k, val, i| {
+                    var kh = hash_value_inner(pool, k);
+                    kh = hash_byte(kh, 0xcd);
+                    kh = hash_value_inner(pool, val) ^ kh;
+                    buf[i] = kh;
+                }
+                std.mem.sort(Fingerprint, buf[0..keys.len], {}, std.sort.asc(Fingerprint));
+                for (buf[0..keys.len]) |entry_h| {
+                    h = hash_combine(h, entry_h);
+                }
+            } else {
+                for (keys, vals) |k, val| {
+                    h = hash_byte(h, 0xcd);
+                    h = hash_value_inner(pool, k) ^ h;
+                    h = hash_value_inner(pool, val) ^ h;
+                }
             }
         },
         .record_v => |r| {
             const fs = r.fields(pool);
             var i: u32 = 0;
             while (i < r.len) : (i += 1) {
-                h = hash_value(pool, fs[i * 2], h);
-                h = hash_value(pool, fs[i * 2 + 1], h);
+                h = hash_byte(h, 0xef);
+                h = hash_combine(h, hash_value_inner(pool, fs[i * 2]));
+                h = hash_combine(h, hash_value_inner(pool, fs[i * 2 + 1]));
             }
         },
     }
     return h;
+}
+
+pub fn hash_value(pool: *const ValuePool, v: Value, fp: Fingerprint) Fingerprint {
+    return hash_combine(fp, hash_value_inner(pool, v));
 }
 
 pub fn hash_state(pool: *const ValuePool, values: []const Value) Fingerprint {

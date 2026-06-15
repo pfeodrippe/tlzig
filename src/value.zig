@@ -108,10 +108,7 @@ pub const Set = extern struct {
 
     pub fn eql(self: Set, other: Set, pool: *const ValuePool) bool {
         if (self.len != other.len) return false;
-        for (self.items(pool), other.items(pool)) |a, b| {
-            if (!a.eql(b, pool)) return false;
-        }
-        return true;
+        return self.is_subset(pool, other);
     }
 
     pub fn clone(self: Set, source: *const ValuePool, target: *ValuePool) error{OutOfMemory}!Set {

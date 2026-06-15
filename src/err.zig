@@ -11,6 +11,7 @@ pub const Error = error{
     Deadlock,
     ConfigError,
     NotImplemented,
+    AssertionFailed,
     IoError,
 };
 

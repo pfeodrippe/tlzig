@@ -56,17 +56,25 @@ pub const Checker = struct {
         evaluator.set_constants(constants);
         const compiler = ActionCompiler.init(arena, evaluator);
 
-        const init_name = cfg.init_name orelse find_init_name(module) orelse return Error.ConfigError;
-        const next_name = cfg.next_name orelse find_next_name(module) orelse return Error.ConfigError;
+        const init_name_v = cfg.init_name orelse blk: {
+            if (cfg.spec_name) |sn| {
+                if (extract_spec_names(module, sn)) |names| {
+                    break :blk names.init;
+                } else |_| {}
+            }
+            break :blk find_init_name(module) orelse return Error.ConfigError;
+        };
+        const next_name_v = cfg.next_name orelse blk: {
+            if (cfg.spec_name) |sn| {
+                if (extract_spec_names(module, sn)) |names| {
+                    break :blk names.next;
+                } else |_| {}
+            }
+            break :blk find_next_name(module) orelse return Error.ConfigError;
+        };
 
-        const init_def = evaluator.find_definition(init_name) orelse {
-            std.debug.print("undefined init: {s}\n", .{init_name});
-            return Error.UndefinedSymbol;
-        };
-        const next_def = evaluator.find_definition(next_name) orelse {
-            std.debug.print("undefined next: {s}\n", .{next_name});
-            return Error.UndefinedSymbol;
-        };
+        const init_def = evaluator.find_definition(init_name_v) orelse return Error.UndefinedSymbol;
+        const next_def = evaluator.find_definition(next_name_v) orelse return Error.UndefinedSymbol;
 
         const compiled_init = try compiler.compile_init(init_def.body);
         const compiled_next = try compiler.compile_next(next_def.body);
@@ -123,6 +131,7 @@ pub const Checker = struct {
             out_states.clearRetainingCapacity();
             self.eval_pool.restore(self.eval_pool.snapshot());
             try executor.execute_next(self.next_spec, idx, &out_states);
+            self.eval_pool.restore(self.eval_pool.snapshot());
             try self.process_generated(&out_states);
         }
 
@@ -137,7 +146,10 @@ pub const Checker = struct {
         for (out_states.items) |idx| {
             self.generated += 1;
             const st = self.state_store.get(idx);
-            if (!try self.check_invariants(st)) {
+            const snap = self.eval_pool.snapshot();
+            const invariants_hold = try self.check_invariants(st);
+            self.eval_pool.restore(snap);
+            if (!invariants_hold) {
                 return Error.InvariantViolated;
             }
             const fp = fingerprint.hash_state(&self.state_store.values_pool, st.values);
@@ -162,6 +174,59 @@ pub const Result = struct {
     distinct: u64,
     error_state: ?u32,
 };
+
+const SpecNames = struct {
+    init: []const u8,
+    next: []const u8,
+};
+
+fn extract_spec_names(module: ast.Module, spec_name: []const u8) !SpecNames {
+    for (module.definitions) |d| {
+        if (!std.mem.eql(u8, d.name, spec_name)) continue;
+        const body = d.body;
+        // Spec == Init /\ [][Next]_vars (possibly with fairness conjuncts)
+        var conj: *ast.Expr = body;
+        while (true) {
+            switch (conj.*) {
+                .binary => |b| {
+                    if (b.op == .and_op) {
+                        const right_name = try action_name(b.right);
+                        if (right_name != null) return SpecNames{ .init = try init_name(b.left) orelse return Error.ConfigError, .next = right_name.? };
+                        conj = b.left;
+                        continue;
+                    }
+                },
+                else => {},
+            }
+            break;
+        }
+        return Error.ConfigError;
+    }
+    return Error.ConfigError;
+}
+
+fn action_name(expr: *ast.Expr) error{ConfigError}!?[]const u8 {
+    // [][Next]_vars
+    switch (expr.*) {
+        .box_action => |ba| return ba.action_name,
+        .binary => |b| {
+            if (b.op == .and_op) {
+                const left = try action_name(b.left);
+                if (left != null) return left;
+                return try action_name(b.right);
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn init_name(expr: *ast.Expr) error{ConfigError}!?[]const u8 {
+    switch (expr.*) {
+        .ident => |name| return name,
+        else => return null,
+    }
+}
 
 fn find_init_name(module: ast.Module) ?[]const u8 {
     for (module.definitions) |d| {

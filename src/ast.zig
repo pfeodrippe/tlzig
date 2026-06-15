@@ -39,7 +39,11 @@ pub const Expr = union(ExprTag) {
     set_binary: *SetBinary,
     set_of_functions: *SetOfFunctions,
     function_literal: *FunctionLiteral,
+    record_set: *RecordSet,
     except: *Except,
+    let_in: *LetIn,
+    case_expr: *CaseExpr,
+    box_action: *BoxAction,
     at,
 };
 
@@ -65,7 +69,11 @@ pub const ExprTag = enum(u8) {
     set_binary,
     set_of_functions,
     function_literal,
+    record_set,
     except,
+    let_in,
+    case_expr,
+    box_action,
     at,
 };
 
@@ -92,6 +100,7 @@ pub const BinaryOp = enum(u8) {
     div,
     mod,
     range,
+    concat,
 };
 
 pub const UnaryOp = enum(u8) {
@@ -165,7 +174,7 @@ pub const SetMap = struct {
     value: *Expr,
 };
 
-pub const SetBinaryOp = enum(u8) { union_op, intersection_op, difference_op };
+pub const SetBinaryOp = enum(u8) { union_op, intersection_op, difference_op, cartesian_op };
 
 pub const SetBinary = struct {
     op: SetBinaryOp,
@@ -174,8 +183,7 @@ pub const SetBinary = struct {
 };
 
 pub const FunctionLiteral = struct {
-    var_name: []const u8,
-    domain: *Expr,
+    vars: []const BoundVar,
     body: *Expr,
 };
 
@@ -193,4 +201,33 @@ pub const Except = struct {
 pub const SetOfFunctions = struct {
     domain: *Expr,
     codomain: *Expr,
+};
+
+pub const RecordFieldDomain = struct {
+    name: []const u8,
+    domain: *Expr,
+};
+
+pub const RecordSet = struct {
+    fields: []const RecordFieldDomain,
+};
+
+pub const LetIn = struct {
+    defs: []const Definition,
+    body: *Expr,
+};
+
+pub const CaseArm = struct {
+    cond: *Expr,
+    value: *Expr,
+};
+
+pub const CaseExpr = struct {
+    arms: []const CaseArm,
+    otherwise: ?*Expr,
+};
+
+pub const BoxAction = struct {
+    action_name: []const u8,
+    vars: *Expr,
 };

@@ -61,8 +61,30 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
             while (it.next()) |cand| {
                 const t = std.mem.trim(u8, cand, " \t");
                 if (t.len == 0) continue;
+                if (std.mem.startsWith(u8, t, "\\*")) continue;
+                if (std.mem.startsWith(u8, t, "(*")) continue;
                 if (is_directive(t)) break;
                 try parse_constant_assignment(arena, t, &constants);
+            }
+        } else if (std.mem.eql(u8, first_word, "PROPERTY") or
+            std.mem.eql(u8, first_word, "PROPERTIES") or
+            std.mem.eql(u8, first_word, "ALIAS") or
+            std.mem.eql(u8, first_word, "VIEW") or
+            std.mem.eql(u8, first_word, "SYMMETRY") or
+            std.mem.eql(u8, first_word, "POSTCONDITION") or
+            std.mem.eql(u8, first_word, "CHECK_DEADLOCK"))
+        {
+            // Not implemented yet; parse and ignore for now.
+            if (std.mem.eql(u8, first_word, "PROPERTIES")) {
+                while (it.next()) |cand| {
+                    const t = std.mem.trim(u8, cand, " \t");
+                    if (t.len == 0) continue;
+                    if (is_directive(t)) {
+                        // Push back by re-tokenizing? std.mem.tokenize doesn't support push-back.
+                        // Accept the small limitation: PROPERTY lists cannot be followed by a directive line as a property.
+                        break;
+                    }
+                }
             }
         }
     }
@@ -99,9 +121,11 @@ fn parse_constant_assignment(arena: *Arena, line: []const u8, out: *std.ArrayLis
 fn is_directive(line: []const u8) bool {
     const first = first_token(line);
     const directives = [_][]const u8{
-        "SPECIFICATION", "INIT",       "NEXT",
-        "INVARIANT",     "INVARIANTS", "CONSTANT",
-        "CONSTANTS",
+        "SPECIFICATION", "INIT",           "NEXT",
+        "INVARIANT",     "INVARIANTS",     "CONSTANT",
+        "CONSTANTS",     "PROPERTY",       "PROPERTIES",
+        "ALIAS",         "VIEW",           "SYMMETRY",
+        "POSTCONDITION", "CHECK_DEADLOCK",
     };
     for (directives) |d| {
         if (std.mem.eql(u8, first, d)) return true;

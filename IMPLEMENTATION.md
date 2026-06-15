@@ -52,7 +52,8 @@ Supported syntax/semantics:
 - Sets: set enumeration `{a, b}`, `\in`, `\notin`, `\subseteq`, `SUBSET S`,
   `S \cup T`, `S \cap T`, `S \ T`.
 - Functions: `[x \in S |-> e]`, application `f[x]`, `DOMAIN f`,
-  set-of-functions `[S -> T]`, `EXCEPT ![x] = e` (with `@`).
+  set-of-functions `[S -> T]` (membership checked without enumerating the set),
+  `EXCEPT ![x] = e` (with `@`).
 - Tuples: `<<a, b>>`, application `t[i]` (1-based).
 - Records: `[a |-> v]`, field access `r.a`.
 - `IF ... THEN ... ELSE ...`.
@@ -63,12 +64,13 @@ Supported syntax/semantics:
 - `UNCHANGED x`, `UNCHANGED <<x, y>>`.
 - Action conjunction/disjunction.
 - `Init`, `Next`, `INVARIANT` from the `.cfg` file.
+- `LET d1 == e1 IN e2` (local definitions, including inside actions).
 
 Out of scope for Phase 1:
 
 - Real modules beyond `Naturals` (no `Sequences`, `Bags`, `FiniteSets`, TLC overrides).
 - Liveness checking (`[]`, `<>`, `~>`). The parser skips `SPECIFICATION` lines that
-  contain these operators and the `--cfg` file must therefore use `INIT`/`NEXT`.
+  contain these operators and the `.cfg` file must therefore use `INIT`/`NEXT`.
 - Symmetry reduction.
 - Model values and views.
 - Theorem/proof constructs.
@@ -136,7 +138,8 @@ const State = struct {
 Fingerprinting:
 
 - 64-bit FNV-1a over the canonical byte sequence of the state's values.
-- Sets and functions are normalized (sorted) before fingerprinting.
+- Sets and functions are hashed in an order-independent way so semantically
+  identical values always produce the same fingerprint.
 
 ## 5. Action Compilation
 
@@ -147,7 +150,9 @@ Actions are compiled once into a list of `ActionStep`s:
 - `condition`    — boolean guard.
 - `choose`       — `\E x \in S : action` (nondeterministic action choice).
 - `call`         — inlined parameterised action call (`proc(self)`).
-- `branch`       — disjunction `\/` (choice point).
+- `branch`       — top-level action disjunction `\/` (choice point);
+  nested `\/` inside conditions is kept as a single condition so short-circuit
+  semantics apply.
 - `unchanged`    — `UNCHANGED x`.
 
 This avoids interpreting the AST inside the hot model-checking loop. Parameterised
@@ -238,6 +243,21 @@ Variable lookup order:
 - Java TLC: ~0.5s, 18 generated, 13 distinct, depth 5
 - tlzig (ReleaseFast): 0.007s, 18 generated, 13 distinct
 - Speedup:  ~70x
+
+### MissionariesAndCannibals
+
+```sh
+./zig-out/bin/tlzig \
+  --spec vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla \
+  --cfg   vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals_typeok.cfg \
+  --max-states 10000
+```
+
+- Java TLC: 283 generated, 64 distinct (TypeOK only)
+- tlzig (ReleaseFast): 283 generated, 64 distinct
+- `Solution` invariant is correctly violated at the goal state.
+- Required: `LET/IN` action bindings, `Cardinality`, `SUBSET`,
+  function-set membership, `\cup`/ `\`, canonical set fingerprints.
 
 ## 8. Running
 

@@ -7,12 +7,19 @@ pub const Module = struct {
     constants: []const []const u8,
     definitions: []const Definition,
     instances: []const Instance,
+    namespace_instances: []const NamespaceInstance,
     init_name: []const u8,
     next_name: []const u8,
     invariants: []const []const u8,
 };
 
 pub const Instance = struct {
+    module_name: []const u8,
+    substitutions: []const Substitution,
+};
+
+pub const NamespaceInstance = struct {
+    alias: []const u8,
     module_name: []const u8,
     substitutions: []const Substitution,
 };

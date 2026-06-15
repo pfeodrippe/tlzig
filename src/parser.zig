@@ -262,6 +262,12 @@ pub const Lexer = struct {
                 return self.mk(.neq, "#", start_line, start_col);
             },
             '<' => {
+                if (self.peek(1) == '=' and self.peek(2) == '>') {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    return self.mk(.equiv, "<=>", start_line, start_col);
+                }
                 if (self.peek(1) == '=') {
                     self.advance2();
                     return self.mk(.le, "<=", start_line, start_col);
@@ -269,12 +275,6 @@ pub const Lexer = struct {
                 if (self.peek(1) == '-') {
                     self.advance2();
                     return self.mk(.subst, "<-", start_line, start_col);
-                }
-                if (self.peek(1) == '>') {
-                    self.advance();
-                    self.advance();
-                    self.advance();
-                    return self.mk(.equiv, "<=>", start_line, start_col);
                 }
                 if (self.peek(1) == '<') {
                     self.advance2();
@@ -560,6 +560,8 @@ pub const Parser = struct {
         defer definitions.deinit(std.heap.page_allocator);
         var instances = std.ArrayList(ast.Instance).empty;
         defer instances.deinit(std.heap.page_allocator);
+        var namespace_instances = std.ArrayList(ast.NamespaceInstance).empty;
+        defer namespace_instances.deinit(std.heap.page_allocator);
         while (true) {
             self.skip_dashes();
             if (self.current.kind == .keyword_variables) {
@@ -574,6 +576,22 @@ pub const Parser = struct {
                 self.advance();
                 while (true) {
                     try constants.append(std.heap.page_allocator, try self.dup(try self.expect_ident_text()));
+                    // Operator constants may be declared with parameters: Op(_,_).
+                    if (self.current.kind == .lparen) {
+                        var depth: u32 = 0;
+                        while (self.current.kind != .eof) {
+                            if (self.current.kind == .lparen) {
+                                depth += 1;
+                            } else if (self.current.kind == .rparen) {
+                                depth -|= 1;
+                                if (depth == 0) {
+                                    self.advance();
+                                    break;
+                                }
+                            }
+                            self.advance();
+                        }
+                    }
                     if (!self.match(.comma)) break;
                 }
                 continue;
@@ -602,6 +620,22 @@ pub const Parser = struct {
             }
             if (self.current.kind != .ident) break;
             const saved = self.*;
+            if (self.current.kind == .ident and self.next.kind == .defeq) {
+                const alias = self.current.text;
+                self.advance(); // alias
+                self.advance(); // ==
+                if (self.current.kind == .keyword_instance) {
+                    const inst = try self.parse_instance();
+                    try namespace_instances.append(std.heap.page_allocator, ast.NamespaceInstance{
+                        .alias = try self.dup(alias),
+                        .module_name = inst.module_name,
+                        .substitutions = inst.substitutions,
+                    });
+                    continue;
+                }
+                // Not an instance alias; rewind and parse as normal definition.
+                self.* = saved;
+            }
             const def = self.parse_definition() catch {
                 self.* = saved;
                 self.skip_to_next_definition();
@@ -622,6 +656,7 @@ pub const Parser = struct {
             .constants = try self.dup_slice([]const u8, constants.items),
             .definitions = try self.dup_slice(ast.Definition, definitions.items),
             .instances = try self.dup_slice(ast.Instance, instances.items),
+            .namespace_instances = try self.dup_slice(ast.NamespaceInstance, namespace_instances.items),
             .init_name = init_name,
             .next_name = next_name,
             .invariants = try self.dup_slice([]const u8, invariants.items),
@@ -935,48 +970,40 @@ pub const Parser = struct {
                 return try self.expr_string(text[1 .. text.len - 1]);
             },
             .ident => {
-                const name = try self.expect_ident_text();
-                var expr = try self.expr_ident(name);
+                var name = try self.expect_ident_text();
                 if (self.match(.bang)) {
+                    // Namespaced instance access: A!Op is represented as a single identifier A!Op.
                     const field = try self.expect_ident_text();
-                    expr = try self.expr_field(expr, field);
+                    name = try self.arena_concat_three(name, "!", field);
                 }
+                var expr = try self.expr_ident(name);
                 if (self.match(.prime)) {
                     expr = try self.expr_primed(name);
                 }
-                while (true) {
-                    if (self.match(.lparen)) {
-                        const args = try self.parse_expr_list(.rparen);
-                        expr = try self.expr_apply(expr, args);
-                        continue;
-                    }
-                    if (self.match(.lbracket)) {
-                        const args = try self.parse_expr_list(.rbracket);
-                        expr = try self.expr_apply(expr, args);
-                        continue;
-                    }
-                    if (self.match(.dot)) {
-                        const field = try self.expect_ident_text();
-                        expr = try self.expr_field(expr, field);
-                        continue;
-                    }
-                    break;
-                }
-                return expr;
+                return try self.parse_suffixes(expr);
             },
             .lparen => {
                 self.advance();
                 const e = try self.parse_expr();
                 try self.expect(.rparen);
-                return e;
+                return try self.parse_suffixes(e);
             },
-            .lbrace => return try self.parse_set(),
-            .lbracket => return try self.parse_function_or_record(),
+            .lbrace => {
+                const expr = try self.parse_set();
+                return try self.parse_suffixes(expr);
+            },
+            .lbracket => {
+                const expr = try self.parse_function_or_record();
+                return try self.parse_suffixes(expr);
+            },
             .at => {
                 self.advance();
-                return try self.expr_at();
+                return try self.parse_suffixes(try self.expr_at());
             },
-            .langle => return try self.parse_tuple(),
+            .langle => {
+                const expr = try self.parse_tuple();
+                return try self.parse_suffixes(expr);
+            },
             .keyword_choose => return try self.parse_choose(),
             .keyword_if => return try self.parse_if(),
             .keyword_forall => return try self.parse_quantifier(.forall),
@@ -987,6 +1014,29 @@ pub const Parser = struct {
             .keyword_lambda => return try self.parse_lambda(),
             else => return error.SyntaxError,
         }
+    }
+
+    fn parse_suffixes(self: *Parser, expr: *ast.Expr) anyerror!*ast.Expr {
+        var result = expr;
+        while (true) {
+            if (self.match(.lparen)) {
+                const args = try self.parse_expr_list(.rparen);
+                result = try self.expr_apply(result, args);
+                continue;
+            }
+            if (self.match(.lbracket)) {
+                const args = try self.parse_expr_list(.rbracket);
+                result = try self.expr_apply(result, args);
+                continue;
+            }
+            if (self.match(.dot)) {
+                const field = try self.expect_ident_text();
+                result = try self.expr_field(result, field);
+                continue;
+            }
+            break;
+        }
+        return result;
     }
 
     fn parse_set(self: *Parser) !*ast.Expr {
@@ -1031,8 +1081,20 @@ pub const Parser = struct {
         }
         if (self.current.kind == .ident and self.next.kind == .mapsto) {
             const fields = try self.parse_record_fields();
-            try self.expect(.rbracket);
-            return try self.expr_record(fields);
+            var expr = try self.expr_record(fields);
+            if (self.match(.except)) {
+                while (true) {
+                    const steps = try self.parse_except_steps();
+                    try self.expect(.eq);
+                    const value = try self.parse_expr();
+                    expr = try self.expr_except(expr, steps, value);
+                    if (!self.match(.comma)) break;
+                }
+                try self.expect(.rbracket);
+            } else {
+                try self.expect(.rbracket);
+            }
+            return expr;
         }
         if (self.current.kind == .ident and self.next.kind == .colon) {
             const fields = try self.parse_record_set_fields();
@@ -1549,6 +1611,15 @@ pub const Parser = struct {
         return copy;
     }
 
+    fn arena_concat_three(self: *Parser, a: []const u8, sep: []const u8, b: []const u8) ![]const u8 {
+        const total = a.len + sep.len + b.len;
+        const result = try self.arena.alloc(u8, total);
+        @memcpy(result[0..a.len], a);
+        @memcpy(result[a.len .. a.len + sep.len], sep);
+        @memcpy(result[a.len + sep.len ..], b);
+        return result;
+    }
+
     fn dup_slice(self: *Parser, comptime T: type, items: []const T) ![]const T {
         if (items.len == 0) return &[0]T{};
         const copy = try self.arena.alloc(T, items.len);
@@ -1561,8 +1632,21 @@ pub const Parser = struct {
         while (self.current.kind != .eof) {
             switch (self.current.kind) {
                 .ident => if (self.current.col == 1) return,
-                .keyword_variables, .keyword_constants, .keyword_instance, .keyword_theorem => return,
+                .keyword_variables, .keyword_constants, .keyword_theorem => return,
                 .keyword_module => return,
+                .keyword_instance => {
+                    // Skip a top-level INSTANCE statement so it is not re-parsed by the module loop.
+                    self.advance();
+                    while (self.current.kind != .eof and self.current.kind != .ident) self.advance();
+                    if (self.current.kind == .ident) self.advance();
+                    if (self.current.kind == .keyword_with) {
+                        self.advance();
+                        while (self.current.kind != .eof and !(self.current.kind == .ident and self.current.col == 1)) {
+                            self.advance();
+                        }
+                    }
+                    continue;
+                },
                 .lbracket, .langle => {
                     self.advance();
                     continue;

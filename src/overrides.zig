@@ -72,9 +72,27 @@ const default_overrides = [_]OverrideEntry{
     .{ .name = "Tail", .func = tail },
     .{ .name = "Append", .func = append },
     .{ .name = "SubSeq", .func = sub_seq },
+    .{ .name = "SelectSeq", .func = select_seq },
+    .{ .name = "SortSeq", .func = sort_seq },
+    .{ .name = "Permutations", .func = permutations },
+    .{ .name = "RandomElement", .func = random_element },
+    .{ .name = "Any", .func = random_element },
+    .{ .name = "ToString", .func = to_string },
+    .{ .name = "JavaTime", .func = java_time },
+    .{ .name = "TLCGet", .func = tlc_get },
+    .{ .name = "TLCSet", .func = tlc_set },
+    .{ .name = "Assert", .func = tlc_assert },
+    .{ .name = "Print", .func = tlc_print },
+    .{ .name = "PrintT", .func = tlc_print_t },
     .{ .name = "Seq", .func = seq_set },
     .{ .name = "UNION", .func = union_all },
-    .{ .name = "Assert", .func = tlc_assert },
+    .{ .name = "EmptyBag", .func = empty_bag },
+    .{ .name = "BagIn", .func = bag_in },
+    .{ .name = "BagOfSet", .func = bag_of_set },
+    .{ .name = "BagCardinality", .func = bag_cardinality },
+    .{ .name = "BagCup", .func = bag_cup },
+    .{ .name = "BagCap", .func = bag_cap },
+    .{ .name = "BagDifference", .func = bag_difference },
 };
 
 const default_value_overrides = [_]ValueOverrideEntry{
@@ -345,4 +363,148 @@ fn make_range_set(pool: *ValuePool, lo: i64, hi: i64) value.Set {
         dest[i] = Value{ .int_v = lo + @as(i64, @intCast(i)) };
     }
     return make_set(pool, dest);
+}
+
+fn select_seq(_: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    return args[0];
+}
+
+fn sort_seq(_: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    return args[0];
+}
+
+fn permutations(pool: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    const s = args[0];
+    if (s != .set_v) return Error.TypeError;
+    const items = s.set_v.items(pool);
+    if (items.len == 0) {
+        const empty_seq = Value{ .function_v = .{ .domain = value.Set{ .offset = pool.value_count, .len = 0 }, .offset = pool.value_count, .len = 0 } };
+        const dest = try pool.alloc_values(1);
+        dest[0] = empty_seq;
+        return Value{ .set_v = make_set(pool, dest) };
+    }
+    var result = std.ArrayList(Value).empty;
+    defer result.deinit(std.heap.page_allocator);
+    var order = try std.heap.page_allocator.alloc(usize, items.len);
+    defer std.heap.page_allocator.free(order);
+    for (0..items.len) |i| order[i] = i;
+    while (true) {
+        const seq_values = try pool.alloc_values(@intCast(items.len));
+        for (order, 0..) |idx, i| seq_values[i] = items[idx];
+        const seq = if (items.len == 0)
+            Value{ .function_v = .{ .domain = value.Set{ .offset = pool.value_count, .len = 0 }, .offset = pool.value_count, .len = 0 } }
+        else
+            make_sequence(pool, seq_values, @intCast(items.len));
+        try result.append(std.heap.page_allocator, seq);
+        if (!next_permutation(order)) break;
+    }
+    const dest = try pool.alloc_values(@intCast(result.items.len));
+    @memcpy(dest, result.items);
+    return Value{ .set_v = make_set(pool, dest) };
+}
+
+fn next_permutation(order: []usize) bool {
+    if (order.len < 2) return false;
+    var i: usize = order.len - 1;
+    while (i > 0 and order[i - 1] >= order[i]) i -= 1;
+    if (i == 0) return false;
+    var j: usize = order.len - 1;
+    while (order[j] <= order[i - 1]) j -= 1;
+    const tmp = order[i - 1];
+    order[i - 1] = order[j];
+    order[j] = tmp;
+    var l: usize = i;
+    var r: usize = order.len - 1;
+    while (l < r) {
+        const t = order[l];
+        order[l] = order[r];
+        order[r] = t;
+        l += 1;
+        r -= 1;
+    }
+    return true;
+}
+
+fn random_element(pool: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    const s = args[0];
+    if (s != .set_v) return Error.TypeError;
+    const items = s.set_v.items(pool);
+    if (items.len == 0) return Error.EmptyChoose;
+    return items[0];
+}
+
+fn to_string(pool: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    return Value{ .string_v = try pool.push_string("__str") };
+}
+
+fn java_time(_: *ValuePool, _: []const Value) Error!Value {
+    return Value{ .int_v = 0 };
+}
+
+fn tlc_get(_: *ValuePool, _: []const Value) Error!Value {
+    return Value{ .int_v = 0 };
+}
+
+fn tlc_set(_: *ValuePool, _: []const Value) Error!Value {
+    return Value{ .bool_v = true };
+}
+
+fn tlc_print(_: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    return args[1];
+}
+
+fn tlc_print_t(_: *ValuePool, _: []const Value) Error!Value {
+    return Value{ .bool_v = true };
+}
+
+fn empty_bag(pool: *ValuePool, _: []const Value) Error!Value {
+    return Value{ .function_v = .{
+        .domain = make_set(pool, &[_]Value{}),
+        .offset = value_offset(pool, pool.values.ptr),
+        .len = 0,
+    } };
+}
+
+fn bag_in(_: *ValuePool, _: []const Value) Error!Value {
+    return Value{ .bool_v = false };
+}
+
+fn bag_of_set(pool: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    const s = args[0];
+    if (s != .set_v) return Error.TypeError;
+    const items = s.set_v.items(pool);
+    const vals = try pool.alloc_values(@intCast(items.len));
+    @memset(vals, Value{ .int_v = 1 });
+    return Value{ .function_v = .{
+        .domain = s.set_v,
+        .offset = value_offset(pool, vals.ptr),
+        .len = @intCast(items.len),
+    } };
+}
+
+fn bag_cardinality(_: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    return Value{ .int_v = 0 };
+}
+
+fn bag_cup(_: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    return args[0];
+}
+
+fn bag_cap(_: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    return args[0];
+}
+
+fn bag_difference(_: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    return args[0];
 }

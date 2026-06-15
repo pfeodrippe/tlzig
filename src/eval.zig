@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Arena = @import("arena.zig").Arena;
 const ast = @import("ast.zig");
 const value = @import("value.zig");
@@ -89,7 +90,7 @@ pub const Evaluator = struct {
         self.aliases = aliases;
     }
 
-    fn resolve_alias(self: Evaluator, name: []const u8) []const u8 {
+    pub fn resolve_alias(self: Evaluator, name: []const u8) []const u8 {
         for (self.aliases) |a| {
             if (std.mem.eql(u8, name, a.from)) return a.to;
         }
@@ -111,6 +112,9 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!Value {
+        assert(@intFromPtr(expr) != 0);
+        assert(eval_pool.value_count <= eval_pool.value_cap);
+        assert(state_pool.value_count <= state_pool.value_cap);
         switch (expr.*) {
             .bool_literal => |b| return Value{ .bool_v = b },
             .int_literal => |i| return Value{ .int_v = i },

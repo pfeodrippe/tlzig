@@ -28,7 +28,7 @@ pub const Arena = struct {
     }
 
     pub fn alloc(self: *Arena, comptime T: type, count: u64) ![]T {
-        assert(count > 0);
+        if (count == 0) return &[_]T{};
         const size = std.math.mul(u64, @sizeOf(T), count) catch return error.OutOfMemory;
         const aligned_size = std.mem.alignForward(u64, size, @alignOf(T));
         const aligned_len = std.mem.alignForward(u64, self.len, @alignOf(T));

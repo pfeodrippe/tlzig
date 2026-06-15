@@ -1,5 +1,6 @@
 const std = @import("std");
 const Arena = @import("arena.zig").Arena;
+const ast = @import("ast.zig");
 
 pub const ConstantAssignment = struct {
     name: []const u8,
@@ -27,7 +28,54 @@ pub const Config = struct {
             .constraints = &[_][]const u8{},
         };
     }
+
+    pub fn default(arena: *Arena) Config {
+        const invariants = arena.alloc([]const u8, 2) catch unreachable;
+        invariants[0] = arena.dup("TypeOK") catch unreachable;
+        invariants[1] = arena.dup("Inv") catch unreachable;
+        return Config{
+            .spec_name = null,
+            .init_name = arena.dup("Init") catch unreachable,
+            .next_name = arena.dup("Next") catch unreachable,
+            .invariants = invariants,
+            .properties = &[_][]const u8{},
+            .constants = &[_]ConstantAssignment{},
+            .constraints = &[_][]const u8{},
+        };
+    }
+
+    pub fn from_module(arena: *Arena, module: ast.Module) Config {
+        const init_name = find_def(module, "Init") orelse find_def(module, "Spec") orelse "Init";
+        const next_name = find_def(module, "Next") orelse init_name;
+        var invs = std.ArrayList([]const u8).empty;
+        defer invs.deinit(std.heap.page_allocator);
+        for (&[_][]const u8{ "TypeOK", "Inv", "Invariant", "Safety", "TypeInvariant" }) |cand| {
+            if (find_def(module, cand) != null) {
+                invs.append(std.heap.page_allocator, arena.dup(cand) catch unreachable) catch {};
+            }
+        }
+        return Config{
+            .spec_name = null,
+            .init_name = arena.dup(init_name) catch unreachable,
+            .next_name = arena.dup(next_name) catch unreachable,
+            .invariants = blk: {
+                const result = arena.alloc([]const u8, invs.items.len) catch unreachable;
+                @memcpy(result, invs.items);
+                break :blk result;
+            },
+            .properties = &[_][]const u8{},
+            .constants = &[_]ConstantAssignment{},
+            .constraints = &[_][]const u8{},
+        };
+    }
 };
+
+fn find_def(module: ast.Module, name: []const u8) ?[]const u8 {
+    for (module.definitions) |d| {
+        if (std.mem.eql(u8, d.name, name)) return d.name;
+    }
+    return null;
+}
 
 pub fn parse(arena: *Arena, source: []const u8) !Config {
     var cfg = Config.empty();

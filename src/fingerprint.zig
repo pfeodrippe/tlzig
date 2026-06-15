@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Value = @import("value.zig").Value;
 const ValuePool = @import("value.zig").ValuePool;
 
@@ -108,6 +109,7 @@ pub fn hash_value(pool: *const ValuePool, v: Value, fp: Fingerprint) Fingerprint
 }
 
 pub fn hash_state(pool: *const ValuePool, values: []const Value) Fingerprint {
+    assert(pool.value_count <= pool.value_cap);
     var h = hash_init();
     for (values) |v| {
         h = hash_value(pool, v, h);

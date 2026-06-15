@@ -12,6 +12,7 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     var spec_path: ?[]const u8 = null;
     var cfg_path: ?[]const u8 = null;
+    var default_cfg = false;
     var max_states: u32 = 100_000;
     var max_seq_len: u32 = 5;
     var max_nat: i64 = 10;
@@ -25,6 +26,8 @@ pub fn main(init: std.process.Init.Minimal) void {
             spec_path = it.next();
         } else if (std.mem.eql(u8, arg, "--cfg")) {
             cfg_path = it.next();
+        } else if (std.mem.eql(u8, arg, "--default-cfg")) {
+            default_cfg = true;
         } else if (std.mem.eql(u8, arg, "--max-states")) {
             if (it.next()) |v| {
                 max_states = std.fmt.parseInt(u32, v, 10) catch 1_000_000;
@@ -60,10 +63,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.debug.print("usage: tlzig --spec FILE.tla --cfg FILE.cfg [--max-states N] [--arena-bytes B] [--eval-arena-bytes B]\n", .{});
         std.process.exit(1);
     };
-    const cfg_path_v = cfg_path orelse {
-        std.debug.print("usage: tlzig --spec FILE.tla --cfg FILE.cfg [--max-states N] [--arena-bytes B] [--eval-arena-bytes B]\n", .{});
+    if (cfg_path == null and !default_cfg) {
+        std.debug.print("usage: tlzig --spec FILE.tla (--cfg FILE.cfg | --default-cfg) [--max-states N] ...\n", .{});
         std.process.exit(1);
-    };
+    }
 
     overrides.set_max_seq_len(max_seq_len);
     overrides.set_nat_bound(max_nat);
@@ -75,25 +78,28 @@ pub fn main(init: std.process.Init.Minimal) void {
     };
     defer arena.deinit();
 
-    const cfg_source = read_file(&arena, cfg_path_v) catch {
-        std.debug.print("failed to read cfg: {s}\n", .{cfg_path_v});
-        std.process.exit(1);
-    };
-
     const spec_dir = std.fs.path.dirname(spec_path_v) orelse ".";
     const search_paths = [_][]const u8{
         spec_dir,
         "specs/modules",
         "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+        "vendor/tlaplus-examples/specifications",
     };
     const loader = ModuleLoader.init(&arena, &search_paths);
     const module = loader.load(spec_path_v) catch |err| {
         std.debug.print("failed to load spec: {any}\n", .{err});
         std.process.exit(1);
     };
-    const cfg = config.parse(&arena, cfg_source) catch {
-        std.debug.print("failed to parse config\n", .{});
-        std.process.exit(1);
+    const cfg: config.Config = if (default_cfg) config.Config.from_module(&arena, module) else blk: {
+        const cfg_path_v = cfg_path.?;
+        const cfg_source = read_file(&arena, cfg_path_v) catch {
+            std.debug.print("failed to read cfg: {s}\n", .{cfg_path_v});
+            std.process.exit(1);
+        };
+        break :blk config.parse(&arena, cfg_source) catch {
+            std.debug.print("failed to parse config\n", .{});
+            std.process.exit(1);
+        };
     };
 
     const eval_value_cap = cap_u32(@min(@max(@as(u64, max_states) * 256, 500_000), 8_000_000));

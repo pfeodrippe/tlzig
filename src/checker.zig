@@ -68,9 +68,7 @@ pub const Checker = struct {
             if (cfg.spec_name) |sn| {
                 if (extract_spec_names(module, sn)) |names| {
                     break :blk names.init;
-                } else |err| {
-                    std.debug.print("extract_spec_names error: {any}\n", .{err});
-                }
+                } else |_| {}
             }
             break :blk find_init_name(module) orelse return Error.ConfigError;
         };
@@ -188,13 +186,19 @@ pub const Checker = struct {
             const invariants_hold = try self.check_invariants(st);
             self.eval_pool.restore(snap);
             if (!constraints_hold or !invariants_hold) {
-                if (!invariants_hold) return Error.InvariantViolated;
+                if (!invariants_hold) {
+                    _ = std.c.printf("generated=%llu distinct=%llu\n", self.generated, self.distinct);
+                    return Error.InvariantViolated;
+                }
                 continue;
             }
             const fp = fingerprint.hash_state(&self.state_store.values_pool, st.values);
             if (self.fp_set.put(fp)) {
                 self.distinct += 1;
-                if (!self.queue.enqueue(idx)) return Error.StateSpaceExhausted;
+                if (!self.queue.enqueue(idx)) {
+                    _ = std.c.printf("generated=%llu distinct=%llu\n", self.generated, self.distinct);
+                    return Error.StateSpaceExhausted;
+                }
             }
         }
     }
@@ -238,8 +242,9 @@ fn extract_spec_names(module: ast.Module, spec_name: []const u8) !SpecNames {
     for (module.definitions) |d| {
         if (!std.mem.eql(u8, d.name, spec_name)) continue;
         var conj: *ast.Expr = d.body;
-        // Follow simple ident aliases such as toolbox-generated spec_... == Spec.
-        for (0..8) |_| {
+        // Resolve aliases and ignore fairness/justice/property conjuncts.
+        var steps: u32 = 0;
+        while (steps < 16) : (steps += 1) {
             switch (conj.*) {
                 .ident => |name| {
                     if (resolve_definition(module, name)) |b| {
@@ -247,17 +252,29 @@ fn extract_spec_names(module: ast.Module, spec_name: []const u8) !SpecNames {
                         continue;
                     }
                 },
-                else => break,
-            }
-            break;
-        }
-        // Spec == Init /\ [][Next]_vars (possibly with fairness conjuncts)
-        while (true) {
-            switch (conj.*) {
                 .binary => |b| {
                     if (b.op == .and_op) {
-                        const right_name = try action_name(b.right);
-                        if (right_name != null) return SpecNames{ .init = try init_name(b.left) orelse return Error.ConfigError, .next = right_name.? };
+                        var right = b.right;
+                        for (0..4) |_| {
+                            switch (right.*) {
+                                .ident => |n| {
+                                    if (resolve_definition(module, n)) |rb| {
+                                        right = rb;
+                                        continue;
+                                    }
+                                },
+                                else => break,
+                            }
+                            break;
+                        }
+                        const right_name = try action_name(right);
+                        if (right_name != null) {
+                            return SpecNames{
+                                .init = try init_name(b.left) orelse return Error.ConfigError,
+                                .next = right_name.?,
+                            };
+                        }
+                        // Right conjunct is not the action (fairness/property/print); drop it.
                         conj = b.left;
                         continue;
                     }
@@ -313,9 +330,10 @@ fn evaluate_constants(arena: *Arena, cfg: Config, evaluator: *Evaluator, state_p
     defer values.deinit(std.heap.page_allocator);
     for (cfg.constants) |ca| {
         if (ca.is_substitution and is_operator_alias(ca.expr)) continue;
+        const value = try evaluate_config_expr(arena, ca, evaluator, state_pool);
         try values.append(std.heap.page_allocator, Constant{
             .name = ca.name,
-            .value = try evaluate_config_expr(arena, ca, evaluator, state_pool),
+            .value = value,
         });
     }
     return try dup_slice(arena, Constant, values.items);
@@ -361,6 +379,13 @@ fn evaluate_config_expr(arena: *Arena, ca: ConstantAssignment, evaluator: *Evalu
     if (ca.is_substitution) {
         const expr = try parser.Parser.parse_expr_string(arena, trimmed);
         return try evaluator.eval_expr(expr, Context.empty(), null, state_pool, state_pool);
+    }
+
+    // A constant assignment of the form C = C declares C to be a model value,
+    // overriding any module definition of the same name.
+    if (std.mem.eql(u8, trimmed, ca.name) and evaluator.treat_unknown_as_model) {
+        const id = try evaluator.models.intern(ca.name);
+        return Value{ .model_v = id };
     }
 
     // Parse the right-hand side as a TLA+ expression so nested sets, ranges,

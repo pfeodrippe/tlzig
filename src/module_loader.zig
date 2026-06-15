@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Arena = @import("arena.zig").Arena;
 const ast = @import("ast.zig");
 const parser = @import("parser.zig");
@@ -20,6 +21,7 @@ pub const ModuleLoader = struct {
         defer loaded.deinit(std.heap.page_allocator);
         try self.load_extends(&module, dir, &loaded);
         try self.load_instances(&module, dir, &loaded);
+        try self.expand_namespace_instances(&module, dir, &loaded);
         return module;
     }
 
@@ -51,8 +53,44 @@ pub const ModuleLoader = struct {
         for (self.search_paths) |sp| {
             const candidate = try std.fs.path.join(std.heap.page_allocator, &.{ sp, filename });
             if (file_exists(candidate)) return candidate;
+            if (try self.find_module_recursive(filename, sp)) |found| return found;
         }
         return error.ModuleNotFound;
+    }
+
+    fn find_module_recursive(self: ModuleLoader, filename: []const u8, dir: []const u8) !?[]const u8 {
+        const dir_z = try std.heap.page_allocator.alloc(u8, dir.len + 1);
+        defer std.heap.page_allocator.free(dir_z);
+        @memcpy(dir_z[0..dir.len], dir);
+        dir_z[dir.len] = 0;
+        const dp = std.c.opendir(@ptrCast(dir_z.ptr)) orelse return null;
+        defer _ = std.c.closedir(dp);
+        while (true) {
+            const entry = std.c.readdir(dp) orelse break;
+            const entry_name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+            if (std.mem.eql(u8, entry_name, ".") or std.mem.eql(u8, entry_name, "..")) continue;
+            const full = try std.fs.path.join(std.heap.page_allocator, &.{ dir, entry_name });
+            var st: std.c.Stat = undefined;
+            const full_z = try std.heap.page_allocator.alloc(u8, full.len + 1);
+            defer std.heap.page_allocator.free(full_z);
+            @memcpy(full_z[0..full.len], full);
+            full_z[full.len] = 0;
+            if (std.c.stat(@ptrCast(full_z.ptr), &st) != 0) continue;
+            if ((st.mode & std.c.S.IFMT) == std.c.S.IFDIR) {
+                const candidate = try std.fs.path.join(std.heap.page_allocator, &.{ full, filename });
+                if (file_exists(candidate)) {
+                    std.heap.page_allocator.free(full);
+                    return candidate;
+                }
+                std.heap.page_allocator.free(candidate);
+                if (try self.find_module_recursive(filename, full)) |found| {
+                    std.heap.page_allocator.free(full);
+                    return found;
+                }
+            }
+            std.heap.page_allocator.free(full);
+        }
+        return null;
     }
 
     fn merge(self: ModuleLoader, parent: *ast.Module, child: ast.Module) !void {
@@ -77,6 +115,22 @@ pub const ModuleLoader = struct {
             @memcpy(merged_consts[parent.constants.len..], child.constants);
             parent.constants = merged_consts;
         }
+
+        const inst_total = parent.instances.len + child.instances.len;
+        if (inst_total > 0) {
+            const merged_insts = try self.arena.alloc(ast.Instance, inst_total);
+            @memcpy(merged_insts[0..parent.instances.len], parent.instances);
+            @memcpy(merged_insts[parent.instances.len..], child.instances);
+            parent.instances = merged_insts;
+        }
+
+        const ns_total = parent.namespace_instances.len + child.namespace_instances.len;
+        if (ns_total > 0) {
+            const merged_ns = try self.arena.alloc(ast.NamespaceInstance, ns_total);
+            @memcpy(merged_ns[0..parent.namespace_instances.len], parent.namespace_instances);
+            @memcpy(merged_ns[parent.namespace_instances.len..], child.namespace_instances);
+            parent.namespace_instances = merged_ns;
+        }
     }
 
     fn merge_instance(self: ModuleLoader, parent: *ast.Module, child: ast.Module, subs: []const ast.Substitution) !void {
@@ -84,8 +138,9 @@ pub const ModuleLoader = struct {
         const total = parent.definitions.len + child.definitions.len;
         const merged = try self.arena.alloc(ast.Definition, total);
         @memcpy(merged[0..parent.definitions.len], parent.definitions);
+        const effective_subs = if (subs.len > 0) subs else try self.implicit_substitutions(parent.*, child);
         for (child.definitions, 0..) |def, i| {
-            const new_body = try copy_expr(self.arena, def.body, subs);
+            const new_body = try copy_expr(self.arena, def.body, effective_subs);
             merged[parent.definitions.len + i] = ast.Definition{
                 .name = def.name,
                 .params = def.params,
@@ -93,6 +148,39 @@ pub const ModuleLoader = struct {
             };
         }
         parent.definitions = merged;
+    }
+
+    fn implicit_substitutions(self: ModuleLoader, parent: ast.Module, child: ast.Module) ![]const ast.Substitution {
+        var result = std.ArrayList(ast.Substitution).empty;
+        defer result.deinit(std.heap.page_allocator);
+        const names = try std.mem.concat(std.heap.page_allocator, []const u8, &.{ child.variables, child.constants });
+        defer std.heap.page_allocator.free(names);
+        for (names) |name| {
+            if (self.has_name(parent, name)) {
+                const expr = try self.expr_ident(name);
+                try result.append(std.heap.page_allocator, .{
+                    .local_name = try self.dup(name),
+                    .expr = expr,
+                });
+            }
+        }
+        const slice = try self.arena.alloc(ast.Substitution, result.items.len);
+        @memcpy(slice, result.items);
+        return slice;
+    }
+
+    fn has_name(self: ModuleLoader, module: ast.Module, name: []const u8) bool {
+        _ = self;
+        for (module.variables) |v| if (std.mem.eql(u8, v, name)) return true;
+        for (module.constants) |c| if (std.mem.eql(u8, c, name)) return true;
+        for (module.definitions) |d| if (std.mem.eql(u8, d.name, name)) return true;
+        return false;
+    }
+
+    fn expr_ident(self: ModuleLoader, name: []const u8) !*ast.Expr {
+        const ptr = try self.arena.alloc_object(ast.Expr);
+        ptr.* = ast.Expr{ .ident = try self.dup(name) };
+        return ptr;
     }
 
     fn load_instances(self: ModuleLoader, module: *ast.Module, dir: []const u8, loaded: *std.ArrayList([]const u8)) !void {
@@ -107,6 +195,94 @@ pub const ModuleLoader = struct {
             try self.load_instances(&child, std.fs.path.dirname(path) orelse ".", loaded);
             try self.merge_instance(module, child, inst.substitutions);
         }
+    }
+
+    fn expand_namespace_instances(self: ModuleLoader, module: *ast.Module, dir: []const u8, loaded: *std.ArrayList([]const u8)) !void {
+        if (module.namespace_instances.len == 0) return;
+        var total: usize = module.definitions.len;
+        var child_modules = try std.heap.page_allocator.alloc(ast.Module, module.namespace_instances.len);
+        defer std.heap.page_allocator.free(child_modules);
+        for (module.namespace_instances, 0..) |ns, i| {
+            child_modules[i] = try self.load_module_by_name(ns.module_name, dir, loaded);
+            try self.expand_namespace_instances(&child_modules[i], dir, loaded);
+            total += child_modules[i].definitions.len;
+        }
+        const merged = try self.arena.alloc(ast.Definition, total);
+        @memcpy(merged[0..module.definitions.len], module.definitions);
+        var def_count: usize = module.definitions.len;
+        for (module.namespace_instances, 0..) |ns, i| {
+            const child = child_modules[i];
+            const internal_subs = try self.build_internal_namespace_subs(ns.alias, child.definitions);
+            for (child.definitions) |def| {
+                const qualified = try self.arena_concat(ns.alias, "!", def.name);
+                const effective_subs = try self.concat_subs(ns.substitutions, internal_subs);
+                const new_body = try copy_expr(self.arena, def.body, effective_subs);
+                merged[def_count] = ast.Definition{
+                    .name = qualified,
+                    .params = def.params,
+                    .body = new_body,
+                };
+                def_count += 1;
+            }
+        }
+        assert(def_count == total);
+        module.definitions = merged[0..def_count];
+    }
+
+    fn build_internal_namespace_subs(self: ModuleLoader, alias: []const u8, defs: []const ast.Definition) ![]const ast.Substitution {
+        if (defs.len == 0) return &[_]ast.Substitution{};
+        const result = try self.arena.alloc(ast.Substitution, defs.len);
+        for (defs, 0..) |def, i| {
+            const qualified = try self.arena_concat(alias, "!", def.name);
+            const expr = try self.expr_ident(qualified);
+            result[i] = ast.Substitution{ .local_name = def.name, .expr = expr };
+        }
+        return result;
+    }
+
+    fn concat_subs(self: ModuleLoader, a: []const ast.Substitution, b: []const ast.Substitution) ![]const ast.Substitution {
+        _ = self;
+        if (a.len == 0) return b;
+        if (b.len == 0) return a;
+        const result = try std.heap.page_allocator.alloc(ast.Substitution, a.len + b.len);
+        @memcpy(result[0..a.len], a);
+        @memcpy(result[a.len..], b);
+        return result;
+    }
+
+    fn load_module_by_name(self: ModuleLoader, name: []const u8, dir: []const u8, loaded: *std.ArrayList([]const u8)) !ast.Module {
+        if (self.already_loaded(loaded.items, name)) {
+            return ast.Module{
+                .name = try self.dup(name),
+                .extends = &.{},
+                .variables = &.{},
+                .constants = &.{},
+                .definitions = &.{},
+                .instances = &.{},
+                .namespace_instances = &.{},
+                .init_name = try self.dup("Init"),
+                .next_name = try self.dup("Next"),
+                .invariants = &.{},
+            };
+        }
+        try loaded.append(std.heap.page_allocator, try self.dup(name));
+        const path = try self.find_module(name, dir);
+        const source = try self.read_file(path);
+        var p = parser.Parser.init(self.arena, source);
+        var child = try p.parse_module();
+        const child_dir = std.fs.path.dirname(path) orelse ".";
+        try self.load_extends(&child, child_dir, loaded);
+        try self.load_instances(&child, child_dir, loaded);
+        return child;
+    }
+
+    fn arena_concat(self: ModuleLoader, a: []const u8, sep: []const u8, b: []const u8) ![]const u8 {
+        const total = a.len + sep.len + b.len;
+        const result = try self.arena.alloc(u8, total);
+        @memcpy(result[0..a.len], a);
+        @memcpy(result[a.len .. a.len + sep.len], sep);
+        @memcpy(result[a.len + sep.len ..], b);
+        return result;
     }
 
     fn read_file(self: ModuleLoader, path: []const u8) ![]u8 {

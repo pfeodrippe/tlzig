@@ -32,12 +32,14 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     for (tla_files) |tla_path| {
-        if (std.mem.endsWith(u8, tla_path, "_proof.tla")) continue;
-        const cfg_path = find_cfg(allocator, tla_path) catch {
+        if (std.mem.endsWith(u8, tla_path, "_proof.tla")) {
             skip += 1;
             continue;
-        };
-        defer allocator.free(cfg_path);
+        }
+        const cfg_path = find_cfg(allocator, tla_path) catch null;
+        var default_cfg = false;
+        if (cfg_path == null) default_cfg = true;
+        defer if (cfg_path) |c| allocator.free(c);
 
         const ok = run_tlzig(allocator, io, tlzig, tla_path, cfg_path) catch |err| {
             fail += 1;
@@ -124,21 +126,25 @@ fn file_exists(path: []const u8) bool {
     return false;
 }
 
-fn run_tlzig(allocator: std.mem.Allocator, io: std.Io, tlzig: []const u8, tla: []const u8, cfg: []const u8) !bool {
-    const argv = [_][]const u8{
-        tlzig,
-        "--spec",
-        tla,
-        "--cfg",
-        cfg,
-        "--max-states",
-        "5000",
-        "--arena-bytes",
-        "2000000000",
-        "--eval-arena-bytes",
-        "1000000000",
-    };
-    const result = try std.process.run(allocator, io, .{ .argv = &argv });
+fn run_tlzig(allocator: std.mem.Allocator, io: std.Io, tlzig: []const u8, tla: []const u8, cfg: ?[]const u8) !bool {
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, tlzig);
+    try argv.append(allocator, "--spec");
+    try argv.append(allocator, tla);
+    if (cfg) |c| {
+        try argv.append(allocator, "--cfg");
+        try argv.append(allocator, c);
+    } else {
+        try argv.append(allocator, "--default-cfg");
+    }
+    try argv.append(allocator, "--max-states");
+    try argv.append(allocator, "5000");
+    try argv.append(allocator, "--arena-bytes");
+    try argv.append(allocator, "2000000000");
+    try argv.append(allocator, "--eval-arena-bytes");
+    try argv.append(allocator, "1000000000");
+    const result = try std.process.run(allocator, io, .{ .argv = argv.items });
     defer allocator.free(result.stderr);
     defer allocator.free(result.stdout);
     if (result.term.exited == 0) return true;

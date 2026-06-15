@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Arena = @import("arena.zig").Arena;
 const value = @import("value.zig");
 const Value = value.Value;
@@ -32,7 +33,11 @@ pub const StateStore = struct {
     }
 
     pub fn alloc_state(self: *StateStore) !u32 {
-        if (self.count >= self.cap) return error.StateSpaceExhausted;
+        assert(self.count <= self.cap);
+        if (self.count >= self.cap) {
+            _ = std.c.printf("generated=%llu distinct=%llu\n", @as(u64, self.count), @as(u64, 0));
+            return error.StateSpaceExhausted;
+        }
         const idx = self.count;
         self.states[idx] = .{
             .level = 0,

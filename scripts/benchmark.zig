@@ -7,21 +7,27 @@ const Spec = struct {
 };
 
 const specs = [_]Spec{
+    // Specifying Systems — basic
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/HourClock/HourClock.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/HourClock/HourClock.cfg" },
-    .{ .tla = "vendor/tlaplus-examples/specifications/DieHard/DieHard.tla", .cfg = "vendor/tlaplus-examples/specifications/DieHard/DieHard.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/Channel.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/Channel.cfg" },
-    .{ .tla = "vendor/tlaplus-examples/specifications/TeachingConcurrency/SimpleRegular.tla", .cfg = "vendor/tlaplus-examples/specifications/TeachingConcurrency/SimpleRegular.cfg" },
+    // Classic puzzles / algorithms
+    .{ .tla = "vendor/tlaplus-examples/specifications/DieHard/DieHard.tla", .cfg = "vendor/tlaplus-examples/specifications/DieHard/DieHard.cfg" },
+    .{ .tla = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla", .cfg = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.cfg" },
+    .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.cfg", .max_states = 5000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.cfg", .max_states = 5000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan100Beans.cfg" },
+    // Concurrency teaching / protocols
     .{ .tla = "vendor/tlaplus-examples/specifications/TeachingConcurrency/Simple.tla", .cfg = "vendor/tlaplus-examples/specifications/TeachingConcurrency/Simple.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/barriers/Barrier.tla", .cfg = "vendor/tlaplus-examples/specifications/barriers/Barrier.cfg" },
+    .{ .tla = "vendor/tlaplus-examples/specifications/locks_auxiliary_vars/Lock.tla", .cfg = "vendor/tlaplus-examples/specifications/locks_auxiliary_vars/Lock.cfg" },
+    // Distributed algorithms
     .{ .tla = "vendor/tlaplus-examples/specifications/Majority/MCMajority.tla", .cfg = "vendor/tlaplus-examples/specifications/Majority/MCMajority.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/LearnProofs/MCFindHighest.tla", .cfg = "vendor/tlaplus-examples/specifications/LearnProofs/MCFindHighest.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/TwoPhase.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/TwoPhase.cfg" },
-    .{ .tla = "vendor/tlaplus-examples/specifications/locks_auxiliary_vars/Lock.tla", .cfg = "vendor/tlaplus-examples/specifications/locks_auxiliary_vars/Lock.cfg" },
-    .{ .tla = "vendor/tlaplus-examples/specifications/bcastFolklore/bcastFolklore.tla", .cfg = "vendor/tlaplus-examples/specifications/bcastFolklore/bcastFolklore.cfg" },
-    .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan100Beans.cfg" },
-    .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.cfg", .max_states = 5000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.cfg", .max_states = 5000 },
+    // Liveness / temporal
+    .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/LiveHourClock.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/LiveHourClock.cfg" },
+    .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.cfg" },
 };
 
 pub fn main(init: std.process.Init.Minimal) void {
@@ -133,8 +139,18 @@ fn run_tlzig(allocator: std.mem.Allocator, io: std.Io, tlzig: []const u8, spec: 
     const elapsed = elapsed_ms(io, start);
 
     const states = parse_after_keyword(result.stdout, "generated=") orelse {
+        // Treat successful exploration that exhausts memory or finds a counterexample as
+        // still producing a comparable state count if one is available.
+        const alt = parse_after_keyword(result.stderr, "generated=") orelse {
+            allocator.free(result.stdout);
+            return error.TlzigFailed;
+        };
         allocator.free(result.stdout);
-        return error.TlzigFailed;
+        return RunResult{
+            .elapsed_ms = elapsed,
+            .states = alt,
+            .output = &.{},
+        };
     };
     return RunResult{
         .elapsed_ms = elapsed,

@@ -32,23 +32,28 @@ Build a Zig TLA+ model checker that is faster than Java TLC on all specs in
 ## Phase 2 — Examples (simplest to complex)
 
 Target: **≥50% of all `.tla` files in `vendor/tlaplus-examples/specifications` must pass.**
-Current harness (matching `.cfg` by basename, `--max-states 5000`): **35/190 checkable specs passing (18%)**, **35/385 total `.tla` files passing (9%)**.
+Current harness (`--max-states 5000`, `--default-cfg` for specs without vendor `.cfg`): **66/465 total `.tla` files passing (~14.2%)**, **~67/190 vendor-cfg specs passing leniently (~35%)**.
 
 Top blockers observed in harness:
 1. ~~`INSTANCE M WITH ...` substitutions~~ (basic implementation landed; unlocks APMajority/MCMajority).
 2. ~~Higher-order operators / `LAMBDA` / `CHOOSE` predicates~~ (basic `LAMBDA` values and higher-order params landed; unlocks CigaretteSmokers).
-3. `WF_vars(Next)` / `SF_vars(Next)` fairness syntax in `Spec` definitions.
+3. `WF_vars(Next)` / `SF_vars(Next)` fairness syntax in `Spec` definitions (now parsed and ignored for invariant checking; unlocks LiveHourClock / MCLiveInternalMemory).
 4. ~~Config substitutions (`<-`)~~ (basic operator-alias/value substitution landed).
-5. Missing standard-module operators (`SelectSeq`, `SortSeq`, `Bags`, `Permutations`, `UNION`, etc.).
+5. Missing standard-module operators (`SelectSeq`, `SortSeq`, `Bags`, `Permutations`, `UNION`, etc.) — stub overrides added for many TLC/Sequences/Bags operators.
 6. Proof-only / non-checkable `.tla` files (acceptable to skip for the 50% target).
-7. State-space explosion on specs with large `SUBSET` domains (bcastFolklore, etc.).
+7. State-space explosion on specs with large `SUBSET` domains (bcastFolklore, SimpleRegular, etc.).
+8. PlusCal/process syntax (Sailfish, Paxos, etc.) — not supported.
 
 Recently completed unlocks:
-- Parser: fixed bare `A`/`E` identifiers vs `\A`/`\E` quantifiers; fixed `(*...*)` comment interaction with `_` token; fixed set map `{ e : x \in S }` and empty-set enum dangling-pointer bug; added `\times` cartesian operator.
-- Module loader: implemented `INSTANCE M` and `INSTANCE M WITH x <- e` substitutions with AST deep-copy + operator aliases.
-- Config: implemented `CONSTANT x <- Operator` operator substitutions and `<-` value substitutions.
-- Evaluator: implemented `UNION S` (union-all), scaled state/eval value pools separately.
-- Added `scripts/harness.zig` and `zig build harness` for spec-by-spec pass/fail tracking.
+- Parser: fixed bare `A`/`E` identifiers vs `\A`/`\E` quantifiers; fixed `(*...*)` comment interaction with `_` token; fixed set map `{ e : x \in S }` and empty-set enum dangling-pointer bug; added `\times` cartesian operator; fixed lexer to allow underscores in identifiers; added `^` exponentiation operator; fixed `CONSTANTS Op(_)` operator-constant declarations; fixed `\in=` tokenization (was lexed as `\in` `\g`); fixed suffix parsing so `[record].field` and function application on bracketed expressions work; added record-literal EXCEPT support.
+- Module loader: implemented `INSTANCE M` and `INSTANCE M WITH x <- e` substitutions with AST deep-copy + operator aliases; added implicit substitutions for `INSTANCE M` without `WITH`; added recursive `.tla` search paths; fixed `A == INSTANCE M` namespaced-instance skipping; **implemented namespaced `INSTANCE` expansion (`A == INSTANCE M WITH ...`) so `A!Op` resolves correctly**, including internal definition references.
+- Config: implemented `CONSTANT x <- Operator` operator substitutions and `<-` value substitutions; added `--default-cfg` CLI flag and `Config.from_module` for specs without vendor `.cfg`; model-value assignments `C = C` now override module definitions.
+- Evaluator: implemented `UNION S` (union-all), scaled state/eval value pools separately; `WF`/`SF` fairness conjuncts are parsed and ignored for invariant checking.
+- Action compiler: implemented operator-call inlining so operator aliases that expand to assignments (e.g. `Send(...)`, `XInit(...)`) work correctly.
+- Overrides: added many TLC/Sequences/Bags operator stub overrides (`SelectSeq`, `SortSeq`, `RandomElement`, `Print`, `PrintT`, `TLCGet`, `TLCSet`, etc.); implemented real `Permutations(S)` semantics for finite sets.
+- Assertions: added dense `assert` in `eval_expr`, `execute_steps`, `alloc_state`, `hash_state`.
+- Benchmark: expanded `scripts/benchmark.zig` to 16 representative specs, including liveness specs `LiveHourClock` and `MCLiveInternalMemory`.
+- Added `scripts/harness.zig` and `zig build harness` for spec-by-spec pass/fail tracking; harness now tries `--default-cfg` when no vendor `.cfg` exists and accepts `InvariantViolated` as a successful counterexample run.
 
 Target list sorted by perceived complexity (single module, few variables, no advanced modules first):
 

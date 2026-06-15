@@ -87,8 +87,8 @@ pub fn main(init: std.process.Init.Minimal) void {
         "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
     };
     const loader = ModuleLoader.init(&arena, &search_paths);
-    const module = loader.load(spec_path_v) catch {
-        std.debug.print("failed to load spec\n", .{});
+    const module = loader.load(spec_path_v) catch |err| {
+        std.debug.print("failed to load spec: {any}\n", .{err});
         std.process.exit(1);
     };
     const cfg = config.parse(&arena, cfg_source) catch {
@@ -96,10 +96,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     };
 
-    const eval_value_cap = cap_u32(@min(@max(@as(u64, max_states) * 64, 100_000), 1_000_000));
-    const eval_string_cap = cap_u32(@min(@max(@as(u64, max_states) * 8, 50_000), 500_000));
-    const state_value_cap = cap_u32(@min(@max(@as(u64, max_states) * 256, 100_000), 4_000_000));
-    const state_string_cap = cap_u32(@min(@max(@as(u64, max_states) * 32, 50_000), 1_000_000));
+    const eval_value_cap = cap_u32(@min(@max(@as(u64, max_states) * 256, 500_000), 8_000_000));
+    const eval_string_cap = cap_u32(@min(@max(@as(u64, max_states) * 64, 500_000), 4_000_000));
+    const state_value_cap = cap_u32(@min(@max(@as(u64, max_states) * 256, 500_000), 8_000_000));
+    const state_string_cap = cap_u32(@min(@max(@as(u64, max_states) * 32, 200_000), 2_000_000));
 
     var ch = checker.Checker.init(
         &arena,
@@ -118,6 +118,7 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     const result = ch.check() catch |err| {
         std.debug.print("checking failed: {any}\n", .{err});
+        if (err == error.TypeError) std.debug.dumpCurrentStackTrace(.{});
         std.process.exit(1);
     };
 

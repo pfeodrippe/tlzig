@@ -56,12 +56,27 @@ pub const ModuleLoader = struct {
     }
 
     fn merge(self: ModuleLoader, parent: *ast.Module, child: ast.Module) !void {
-        if (child.definitions.len == 0) return;
-        const total = parent.definitions.len + child.definitions.len;
-        const merged = try self.arena.alloc(ast.Definition, total);
-        @memcpy(merged[0..parent.definitions.len], parent.definitions);
-        @memcpy(merged[parent.definitions.len..], child.definitions);
-        parent.definitions = merged;
+        const def_total = parent.definitions.len + child.definitions.len;
+        const merged_defs = try self.arena.alloc(ast.Definition, def_total);
+        @memcpy(merged_defs[0..parent.definitions.len], parent.definitions);
+        @memcpy(merged_defs[parent.definitions.len..], child.definitions);
+        parent.definitions = merged_defs;
+
+        const var_total = parent.variables.len + child.variables.len;
+        if (var_total > 0) {
+            const merged_vars = try self.arena.alloc([]const u8, var_total);
+            @memcpy(merged_vars[0..parent.variables.len], parent.variables);
+            @memcpy(merged_vars[parent.variables.len..], child.variables);
+            parent.variables = merged_vars;
+        }
+
+        const const_total = parent.constants.len + child.constants.len;
+        if (const_total > 0) {
+            const merged_consts = try self.arena.alloc([]const u8, const_total);
+            @memcpy(merged_consts[0..parent.constants.len], parent.constants);
+            @memcpy(merged_consts[parent.constants.len..], child.constants);
+            parent.constants = merged_consts;
+        }
     }
 
     fn merge_instance(self: ModuleLoader, parent: *ast.Module, child: ast.Module, subs: []const ast.Substitution) !void {
@@ -464,7 +479,7 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
             const cp = try arena.alloc_object(ast.Choose);
             cp.* = .{
                 .var_name = try arena.dup(c.var_name),
-                .domain = try copy_expr(arena, c.domain, subs),
+                .domain = if (c.domain) |d| try copy_expr(arena, d, subs) else null,
                 .body = try copy_expr(arena, c.body, subs),
             };
             const ptr = try arena.alloc_object(ast.Expr);

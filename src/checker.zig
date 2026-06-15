@@ -28,6 +28,7 @@ pub const Checker = struct {
     init_spec: action.CompiledInit,
     next_spec: action.CompiledNext,
     invariants: []const *ast.Expr,
+    constraints: []const *ast.Expr,
     eval_arena: Arena,
     eval_pool: ValuePool,
     max_states: u32,
@@ -56,10 +57,10 @@ pub const Checker = struct {
         const fp_set = try FpSet.init(arena, max_states * 2);
         var evaluator = try Evaluator.init(module, arena);
         evaluator.set_treat_unknown_as_model(true);
-        const constants = try evaluate_constants(arena, cfg, &evaluator, &state_store.values_pool);
-        evaluator.set_constants(constants);
         const aliases = try evaluate_aliases(arena, cfg);
         evaluator.set_aliases(aliases);
+        const constants = try evaluate_constants(arena, cfg, &evaluator, &state_store.values_pool);
+        evaluator.set_constants(constants);
         evaluator.set_treat_unknown_as_model(false);
         const compiler = ActionCompiler.init(arena, evaluator);
 
@@ -67,7 +68,9 @@ pub const Checker = struct {
             if (cfg.spec_name) |sn| {
                 if (extract_spec_names(module, sn)) |names| {
                     break :blk names.init;
-                } else |_| {}
+                } else |err| {
+                    std.debug.print("extract_spec_names error: {any}\n", .{err});
+                }
             }
             break :blk find_init_name(module) orelse return Error.ConfigError;
         };
@@ -110,6 +113,23 @@ pub const Checker = struct {
             break :blk result;
         };
 
+        var constraint_exprs = std.ArrayList(*ast.Expr).empty;
+        defer constraint_exprs.deinit(std.heap.page_allocator);
+        for (cfg.constraints) |cname| {
+            const def = evaluator.find_definition(cname) orelse {
+                std.debug.print("undefined constraint: {s}\n", .{cname});
+                return Error.UndefinedSymbol;
+            };
+            try constraint_exprs.append(std.heap.page_allocator, def.body);
+        }
+        const constraints: []const *ast.Expr = if (constraint_exprs.items.len == 0) &[_]*ast.Expr{} else blk: {
+            const result = try arena.alloc(*ast.Expr, constraint_exprs.items.len);
+            for (constraint_exprs.items, 0..) |c, i| {
+                result[i] = c;
+            }
+            break :blk result;
+        };
+
         var eval_arena = try Arena.init(eval_arena_bytes);
         const eval_pool = try ValuePool.init(&eval_arena, eval_value_cap, eval_string_cap);
 
@@ -122,6 +142,7 @@ pub const Checker = struct {
             .init_spec = compiled_init,
             .next_spec = compiled_next,
             .invariants = invariants,
+            .constraints = constraints,
             .eval_arena = eval_arena,
             .eval_pool = eval_pool,
             .max_states = max_states,
@@ -163,10 +184,12 @@ pub const Checker = struct {
             self.generated += 1;
             const st = self.state_store.get(idx);
             const snap = self.eval_pool.snapshot();
+            const constraints_hold = try self.check_constraints(st);
             const invariants_hold = try self.check_invariants(st);
             self.eval_pool.restore(snap);
-            if (!invariants_hold) {
-                return Error.InvariantViolated;
+            if (!constraints_hold or !invariants_hold) {
+                if (!invariants_hold) return Error.InvariantViolated;
+                continue;
             }
             const fp = fingerprint.hash_state(&self.state_store.values_pool, st.values);
             if (self.fp_set.put(fp)) {
@@ -174,6 +197,14 @@ pub const Checker = struct {
                 if (!self.queue.enqueue(idx)) return Error.StateSpaceExhausted;
             }
         }
+    }
+
+    fn check_constraints(self: *Checker, st: *StateStore.State) !bool {
+        for (self.constraints) |c| {
+            const v = try self.evaluator.eval_expr(c, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool);
+            if (!v.is_truthy()) return false;
+        }
+        return true;
     }
 
     fn check_invariants(self: *Checker, st: *StateStore.State) !bool {
@@ -196,12 +227,31 @@ const SpecNames = struct {
     next: []const u8,
 };
 
+fn resolve_definition(module: ast.Module, name: []const u8) ?*ast.Expr {
+    for (module.definitions) |d| {
+        if (std.mem.eql(u8, d.name, name)) return d.body;
+    }
+    return null;
+}
+
 fn extract_spec_names(module: ast.Module, spec_name: []const u8) !SpecNames {
     for (module.definitions) |d| {
         if (!std.mem.eql(u8, d.name, spec_name)) continue;
-        const body = d.body;
+        var conj: *ast.Expr = d.body;
+        // Follow simple ident aliases such as toolbox-generated spec_... == Spec.
+        for (0..8) |_| {
+            switch (conj.*) {
+                .ident => |name| {
+                    if (resolve_definition(module, name)) |b| {
+                        conj = b;
+                        continue;
+                    }
+                },
+                else => break,
+            }
+            break;
+        }
         // Spec == Init /\ [][Next]_vars (possibly with fairness conjuncts)
-        var conj: *ast.Expr = body;
         while (true) {
             switch (conj.*) {
                 .binary => |b| {

@@ -77,6 +77,7 @@ pub const Token = struct {
         plus,
         minus,
         star,
+        power,
         slash,
         percent,
         range,
@@ -181,6 +182,10 @@ pub const Lexer = struct {
             '*' => {
                 self.advance();
                 return self.mk(.star, "*", start_line, start_col);
+            },
+            '^' => {
+                self.advance();
+                return self.mk(.power, "^", start_line, start_col);
             },
             '/' => {
                 if (self.peek(1) == '\\') {
@@ -423,7 +428,7 @@ pub const Lexer = struct {
 
     fn is_ident_char(self: Lexer, c: u8) bool {
         _ = self;
-        return std.ascii.isAlphanumeric(c);
+        return std.ascii.isAlphanumeric(c) or c == '_';
     }
 
     fn advance(self: *Lexer) void {
@@ -878,9 +883,21 @@ pub const Parser = struct {
     }
 
     fn parse_multiplicative(self: *Parser) !*ast.Expr {
-        var left = try self.parse_unary();
+        var left = try self.parse_power();
         while (true) {
             const op: ?ast.BinaryOp = if (self.match(.star)) .times else if (self.match(.slash)) .div else if (self.match(.percent)) .mod else null;
+            if (op) |o| {
+                const right = try self.parse_power();
+                left = try self.expr_binary(o, left, right);
+            } else break;
+        }
+        return left;
+    }
+
+    fn parse_power(self: *Parser) !*ast.Expr {
+        var left = try self.parse_unary();
+        while (true) {
+            const op: ?ast.BinaryOp = if (self.match(.power)) .power else null;
             if (op) |o| {
                 const right = try self.parse_unary();
                 left = try self.expr_binary(o, left, right);
@@ -1130,8 +1147,12 @@ pub const Parser = struct {
     fn parse_choose(self: *Parser) !*ast.Expr {
         try self.expect(.keyword_choose);
         const var_name = try self.expect_ident_text();
-        try self.expect(.in);
-        const domain = try self.parse_expr();
+        const has_domain = self.current.kind == .in;
+        var domain: ?*ast.Expr = null;
+        if (has_domain) {
+            self.advance();
+            domain = try self.parse_expr();
+        }
         try self.expect(.colon);
         const body = try self.parse_expr();
         return try self.expr_choose(var_name, domain, body);
@@ -1497,7 +1518,7 @@ pub const Parser = struct {
         return ptr;
     }
 
-    fn expr_choose(self: *Parser, var_name: []const u8, domain: *ast.Expr, body: *ast.Expr) !*ast.Expr {
+    fn expr_choose(self: *Parser, var_name: []const u8, domain: ?*ast.Expr, body: *ast.Expr) !*ast.Expr {
         const cptr = try self.arena.alloc_object(ast.Choose);
         cptr.* = ast.Choose{ .var_name = try self.dup(var_name), .domain = domain, .body = body };
         const ptr = try self.arena.alloc_object(ast.Expr);
@@ -1538,18 +1559,15 @@ pub const Parser = struct {
     fn skip_to_next_definition(self: *Parser) void {
         self.advance(); // skip the definition name that failed
         while (self.current.kind != .eof) {
-            if (self.current.kind == .ident and self.current.col == 1) return;
-            if (self.current.kind == .keyword_theorem) {
-                self.advance();
-                while (self.current.kind != .eof and !(self.current.kind == .ident and self.current.col == 1)) {
+            switch (self.current.kind) {
+                .ident => if (self.current.col == 1) return,
+                .keyword_variables, .keyword_constants, .keyword_instance, .keyword_theorem => return,
+                .keyword_module => return,
+                .lbracket, .langle => {
                     self.advance();
-                }
-                continue;
-            }
-            if (self.current.kind == .keyword_module) return;
-            if (self.current.kind == .lbracket or self.current.kind == .langle) {
-                self.advance();
-                continue;
+                    continue;
+                },
+                else => {},
             }
             self.advance();
         }

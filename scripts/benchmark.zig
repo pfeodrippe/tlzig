@@ -21,6 +21,7 @@ const specs = [_]Spec{
     .{ .tla = "vendor/tlaplus-examples/specifications/bcastFolklore/bcastFolklore.tla", .cfg = "vendor/tlaplus-examples/specifications/bcastFolklore/bcastFolklore.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan100Beans.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.cfg", .max_states = 5000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.cfg", .max_states = 5000 },
 };
 
 pub fn main(init: std.process.Init.Minimal) void {
@@ -120,6 +121,10 @@ fn run_tlzig(allocator: std.mem.Allocator, io: std.Io, tlzig: []const u8, spec: 
         spec.cfg,
         "--max-states",
         max_states_str,
+        "--arena-bytes",
+        "4000000000",
+        "--eval-arena-bytes",
+        "2000000000",
     };
 
     const start = std.Io.Clock.Timestamp.now(io, .real);
@@ -149,6 +154,8 @@ fn run_tlc(allocator: std.mem.Allocator, io: std.Io, java_cp: []const u8, spec: 
         "-metadir",
         "benchmark_results/tlc_meta",
         "-cleanup",
+        "-config",
+        spec.cfg,
         spec.tla,
     };
 

@@ -12,15 +12,19 @@ pub const Config = struct {
     init_name: ?[]const u8,
     next_name: ?[]const u8,
     invariants: []const []const u8,
+    properties: []const []const u8,
     constants: []const ConstantAssignment,
+    constraints: []const []const u8,
 
     pub fn empty() Config {
         return Config{
             .spec_name = null,
             .init_name = null,
             .next_name = null,
-            .invariants = &.{},
-            .constants = &.{},
+            .invariants = &[_][]const u8{},
+            .properties = &[_][]const u8{},
+            .constants = &[_]ConstantAssignment{},
+            .constraints = &[_][]const u8{},
         };
     }
 };
@@ -29,8 +33,12 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
     var cfg = Config.empty();
     var invariants = std.ArrayList([]const u8).empty;
     defer invariants.deinit(std.heap.page_allocator);
+    var properties = std.ArrayList([]const u8).empty;
+    defer properties.deinit(std.heap.page_allocator);
     var constants = std.ArrayList(ConstantAssignment).empty;
     defer constants.deinit(std.heap.page_allocator);
+    var constraints = std.ArrayList([]const u8).empty;
+    defer constraints.deinit(std.heap.page_allocator);
 
     const lines = try split_lines(arena, source);
     var i: usize = 0;
@@ -80,26 +88,56 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
                 }
                 try parse_constant_assignment(arena, t, &constants);
             }
-        } else if (eql(first_word, "PROPERTY") or
-            eql(first_word, "PROPERTIES") or
-            eql(first_word, "ALIAS") or
+        } else if (eql(first_word, "PROPERTY")) {
+            try properties.append(std.heap.page_allocator, try arena_dup(arena, rest));
+        } else if (eql(first_word, "PROPERTIES")) {
+            i += 1;
+            while (i < lines.len) : (i += 1) {
+                const t = trim(lines[i]);
+                if (t.len == 0) continue;
+                if (is_comment(t)) continue;
+                if (is_directive(t)) {
+                    i -= 1;
+                    break;
+                }
+                try properties.append(std.heap.page_allocator, try arena_dup(arena, t));
+            }
+        } else if (eql(first_word, "CONSTRAINT")) {
+            try constraints.append(std.heap.page_allocator, try arena_dup(arena, rest));
+        } else if (eql(first_word, "CONSTRAINTS")) {
+            i += 1;
+            while (i < lines.len) : (i += 1) {
+                const t = trim(lines[i]);
+                if (t.len == 0) continue;
+                if (is_comment(t)) continue;
+                if (is_directive(t)) {
+                    i -= 1;
+                    break;
+                }
+                try constraints.append(std.heap.page_allocator, try arena_dup(arena, t));
+            }
+        } else if (eql(first_word, "ALIAS") or
             eql(first_word, "VIEW") or
             eql(first_word, "SYMMETRY") or
             eql(first_word, "POSTCONDITION") or
-            eql(first_word, "CHECK_DEADLOCK") or
-            eql(first_word, "CONSTRAINT") or
-            eql(first_word, "CONSTRAINTS"))
+            eql(first_word, "CHECK_DEADLOCK"))
         {
             // Not implemented yet; parse and ignore for now.
-            if (eql(first_word, "PROPERTIES")) {
-                i += 1;
-                while (i < lines.len) : (i += 1) {
-                    const t = trim(lines[i]);
-                    if (t.len == 0) continue;
-                    if (is_comment(t)) continue;
-                    if (is_directive(t)) {
-                        i -= 1;
-                        break;
+            if (eql(first_word, "ALIAS") or eql(first_word, "VIEW") or
+                eql(first_word, "SYMMETRY") or eql(first_word, "POSTCONDITION") or
+                eql(first_word, "CHECK_DEADLOCK"))
+            {
+                // Single-line or block values are ignored.
+                if (rest.len == 0) {
+                    i += 1;
+                    while (i < lines.len) : (i += 1) {
+                        const t = trim(lines[i]);
+                        if (t.len == 0) continue;
+                        if (is_comment(t)) continue;
+                        if (is_directive(t)) {
+                            i -= 1;
+                            break;
+                        }
                     }
                 }
             }
@@ -111,7 +149,9 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
         .init_name = cfg.init_name,
         .next_name = cfg.next_name,
         .invariants = try dup_slice(arena, []const u8, invariants.items),
+        .properties = try dup_slice(arena, []const u8, properties.items),
         .constants = try dup_slice(arena, ConstantAssignment, constants.items),
+        .constraints = try dup_slice(arena, []const u8, constraints.items),
     };
 }
 

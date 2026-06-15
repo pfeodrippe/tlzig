@@ -80,6 +80,7 @@ const default_overrides = [_]OverrideEntry{
 const default_value_overrides = [_]ValueOverrideEntry{
     .{ .name = "Nat", .func = nat_set },
     .{ .name = "Int", .func = int_set },
+    .{ .name = "BOOLEAN", .func = boolean_set },
 };
 
 fn cardinality(pool: *ValuePool, args: []const Value) Error!Value {
@@ -219,6 +220,13 @@ fn nat_set(pool: *ValuePool) Error!Value {
 
 fn int_set(pool: *ValuePool) Error!Value {
     return Value{ .set_v = make_range_set(pool, g_min_int, g_max_int) };
+}
+
+fn boolean_set(pool: *ValuePool) Error!Value {
+    const dest = pool.alloc_values(2) catch return error.OutOfMemory;
+    dest[0] = Value{ .bool_v = false };
+    dest[1] = Value{ .bool_v = true };
+    return Value{ .set_v = make_set(pool, dest) };
 }
 
 fn seq_set(pool: *ValuePool, args: []const Value) Error!Value {

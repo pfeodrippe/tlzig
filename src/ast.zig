@@ -112,6 +112,7 @@ pub const BinaryOp = enum(u8) {
     times,
     div,
     mod,
+    power,
     range,
     concat,
 };
@@ -150,7 +151,7 @@ pub const BoundVar = struct {
 
 pub const Choose = struct {
     var_name: []const u8,
-    domain: *Expr,
+    domain: ?*Expr,
     body: *Expr,
 };
 

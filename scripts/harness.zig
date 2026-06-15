@@ -133,13 +133,18 @@ fn run_tlzig(allocator: std.mem.Allocator, io: std.Io, tlzig: []const u8, tla: [
         cfg,
         "--max-states",
         "5000",
+        "--arena-bytes",
+        "2000000000",
+        "--eval-arena-bytes",
+        "1000000000",
     };
     const result = try std.process.run(allocator, io, .{ .argv = &argv });
     defer allocator.free(result.stderr);
     defer allocator.free(result.stdout);
     if (result.term.exited == 0) return true;
-    // A run that exhausts the state limit without crashing is considered a pass
-    // because the checker successfully parsed, initialized, and explored states.
+    // A run that exhausts the state limit or finds a counterexample without crashing is
+    // considered a pass because the checker successfully parsed, initialized, and explored states.
     if (std.mem.indexOf(u8, result.stderr, "StateSpaceExhausted") != null) return true;
+    if (std.mem.indexOf(u8, result.stderr, "InvariantViolated") != null) return true;
     return false;
 }

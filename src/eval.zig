@@ -123,10 +123,10 @@ pub const Evaluator = struct {
                 }
                 if (ctx.lookup(name)) |v| return v;
                 if (self.find_constant(name)) |v| return try v.clone(state_pool, eval_pool);
-                if (self.override_registry.find_value(name)) |func| {
+                const aliased = self.resolve_alias(name);
+                if (self.override_registry.find_value(aliased)) |func| {
                     return try func(eval_pool);
                 }
-                const aliased = self.resolve_alias(name);
                 if (self.find_definition(aliased)) |def| {
                     if (def.params.len != 0) return Error.TypeError;
                     return try self.eval_expr(def.body, ctx, s0, eval_pool, state_pool);
@@ -135,12 +135,10 @@ pub const Evaluator = struct {
                     const id = try self.models.intern(name);
                     return Value{ .model_v = id };
                 }
-                std.debug.print("UndefinedSymbol: {s}\n", .{name});
                 return Error.UndefinedSymbol;
             },
             .primed => |name| {
                 if (ctx.lookup(name)) |v| return v;
-                std.debug.print("UndefinedPrimed: {s}\n", .{name});
                 return Error.UndefinedSymbol;
             },
             .binary => |b| return try self.eval_binary(b, ctx, s0, eval_pool, state_pool),
@@ -237,12 +235,23 @@ pub const Evaluator = struct {
             },
             .in => {
                 if (b.right.* == .set_of_functions) {
-                    if (left != .function_v) return Value{ .bool_v = false };
+                    if (left != .function_v) {
+                        std.debug.print("function set membership left not function: {s}\n", .{@tagName(left)});
+                        return Value{ .bool_v = false };
+                    }
                     const fs = b.right.*.set_of_functions;
                     const domain = try self.eval_expr(fs.domain, ctx, s0, eval_pool, state_pool);
                     const codomain = try self.eval_expr(fs.codomain, ctx, s0, eval_pool, state_pool);
                     if (domain != .set_v or codomain != .set_v) return Error.TypeError;
                     return Value{ .bool_v = try self.is_function_in_set(left.function_v, domain.set_v, codomain.set_v, eval_pool) };
+                }
+                // Optimize `x \in a..b` without materializing the range set.
+                if (b.right.* == .binary and b.right.*.binary.op == .range) {
+                    const range = b.right.*.binary;
+                    const lo = try self.eval_expr(range.left, ctx, s0, eval_pool, state_pool);
+                    const hi = try self.eval_expr(range.right, ctx, s0, eval_pool, state_pool);
+                    if (left != .int_v or lo != .int_v or hi != .int_v) return Error.TypeError;
+                    return Value{ .bool_v = left.int_v >= lo.int_v and left.int_v <= hi.int_v };
                 }
                 const right = try self.eval_expr(b.right, ctx, s0, eval_pool, state_pool);
                 if (right != .set_v) return Error.TypeError;
@@ -279,6 +288,15 @@ pub const Evaluator = struct {
                 const denom = right.as_int() orelse return Error.TypeError;
                 if (denom == 0) return Error.DivisionByZero;
                 return Value{ .int_v = @mod(left.as_int() orelse return Error.TypeError, denom) };
+            },
+            .power => {
+                const base = left.as_int() orelse return Error.TypeError;
+                const exp = right.as_int() orelse return Error.TypeError;
+                if (exp < 0) return Error.DivisionByZero;
+                var result: i64 = 1;
+                var i: i64 = 0;
+                while (i < exp) : (i += 1) result *= base;
+                return Value{ .int_v = result };
             },
             .range => {
                 const lo = left.as_int() orelse return Error.TypeError;
@@ -614,11 +632,15 @@ pub const Evaluator = struct {
                 return func(eval_pool, values);
             }
             if (self.find_definition(name)) |def| {
-                if (def.params.len != ap.args.len) return Error.TypeError;
                 const values = try eval_pool.alloc_values(@intCast(ap.args.len));
                 for (ap.args, 0..) |arg, i| {
                     values[i] = try self.eval_expr(arg, ctx, s0, eval_pool, state_pool);
                 }
+                if (def.params.len == 0) {
+                    const func = try self.eval_expr(def.body, ctx, s0, eval_pool, state_pool);
+                    return try self.apply_values(func, values, eval_pool, state_pool, s0);
+                }
+                if (def.params.len != ap.args.len) return Error.TypeError;
                 var new_ctx = Context{ .names = undefined, .values = undefined, .len = 0 };
                 for (def.params, 0..) |p, i| {
                     new_ctx = new_ctx.extend(p, values[i]);
@@ -627,15 +649,18 @@ pub const Evaluator = struct {
             }
         }
         const func = try self.eval_expr(ap.func, ctx, s0, eval_pool, state_pool);
-        if (ap.args.len == 0) return func;
-        if (ap.args.len == 1) {
-            const arg = try self.eval_expr(ap.args[0], ctx, s0, eval_pool, state_pool);
-            return try self.apply_value(func, arg, eval_pool, state_pool, s0);
-        }
-        const tuple_values = try eval_pool.alloc_values(@intCast(ap.args.len));
+        const values = try eval_pool.alloc_values(@intCast(ap.args.len));
         for (ap.args, 0..) |a, i| {
-            tuple_values[i] = try self.eval_expr(a, ctx, s0, eval_pool, state_pool);
+            values[i] = try self.eval_expr(a, ctx, s0, eval_pool, state_pool);
         }
+        return try self.apply_values(func, values, eval_pool, state_pool, s0);
+    }
+
+    fn apply_values(self: Evaluator, func: Value, args: []const Value, eval_pool: *ValuePool, state_pool: *ValuePool, s0: ?*StateStore.State) Error!Value {
+        if (args.len == 0) return func;
+        if (args.len == 1) return try self.apply_value(func, args[0], eval_pool, state_pool, s0);
+        const tuple_values = try eval_pool.alloc_values(@intCast(args.len));
+        @memcpy(tuple_values, args);
         const arg = Value{ .tuple_v = make_tuple(eval_pool, tuple_values) };
         return try self.apply_value(func, arg, eval_pool, state_pool, s0);
     }
@@ -766,22 +791,36 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!Value {
-        const domain = try self.eval_expr(c.domain, ctx, s0, eval_pool, state_pool);
-        if (domain != .set_v) return Error.TypeError;
-        const items = domain.set_v.items(eval_pool);
-        var chosen: ?Value = null;
-        for (items) |it| {
-            const new_ctx = ctx.extend(c.var_name, it);
-            const pred = try self.eval_expr(c.body, new_ctx, s0, eval_pool, state_pool);
-            if (pred.is_truthy()) {
-                if (chosen == null) {
-                    chosen = it;
-                } else if (it.compare(chosen.?, eval_pool)) |cmp| {
-                    if (cmp < 0) chosen = it;
+        if (c.domain) |domain_expr| {
+            const domain = try self.eval_expr(domain_expr, ctx, s0, eval_pool, state_pool);
+            if (domain != .set_v) return Error.TypeError;
+            const items = domain.set_v.items(eval_pool);
+            var chosen: ?Value = null;
+            for (items) |it| {
+                const new_ctx = ctx.extend(c.var_name, it);
+                const pred = try self.eval_expr(c.body, new_ctx, s0, eval_pool, state_pool);
+                if (pred.is_truthy()) {
+                    if (chosen == null) {
+                        chosen = it;
+                    } else if (it.compare(chosen.?, eval_pool)) |cmp| {
+                        if (cmp < 0) chosen = it;
+                    }
                 }
             }
+            return chosen orelse Error.EmptyChoose;
         }
-        return chosen orelse Error.EmptyChoose;
+        // Domain-free CHOOSE: try fresh model values until the predicate holds.
+        var attempt: u32 = 0;
+        while (attempt < 1024) : (attempt += 1) {
+            const name = try std.fmt.allocPrint(std.heap.page_allocator, "__choose_{d}", .{attempt});
+            defer std.heap.page_allocator.free(name);
+            const id = try self.models.intern(name);
+            const candidate = Value{ .model_v = id };
+            const new_ctx = ctx.extend(c.var_name, candidate);
+            const pred = try self.eval_expr(c.body, new_ctx, s0, eval_pool, state_pool);
+            if (pred.is_truthy()) return candidate;
+        }
+        return Error.EmptyChoose;
     }
 
     fn eval_except(

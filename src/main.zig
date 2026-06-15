@@ -17,6 +17,8 @@ pub fn main(init: std.process.Init.Minimal) void {
     var max_nat: i64 = 10;
     var min_int: i64 = -10;
     var max_int: i64 = 10;
+    var arena_bytes: u64 = 512 * 1024 * 1024;
+    var eval_arena_bytes: u64 = 256 * 1024 * 1024;
 
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--spec")) {
@@ -43,15 +45,23 @@ pub fn main(init: std.process.Init.Minimal) void {
             if (it.next()) |v| {
                 max_int = std.fmt.parseInt(i64, v, 10) catch 10;
             }
+        } else if (std.mem.eql(u8, arg, "--arena-bytes")) {
+            if (it.next()) |v| {
+                arena_bytes = std.fmt.parseInt(u64, v, 10) catch 512 * 1024 * 1024;
+            }
+        } else if (std.mem.eql(u8, arg, "--eval-arena-bytes")) {
+            if (it.next()) |v| {
+                eval_arena_bytes = std.fmt.parseInt(u64, v, 10) catch 256 * 1024 * 1024;
+            }
         }
     }
 
     const spec_path_v = spec_path orelse {
-        std.debug.print("usage: tlzig --spec FILE.tla --cfg FILE.cfg [--max-states N]\n", .{});
+        std.debug.print("usage: tlzig --spec FILE.tla --cfg FILE.cfg [--max-states N] [--arena-bytes B] [--eval-arena-bytes B]\n", .{});
         std.process.exit(1);
     };
     const cfg_path_v = cfg_path orelse {
-        std.debug.print("usage: tlzig --spec FILE.tla --cfg FILE.cfg [--max-states N]\n", .{});
+        std.debug.print("usage: tlzig --spec FILE.tla --cfg FILE.cfg [--max-states N] [--arena-bytes B] [--eval-arena-bytes B]\n", .{});
         std.process.exit(1);
     };
 
@@ -59,7 +69,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     overrides.set_nat_bound(max_nat);
     overrides.set_int_bounds(min_int, max_int);
 
-    var arena = Arena.init(512 * 1024 * 1024) catch {
+    var arena = Arena.init(arena_bytes) catch {
         std.debug.print("failed to allocate arena\n", .{});
         std.process.exit(1);
     };
@@ -86,17 +96,21 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     };
 
-    const value_cap = @min(@as(u64, max_states) * 16, 2_000_000);
-    const string_cap = @min(@as(u64, max_states) * 2, 200_000);
+    const eval_value_cap = cap_u32(@min(@max(@as(u64, max_states) * 64, 100_000), 1_000_000));
+    const eval_string_cap = cap_u32(@min(@max(@as(u64, max_states) * 8, 50_000), 500_000));
+    const state_value_cap = cap_u32(@min(@max(@as(u64, max_states) * 256, 100_000), 4_000_000));
+    const state_string_cap = cap_u32(@min(@max(@as(u64, max_states) * 32, 50_000), 1_000_000));
+
     var ch = checker.Checker.init(
         &arena,
         module,
         cfg,
         max_states,
-        value_cap,
-        string_cap,
-        value_cap,
-        string_cap,
+        eval_value_cap,
+        eval_string_cap,
+        state_value_cap,
+        state_string_cap,
+        eval_arena_bytes,
     ) catch |err| {
         std.debug.print("failed to initialize checker: {any}\n", .{err});
         std.process.exit(1);
@@ -107,7 +121,12 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     };
 
-    std.debug.print("generated={d} distinct={d}\n", .{ result.generated, result.distinct });
+    _ = std.c.printf("generated=%llu distinct=%llu\n", result.generated, result.distinct);
+}
+
+fn cap_u32(v: u64) u32 {
+    const max = std.math.maxInt(u32);
+    return if (v > max) max else @intCast(v);
 }
 
 fn read_file(arena: *Arena, path: []const u8) ![]u8 {

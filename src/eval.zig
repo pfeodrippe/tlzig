@@ -45,23 +45,55 @@ pub const Context = struct {
     }
 };
 
+pub const Alias = struct {
+    from: []const u8,
+    to: []const u8,
+};
+
+pub const EvalLambda = struct {
+    params: []const []const u8,
+    body: *ast.Expr,
+    ctx: Context,
+};
+
 pub const Evaluator = struct {
     module: ast.Module,
     constants: []const Constant,
-    models: ModelTable,
+    aliases: []const Alias,
+    models: *ModelTable,
     override_registry: overrides.Registry,
+    treat_unknown_as_model: bool,
 
     pub fn init(module: ast.Module, arena: *Arena) !Evaluator {
+        const models = try arena.alloc_object(ModelTable);
+        models.* = try ModelTable.init(arena, 1024);
         return Evaluator{
             .module = module,
             .constants = &[_]Constant{},
-            .models = try ModelTable.init(arena, 1024),
+            .aliases = &[_]Alias{},
+            .models = models,
             .override_registry = overrides.default_registry(),
+            .treat_unknown_as_model = false,
         };
+    }
+
+    pub fn set_treat_unknown_as_model(self: *Evaluator, enable: bool) void {
+        self.treat_unknown_as_model = enable;
     }
 
     pub fn set_constants(self: *Evaluator, constants: []const Constant) void {
         self.constants = constants;
+    }
+
+    pub fn set_aliases(self: *Evaluator, aliases: []const Alias) void {
+        self.aliases = aliases;
+    }
+
+    fn resolve_alias(self: Evaluator, name: []const u8) []const u8 {
+        for (self.aliases) |a| {
+            if (std.mem.eql(u8, name, a.from)) return a.to;
+        }
+        return name;
     }
 
     pub fn find_constant(self: Evaluator, name: []const u8) ?Value {
@@ -94,9 +126,14 @@ pub const Evaluator = struct {
                 if (self.override_registry.find_value(name)) |func| {
                     return try func(eval_pool);
                 }
-                if (self.find_definition(name)) |def| {
+                const aliased = self.resolve_alias(name);
+                if (self.find_definition(aliased)) |def| {
                     if (def.params.len != 0) return Error.TypeError;
                     return try self.eval_expr(def.body, ctx, s0, eval_pool, state_pool);
+                }
+                if (self.treat_unknown_as_model) {
+                    const id = try self.models.intern(name);
+                    return Value{ .model_v = id };
                 }
                 std.debug.print("UndefinedSymbol: {s}\n", .{name});
                 return Error.UndefinedSymbol;
@@ -152,6 +189,19 @@ pub const Evaluator = struct {
             .let_in => |l| return try self.eval_let_in(l, ctx, s0, eval_pool, state_pool),
             .case_expr => |c| return try self.eval_case_expr(c, ctx, s0, eval_pool, state_pool),
             .box_action => return Value{ .bool_v = true },
+            .lambda => |l| {
+                const lam = try eval_pool.arena.alloc_object(value.Lambda);
+                const ctx_ptr = try eval_pool.arena.alloc_object(Context);
+                ctx_ptr.* = ctx;
+                const params_copy = try eval_pool.arena.alloc([]const u8, l.params.len);
+                for (l.params, 0..) |p, i| params_copy[i] = p;
+                lam.* = value.Lambda{
+                    .params = params_copy,
+                    .body = @ptrCast(l.body),
+                    .ctx = @ptrCast(ctx_ptr),
+                };
+                return Value{ .lambda_v = lam };
+            },
             .at => return ctx.lookup("@") orelse Error.SyntaxError,
         }
     }
@@ -259,7 +309,7 @@ pub const Evaluator = struct {
             .not => Value{ .bool_v = !operand.is_truthy() },
             .neg => Value{ .int_v = -(operand.as_int() orelse return Error.TypeError) },
             .subset => try eval_subset(eval_pool, operand),
-            .union_all => Error.NotImplemented,
+            .union_all => try eval_union_all(eval_pool, operand),
             .domain => {
                 if (operand != .function_v) return Error.TypeError;
                 return Value{ .set_v = operand.function_v.domain };
@@ -555,7 +605,7 @@ pub const Evaluator = struct {
         state_pool: *ValuePool,
     ) Error!Value {
         if (ap.func.* == .ident) {
-            const name = ap.func.*.ident;
+            const name = self.resolve_alias(ap.func.*.ident);
             if (self.override_registry.find(name)) |func| {
                 const values = try eval_pool.alloc_values(@intCast(ap.args.len));
                 for (ap.args, 0..) |arg, i| {
@@ -580,18 +630,17 @@ pub const Evaluator = struct {
         if (ap.args.len == 0) return func;
         if (ap.args.len == 1) {
             const arg = try self.eval_expr(ap.args[0], ctx, s0, eval_pool, state_pool);
-            return try self.apply_value(func, arg, eval_pool);
+            return try self.apply_value(func, arg, eval_pool, state_pool, s0);
         }
         const tuple_values = try eval_pool.alloc_values(@intCast(ap.args.len));
         for (ap.args, 0..) |a, i| {
             tuple_values[i] = try self.eval_expr(a, ctx, s0, eval_pool, state_pool);
         }
         const arg = Value{ .tuple_v = make_tuple(eval_pool, tuple_values) };
-        return try self.apply_value(func, arg, eval_pool);
+        return try self.apply_value(func, arg, eval_pool, state_pool, s0);
     }
 
-    fn apply_value(self: Evaluator, func: Value, arg: Value, eval_pool: *ValuePool) Error!Value {
-        _ = self;
+    fn apply_value(self: Evaluator, func: Value, arg: Value, eval_pool: *ValuePool, state_pool: *ValuePool, s0: ?*StateStore.State) Error!Value {
         switch (func) {
             .function_v => |f| return f.apply(eval_pool, arg) orelse Error.UndefinedSymbol,
             .tuple_v => |t| {
@@ -602,6 +651,21 @@ pub const Evaluator = struct {
             .record_v => |r| {
                 const name = arg.string_v.slice(eval_pool);
                 return r.lookup(eval_pool, name) orelse Error.UndefinedSymbol;
+            },
+            .lambda_v => |l| {
+                const body: *ast.Expr = @ptrCast(@alignCast(l.body));
+                const lambda_ctx: *Context = @ptrCast(@alignCast(l.ctx));
+                var new_ctx = lambda_ctx.*;
+                if (l.params.len == 1) {
+                    new_ctx = new_ctx.extend(l.params[0], arg);
+                } else {
+                    if (arg != .tuple_v or arg.tuple_v.len != l.params.len) return Error.TypeError;
+                    const items = arg.tuple_v.items(eval_pool);
+                    for (l.params, 0..) |p, i| {
+                        new_ctx = new_ctx.extend(p, items[i]);
+                    }
+                }
+                return try self.eval_expr(body, new_ctx, s0, eval_pool, state_pool);
             },
             else => return Error.TypeError,
         }
@@ -728,21 +792,37 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!Value {
-        if (e.steps.len != 1) return Error.NotImplemented;
         const original = try self.eval_expr(e.func, ctx, s0, eval_pool, state_pool);
-        const step = e.steps[0];
+        return try self.except_steps(original, e.steps, 0, e.value, ctx, s0, eval_pool, state_pool);
+    }
+
+    fn except_steps(
+        self: Evaluator,
+        original: Value,
+        steps: []const ast.AccessStep,
+        idx: u32,
+        value_expr: *ast.Expr,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!Value {
+        if (idx >= steps.len) {
+            return try self.eval_expr(value_expr, ctx, s0, eval_pool, state_pool);
+        }
+        const step = steps[idx];
         switch (step) {
             .index => |idx_expr| {
                 const key = try self.eval_expr(idx_expr, ctx, s0, eval_pool, state_pool);
                 const old_value = try self.except_lookup_index(original, key, eval_pool);
                 const new_ctx = ctx.extend("@", old_value);
-                const new_value = try self.eval_expr(e.value, new_ctx, s0, eval_pool, state_pool);
+                const new_value = try self.except_steps(old_value, steps, idx + 1, value_expr, new_ctx, s0, eval_pool, state_pool);
                 return try self.except_update_index(original, key, new_value, eval_pool);
             },
             .field => |field| {
                 const old_value = try self.except_lookup_field(original, field, eval_pool);
                 const new_ctx = ctx.extend("@", old_value);
-                const new_value = try self.eval_expr(e.value, new_ctx, s0, eval_pool, state_pool);
+                const new_value = try self.except_steps(old_value, steps, idx + 1, value_expr, new_ctx, s0, eval_pool, state_pool);
                 return try self.except_update_field(original, field, new_value, eval_pool);
             },
         }
@@ -753,9 +833,9 @@ pub const Evaluator = struct {
         switch (original) {
             .function_v => |f| return f.apply(eval_pool, key) orelse Error.IndexOutOfBounds,
             .tuple_v => |t| {
-                const idx = (key.as_int() orelse return Error.TypeError) - 1;
-                if (idx < 0 or idx >= t.len) return Error.IndexOutOfBounds;
-                return t.items(eval_pool)[@intCast(idx)];
+                const i = (key.as_int() orelse return Error.TypeError) - 1;
+                if (i < 0 or i >= t.len) return Error.IndexOutOfBounds;
+                return t.items(eval_pool)[@intCast(i)];
             },
             else => return Error.TypeError,
         }
@@ -778,12 +858,12 @@ pub const Evaluator = struct {
                 } };
             },
             .tuple_v => |t| {
-                const idx = (key.as_int() orelse return Error.TypeError) - 1;
-                if (idx < 0 or idx >= t.len) return Error.IndexOutOfBounds;
+                const i = (key.as_int() orelse return Error.TypeError) - 1;
+                if (i < 0 or i >= t.len) return Error.IndexOutOfBounds;
                 const items = t.items(eval_pool);
                 const dest = try eval_pool.alloc_values(@intCast(items.len));
                 @memcpy(dest, items);
-                dest[@intCast(idx)] = new_value;
+                dest[@intCast(i)] = new_value;
                 return Value{ .tuple_v = make_tuple(eval_pool, dest) };
             },
             else => return Error.TypeError,
@@ -827,6 +907,36 @@ pub const Evaluator = struct {
         return null;
     }
 };
+
+fn eval_union_all(eval_pool: *ValuePool, operand: Value) Error!Value {
+    if (operand != .set_v) return Error.TypeError;
+    const sets = operand.set_v.items(eval_pool);
+    var total: u32 = 0;
+    for (sets) |s| {
+        if (s != .set_v) return Error.TypeError;
+        total += s.set_v.len;
+    }
+    const dest = try eval_pool.alloc_values(total);
+    var pos: u32 = 0;
+    for (sets) |s| {
+        const items = s.set_v.items(eval_pool);
+        for (items) |it| {
+            var found = false;
+            var j: u32 = 0;
+            while (j < pos) : (j += 1) {
+                if (dest[j].eql(it, eval_pool)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                dest[pos] = it;
+                pos += 1;
+            }
+        }
+    }
+    return Value{ .set_v = make_set(eval_pool, dest[0..pos]) };
+}
 
 fn eval_subset(eval_pool: *ValuePool, operand: Value) Error!Value {
     if (operand != .set_v) return Error.TypeError;

@@ -42,8 +42,12 @@ pub const Token = struct {
         keyword_in,
         keyword_case,
         keyword_other,
+        keyword_lambda,
+        keyword_instance,
+        keyword_with,
         cartesian,
         concat,
+        subst,
         lparen,
         rparen,
         lbrace,
@@ -257,6 +261,10 @@ pub const Lexer = struct {
                     self.advance2();
                     return self.mk(.le, "<=", start_line, start_col);
                 }
+                if (self.peek(1) == '-') {
+                    self.advance2();
+                    return self.mk(.subst, "<-", start_line, start_col);
+                }
                 if (self.peek(1) == '>') {
                     self.advance();
                     self.advance();
@@ -374,7 +382,9 @@ pub const Lexer = struct {
         }
         const word = self.source[after..self.pos];
         const text = self.source[after - 1 .. self.pos];
-        return .{ .kind = switch_word(word), .text = text, .line = start_line, .col = start_col };
+        var kind = switch_word(word);
+        if (std.mem.eql(u8, word, "times") or std.mem.eql(u8, word, "Times")) kind = .cartesian;
+        return .{ .kind = kind, .text = text, .line = start_line, .col = start_col };
     }
 
     fn read_ident_or_keyword(self: *Lexer, start_line: u32, start_col: u32) Token {
@@ -383,7 +393,10 @@ pub const Lexer = struct {
             self.advance();
         }
         const word = self.source[start..self.pos];
-        return .{ .kind = switch_word(word), .text = word, .line = start_line, .col = start_col };
+        var kind = switch_word(word);
+        // Bare A/E are identifiers; \A/\E are quantifier keywords via read_backslash_keyword.
+        if (kind == .keyword_forall or kind == .keyword_exists) kind = .ident;
+        return .{ .kind = kind, .text = word, .line = start_line, .col = start_col };
     }
 
     fn read_number(self: *Lexer, start_line: u32, start_col: u32) Token {
@@ -470,6 +483,9 @@ fn switch_word(word: []const u8) Token.Kind {
         .{ "IN", .keyword_in },
         .{ "CASE", .keyword_case },
         .{ "OTHER", .keyword_other },
+        .{ "LAMBDA", .keyword_lambda },
+        .{ "INSTANCE", .keyword_instance },
+        .{ "WITH", .keyword_with },
         .{ "EXCEPT", .except },
         .{ "in", .in },
         .{ "notin", .notin },
@@ -507,6 +523,13 @@ pub const Parser = struct {
         };
     }
 
+    pub fn parse_expr_string(arena: *Arena, source: []const u8) !*ast.Expr {
+        var p = Parser.init(arena, source);
+        const expr = try p.parse_expr();
+        if (p.current.kind != .eof) return error.SyntaxError;
+        return expr;
+    }
+
     pub fn parse_module(self: *Parser) !ast.Module {
         self.skip_dashes();
         try self.expect(.keyword_module);
@@ -528,41 +551,48 @@ pub const Parser = struct {
         var constants = std.ArrayList([]const u8).empty;
         defer constants.deinit(std.heap.page_allocator);
 
+        var definitions = std.ArrayList(ast.Definition).empty;
+        defer definitions.deinit(std.heap.page_allocator);
+        var instances = std.ArrayList(ast.Instance).empty;
+        defer instances.deinit(std.heap.page_allocator);
         while (true) {
             self.skip_dashes();
-            if (self.match(.keyword_variables)) {
+            if (self.current.kind == .keyword_variables) {
+                self.advance();
                 while (true) {
                     try variables.append(std.heap.page_allocator, try self.dup(try self.expect_ident_text()));
                     if (!self.match(.comma)) break;
                 }
-            } else if (self.match(.keyword_constants)) {
+                continue;
+            }
+            if (self.current.kind == .keyword_constants) {
+                self.advance();
                 while (true) {
                     try constants.append(std.heap.page_allocator, try self.dup(try self.expect_ident_text()));
                     if (!self.match(.comma)) break;
                 }
-            } else if (self.current.kind == .keyword_assume) {
+                continue;
+            }
+            if (self.current.kind == .keyword_assume) {
                 self.advance();
                 if (self.current.kind == .ident and self.next.kind == .defeq) {
-                    self.advance();
-                    self.advance();
+                    _ = try self.parse_definition();
+                } else {
+                    _ = try self.parse_expr();
                 }
-                _ = try self.parse_expr();
                 if (self.current.kind == .semi) self.advance();
-            } else {
-                break;
+                continue;
             }
-        }
-
-        var definitions = std.ArrayList(ast.Definition).empty;
-        defer definitions.deinit(std.heap.page_allocator);
-        while (true) {
-            self.skip_dashes();
             if (self.current.kind == .keyword_theorem or
-                self.current.kind == .keyword_assume or
                 self.current.kind == .lbracket or
                 self.current.kind == .langle)
             {
                 self.skip_to_next_definition();
+                continue;
+            }
+            if (self.current.kind == .keyword_instance) {
+                const inst = try self.parse_instance();
+                try instances.append(std.heap.page_allocator, inst);
                 continue;
             }
             if (self.current.kind != .ident) break;
@@ -586,9 +616,33 @@ pub const Parser = struct {
             .variables = try self.dup_slice([]const u8, variables.items),
             .constants = try self.dup_slice([]const u8, constants.items),
             .definitions = try self.dup_slice(ast.Definition, definitions.items),
+            .instances = try self.dup_slice(ast.Instance, instances.items),
             .init_name = init_name,
             .next_name = next_name,
             .invariants = try self.dup_slice([]const u8, invariants.items),
+        };
+    }
+
+    fn parse_instance(self: *Parser) !ast.Instance {
+        try self.expect(.keyword_instance);
+        const module_name = try self.expect_ident_text();
+        var subs = std.ArrayList(ast.Substitution).empty;
+        defer subs.deinit(std.heap.page_allocator);
+        if (self.match(.keyword_with)) {
+            while (true) {
+                const local_name = try self.expect_ident_text();
+                try self.expect(.subst);
+                const expr = try self.parse_expr();
+                try subs.append(std.heap.page_allocator, .{
+                    .local_name = try self.dup(local_name),
+                    .expr = expr,
+                });
+                if (!self.match(.comma)) break;
+            }
+        }
+        return ast.Instance{
+            .module_name = try self.dup(module_name),
+            .substitutions = try self.dup_slice(ast.Substitution, subs.items),
         };
     }
 
@@ -599,7 +653,22 @@ pub const Parser = struct {
         if (self.match(.lparen)) {
             if (self.current.kind != .rparen) {
                 while (true) {
-                    try params.append(std.heap.page_allocator, try self.dup(try self.expect_ident_text()));
+                    const pname = try self.expect_ident_text();
+                    try params.append(std.heap.page_allocator, try self.dup(pname));
+                    // Higher-order parameter syntax: Op(_) or Op(_,_) ; arity ignored for now.
+                    if (self.current.kind == .lparen) {
+                        try self.expect(.lparen);
+                        while (self.current.kind != .rparen) {
+                            if (self.current.kind == .underscore or self.current.kind == .ident) {
+                                self.advance();
+                            } else if (self.current.kind == .comma) {
+                                self.advance();
+                            } else {
+                                return error.SyntaxError;
+                            }
+                        }
+                        try self.expect(.rparen);
+                    }
                     if (!self.match(.comma)) break;
                 }
             }
@@ -849,28 +918,34 @@ pub const Parser = struct {
                 return try self.expr_string(text[1 .. text.len - 1]);
             },
             .ident => {
-                const name = self.current.text;
-                self.advance();
+                const name = try self.expect_ident_text();
+                var expr = try self.expr_ident(name);
                 if (self.match(.bang)) {
                     const field = try self.expect_ident_text();
-                    return try self.expr_field(try self.expr_ident(name), field);
+                    expr = try self.expr_field(expr, field);
                 }
                 if (self.match(.prime)) {
-                    return try self.expr_primed(name);
+                    expr = try self.expr_primed(name);
                 }
-                if (self.match(.lparen)) {
-                    const args = try self.parse_expr_list(.rparen);
-                    return try self.expr_apply(try self.expr_ident(name), args);
+                while (true) {
+                    if (self.match(.lparen)) {
+                        const args = try self.parse_expr_list(.rparen);
+                        expr = try self.expr_apply(expr, args);
+                        continue;
+                    }
+                    if (self.match(.lbracket)) {
+                        const args = try self.parse_expr_list(.rbracket);
+                        expr = try self.expr_apply(expr, args);
+                        continue;
+                    }
+                    if (self.match(.dot)) {
+                        const field = try self.expect_ident_text();
+                        expr = try self.expr_field(expr, field);
+                        continue;
+                    }
+                    break;
                 }
-                if (self.match(.lbracket)) {
-                    const args = try self.parse_expr_list(.rbracket);
-                    return try self.expr_apply(try self.expr_ident(name), args);
-                }
-                if (self.match(.dot)) {
-                    const field = try self.expect_ident_text();
-                    return try self.expr_field(try self.expr_ident(name), field);
-                }
-                return try self.expr_ident(name);
+                return expr;
             },
             .lparen => {
                 self.advance();
@@ -892,12 +967,17 @@ pub const Parser = struct {
             .keyword_unchanged => return try self.parse_unchanged(),
             .keyword_let => return try self.parse_let_in(),
             .keyword_case => return try self.parse_case_expr(),
+            .keyword_lambda => return try self.parse_lambda(),
             else => return error.SyntaxError,
         }
     }
 
     fn parse_set(self: *Parser) !*ast.Expr {
         try self.expect(.lbrace);
+        if (self.current.kind == .rbrace) {
+            self.advance();
+            return try self.expr_set_enum(&[_]*ast.Expr{});
+        }
         if (self.current.kind == .ident and self.next.kind == .in) {
             const var_name = try self.expect_ident_text();
             try self.expect(.in);
@@ -907,8 +987,23 @@ pub const Parser = struct {
             try self.expect(.rbrace);
             return try self.expr_set_filter(var_name, domain, pred);
         }
-        const items = try self.parse_expr_list(.rbrace);
-        return try self.expr_set_enum(items);
+        const first = try self.parse_expr();
+        if (self.current.kind == .colon) {
+            self.advance();
+            const var_name = try self.expect_ident_text();
+            try self.expect(.in);
+            const domain = try self.parse_expr();
+            try self.expect(.rbrace);
+            return try self.expr_set_map(var_name, domain, first);
+        }
+        var items = std.ArrayList(*ast.Expr).empty;
+        defer items.deinit(std.heap.page_allocator);
+        try items.append(std.heap.page_allocator, first);
+        while (self.match(.comma)) {
+            try items.append(std.heap.page_allocator, try self.parse_expr());
+        }
+        try self.expect(.rbrace);
+        return try self.expr_set_enum(try self.dup_slice(*ast.Expr, items.items));
     }
 
     fn parse_function_or_record(self: *Parser) !*ast.Expr {
@@ -983,8 +1078,8 @@ pub const Parser = struct {
     fn parse_except_steps(self: *Parser) ![]const ast.AccessStep {
         var steps = std.ArrayList(ast.AccessStep).empty;
         defer steps.deinit(std.heap.page_allocator);
+        try self.expect(.bang);
         while (true) {
-            try self.expect(.bang);
             if (self.match(.dot)) {
                 const field = try self.expect_ident_text();
                 try steps.append(std.heap.page_allocator, ast.AccessStep{ .field = try self.dup(field) });
@@ -995,7 +1090,7 @@ pub const Parser = struct {
             } else {
                 return error.SyntaxError;
             }
-            if (!self.match(.comma)) break;
+            if (self.current.kind == .comma or self.current.kind == .eq) break;
         }
         return try self.dup_slice(ast.AccessStep, steps.items);
     }
@@ -1087,6 +1182,30 @@ pub const Parser = struct {
         return try self.expr_let_in(defs.items, body);
     }
 
+    fn parse_lambda(self: *Parser) !*ast.Expr {
+        try self.expect(.keyword_lambda);
+        var names = std.ArrayList([]const u8).empty;
+        defer names.deinit(std.heap.page_allocator);
+        while (true) {
+            const name = try self.expect_ident_text();
+            try names.append(std.heap.page_allocator, try self.dup(name));
+            if (!self.match(.comma)) break;
+        }
+        try self.expect(.colon);
+        const body = try self.parse_expr();
+        return try self.expr_lambda(names.items, body);
+    }
+
+    fn expr_lambda(self: *Parser, params: []const []const u8, body: *ast.Expr) !*ast.Expr {
+        const lptr = try self.arena.alloc_object(ast.Lambda);
+        const dup_params = try self.arena.alloc([]const u8, params.len);
+        for (params, 0..) |p, i| dup_params[i] = p;
+        lptr.* = ast.Lambda{ .params = dup_params, .body = body };
+        const ptr = try self.arena.alloc_object(ast.Expr);
+        ptr.* = ast.Expr{ .lambda = lptr };
+        return ptr;
+    }
+
     fn parse_case_expr(self: *Parser) !*ast.Expr {
         try self.expect(.keyword_case);
         var arms = std.ArrayList(ast.CaseArm).empty;
@@ -1169,10 +1288,40 @@ pub const Parser = struct {
     }
 
     fn expect_ident_text(self: *Parser) ![]const u8 {
+        return try self.parse_ident_name();
+    }
+
+    fn parse_ident_name(self: *Parser) ![]const u8 {
         if (self.current.kind != .ident) return error.SyntaxError;
-        const text = self.current.text;
+        const first = self.current.text;
         self.advance();
-        return text;
+        if (self.current.kind != .underscore) return first;
+        var parts: [8][]const u8 = undefined;
+        parts[0] = first;
+        var count: u32 = 1;
+        while (self.current.kind == .underscore and self.next.kind == .ident) {
+            self.advance(); // _
+            std.debug.assert(count < parts.len);
+            parts[count] = self.current.text;
+            count += 1;
+            self.advance(); // ident
+        }
+        if (count == 1) return first;
+        var len: usize = count - 1; // underscores
+        var i: u32 = 0;
+        while (i < count) : (i += 1) len += parts[i].len;
+        const result = try self.arena.alloc(u8, len);
+        var pos: usize = 0;
+        i = 0;
+        while (i < count) : (i += 1) {
+            if (i > 0) {
+                result[pos] = '_';
+                pos += 1;
+            }
+            @memcpy(result[pos .. pos + parts[i].len], parts[i]);
+            pos += parts[i].len;
+        }
+        return result;
     }
 
     fn expr_bool(self: *Parser, b: bool) !*ast.Expr {

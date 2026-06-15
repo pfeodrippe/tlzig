@@ -4,6 +4,7 @@ const Arena = @import("arena.zig").Arena;
 pub const ConstantAssignment = struct {
     name: []const u8,
     expr: []const u8,
+    is_substitution: bool,
 };
 
 pub const Config = struct {
@@ -31,57 +32,73 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
     var constants = std.ArrayList(ConstantAssignment).empty;
     defer constants.deinit(std.heap.page_allocator);
 
-    var it = std.mem.tokenizeAny(u8, source, "\r\n");
-    while (it.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t");
+    const lines = try split_lines(arena, source);
+    var i: usize = 0;
+    while (i < lines.len) : (i += 1) {
+        const trimmed = trim(lines[i]);
         if (trimmed.len == 0) continue;
-        if (std.mem.startsWith(u8, trimmed, "\\*")) continue;
-        if (std.mem.startsWith(u8, trimmed, "(*")) continue;
+        if (is_comment(trimmed)) continue;
 
         const first_word = first_token(trimmed);
-        const rest = std.mem.trim(u8, trimmed[first_word.len..], " \t");
-        if (std.mem.eql(u8, first_word, "SPECIFICATION")) {
+        var rest = trim(trimmed[first_word.len..]);
+        if (rest.len == 0 and i + 1 < lines.len) {
+            i += 1;
+            rest = trim(lines[i]);
+        }
+        if (eql(first_word, "SPECIFICATION")) {
             cfg.spec_name = try arena_dup(arena, rest);
-        } else if (std.mem.eql(u8, first_word, "INIT")) {
+        } else if (eql(first_word, "INIT")) {
             cfg.init_name = try arena_dup(arena, rest);
-        } else if (std.mem.eql(u8, first_word, "NEXT")) {
+        } else if (eql(first_word, "NEXT")) {
             cfg.next_name = try arena_dup(arena, rest);
-        } else if (std.mem.eql(u8, first_word, "INVARIANT")) {
-            invariants.append(std.heap.page_allocator, try arena_dup(arena, rest)) catch return error.OutOfMemory;
-        } else if (std.mem.eql(u8, first_word, "INVARIANTS")) {
-            while (it.next()) |inv| {
-                const t = std.mem.trim(u8, inv, " \t");
+        } else if (eql(first_word, "INVARIANT")) {
+            try invariants.append(std.heap.page_allocator, try arena_dup(arena, rest));
+        } else if (eql(first_word, "INVARIANTS")) {
+            i += 1;
+            while (i < lines.len) : (i += 1) {
+                const t = trim(lines[i]);
                 if (t.len == 0) continue;
-                invariants.append(std.heap.page_allocator, try arena_dup(arena, t)) catch return error.OutOfMemory;
+                if (is_comment(t)) continue;
+                if (is_directive(t)) {
+                    i -= 1; // let outer loop process the directive
+                    break;
+                }
+                try invariants.append(std.heap.page_allocator, try arena_dup(arena, t));
             }
-        } else if (std.mem.eql(u8, first_word, "CONSTANT") or std.mem.eql(u8, first_word, "CONSTANTS")) {
+        } else if (eql(first_word, "CONSTANT") or eql(first_word, "CONSTANTS")) {
             if (rest.len > 0) {
                 try parse_constant_assignment(arena, rest, &constants);
             }
-            while (it.next()) |cand| {
-                const t = std.mem.trim(u8, cand, " \t");
+            i += 1;
+            while (i < lines.len) : (i += 1) {
+                const t = trim(lines[i]);
                 if (t.len == 0) continue;
-                if (std.mem.startsWith(u8, t, "\\*")) continue;
-                if (std.mem.startsWith(u8, t, "(*")) continue;
-                if (is_directive(t)) break;
+                if (is_comment(t)) continue;
+                if (is_directive(t)) {
+                    i -= 1; // let outer loop process the directive
+                    break;
+                }
                 try parse_constant_assignment(arena, t, &constants);
             }
-        } else if (std.mem.eql(u8, first_word, "PROPERTY") or
-            std.mem.eql(u8, first_word, "PROPERTIES") or
-            std.mem.eql(u8, first_word, "ALIAS") or
-            std.mem.eql(u8, first_word, "VIEW") or
-            std.mem.eql(u8, first_word, "SYMMETRY") or
-            std.mem.eql(u8, first_word, "POSTCONDITION") or
-            std.mem.eql(u8, first_word, "CHECK_DEADLOCK"))
+        } else if (eql(first_word, "PROPERTY") or
+            eql(first_word, "PROPERTIES") or
+            eql(first_word, "ALIAS") or
+            eql(first_word, "VIEW") or
+            eql(first_word, "SYMMETRY") or
+            eql(first_word, "POSTCONDITION") or
+            eql(first_word, "CHECK_DEADLOCK") or
+            eql(first_word, "CONSTRAINT") or
+            eql(first_word, "CONSTRAINTS"))
         {
             // Not implemented yet; parse and ignore for now.
-            if (std.mem.eql(u8, first_word, "PROPERTIES")) {
-                while (it.next()) |cand| {
-                    const t = std.mem.trim(u8, cand, " \t");
+            if (eql(first_word, "PROPERTIES")) {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
                     if (t.len == 0) continue;
+                    if (is_comment(t)) continue;
                     if (is_directive(t)) {
-                        // Push back by re-tokenizing? std.mem.tokenize doesn't support push-back.
-                        // Accept the small limitation: PROPERTY lists cannot be followed by a directive line as a property.
+                        i -= 1;
                         break;
                     }
                 }
@@ -89,33 +106,43 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
         }
     }
 
-    const invariants_copy: []const []const u8 = if (invariants.items.len == 0) &[_][]const u8{} else blk: {
-        const result = try arena.alloc([]const u8, invariants.items.len);
-        @memcpy(result, invariants.items);
-        break :blk result;
-    };
-    const constants_copy: []const ConstantAssignment = if (constants.items.len == 0) &[_]ConstantAssignment{} else blk: {
-        const result = try arena.alloc(ConstantAssignment, constants.items.len);
-        @memcpy(result, constants.items);
-        break :blk result;
-    };
     return Config{
         .spec_name = cfg.spec_name,
         .init_name = cfg.init_name,
         .next_name = cfg.next_name,
-        .invariants = invariants_copy,
-        .constants = constants_copy,
+        .invariants = try dup_slice(arena, []const u8, invariants.items),
+        .constants = try dup_slice(arena, ConstantAssignment, constants.items),
     };
 }
 
+fn split_lines(arena: *Arena, source: []const u8) ![]const []const u8 {
+    var result = std.ArrayList([]const u8).empty;
+    defer result.deinit(std.heap.page_allocator);
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < source.len) : (i += 1) {
+        if (source[i] == '\n' or source[i] == '\r') {
+            if (i > start) try result.append(std.heap.page_allocator, source[start..i]);
+            start = i + 1;
+        }
+    }
+    if (i > start) try result.append(std.heap.page_allocator, source[start..i]);
+    return try dup_slice(arena, []const u8, result.items);
+}
+
 fn parse_constant_assignment(arena: *Arena, line: []const u8, out: *std.ArrayList(ConstantAssignment)) !void {
-    const eq_idx = std.mem.indexOf(u8, line, "=") orelse return error.SyntaxError;
-    const name = std.mem.trim(u8, line[0..eq_idx], " \t");
-    const expr = std.mem.trim(u8, line[eq_idx + 1 ..], " \t");
-    out.append(std.heap.page_allocator, ConstantAssignment{
+    const is_substitution = std.mem.indexOf(u8, line, "<-") != null;
+    const sep_idx = if (is_substitution)
+        std.mem.indexOf(u8, line, "<-").?
+    else
+        std.mem.indexOf(u8, line, "=") orelse return error.SyntaxError;
+    const name = trim(line[0..sep_idx]);
+    const expr = trim(line[sep_idx + (if (is_substitution) @as(usize, 2) else @as(usize, 1)) ..]);
+    try out.append(std.heap.page_allocator, ConstantAssignment{
         .name = try arena_dup(arena, name),
         .expr = try arena_dup(arena, expr),
-    }) catch return error.OutOfMemory;
+        .is_substitution = is_substitution,
+    });
 }
 
 fn is_directive(line: []const u8) bool {
@@ -125,12 +152,17 @@ fn is_directive(line: []const u8) bool {
         "INVARIANT",     "INVARIANTS",     "CONSTANT",
         "CONSTANTS",     "PROPERTY",       "PROPERTIES",
         "ALIAS",         "VIEW",           "SYMMETRY",
-        "POSTCONDITION", "CHECK_DEADLOCK",
+        "POSTCONDITION", "CHECK_DEADLOCK", "CONSTRAINT",
+        "CONSTRAINTS",
     };
     for (directives) |d| {
-        if (std.mem.eql(u8, first, d)) return true;
+        if (eql(first, d)) return true;
     }
     return false;
+}
+
+fn is_comment(line: []const u8) bool {
+    return std.mem.startsWith(u8, line, "\\*") or std.mem.startsWith(u8, line, "(*");
 }
 
 fn first_token(s: []const u8) []const u8 {
@@ -139,8 +171,23 @@ fn first_token(s: []const u8) []const u8 {
     return s[0..i];
 }
 
+fn trim(s: []const u8) []const u8 {
+    return std.mem.trim(u8, s, " \t");
+}
+
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
 fn arena_dup(arena: *Arena, s: []const u8) ![]const u8 {
     const copy = try arena.alloc(u8, s.len);
     @memcpy(copy, s);
     return copy;
+}
+
+fn dup_slice(arena: *Arena, comptime T: type, items: []const T) ![]const T {
+    if (items.len == 0) return &[_]T{};
+    const result = try arena.alloc(T, items.len);
+    @memcpy(result, items);
+    return result;
 }

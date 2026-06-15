@@ -44,37 +44,44 @@ Phase 1 targets single-module teaching specs with the `Naturals` module.
 
 Supported syntax/semantics:
 
-- Modules, `EXTENDS Naturals`/`Integers`/`TLAPS`, `VARIABLES`, `CONSTANTS`.
+- Modules, `EXTENDS Naturals`/`Integers`/`FiniteSets`/`TLAPS`, `VARIABLES`, `CONSTANTS`.
 - Definitions with `==`, including parameterised operators (`Min(m,n) == ...`).
 - Boolean operators: `/\`, `\/`, `~`, `=>`, `<=>`, `TRUE`, `FALSE`.
 - Equality/inequality: `=`, `#`, `/=`.
 - Naturals: integer literals, `+`, `-`, `*`, `%`, `..`, `<`, `>`, `<=`, `>=`.
 - Sets: set enumeration `{a, b}`, `\in`, `\notin`, `\subseteq`, `SUBSET S`,
-  `S \cup T`, `S \cap T`, `S \ T`.
+  `S \cup T`, `S \cap T`, `S \ T`, `\times`/`\X`, `{ x \in S : P }`,
+  `{ e : x \in S }`, `UNION S`.
 - Functions: `[x \in S |-> e]`, application `f[x]`, `DOMAIN f`,
   set-of-functions `[S -> T]` (membership checked without enumerating the set),
-  `EXCEPT ![x] = e` (with `@`).
+  `EXCEPT ![x] = e` and `EXCEPT ![x].field = e` (with `@`).
 - Tuples: `<<a, b>>`, application `t[i]` (1-based).
-- Records: `[a |-> v]`, field access `r.a`.
+- Records: `[a |-> v]`, field access `r.a`, record sets `[field : Domain]`.
 - `IF ... THEN ... ELSE ...`.
-- Quantifiers: `\E x \in S : P`, `\A x \in S : P`.
+- Quantifiers: `\E x \in S : P`, `\A x \in S : P` (multi-variable).
 - Quantified action calls (`\E self \in S : proc(self)`).
 - `CHOOSE x \in S : P` (deterministic smallest element).
+- `LAMBDA x : e` values and higher-order operator parameters (`Op(_)`).
 - Primed variables in actions: `x'`.
 - `UNCHANGED x`, `UNCHANGED <<x, y>>`.
-- Action conjunction/disjunction.
-- `Init`, `Next`, `INVARIANT` from the `.cfg` file.
-- `LET d1 == e1 IN e2` (local definitions, including inside actions).
+- Action conjunction/disjunction, action-level `IF/THEN/ELSE`, `LET/IN` actions.
+- `Init`, `Next`, `INVARIANT`, and `SPECIFICATION` from the `.cfg` file.
+- `INSTANCE M` and `INSTANCE M WITH x <- e` substitutions.
+- Config `CONSTANT x <- Operator` operator aliases and value substitutions.
 
 Out of scope for Phase 1:
 
-- Real modules beyond `Naturals` (no `Sequences`, `Bags`, `FiniteSets`, TLC overrides).
-- Liveness checking (`[]`, `<>`, `~>`). The parser skips `SPECIFICATION` lines that
-  contain these operators and the `.cfg` file must therefore use `INIT`/`NEXT`.
+- Real modules beyond `Naturals`/`Integers`/`FiniteSets`/`TLAPS` (no `Sequences`,
+  `Bags`, `TLC`, `FiniteSets` theorems, etc.). Some standard operators are
+  overridden in Zig (`Cardinality`, `IsFiniteSet`, `Len`, `Head`, `Tail`,
+  `Append`, `SubSeq`, `Seq`, `UNION`, `Assert`).
+- Liveness checking (`[]`, `<>`, `~>`). `SPECIFICATION` lines containing only
+  `Init /\ [][Next]_vars` are supported; fairness conjuncts like `WF_vars(Next)`
+  are parsed but ignored as a pass-through condition.
 - Symmetry reduction.
 - Model values and views.
 - Theorem/proof constructs.
-- Recursive operators and `LAMBDA`.
+- Recursive operators.
 - Real numbers, strings (string literals are parsed but have no operations).
 - Disk spill (`FPSet` stays in pre-allocated RAM).
 
@@ -101,10 +108,12 @@ src/
 
 Memory design (TigerBeetle style):
 
-- One `Arena` is sized at startup from CLI flags (`--max-states`, `--max-memory`).
-- All states, values, sets, functions, and queue entries live in this arena.
+- Two arenas: a main arena for the AST, state store, and fingerprint set, and a
+  per-check eval arena for temporary values. Both are sized from CLI flags
+  (`--max-states`, `--arena-bytes`, `--eval-arena-bytes`).
+- All states, values, sets, functions, and queue entries live in these arenas.
 - No `Allocator` interface is used at run-time; the arena is bumped forward.
-- When the arena is exhausted the checker stops with a clear error.
+- When an arena is exhausted the checker stops with a clear error.
 - Function recursion is avoided; all loops are bounded by constants or arena limits.
 
 Value representation:
@@ -119,6 +128,7 @@ const Value = union(enum(u8)) {
     record_v: Record,
     string_v: String,
     model_v: u32,
+    lambda_v: *Lambda,
 };
 ```
 
@@ -175,7 +185,19 @@ Variable lookup order:
 3. Operator definitions are resolved directly at application time for ident
    functions (`Min(big + small, 5)`).
 
-## 7. Verified Examples
+## 7. Config Constants and Model Values
+
+Config `CONSTANT` assignments are parsed as TLA+ expressions and evaluated by
+`Evaluator` before model checking starts. Unknown identifiers in config
+expressions are interned as model values (e.g. ` Ingredients = {matches, paper,
+tobacco}` creates three model-value ids). This gives correct semantics for
+checking `\in` and set equality without relying on a fragile string splitter.
+
+`Evaluator.models` is a pointer to a `ModelTable` allocated in the main arena so
+that interning during config evaluation persists across the copied `Evaluator`
+values used during expression evaluation.
+
+## 8. Verified Examples
 
 ### HourClock
 
@@ -259,7 +281,21 @@ Variable lookup order:
 - Required: `LET/IN` action bindings, `Cardinality`, `SUBSET`,
   function-set membership, `\cup`/ `\`, canonical set fingerprints.
 
-## 8. Running
+### CigaretteSmokers
+
+```sh
+./zig-out/bin/tlzig \
+  --spec vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.tla \
+  --cfg   vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.cfg \
+  --max-states 5000
+```
+
+- tlzig (ReleaseFast): 15 generated, 6 distinct
+- Required: `LAMBDA` values, higher-order operator parameters (`Op(_)`),
+  chained `EXCEPT` steps (`![x].field`), suffix field access on function
+  application (`f[x].field`), nested config sets.
+
+## 9. Running
 
 ```sh
 # Build the engine.
@@ -272,7 +308,7 @@ Variable lookup order:
 ./zig-out/bin/tlzig --spec SPEC.tla --cfg CFG.cfg --max-states N
 ```
 
-## 9. Design Rules (TigerBeetle Style Applied)
+## 10. Design Rules (TigerBeetle Style Applied)
 
 - All loops have a fixed upper bound derived from arena limits or `max_states`.
 - Every function asserts preconditions and postconditions.
@@ -282,7 +318,7 @@ Variable lookup order:
 - No dependencies beyond the Zig toolchain.
 - Use `zig fmt` and keep lines <= 100 columns.
 
-## 10. Notes on Correctness
+## 11. Notes on Correctness
 
 - We cross-validate against TLC on every spec we claim to support.
 - Invariant checking is synchronous with state generation.

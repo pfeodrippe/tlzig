@@ -32,15 +32,23 @@ Build a Zig TLA+ model checker that is faster than Java TLC on all specs in
 ## Phase 2 — Examples (simplest to complex)
 
 Target: **≥50% of all `.tla` files in `vendor/tlaplus-examples/specifications` must pass.**
-Current harness (existing `.cfg` when present, otherwise generic `INIT Init / NEXT Next / INVARIANT TypeOK`, `--max-states 5000`): **16/394 passing (4%)**.
+Current harness (matching `.cfg` by basename, `--max-states 5000`): **35/190 checkable specs passing (18%)**, **35/385 total `.tla` files passing (9%)**.
 
 Top blockers observed in harness:
-1. `INSTANCE M WITH ...` substitutions (modular specs).
-2. Higher-order operators / `LAMBDA` / `CHOOSE` predicates (CigaretteSmokers, Echo, SlidingPuzzles, ...).
+1. ~~`INSTANCE M WITH ...` substitutions~~ (basic implementation landed; unlocks APMajority/MCMajority).
+2. ~~Higher-order operators / `LAMBDA` / `CHOOSE` predicates~~ (basic `LAMBDA` values and higher-order params landed; unlocks CigaretteSmokers).
 3. `WF_vars(Next)` / `SF_vars(Next)` fairness syntax in `Spec` definitions.
-4. Config substitutions (`<-`) and advanced config directives.
-5. Missing standard-module operators (`SelectSeq`, `SortSeq`, `Bags`, `Permutations`, etc.).
+4. ~~Config substitutions (`<-`)~~ (basic operator-alias/value substitution landed).
+5. Missing standard-module operators (`SelectSeq`, `SortSeq`, `Bags`, `Permutations`, `UNION`, etc.).
 6. Proof-only / non-checkable `.tla` files (acceptable to skip for the 50% target).
+7. State-space explosion on specs with large `SUBSET` domains (bcastFolklore, etc.).
+
+Recently completed unlocks:
+- Parser: fixed bare `A`/`E` identifiers vs `\A`/`\E` quantifiers; fixed `(*...*)` comment interaction with `_` token; fixed set map `{ e : x \in S }` and empty-set enum dangling-pointer bug; added `\times` cartesian operator.
+- Module loader: implemented `INSTANCE M` and `INSTANCE M WITH x <- e` substitutions with AST deep-copy + operator aliases.
+- Config: implemented `CONSTANT x <- Operator` operator substitutions and `<-` value substitutions.
+- Evaluator: implemented `UNION S` (union-all), scaled state/eval value pools separately.
+- Added `scripts/harness.zig` and `zig build harness` for spec-by-spec pass/fail tracking.
 
 Target list sorted by perceived complexity (single module, few variables, no advanced modules first):
 
@@ -94,7 +102,10 @@ Target list sorted by perceived complexity (single module, few variables, no adv
 14. [x] `specifications/CoffeeCan/CoffeeCan.tla` (existing cfg)
 15. [x] `specifications/SpecifyingSystems/Composing/HourClock.tla` (existing cfg)
 16. [x] `specifications/SpecifyingSystems/Liveness/HourClock.tla` (existing cfg, liveness property ignored)
-17. [ ] `specifications/echo/Echo.tla`
+17. [x] `specifications/CigaretteSmokers/CigaretteSmokers.tla`
+    - tlzig (ReleaseFast): 15 generated, 6 distinct
+    - Required: `LAMBDA` values, higher-order operator params (`Op(_)`), chained EXCEPT steps (`![x].field`), suffix field access on function application (`f[x].field`), nested config sets
+18. [ ] `specifications/echo/Echo.tla`
 9. [ ] `specifications/Majority/Majority.tla`
 10. [ ] `specifications/Bakery-Boulangerie/Bakery.tla`
 11. [ ] `specifications/KeyValueStore/KeyValueStore.tla`
@@ -114,7 +125,7 @@ For each spec:
 ## Phase 2b — Scale to 50% of all specs
 
 - [ ] Implement `INSTANCE M WITH ...` substitutions (highest unlock rate).
-- [ ] Implement `LAMBDA`/higher-order operators and `CHOOSE` predicates.
+- [x] Implement `LAMBDA`/higher-order operators and `CHOOSE` predicates (basic).
 - [ ] Parse `WF_vars(A)` / `SF_vars(A)` fairness syntax (or skip in `Spec` extraction).
 - [ ] Add remaining standard-module overrides (`SelectSeq`, `SortSeq`, `Bags`, etc.).
 - [ ] Support config substitutions (`<-`) and multi-line `CONSTANTS` blocks.

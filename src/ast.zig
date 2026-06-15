@@ -6,9 +6,20 @@ pub const Module = struct {
     variables: []const []const u8,
     constants: []const []const u8,
     definitions: []const Definition,
+    instances: []const Instance,
     init_name: []const u8,
     next_name: []const u8,
     invariants: []const []const u8,
+};
+
+pub const Instance = struct {
+    module_name: []const u8,
+    substitutions: []const Substitution,
+};
+
+pub const Substitution = struct {
+    local_name: []const u8,
+    expr: *Expr,
 };
 
 pub const Definition = struct {
@@ -44,6 +55,7 @@ pub const Expr = union(ExprTag) {
     let_in: *LetIn,
     case_expr: *CaseExpr,
     box_action: *BoxAction,
+    lambda: *Lambda,
     at,
 };
 
@@ -74,6 +86,7 @@ pub const ExprTag = enum(u8) {
     let_in,
     case_expr,
     box_action,
+    lambda,
     at,
 };
 
@@ -230,4 +243,9 @@ pub const CaseExpr = struct {
 pub const BoxAction = struct {
     action_name: []const u8,
     vars: *Expr,
+};
+
+pub const Lambda = struct {
+    params: []const []const u8,
+    body: *Expr,
 };

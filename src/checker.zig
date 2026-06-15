@@ -15,7 +15,9 @@ const ValuePool = @import("value.zig").ValuePool;
 const Value = @import("value.zig").Value;
 const Error = @import("err.zig").Error;
 const Config = @import("config.zig").Config;
+const ConstantAssignment = @import("config.zig").ConstantAssignment;
 const Constant = eval.Constant;
+const parser = @import("parser.zig");
 
 pub const Checker = struct {
     arena: *Arena,
@@ -41,6 +43,7 @@ pub const Checker = struct {
         eval_string_cap: u32,
         state_value_cap: u32,
         state_string_cap: u32,
+        eval_arena_bytes: u64,
     ) !Checker {
         var state_store = try StateStore.init(
             arena,
@@ -52,8 +55,12 @@ pub const Checker = struct {
         const queue = try StateQueue.init(arena, max_states);
         const fp_set = try FpSet.init(arena, max_states * 2);
         var evaluator = try Evaluator.init(module, arena);
+        evaluator.set_treat_unknown_as_model(true);
         const constants = try evaluate_constants(arena, cfg, &evaluator, &state_store.values_pool);
         evaluator.set_constants(constants);
+        const aliases = try evaluate_aliases(arena, cfg);
+        evaluator.set_aliases(aliases);
+        evaluator.set_treat_unknown_as_model(false);
         const compiler = ActionCompiler.init(arena, evaluator);
 
         const init_name_v = cfg.init_name orelse blk: {
@@ -73,8 +80,14 @@ pub const Checker = struct {
             break :blk find_next_name(module) orelse return Error.ConfigError;
         };
 
-        const init_def = evaluator.find_definition(init_name_v) orelse return Error.UndefinedSymbol;
-        const next_def = evaluator.find_definition(next_name_v) orelse return Error.UndefinedSymbol;
+        const init_def = evaluator.find_definition(init_name_v) orelse {
+            std.debug.print("undefined init def: {s}\n", .{init_name_v});
+            return Error.UndefinedSymbol;
+        };
+        const next_def = evaluator.find_definition(next_name_v) orelse {
+            std.debug.print("undefined next def: {s}\n", .{next_name_v});
+            return Error.UndefinedSymbol;
+        };
 
         const compiled_init = try compiler.compile_init(init_def.body);
         const compiled_next = try compiler.compile_next(next_def.body);
@@ -82,7 +95,10 @@ pub const Checker = struct {
         var invariant_exprs = std.ArrayList(*ast.Expr).empty;
         defer invariant_exprs.deinit(std.heap.page_allocator);
         for (cfg.invariants) |inv_name| {
-            const def = evaluator.find_definition(inv_name) orelse return Error.UndefinedSymbol;
+            const def = evaluator.find_definition(inv_name) orelse {
+                std.debug.print("undefined invariant: {s}\n", .{inv_name});
+                return Error.UndefinedSymbol;
+            };
             try invariant_exprs.append(std.heap.page_allocator, def.body);
         }
 
@@ -94,7 +110,7 @@ pub const Checker = struct {
             break :blk result;
         };
 
-        var eval_arena = try Arena.init(64 * 1024 * 1024);
+        var eval_arena = try Arena.init(eval_arena_bytes);
         const eval_pool = try ValuePool.init(&eval_arena, eval_value_cap, eval_string_cap);
 
         return Checker{
@@ -243,62 +259,62 @@ fn find_next_name(module: ast.Module) ?[]const u8 {
 }
 
 fn evaluate_constants(arena: *Arena, cfg: Config, evaluator: *Evaluator, state_pool: *ValuePool) ![]const Constant {
-    if (cfg.constants.len == 0) return &[_]Constant{};
-    const result = try arena.alloc(Constant, cfg.constants.len);
-    for (cfg.constants, 0..) |ca, i| {
-        result[i] = Constant{
+    var values = std.ArrayList(Constant).empty;
+    defer values.deinit(std.heap.page_allocator);
+    for (cfg.constants) |ca| {
+        if (ca.is_substitution and is_operator_alias(ca.expr)) continue;
+        try values.append(std.heap.page_allocator, Constant{
             .name = ca.name,
-            .value = try evaluate_config_expr(ca.expr, evaluator, state_pool),
-        };
+            .value = try evaluate_config_expr(arena, ca, evaluator, state_pool),
+        });
     }
+    return try dup_slice(arena, Constant, values.items);
+}
+
+fn dup_slice(arena: *Arena, comptime T: type, items: []const T) ![]const T {
+    if (items.len == 0) return &[_]T{};
+    const result = try arena.alloc(T, items.len);
+    @memcpy(result, items);
     return result;
 }
 
-fn evaluate_config_expr(expr: []const u8, evaluator: *Evaluator, state_pool: *ValuePool) !Value {
-    const trimmed = std.mem.trim(u8, expr, " \t");
-    if (trimmed.len == 0) return error.SyntaxError;
-
-    if (trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') {
-        const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t");
-        var items = std.ArrayList(Value).empty;
-        defer items.deinit(std.heap.page_allocator);
-        var it = std.mem.splitScalar(u8, inner, ',');
-        while (it.next()) |raw| {
-            const t = std.mem.trim(u8, raw, " \t");
-            if (t.len == 0) continue;
-            try items.append(std.heap.page_allocator, try parse_config_value(t, evaluator));
+fn evaluate_aliases(arena: *Arena, cfg: Config) ![]const eval.Alias {
+    var aliases = std.ArrayList(eval.Alias).empty;
+    defer aliases.deinit(std.heap.page_allocator);
+    for (cfg.constants) |ca| {
+        if (!ca.is_substitution) continue;
+        const trimmed = std.mem.trim(u8, ca.expr, " \t");
+        if (is_operator_alias(trimmed)) {
+            try aliases.append(std.heap.page_allocator, eval.Alias{
+                .from = try arena.dup(ca.name),
+                .to = try arena.dup(trimmed),
+            });
         }
-        const dest = try state_pool.alloc_values(@intCast(items.items.len));
-        @memcpy(dest, items.items);
-        return Value{ .set_v = .{
-            .offset = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(state_pool.values.ptr)) / @sizeOf(Value)),
-            .len = @intCast(dest.len),
-        } };
     }
-
-    if (std.mem.indexOf(u8, trimmed, "..") != null) {
-        const dots = std.mem.indexOf(u8, trimmed, "..").?;
-        const lo = std.fmt.parseInt(i64, std.mem.trim(u8, trimmed[0..dots], " \t"), 10) catch return error.SyntaxError;
-        const hi = std.fmt.parseInt(i64, std.mem.trim(u8, trimmed[dots + 2 ..], " \t"), 10) catch return error.SyntaxError;
-        if (lo > hi) return Value{ .set_v = .{ .offset = state_pool.value_count, .len = 0 } };
-        const len: u32 = @intCast(hi - lo + 1);
-        const dest = try state_pool.alloc_values(len);
-        for (0..len) |i| {
-            dest[i] = Value{ .int_v = lo + @as(i64, @intCast(i)) };
-        }
-        return Value{ .set_v = .{
-            .offset = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(state_pool.values.ptr)) / @sizeOf(Value)),
-            .len = len,
-        } };
-    }
-
-    return parse_config_value(trimmed, evaluator);
+    return try dup_slice(arena, eval.Alias, aliases.items);
 }
 
-fn parse_config_value(text: []const u8, evaluator: *Evaluator) !Value {
-    if (std.fmt.parseInt(i64, text, 10)) |i| {
-        return Value{ .int_v = i };
-    } else |_| {}
-    const id = try evaluator.models.intern(text);
-    return Value{ .model_v = id };
+fn is_operator_alias(expr: []const u8) bool {
+    const trimmed = std.mem.trim(u8, expr, " \t");
+    if (trimmed.len == 0) return false;
+    if (!std.ascii.isAlphabetic(trimmed[0])) return false;
+    for (trimmed[1..]) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+    }
+    return true;
+}
+
+fn evaluate_config_expr(arena: *Arena, ca: ConstantAssignment, evaluator: *Evaluator, state_pool: *ValuePool) !Value {
+    const trimmed = std.mem.trim(u8, ca.expr, " \t");
+    if (trimmed.len == 0) return error.SyntaxError;
+
+    if (ca.is_substitution) {
+        const expr = try parser.Parser.parse_expr_string(arena, trimmed);
+        return try evaluator.eval_expr(expr, Context.empty(), null, state_pool, state_pool);
+    }
+
+    // Parse the right-hand side as a TLA+ expression so nested sets, ranges,
+    // and model values are handled by the real parser/evaluator.
+    const expr = try parser.Parser.parse_expr_string(arena, trimmed);
+    return try evaluator.eval_expr(expr, Context.empty(), null, state_pool, state_pool);
 }

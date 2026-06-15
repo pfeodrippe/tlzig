@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Arena = @import("arena.zig").Arena;
 
 pub const ValueTag = enum(u8) {
@@ -10,6 +11,13 @@ pub const ValueTag = enum(u8) {
     record_v,
     string_v,
     model_v,
+    lambda_v,
+};
+
+pub const Lambda = struct {
+    params: []const []const u8,
+    body: *anyopaque,
+    ctx: *anyopaque,
 };
 
 pub const Value = union(ValueTag) {
@@ -21,6 +29,7 @@ pub const Value = union(ValueTag) {
     record_v: Record,
     string_v: String,
     model_v: u32,
+    lambda_v: *Lambda,
 
     pub fn is_truthy(self: Value) bool {
         return switch (self) {
@@ -43,7 +52,13 @@ pub const Value = union(ValueTag) {
         };
     }
 
+    pub fn tag(self: Value) ValueTag {
+        return std.meta.activeTag(self);
+    }
+
     pub fn eql(a: Value, b: Value, pool: *const ValuePool) bool {
+        assert(pool.value_count <= pool.value_cap);
+        assert(pool.string_count <= pool.string_cap);
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
             .bool_v => |ba| ba == b.bool_v,
@@ -54,10 +69,13 @@ pub const Value = union(ValueTag) {
             .tuple_v => |ta| ta.eql(b.tuple_v, pool),
             .record_v => |ra| ra.eql(b.record_v, pool),
             .string_v => |sa| sa.eql(b.string_v, pool),
+            .lambda_v => return false,
         };
     }
 
     pub fn compare(a: Value, b: Value, pool: *const ValuePool) ?i8 {
+        assert(pool.value_count <= pool.value_cap);
+        assert(pool.string_count <= pool.string_cap);
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return null;
         return switch (a) {
             .bool_v => |ba| if (ba == b.bool_v) 0 else if (ba) 1 else -1,
@@ -66,11 +84,16 @@ pub const Value = union(ValueTag) {
                 return if (ia < ib) -1 else if (ia > ib) 1 else 0;
             },
             .string_v => |sa| sa.compare(b.string_v, pool),
+            .lambda_v => null,
             else => null,
         };
     }
 
-    pub fn clone(self: Value, source: *const ValuePool, target: *ValuePool) error{OutOfMemory}!Value {
+    pub fn clone(self: Value, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!Value {
+        assert(source.value_count <= source.value_cap);
+        assert(source.string_count <= source.string_cap);
+        assert(target.value_count <= target.value_cap);
+        assert(target.string_count <= target.string_cap);
         return switch (self) {
             .bool_v => |b| Value{ .bool_v = b },
             .int_v => |i| Value{ .int_v = i },
@@ -80,6 +103,7 @@ pub const Value = union(ValueTag) {
             .function_v => |f| Value{ .function_v = try f.clone(source, target) },
             .tuple_v => |t| Value{ .tuple_v = try t.clone(source, target) },
             .record_v => |r| Value{ .record_v = try r.clone(source, target) },
+            .lambda_v => return error.NotImplemented,
         };
     }
 };
@@ -89,10 +113,12 @@ pub const Set = extern struct {
     len: u32,
 
     pub fn items(self: Set, pool: *const ValuePool) []const Value {
+        assert(self.offset + self.len <= pool.value_count);
         return pool.values[self.offset..][0..self.len];
     }
 
     pub fn contains(self: Set, pool: *const ValuePool, v: Value) bool {
+        assert(self.offset + self.len <= pool.value_count);
         for (self.items(pool)) |it| {
             if (it.eql(v, pool)) return true;
         }
@@ -100,6 +126,8 @@ pub const Set = extern struct {
     }
 
     pub fn is_subset(self: Set, pool: *const ValuePool, other: Set) bool {
+        assert(self.offset + self.len <= pool.value_count);
+        assert(other.offset + other.len <= pool.value_count);
         for (self.items(pool)) |it| {
             if (!other.contains(pool, it)) return false;
         }
@@ -107,17 +135,23 @@ pub const Set = extern struct {
     }
 
     pub fn eql(self: Set, other: Set, pool: *const ValuePool) bool {
+        assert(self.offset + self.len <= pool.value_count);
+        assert(other.offset + other.len <= pool.value_count);
         if (self.len != other.len) return false;
         return self.is_subset(pool, other);
     }
 
-    pub fn clone(self: Set, source: *const ValuePool, target: *ValuePool) error{OutOfMemory}!Set {
+    pub fn clone(self: Set, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!Set {
+        assert(self.offset + self.len <= source.value_count);
+        assert(target.value_count <= target.value_cap);
         const src_items = self.items(source);
         const dest = try target.alloc_values(@intCast(src_items.len));
+        assert(dest.len == src_items.len);
         for (src_items, 0..) |it, i| {
             dest[i] = try it.clone(source, target);
         }
         const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
+        assert(offset + dest.len <= target.value_cap);
         return Set{ .offset = offset, .len = @intCast(src_items.len) };
     }
 };
@@ -128,12 +162,15 @@ pub const Function = extern struct {
     len: u32,
 
     pub fn entries(self: Function, pool: *const ValuePool) []const Value {
-        std.debug.assert(self.len == self.domain.len);
+        assert(self.len == self.domain.len);
+        assert(self.offset + self.len <= pool.value_count);
         return pool.values[self.offset..][0..self.len];
     }
 
     pub fn apply(self: Function, pool: *const ValuePool, key: Value) ?Value {
+        assert(self.offset + self.len <= pool.value_count);
         const keys = self.domain.items(pool);
+        assert(keys.len == self.len);
         for (keys, 0..) |k, i| {
             if (k.eql(key, pool)) return self.entries(pool)[i];
         }
@@ -141,6 +178,8 @@ pub const Function = extern struct {
     }
 
     pub fn eql(self: Function, other: Function, pool: *const ValuePool) bool {
+        assert(self.offset + self.len <= pool.value_count);
+        assert(other.offset + other.len <= pool.value_count);
         if (!self.domain.eql(other.domain, pool)) return false;
         const a = self.entries(pool);
         const b = other.entries(pool);
@@ -151,14 +190,18 @@ pub const Function = extern struct {
         return true;
     }
 
-    pub fn clone(self: Function, source: *const ValuePool, target: *ValuePool) error{OutOfMemory}!Function {
+    pub fn clone(self: Function, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!Function {
+        assert(self.offset + self.len <= source.value_count);
+        assert(target.value_count <= target.value_cap);
         const dom = try self.domain.clone(source, target);
         const vals = self.entries(source);
         const dest = try target.alloc_values(@intCast(vals.len));
+        assert(dest.len == vals.len);
         for (vals, 0..) |v, i| {
             dest[i] = try v.clone(source, target);
         }
         const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
+        assert(offset + dest.len <= target.value_cap);
         return Function{
             .domain = dom,
             .offset = offset,
@@ -172,10 +215,13 @@ pub const Tuple = extern struct {
     len: u32,
 
     pub fn items(self: Tuple, pool: *const ValuePool) []const Value {
+        assert(self.offset + self.len <= pool.value_count);
         return pool.values[self.offset..][0..self.len];
     }
 
     pub fn eql(self: Tuple, other: Tuple, pool: *const ValuePool) bool {
+        assert(self.offset + self.len <= pool.value_count);
+        assert(other.offset + other.len <= pool.value_count);
         if (self.len != other.len) return false;
         for (self.items(pool), other.items(pool)) |a, b| {
             if (!a.eql(b, pool)) return false;
@@ -183,13 +229,17 @@ pub const Tuple = extern struct {
         return true;
     }
 
-    pub fn clone(self: Tuple, source: *const ValuePool, target: *ValuePool) error{OutOfMemory}!Tuple {
+    pub fn clone(self: Tuple, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!Tuple {
+        assert(self.offset + self.len <= source.value_count);
+        assert(target.value_count <= target.value_cap);
         const src_items = self.items(source);
         const dest = try target.alloc_values(@intCast(src_items.len));
+        assert(dest.len == src_items.len);
         for (src_items, 0..) |it, i| {
             dest[i] = try it.clone(source, target);
         }
         const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
+        assert(offset + dest.len <= target.value_cap);
         return Tuple{ .offset = offset, .len = @intCast(src_items.len) };
     }
 };
@@ -199,10 +249,12 @@ pub const Record = extern struct {
     len: u32,
 
     pub fn fields(self: Record, pool: *const ValuePool) []const Value {
+        assert(self.offset + self.len * 2 <= pool.value_count);
         return pool.values[self.offset..][0 .. self.len * 2];
     }
 
     pub fn lookup(self: Record, pool: *const ValuePool, name: []const u8) ?Value {
+        assert(self.offset + self.len * 2 <= pool.value_count);
         const fs = self.fields(pool);
         var i: u32 = 0;
         while (i < self.len) : (i += 1) {
@@ -215,6 +267,8 @@ pub const Record = extern struct {
     }
 
     pub fn eql(self: Record, other: Record, pool: *const ValuePool) bool {
+        assert(self.offset + self.len * 2 <= pool.value_count);
+        assert(other.offset + other.len * 2 <= pool.value_count);
         if (self.len != other.len) return false;
         const a = self.fields(pool);
         const b = other.fields(pool);
@@ -226,13 +280,17 @@ pub const Record = extern struct {
         return true;
     }
 
-    pub fn clone(self: Record, source: *const ValuePool, target: *ValuePool) error{OutOfMemory}!Record {
+    pub fn clone(self: Record, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!Record {
+        assert(self.offset + self.len * 2 <= source.value_count);
+        assert(target.value_count <= target.value_cap);
         const fs = self.fields(source);
         const dest = try target.alloc_values(@intCast(fs.len));
+        assert(dest.len == fs.len);
         for (fs, 0..) |v, i| {
             dest[i] = try v.clone(source, target);
         }
         const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
+        assert(offset + dest.len <= target.value_cap);
         return Record{ .offset = offset, .len = self.len };
     }
 };
@@ -242,14 +300,19 @@ pub const String = extern struct {
     len: u32,
 
     pub fn slice(self: String, pool: *const ValuePool) []const u8 {
+        assert(self.offset + self.len <= pool.string_count);
         return pool.strings[self.offset..][0..self.len];
     }
 
     pub fn eql(self: String, other: String, pool: *const ValuePool) bool {
+        assert(self.offset + self.len <= pool.string_count);
+        assert(other.offset + other.len <= pool.string_count);
         return std.mem.eql(u8, self.slice(pool), other.slice(pool));
     }
 
     pub fn compare(self: String, other: String, pool: *const ValuePool) i8 {
+        assert(self.offset + self.len <= pool.string_count);
+        assert(other.offset + other.len <= pool.string_count);
         const order = std.mem.order(u8, self.slice(pool), other.slice(pool));
         return switch (order) {
             .lt => -1,
@@ -259,6 +322,8 @@ pub const String = extern struct {
     }
 
     pub fn clone(self: String, source: *const ValuePool, target: *ValuePool) error{OutOfMemory}!String {
+        assert(self.offset + self.len <= source.string_count);
+        assert(target.string_count <= target.string_cap);
         return try target.push_string(self.slice(source));
     }
 };
@@ -270,7 +335,9 @@ pub const ModelTable = struct {
     cap: u32,
 
     pub fn init(arena: *Arena, cap: u32) !ModelTable {
+        assert(cap > 0);
         const names = try arena.alloc([]const u8, cap);
+        assert(names.len == cap);
         return ModelTable{
             .arena = arena,
             .names = names,
@@ -280,20 +347,25 @@ pub const ModelTable = struct {
     }
 
     pub fn intern(self: *ModelTable, name: []const u8) !u32 {
+        assert(self.count <= self.cap);
         for (0..self.count) |i| {
+            assert(i < self.cap);
             if (std.mem.eql(u8, self.names[i], name)) return @intCast(i);
         }
         if (self.count >= self.cap) return error.OutOfMemory;
         const copy = try self.arena.alloc(u8, name.len);
+        assert(copy.len == name.len);
         @memcpy(copy, name);
         const id = self.count;
         self.names[id] = copy;
         self.count += 1;
+        assert(self.count <= self.cap);
         return id;
     }
 
     pub fn get_name(self: *const ModelTable, id: u32) []const u8 {
-        std.debug.assert(id < self.count);
+        assert(id < self.count);
+        assert(self.count <= self.cap);
         return self.names[id];
     }
 };
@@ -308,10 +380,16 @@ pub const ValuePool = struct {
     string_cap: u32,
 
     pub fn init(arena: *Arena, value_cap: u32, string_cap: u32) !ValuePool {
+        assert(value_cap > 0);
+        assert(string_cap > 0);
+        const values = try arena.alloc(Value, value_cap);
+        assert(values.len == value_cap);
+        const strings = try arena.alloc(u8, string_cap);
+        assert(strings.len == string_cap);
         return ValuePool{
             .arena = arena,
-            .values = try arena.alloc(Value, value_cap),
-            .strings = try arena.alloc(u8, string_cap),
+            .values = values,
+            .strings = strings,
             .value_count = 0,
             .string_count = 0,
             .value_cap = value_cap,
@@ -320,29 +398,37 @@ pub const ValuePool = struct {
     }
 
     pub fn push_value(self: *ValuePool, v: Value) !u32 {
+        assert(self.value_count <= self.value_cap);
         if (self.value_count >= self.value_cap) return error.OutOfMemory;
         const idx = self.value_count;
         self.values[idx] = v;
         self.value_count += 1;
+        assert(self.value_count <= self.value_cap);
         return idx;
     }
 
     pub fn alloc_values(self: *ValuePool, count: u32) ![]Value {
+        assert(self.value_count <= self.value_cap);
         if (self.value_count + count > self.value_cap) return error.OutOfMemory;
         const start = self.value_count;
         self.value_count += count;
+        assert(self.value_count <= self.value_cap);
         return self.values[start..][0..count];
     }
 
     pub fn push_string(self: *ValuePool, s: []const u8) !String {
+        assert(self.string_count <= self.string_cap);
         if (self.string_count + s.len > self.string_cap) return error.OutOfMemory;
         const start = self.string_count;
         @memcpy(self.strings[start..][0..s.len], s);
         self.string_count += @intCast(s.len);
+        assert(self.string_count <= self.string_cap);
         return String{ .offset = start, .len = @intCast(s.len) };
     }
 
     pub fn snapshot(self: ValuePool) Snapshot {
+        assert(self.value_count <= self.value_cap);
+        assert(self.string_count <= self.string_cap);
         return .{
             .value_count = self.value_count,
             .string_count = self.string_count,
@@ -350,6 +436,8 @@ pub const ValuePool = struct {
     }
 
     pub fn restore(self: *ValuePool, snap: Snapshot) void {
+        assert(snap.value_count <= self.value_cap);
+        assert(snap.string_count <= self.string_cap);
         self.value_count = snap.value_count;
         self.string_count = snap.string_count;
     }

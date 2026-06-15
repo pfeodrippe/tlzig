@@ -98,6 +98,7 @@ fn hash_value_inner(pool: *const ValuePool, v: Value) Fingerprint {
                 h = hash_combine(h, hash_value_inner(pool, fs[i * 2 + 1]));
             }
         },
+        .lambda_v => @panic("lambda values cannot be fingerprinted"),
     }
     return h;
 }

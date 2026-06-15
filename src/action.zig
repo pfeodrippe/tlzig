@@ -25,11 +25,13 @@ pub const ActionStep = union(enum(u8)) {
 pub const AssignVar = struct {
     var_name: []const u8,
     expr: *ast.Expr,
+    is_membership: bool,
 };
 
 pub const AssignPrime = struct {
     var_name: []const u8,
     expr: *ast.Expr,
+    is_membership: bool,
 };
 
 pub const Choose = struct {
@@ -90,25 +92,29 @@ pub const ActionCompiler = struct {
     }
 
     fn is_action_expr(self: ActionCompiler, expr: *ast.Expr) bool {
+        return self.is_action_expr_inner(expr);
+    }
+
+    fn is_action_expr_inner(self: ActionCompiler, expr: *ast.Expr) bool {
         switch (expr.*) {
             .primed, .unchanged => return true,
             .ident => |name| {
-                if (self.evaluator.find_definition(name)) |def| return self.is_action_expr(def.body);
+                if (self.evaluator.find_definition(name)) |def| return self.is_action_expr_inner(def.body);
                 return false;
             },
             .binary => |b| {
                 if (b.op == .or_op) return self.is_action_expr(b.left) and self.is_action_expr(b.right);
                 return self.is_action_expr(b.left) or self.is_action_expr(b.right);
             },
-            .let_in => |l| return self.is_action_expr(l.body),
+            .let_in => |l| return self.is_action_expr_inner(l.body),
             .if_then_else => |ite| return self.is_action_expr(ite.then_branch) or self.is_action_expr(ite.else_branch),
             .apply => |ap| {
                 if (ap.func.* == .ident) {
-                    if (self.evaluator.find_definition(ap.func.*.ident)) |def| return self.is_action_expr(def.body);
+                    if (self.evaluator.find_definition(ap.func.*.ident)) |def| return self.is_action_expr_inner(def.body);
                 }
                 return false;
             },
-            .quantifier => |q| return self.is_action_expr(q.body),
+            .quantifier => |q| return self.is_action_expr_inner(q.body),
             else => return false,
         }
     }
@@ -126,37 +132,39 @@ pub const ActionCompiler = struct {
                     try self.collect_steps(b.right, steps, is_init);
                     return;
                 }
-                if (b.op == .or_op and self.is_action_expr(b.left) and self.is_action_expr(b.right)) {
-                    var options = std.ArrayList([]const ActionStep).empty;
-                    defer options.deinit(std.heap.page_allocator);
-                    var left_steps = std.ArrayList(ActionStep).empty;
-                    defer left_steps.deinit(std.heap.page_allocator);
-                    try self.collect_steps(b.left, &left_steps, is_init);
-                    try options.append(std.heap.page_allocator, try self.dup_slice(ActionStep, left_steps.items));
-                    var right_steps = std.ArrayList(ActionStep).empty;
-                    defer right_steps.deinit(std.heap.page_allocator);
-                    try self.collect_steps(b.right, &right_steps, is_init);
-                    try options.append(std.heap.page_allocator, try self.dup_slice(ActionStep, right_steps.items));
-                    try steps.append(std.heap.page_allocator, ActionStep{ .branch = .{ .options = try self.dup_slice([]const ActionStep, options.items) } });
-                    return;
+                if (b.op == .or_op) {
+                    if (self.is_action_expr(b.left) and self.is_action_expr(b.right)) {
+                        var options = std.ArrayList([]const ActionStep).empty;
+                        defer options.deinit(std.heap.page_allocator);
+                        var left_steps = std.ArrayList(ActionStep).empty;
+                        defer left_steps.deinit(std.heap.page_allocator);
+                        try self.collect_steps(b.left, &left_steps, is_init);
+                        try options.append(std.heap.page_allocator, try self.dup_slice(ActionStep, left_steps.items));
+                        var right_steps = std.ArrayList(ActionStep).empty;
+                        defer right_steps.deinit(std.heap.page_allocator);
+                        try self.collect_steps(b.right, &right_steps, is_init);
+                        try options.append(std.heap.page_allocator, try self.dup_slice(ActionStep, right_steps.items));
+                        try steps.append(std.heap.page_allocator, ActionStep{ .branch = .{ .options = try self.dup_slice([]const ActionStep, options.items) } });
+                        return;
+                    }
                 }
                 if (b.op == .eq) {
                     if (!is_init and b.left.* == .primed) {
-                        try steps.append(std.heap.page_allocator, ActionStep{ .assign_prime = .{ .var_name = b.left.*.primed, .expr = b.right } });
+                        try steps.append(std.heap.page_allocator, ActionStep{ .assign_prime = .{ .var_name = b.left.*.primed, .expr = b.right, .is_membership = false } });
                         return;
                     }
                     if (is_init and b.left.* == .ident) {
-                        try steps.append(std.heap.page_allocator, ActionStep{ .assign_var = .{ .var_name = b.left.*.ident, .expr = b.right } });
+                        try steps.append(std.heap.page_allocator, ActionStep{ .assign_var = .{ .var_name = b.left.*.ident, .expr = b.right, .is_membership = false } });
                         return;
                     }
                 }
                 if (b.op == .in) {
                     if (is_init and b.left.* == .ident) {
-                        try steps.append(std.heap.page_allocator, ActionStep{ .assign_var = .{ .var_name = b.left.*.ident, .expr = b.right } });
+                        try steps.append(std.heap.page_allocator, ActionStep{ .assign_var = .{ .var_name = b.left.*.ident, .expr = b.right, .is_membership = true } });
                         return;
                     }
                     if (!is_init and b.left.* == .primed) {
-                        try steps.append(std.heap.page_allocator, ActionStep{ .assign_prime = .{ .var_name = b.left.*.primed, .expr = b.right } });
+                        try steps.append(std.heap.page_allocator, ActionStep{ .assign_prime = .{ .var_name = b.left.*.primed, .expr = b.right, .is_membership = true } });
                         return;
                     }
                 }
@@ -295,7 +303,7 @@ pub const ActionExecutor = struct {
         switch (step) {
             .assign_var => |a| {
                 const val = try self.evaluator.eval_expr(a.expr, ctx, s0, self.eval_pool, &self.state_store.values_pool);
-                if (val == .set_v) {
+                if (a.is_membership and val == .set_v) {
                     const items = val.set_v.items(self.eval_pool);
                     const snap = self.eval_pool.snapshot();
                     for (items) |it| {
@@ -310,7 +318,7 @@ pub const ActionExecutor = struct {
             },
             .assign_prime => |a| {
                 const val = try self.evaluator.eval_expr(a.expr, ctx, s0, self.eval_pool, &self.state_store.values_pool);
-                if (val == .set_v) {
+                if (a.is_membership and val == .set_v) {
                     const items = val.set_v.items(self.eval_pool);
                     const snap = self.eval_pool.snapshot();
                     for (items) |it| {
@@ -391,7 +399,10 @@ pub const ActionExecutor = struct {
             },
             .unchanged => |name| {
                 if (s0 == null) return Error.TypeError;
-                const idx = self.evaluator.find_variable(name) orelse return Error.UndefinedSymbol;
+                const idx = self.evaluator.find_variable(name) orelse {
+                    std.debug.print("UndefinedVariable in UNCHANGED: {s}\n", .{name});
+                    return Error.UndefinedSymbol;
+                };
                 const v = try s0.?.values[idx].clone(&self.state_store.values_pool, self.eval_pool);
                 const new_ctx = ctx.extend(name, v);
                 try self.execute_steps(rest, new_ctx, s0, out_states, is_init);

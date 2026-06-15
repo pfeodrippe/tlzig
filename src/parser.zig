@@ -56,12 +56,14 @@ pub const Token = struct {
         rbracket,
         langle,
         rangle,
+        diamond,
         comma,
         colon,
         semi,
         dot,
         arrow,
         mapsto,
+        recordto,
         eq,
         defeq,
         neq,
@@ -89,6 +91,7 @@ pub const Token = struct {
         subseteq,
         except,
         at,
+        ooverride,
         underscore,
         bang,
         prime,
@@ -148,6 +151,10 @@ pub const Lexer = struct {
                 return self.mk(.comma, ",", start_line, start_col);
             },
             ':' => {
+                if (self.peek(1) == '>') {
+                    self.advance2();
+                    return self.mk(.recordto, ":>", start_line, start_col);
+                }
                 self.advance();
                 return self.mk(.colon, ":", start_line, start_col);
             },
@@ -164,6 +171,10 @@ pub const Lexer = struct {
                 return self.mk(.dot, ".", start_line, start_col);
             },
             '@' => {
+                if (self.peek(1) == '@') {
+                    self.advance2();
+                    return self.mk(.ooverride, "@@", start_line, start_col);
+                }
                 self.advance();
                 return self.mk(.at, "@", start_line, start_col);
             },
@@ -279,6 +290,10 @@ pub const Lexer = struct {
                 if (self.peek(1) == '<') {
                     self.advance2();
                     return self.mk(.langle, "<<", start_line, start_col);
+                }
+                if (self.peek(1) == '>') {
+                    self.advance2();
+                    return self.mk(.diamond, "<>", start_line, start_col);
                 }
                 self.advance();
                 return self.mk(.lt, "<", start_line, start_col);
@@ -535,10 +550,27 @@ pub const Parser = struct {
         return expr;
     }
 
+    fn parse_module_name(self: *Parser) ![]const u8 {
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(std.heap.page_allocator);
+        const start_line = self.current.line;
+        while (self.current.line == start_line and
+            (self.current.kind == .ident or self.current.kind == .number or self.current.kind == .underscore))
+        {
+            try buf.appendSlice(std.heap.page_allocator, self.current.text);
+            self.advance();
+        }
+        if (buf.items.len == 0) return error.SyntaxError;
+        return try self.dup(buf.items);
+    }
+
     pub fn parse_module(self: *Parser) !ast.Module {
-        self.skip_dashes();
+        // Skip any preamble (narrative text, comments) before the MODULE header.
+        while (self.current.kind != .eof and self.current.kind != .keyword_module) {
+            self.advance();
+        }
         try self.expect(.keyword_module);
-        const name = try self.expect_ident_text();
+        const name = try self.parse_module_name();
         self.skip_dashes();
 
         var extends = std.ArrayList([]const u8).empty;
@@ -564,6 +596,14 @@ pub const Parser = struct {
         defer namespace_instances.deinit(std.heap.page_allocator);
         while (true) {
             self.skip_dashes();
+            if (self.current.kind == .setminus) {
+                const start_line = self.current.line;
+                self.advance();
+                while (self.current.kind != .eof and self.current.line == start_line) {
+                    self.advance();
+                }
+                continue;
+            }
             if (self.current.kind == .keyword_variables) {
                 self.advance();
                 while (true) {
@@ -898,9 +938,17 @@ pub const Parser = struct {
 
     fn parse_concat(self: *Parser) !*ast.Expr {
         var left = try self.parse_union();
-        while (self.match(.concat)) {
-            const right = try self.parse_union();
-            left = try self.expr_binary(.concat, left, right);
+        while (true) {
+            if (self.match(.concat)) {
+                const right = try self.parse_union();
+                left = try self.expr_binary(.concat, left, right);
+            } else if (self.match(.ooverride)) {
+                const right = try self.parse_union();
+                left = try self.expr_binary(.ooverride, left, right);
+            } else if (self.match(.recordto)) {
+                const right = try self.parse_union();
+                left = try self.expr_binary(.recordto, left, right);
+            } else break;
         }
         return left;
     }
@@ -993,6 +1041,16 @@ pub const Parser = struct {
                 return try self.parse_suffixes(expr);
             },
             .lbracket => {
+                if (self.next.kind == .rbracket) {
+                    self.advance();
+                    self.advance();
+                    const operand = try self.parse_expr();
+                    const u = try self.arena.alloc(ast.Unary, 1);
+                    u[0] = .{ .op = .temporal_box, .operand = operand };
+                    const ptr = try self.arena.alloc(ast.Expr, 1);
+                    ptr[0] = .{ .unary = &u[0] };
+                    return &ptr[0];
+                }
                 const expr = try self.parse_function_or_record();
                 return try self.parse_suffixes(expr);
             },
@@ -1012,6 +1070,15 @@ pub const Parser = struct {
             .keyword_let => return try self.parse_let_in(),
             .keyword_case => return try self.parse_case_expr(),
             .keyword_lambda => return try self.parse_lambda(),
+            .diamond => {
+                self.advance();
+                const operand = try self.parse_expr();
+                const u = try self.arena.alloc(ast.Unary, 1);
+                u[0] = .{ .op = .temporal_diamond, .operand = operand };
+                const ptr = try self.arena.alloc(ast.Expr, 1);
+                ptr[0] = .{ .unary = &u[0] };
+                return &ptr[0];
+            },
             else => return error.SyntaxError,
         }
     }
@@ -1347,8 +1414,36 @@ pub const Parser = struct {
     }
 
     fn skip_dashes(self: *Parser) void {
-        while (self.current.kind == .minus) {
-            self.advance();
+        while (true) {
+            if (self.current.kind == .minus) {
+                self.advance();
+                continue;
+            }
+            if (self.current.kind == .lparen and self.next.kind == .star) {
+                self.skip_comment_block();
+                continue;
+            }
+            break;
+        }
+    }
+
+    fn skip_comment_block(self: *Parser) void {
+        // current is '(' and next is '*'
+        self.advance(); // '('
+        self.advance(); // '*'
+        var depth: u32 = 1;
+        while (self.current.kind != .eof and depth > 0) {
+            if (self.current.kind == .lparen and self.next.kind == .star) {
+                self.advance();
+                self.advance();
+                depth += 1;
+            } else if (self.current.kind == .star and self.next.kind == .rparen) {
+                self.advance();
+                self.advance();
+                depth -= 1;
+            } else {
+                self.advance();
+            }
         }
     }
 

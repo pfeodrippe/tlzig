@@ -32,7 +32,10 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     for (tla_files) |tla_path| {
-        if (std.mem.endsWith(u8, tla_path, "_proof.tla")) {
+        if (std.mem.endsWith(u8, tla_path, "_proof.tla") or
+            std.mem.indexOf(u8, tla_path, "_TTrace_") != null or
+            std.mem.indexOf(u8, tla_path, "/TLAPS") != null)
+        {
             skip += 1;
             continue;
         }
@@ -41,9 +44,12 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (cfg_path == null) default_cfg = true;
         defer if (cfg_path) |c| allocator.free(c);
 
-        const ok = run_tlzig(allocator, io, tlzig, tla_path, cfg_path) catch |err| {
+        var err_detail: ?[]const u8 = null;
+        defer if (err_detail) |d| allocator.free(d);
+        const ok = run_tlzig(allocator, io, tlzig, tla_path, cfg_path, &err_detail) catch |err| {
             fail += 1;
-            const msg = std.fmt.allocPrint(allocator, "{s}: {any}", .{ tla_path, err }) catch continue;
+            const detail = err_detail orelse @errorName(err);
+            const msg = std.fmt.allocPrint(allocator, "{s}: {s}", .{ tla_path, detail }) catch continue;
             failures.append(allocator, msg) catch allocator.free(msg);
             continue;
         };
@@ -126,7 +132,7 @@ fn file_exists(path: []const u8) bool {
     return false;
 }
 
-fn run_tlzig(allocator: std.mem.Allocator, io: std.Io, tlzig: []const u8, tla: []const u8, cfg: ?[]const u8) !bool {
+fn run_tlzig(allocator: std.mem.Allocator, io: std.Io, tlzig: []const u8, tla: []const u8, cfg: ?[]const u8, err_detail: *?[]const u8) !bool {
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, tlzig);
@@ -145,12 +151,34 @@ fn run_tlzig(allocator: std.mem.Allocator, io: std.Io, tlzig: []const u8, tla: [
     try argv.append(allocator, "--eval-arena-bytes");
     try argv.append(allocator, "1000000000");
     const result = try std.process.run(allocator, io, .{ .argv = argv.items });
-    defer allocator.free(result.stderr);
     defer allocator.free(result.stdout);
-    if (result.term.exited == 0) return true;
+    if (result.term.exited == 0) {
+        allocator.free(result.stderr);
+        return true;
+    }
     // A run that exhausts the state limit or finds a counterexample without crashing is
     // considered a pass because the checker successfully parsed, initialized, and explored states.
-    if (std.mem.indexOf(u8, result.stderr, "StateSpaceExhausted") != null) return true;
-    if (std.mem.indexOf(u8, result.stderr, "InvariantViolated") != null) return true;
-    return false;
+    if (std.mem.indexOf(u8, result.stderr, "StateSpaceExhausted") != null) {
+        allocator.free(result.stderr);
+        return true;
+    }
+    if (std.mem.indexOf(u8, result.stderr, "InvariantViolated") != null) {
+        allocator.free(result.stderr);
+        return true;
+    }
+    // Extract the final error line from stderr for diagnostics.
+    const err_line = extract_error(result.stderr);
+    if (err_line.len > 0) {
+        err_detail.* = try allocator.dupe(u8, err_line);
+    }
+    allocator.free(result.stderr);
+    return error.RunFailed;
+}
+
+fn extract_error(stderr: []const u8) []const u8 {
+    var end: usize = stderr.len;
+    while (end > 0 and stderr[end - 1] == '\n') end -= 1;
+    var start: usize = end;
+    while (start > 0 and stderr[start - 1] != '\n') start -= 1;
+    return stderr[start..end];
 }

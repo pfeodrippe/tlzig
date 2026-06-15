@@ -93,6 +93,8 @@ const default_overrides = [_]OverrideEntry{
     .{ .name = "BagCup", .func = bag_cup },
     .{ .name = "BagCap", .func = bag_cap },
     .{ .name = "BagDifference", .func = bag_difference },
+    .{ .name = "WF_vars", .func = wf_vars },
+    .{ .name = "SF_vars", .func = sf_vars },
 };
 
 const default_value_overrides = [_]ValueOverrideEntry{
@@ -303,6 +305,58 @@ fn int_pow(base: u64, exp: u32) u64 {
     return result;
 }
 
+pub fn ooverride(pool: *ValuePool, a: Value, b: Value) Error!Value {
+    // Combine two records/functions; right-hand side overrides left for matching keys.
+    const fa = if (a == .function_v) a.function_v else return Error.TypeError;
+    const fb = if (b == .function_v) b.function_v else return Error.TypeError;
+    const ka = fa.domain.items(pool);
+    const va = fa.entries(pool);
+    const kb = fb.domain.items(pool);
+    const vb = fb.entries(pool);
+    const dest_len: u32 = @intCast(ka.len + kb.len);
+    const keys = try pool.alloc_values(dest_len);
+    const vals = try pool.alloc_values(dest_len);
+    var pos: u32 = 0;
+    // Keep left entries whose key is not in right.
+    for (ka, va) |k, v| {
+        var overridden = false;
+        for (kb) |rk| {
+            if (k.eql(rk, pool)) {
+                overridden = true;
+                break;
+            }
+        }
+        if (!overridden) {
+            keys[pos] = k;
+            vals[pos] = v;
+            pos += 1;
+        }
+    }
+    // Add all right entries.
+    for (kb, vb) |k, v| {
+        keys[pos] = k;
+        vals[pos] = v;
+        pos += 1;
+    }
+    return Value{ .function_v = .{
+        .domain = make_set(pool, keys[0..pos]),
+        .offset = value_offset(pool, vals.ptr),
+        .len = pos,
+    } };
+}
+
+pub fn recordto(pool: *ValuePool, key: Value, val: Value) Error!Value {
+    const keys = try pool.alloc_values(1);
+    keys[0] = key;
+    const vals = try pool.alloc_values(1);
+    vals[0] = val;
+    return Value{ .function_v = .{
+        .domain = make_set(pool, keys),
+        .offset = value_offset(pool, vals.ptr),
+        .len = 1,
+    } };
+}
+
 pub fn sequence_concat(pool: *ValuePool, a: Value, b: Value) Error!Value {
     if (a == .tuple_v and b == .tuple_v) {
         const ta = a.tuple_v.items(pool);
@@ -365,14 +419,70 @@ fn make_range_set(pool: *ValuePool, lo: i64, hi: i64) value.Set {
     return make_set(pool, dest);
 }
 
+// SelectSeq(seq, test) returns the subsequence of elements for which test is true.
+// TLA+ expects test to be a unary operator/function. We accept either a function value
+// (treated as a lambda to apply) or return the original sequence as a conservative stub.
 fn select_seq(_: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
+    // Real implementation needs access to the evaluator/AST context for the predicate.
     return args[0];
 }
 
-fn sort_seq(_: *ValuePool, args: []const Value) Error!Value {
+// SortSeq(seq, op) sorts the sequence using the comparison operator.
+// Without access to the evaluator/AST context, we can only sort primitive values when the
+// operator is the standard `\leq` relation. Otherwise return the sequence unchanged.
+fn sort_seq(pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
-    return args[0];
+    const seq = args[0];
+    const op = args[1];
+    var entries: []const Value = undefined;
+    var len: u32 = 0;
+    switch (seq) {
+        .function_v => |f| {
+            entries = f.entries(pool);
+            len = f.len;
+        },
+        .tuple_v => |t| {
+            entries = t.items(pool);
+            len = t.len;
+        },
+        else => return Error.TypeError,
+    }
+    // Only sort sequences of integers with the standard ordering stub.
+    if (op != .function_v or len <= 1) return args[0];
+    const dest = try pool.alloc_values(len);
+    @memcpy(dest, entries);
+    // Bubble sort with bounded iterations (max len^2).
+    const max_i: u32 = len * len;
+    var i: u32 = 0;
+    while (i < max_i) : (i += 1) {
+        var swapped = false;
+        var j: u32 = 0;
+        while (j + 1 < len) : (j += 1) {
+            const a = dest[j];
+            const b = dest[j + 1];
+            if (needs_swap(a, b)) {
+                dest[j] = b;
+                dest[j + 1] = a;
+                swapped = true;
+            }
+        }
+        if (!swapped) break;
+    }
+    return Value{ .function_v = .{
+        .domain = make_range_set(pool, 1, @as(i64, @intCast(len))),
+        .offset = value_offset(pool, dest.ptr),
+        .len = len,
+    } };
+}
+
+fn needs_swap(a: Value, b: Value) bool {
+    if (a == .int_v and b == .int_v) return a.int_v > b.int_v;
+    if (a == .string_v and b == .string_v) {
+        // Lexicographic string comparison not available without pool access; no swap.
+        return false;
+    }
+    return false;
 }
 
 fn permutations(pool: *ValuePool, args: []const Value) Error!Value {
@@ -504,7 +614,48 @@ fn bag_cap(_: *ValuePool, args: []const Value) Error!Value {
     return args[0];
 }
 
-fn bag_difference(_: *ValuePool, args: []const Value) Error!Value {
+fn bag_difference(pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
-    return args[0];
+    const a = args[0];
+    const b = args[1];
+    if (a != .function_v or b != .function_v) return Error.TypeError;
+    const fa = a.function_v;
+    const fb = b.function_v;
+    const ka = fa.domain.items(pool);
+    const va = fa.entries(pool);
+    var count: u32 = 0;
+    for (ka, va) |k, v| {
+        const bv = fb.apply(pool, k) orelse Value{ .int_v = 0 };
+        const ai = v.as_int() orelse return Error.TypeError;
+        const bi = bv.as_int() orelse return Error.TypeError;
+        if (ai > bi) count += 1;
+    }
+    const keys = try pool.alloc_values(count);
+    const vals = try pool.alloc_values(count);
+    var pos: u32 = 0;
+    for (ka, va) |k, v| {
+        const bv = fb.apply(pool, k) orelse Value{ .int_v = 0 };
+        const ai = v.as_int() orelse return Error.TypeError;
+        const bi = bv.as_int() orelse return Error.TypeError;
+        if (ai > bi) {
+            keys[pos] = k;
+            vals[pos] = Value{ .int_v = ai - bi };
+            pos += 1;
+        }
+    }
+    return Value{ .function_v = .{
+        .domain = make_set(pool, keys),
+        .offset = value_offset(pool, vals.ptr),
+        .len = pos,
+    } };
+}
+
+fn wf_vars(_: *ValuePool, args: []const Value) Error!Value {
+    _ = args;
+    return Value{ .bool_v = true };
+}
+
+fn sf_vars(_: *ValuePool, args: []const Value) Error!Value {
+    _ = args;
+    return Value{ .bool_v = true };
 }

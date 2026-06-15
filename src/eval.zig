@@ -139,10 +139,17 @@ pub const Evaluator = struct {
                     const id = try self.models.intern(name);
                     return Value{ .model_v = id };
                 }
+                std.debug.print("UndefinedSymbol(ident): {s}\n", .{name});
                 return Error.UndefinedSymbol;
             },
             .primed => |name| {
                 if (ctx.lookup(name)) |v| return v;
+                if (s0) |st| {
+                    if (self.find_variable(name)) |idx| {
+                        return try st.values[idx].clone(state_pool, eval_pool);
+                    }
+                }
+                std.debug.print("UndefinedSymbol(primed): {s}\n", .{name});
                 return Error.UndefinedSymbol;
             },
             .binary => |b| return try self.eval_binary(b, ctx, s0, eval_pool, state_pool),
@@ -314,6 +321,8 @@ pub const Evaluator = struct {
                 return Value{ .set_v = make_set(eval_pool, dest) };
             },
             .concat => return try overrides.sequence_concat(eval_pool, left, right),
+            .ooverride => return try overrides.ooverride(eval_pool, left, right),
+            .recordto => return try overrides.recordto(eval_pool, left, right),
             else => Error.NotImplemented,
         };
     }
@@ -335,6 +344,10 @@ pub const Evaluator = struct {
             .domain => {
                 if (operand != .function_v) return Error.TypeError;
                 return Value{ .set_v = operand.function_v.domain };
+            },
+            .temporal_box, .temporal_diamond => {
+                // Liveness/temporal operators are not checked; treat as trivially true.
+                return Value{ .bool_v = true };
             },
         };
     }

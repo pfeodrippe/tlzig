@@ -27,7 +27,9 @@ const specs = [_]Spec{
     .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/TwoPhase.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/TwoPhase.cfg" },
     // Liveness / temporal
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/LiveHourClock.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/LiveHourClock.cfg" },
-    .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/MCLiveInternalMemory.cfg" },
+    // MCLiveInternalMemory is omitted from the benchmark because its configuration
+    // checks liveness PROPERTIES. tlzig currently checks invariants only, so state
+    // counts are not comparable to TLC until liveness checking is implemented.
 };
 
 pub fn main(init: std.process.Init.Minimal) void {

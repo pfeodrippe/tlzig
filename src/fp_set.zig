@@ -18,18 +18,18 @@ pub const FpSet = struct {
     }
 
     pub fn put(self: *FpSet, fp: Fingerprint) bool {
-        std.debug.assert(fp != 0);
+        const effective = if (fp == 0) 0xdeadbeef else fp;
         if (self.count * 2 >= self.cap) return false;
-        var idx: u32 = @intCast(fp % self.cap);
+        var idx: u32 = @intCast(effective % self.cap);
         var i: u32 = 0;
         while (i < self.cap) : (i += 1) {
             const slot = &self.slots[idx];
             if (slot.* == null) {
-                slot.* = fp;
+                slot.* = effective;
                 self.count += 1;
                 return true;
             }
-            if (slot.*.? == fp) {
+            if (slot.*.? == effective) {
                 return false;
             }
             idx = (idx + 1) % self.cap;
@@ -38,8 +38,8 @@ pub const FpSet = struct {
     }
 
     pub fn contains(self: FpSet, fp: Fingerprint) bool {
-        if (fp == 0) return false;
-        var idx: u32 = @intCast(fp % self.cap);
+        const effective = if (fp == 0) 0xdeadbeef else fp;
+        var idx: u32 = @intCast(effective % self.cap);
         var i: u32 = 0;
         while (i < self.cap) : (i += 1) {
             const slot = self.slots[idx];

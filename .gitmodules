@@ -4,3 +4,6 @@
 [submodule "vendor/zig"]
 	path = vendor/zig
 	url = https://codeberg.org/ziglang/zig
+[submodule "vendor/tlaplus-community-modules"]
+	path = vendor/tlaplus-community-modules
+	url = https://github.com/tlaplus/CommunityModules.git

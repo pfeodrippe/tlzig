@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 const Arena = @import("arena.zig").Arena;
 const ast = @import("ast.zig");
 const parser = @import("parser.zig");
+const pluscal = @import("pluscal.zig");
 
 pub const ModuleLoader = struct {
     arena: *Arena,
@@ -13,7 +14,11 @@ pub const ModuleLoader = struct {
     }
 
     pub fn load(self: ModuleLoader, path: []const u8) !ast.Module {
-        const source = try self.read_file(path);
+        const raw = try self.read_file(path);
+        const source = pluscal.translate(self.arena, raw) catch |err| blk: {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            break :blk raw;
+        };
         var p = parser.Parser.init(self.arena, source);
         var module = try p.parse_module();
         const dir = std.fs.path.dirname(path) orelse ".";

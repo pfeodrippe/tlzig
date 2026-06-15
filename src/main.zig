@@ -83,6 +83,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         spec_dir,
         "specs/modules",
         "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+        "vendor/tlaplus-community-modules/modules",
         "vendor/tlaplus-examples/specifications",
     };
     const loader = ModuleLoader.init(&arena, &search_paths);

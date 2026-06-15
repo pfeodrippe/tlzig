@@ -181,22 +181,21 @@ pub const Checker = struct {
         for (out_states.items) |idx| {
             self.generated += 1;
             const st = self.state_store.get(idx);
+            const fp = fingerprint.hash_state(&self.state_store.values_pool, st.values);
             const snap = self.eval_pool.snapshot();
             const constraints_hold = try self.check_constraints(st);
             const invariants_hold = try self.check_invariants(st);
             self.eval_pool.restore(snap);
             if (!constraints_hold or !invariants_hold) {
                 if (!invariants_hold) {
-                    _ = std.c.printf("generated=%llu distinct=%llu\n", self.generated, self.distinct);
+                    std.debug.print("InvariantViolated generated={d} distinct={d}\n", .{ self.generated, self.distinct });
                     return Error.InvariantViolated;
                 }
                 continue;
             }
-            const fp = fingerprint.hash_state(&self.state_store.values_pool, st.values);
             if (self.fp_set.put(fp)) {
                 self.distinct += 1;
                 if (!self.queue.enqueue(idx)) {
-                    _ = std.c.printf("generated=%llu distinct=%llu\n", self.generated, self.distinct);
                     return Error.StateSpaceExhausted;
                 }
             }
@@ -292,6 +291,7 @@ fn action_name(expr: *ast.Expr) error{ConfigError}!?[]const u8 {
     // [][Next]_vars
     switch (expr.*) {
         .box_action => |ba| return ba.action_name,
+        .unary => |u| return try action_name(u.operand),
         .binary => |b| {
             if (b.op == .and_op) {
                 const left = try action_name(b.left);

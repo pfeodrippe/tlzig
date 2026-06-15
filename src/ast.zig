@@ -122,6 +122,8 @@ pub const BinaryOp = enum(u8) {
     power,
     range,
     concat,
+    ooverride,
+    recordto,
 };
 
 pub const UnaryOp = enum(u8) {
@@ -130,6 +132,8 @@ pub const UnaryOp = enum(u8) {
     subset,
     union_all,
     domain,
+    temporal_box,
+    temporal_diamond,
 };
 
 pub const Binary = struct {

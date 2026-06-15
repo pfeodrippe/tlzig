@@ -35,7 +35,6 @@ pub const StateStore = struct {
     pub fn alloc_state(self: *StateStore) !u32 {
         assert(self.count <= self.cap);
         if (self.count >= self.cap) {
-            _ = std.c.printf("generated=%llu distinct=%llu\n", @as(u64, self.count), @as(u64, 0));
             return error.StateSpaceExhausted;
         }
         const idx = self.count;

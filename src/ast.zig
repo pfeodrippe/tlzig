@@ -1,0 +1,196 @@
+const Value = @import("value.zig").Value;
+
+pub const Module = struct {
+    name: []const u8,
+    extends: []const []const u8,
+    variables: []const []const u8,
+    constants: []const []const u8,
+    definitions: []const Definition,
+    init_name: []const u8,
+    next_name: []const u8,
+    invariants: []const []const u8,
+};
+
+pub const Definition = struct {
+    name: []const u8,
+    params: []const []const u8,
+    body: *Expr,
+};
+
+pub const Expr = union(ExprTag) {
+    bool_literal: bool,
+    int_literal: i64,
+    string_literal: []const u8,
+    ident: []const u8,
+    primed: []const u8,
+    unchanged: []const []const u8,
+    binary: *Binary,
+    unary: *Unary,
+    quantifier: *Quantifier,
+    choose: *Choose,
+    if_then_else: *IfThenElse,
+    apply: *Apply,
+    field: *Field,
+    tuple: []const *Expr,
+    record: []const FieldInit,
+    set_enum: []const *Expr,
+    set_filter: *SetFilter,
+    set_map: *SetMap,
+    set_binary: *SetBinary,
+    set_of_functions: *SetOfFunctions,
+    function_literal: *FunctionLiteral,
+    except: *Except,
+    at,
+};
+
+pub const ExprTag = enum(u8) {
+    bool_literal,
+    int_literal,
+    string_literal,
+    ident,
+    primed,
+    unchanged,
+    binary,
+    unary,
+    quantifier,
+    choose,
+    if_then_else,
+    apply,
+    field,
+    tuple,
+    record,
+    set_enum,
+    set_filter,
+    set_map,
+    set_binary,
+    set_of_functions,
+    function_literal,
+    except,
+    at,
+};
+
+pub const BinaryOp = enum(u8) {
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge,
+    and_op,
+    or_op,
+    implies,
+    equiv,
+    in,
+    notin,
+    subseteq,
+    set_union,
+    set_intersection,
+    set_difference,
+    plus,
+    minus,
+    times,
+    div,
+    mod,
+    range,
+};
+
+pub const UnaryOp = enum(u8) {
+    not,
+    neg,
+    subset,
+    union_all,
+    domain,
+};
+
+pub const Binary = struct {
+    op: BinaryOp,
+    left: *Expr,
+    right: *Expr,
+};
+
+pub const Unary = struct {
+    op: UnaryOp,
+    operand: *Expr,
+};
+
+pub const QuantifierKind = enum(u8) { exists, forall };
+
+pub const Quantifier = struct {
+    kind: QuantifierKind,
+    vars: []const BoundVar,
+    body: *Expr,
+};
+
+pub const BoundVar = struct {
+    name: []const u8,
+    domain: *Expr,
+};
+
+pub const Choose = struct {
+    var_name: []const u8,
+    domain: *Expr,
+    body: *Expr,
+};
+
+pub const IfThenElse = struct {
+    cond: *Expr,
+    then_branch: *Expr,
+    else_branch: *Expr,
+};
+
+pub const Apply = struct {
+    func: *Expr,
+    args: []const *Expr,
+};
+
+pub const Field = struct {
+    expr: *Expr,
+    name: []const u8,
+};
+
+pub const FieldInit = struct {
+    name: []const u8,
+    value: *Expr,
+};
+
+pub const SetFilter = struct {
+    var_name: []const u8,
+    domain: *Expr,
+    pred: *Expr,
+};
+
+pub const SetMap = struct {
+    var_name: []const u8,
+    domain: *Expr,
+    value: *Expr,
+};
+
+pub const SetBinaryOp = enum(u8) { union_op, intersection_op, difference_op };
+
+pub const SetBinary = struct {
+    op: SetBinaryOp,
+    left: *Expr,
+    right: *Expr,
+};
+
+pub const FunctionLiteral = struct {
+    var_name: []const u8,
+    domain: *Expr,
+    body: *Expr,
+};
+
+pub const AccessStep = union(enum(u8)) {
+    field: []const u8,
+    index: *Expr,
+};
+
+pub const Except = struct {
+    func: *Expr,
+    steps: []const AccessStep,
+    value: *Expr,
+};
+
+pub const SetOfFunctions = struct {
+    domain: *Expr,
+    codomain: *Expr,
+};

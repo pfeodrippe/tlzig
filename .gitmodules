@@ -1,0 +1,6 @@
+[submodule "vendor/tlaplus-examples"]
+	path = vendor/tlaplus-examples
+	url = https://github.com/tlaplus/Examples.git
+[submodule "vendor/zig"]
+	path = vendor/zig
+	url = https://codeberg.org/ziglang/zig

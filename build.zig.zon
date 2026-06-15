@@ -1,0 +1,13 @@
+.{
+    .name = .tlzig,
+    .fingerprint = 0x850f303a5570eccc,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.0-dev",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "IMPLEMENTATION.md",
+    },
+}

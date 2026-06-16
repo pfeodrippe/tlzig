@@ -1,35 +1,36 @@
 const std = @import("std");
+const tlzig = @import("tlzig");
+const Arena = tlzig.Arena;
+const checker = tlzig.checker;
+const config = tlzig.config;
+const ModuleLoader = tlzig.ModuleLoader;
+const overrides = tlzig.overrides;
 
 const Spec = struct {
     tla: []const u8,
     cfg: []const u8,
     max_states: u32 = 100_000,
+    max_nat: i64 = 1000,
+    min_int: i64 = -1000,
+    max_int: i64 = 1000,
 };
 
 const specs = [_]Spec{
-    // Specifying Systems — basic
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/HourClock/HourClock.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/HourClock/HourClock.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/Channel.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/Channel.cfg" },
-    // Classic puzzles / algorithms
     .{ .tla = "vendor/tlaplus-examples/specifications/DieHard/DieHard.tla", .cfg = "vendor/tlaplus-examples/specifications/DieHard/DieHard.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla", .cfg = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.cfg", .max_states = 5000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.cfg", .max_states = 5000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan100Beans.cfg" },
-    // Concurrency teaching / protocols
+    .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan100Beans.cfg", .max_states = 100_000, .max_nat = 1000, .min_int = -1000, .max_int = 1000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/TeachingConcurrency/Simple.tla", .cfg = "vendor/tlaplus-examples/specifications/TeachingConcurrency/Simple.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/barriers/Barrier.tla", .cfg = "vendor/tlaplus-examples/specifications/barriers/Barrier.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/locks_auxiliary_vars/Lock.tla", .cfg = "vendor/tlaplus-examples/specifications/locks_auxiliary_vars/Lock.cfg" },
-    // Distributed algorithms
     .{ .tla = "vendor/tlaplus-examples/specifications/Majority/MCMajority.tla", .cfg = "vendor/tlaplus-examples/specifications/Majority/MCMajority.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/LearnProofs/MCFindHighest.tla", .cfg = "vendor/tlaplus-examples/specifications/LearnProofs/MCFindHighest.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/TwoPhase.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/TwoPhase.cfg" },
-    // Liveness / temporal
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/LiveHourClock.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/LiveHourClock.cfg" },
-    // MCLiveInternalMemory is omitted from the benchmark because its configuration
-    // checks liveness PROPERTIES. tlzig currently checks invariants only, so state
-    // counts are not comparable to TLC until liveness checking is implemented.
 };
 
 pub fn main(init: std.process.Init.Minimal) void {
@@ -44,39 +45,20 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     };
 
-    const tlzig = find_tlzig(allocator, io) catch |err| {
-        std.debug.print("failed to find tlzig binary: {any}\n", .{err});
-        std.process.exit(1);
-    };
-    defer allocator.free(tlzig);
-
     const java_classpath = "/tmp/tla2tools.jar";
 
     std.debug.print("{s:40} {s:>10} {s:>10} {s:>12} {s:>12} {s:>8}\n", .{ "SPEC", "TLC(s)", "Tlzig(s)", "TLC states", "Tlzig states", "Speedup" });
     std.debug.print("---------------------------------------------------------------------------------------------\n", .{});
 
     for (specs) |spec| {
-        run_comparison(allocator, io, tlzig, java_classpath, spec) catch |err| {
+        run_comparison(allocator, io, java_classpath, spec) catch |err| {
             std.debug.print("{s:40} ERROR {any}\n", .{ spec.tla, err });
         };
     }
 }
 
-fn find_tlzig(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
-    const candidates = [_][]const u8{
-        "zig-out/bin/tlzig",
-        "./zig-out/bin/tlzig",
-        "../zig-out/bin/tlzig",
-    };
-    for (candidates) |c| {
-        const stat = std.Io.Dir.cwd().statFile(io, c, .{}) catch continue;
-        if (stat.kind == .file) return try allocator.dupe(u8, c);
-    }
-    return error.NotFound;
-}
-
-fn run_comparison(allocator: std.mem.Allocator, io: std.Io, tlzig: []const u8, java_cp: []const u8, spec: Spec) !void {
-    const tlzig_result = try run_tlzig(allocator, io, tlzig, spec);
+fn run_comparison(allocator: std.mem.Allocator, io: std.Io, java_cp: []const u8, spec: Spec) !void {
+    const tlzig_result = try run_tlzig_internal(allocator, io, spec);
     defer tlzig_result.deinit(allocator);
 
     const tlc_result = try run_tlc(allocator, io, java_cp, spec);
@@ -117,47 +99,88 @@ fn elapsed_ms(io: std.Io, start: std.Io.Clock.Timestamp) u64 {
     return @intCast(@divTrunc(duration.raw.nanoseconds, 1_000_000));
 }
 
-fn run_tlzig(allocator: std.mem.Allocator, io: std.Io, tlzig: []const u8, spec: Spec) !RunResult {
-    const max_states_str = try std.fmt.allocPrint(allocator, "{d}", .{spec.max_states});
-    defer allocator.free(max_states_str);
+fn run_tlzig_internal(allocator: std.mem.Allocator, io: std.Io, spec: Spec) !RunResult {
+    const start = std.Io.Clock.Timestamp.now(io, .real);
 
-    const argv = [_][]const u8{
-        tlzig,
-        "--spec",
-        spec.tla,
-        "--cfg",
-        spec.cfg,
-        "--max-states",
-        max_states_str,
-        "--arena-bytes",
-        "4000000000",
-        "--eval-arena-bytes",
-        "2000000000",
+    var arena = Arena.init(512 * 1024 * 1024) catch |err| {
+        std.debug.print("failed to allocate arena for {s}: {any}\n", .{ spec.tla, err });
+        return error.OutOfMemory;
+    };
+    defer arena.deinit();
+
+    const spec_dir = std.fs.path.dirname(spec.tla) orelse ".";
+    const search_paths = [_][]const u8{
+        spec_dir,
+        "specs/modules",
+        "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+        "vendor/tlaplus-community-modules/modules",
+        "vendor/tlaplus-examples/specifications",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = loader.load(spec.tla) catch |err| {
+        std.debug.print("failed to load spec {s}: {any}\n", .{ spec.tla, err });
+        return error.LoadFailed;
+    };
+    const cfg_source = read_file(&arena, spec.cfg) catch |err| {
+        std.debug.print("failed to read cfg {s}: {any}\n", .{ spec.cfg, err });
+        return error.LoadFailed;
+    };
+    const cfg = config.parse(&arena, cfg_source) catch |err| {
+        std.debug.print("failed to parse cfg {s}: {any}\n", .{ spec.cfg, err });
+        return error.LoadFailed;
     };
 
-    const start = std.Io.Clock.Timestamp.now(io, .real);
-    const result = try std.process.run(allocator, io, .{ .argv = &argv });
-    defer allocator.free(result.stderr);
+    const override_ctx = overrides.OverrideContext{
+        .max_seq_len = 5,
+        .max_nat = spec.max_nat,
+        .min_int = spec.min_int,
+        .max_int = spec.max_int,
+    };
+
+    const eval_value_cap = cap_u32(@min(@max(@as(u64, spec.max_states) * 256, 500_000), 8_000_000));
+    const eval_string_cap = cap_u32(@min(@max(@as(u64, spec.max_states) * 64, 500_000), 4_000_000));
+    const state_value_cap = cap_u32(@min(@max(@as(u64, spec.max_states) * 256, 500_000), 8_000_000));
+    const state_string_cap = cap_u32(@min(@max(@as(u64, spec.max_states) * 32, 200_000), 2_000_000));
+
+    var ch = checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        spec.max_states,
+        eval_value_cap,
+        eval_string_cap,
+        state_value_cap,
+        state_string_cap,
+        256 * 1024 * 1024,
+        override_ctx,
+    ) catch |err| {
+        std.debug.print("failed to initialize checker for {s}: {any}\n", .{ spec.tla, err });
+        return error.CheckFailed;
+    };
+    defer ch.deinit();
+
+    const result = ch.check() catch |err| {
+        const elapsed = elapsed_ms(io, start);
+        const distinct = ch.distinct;
+        const output = try std.fmt.allocPrint(allocator, "generated={d} distinct={d} error={any}", .{ ch.generated, distinct, err });
+        if (err == error.InvariantViolated or err == error.PropertyViolated) {
+            return RunResult{
+                .elapsed_ms = elapsed,
+                .states = distinct,
+                .output = output,
+            };
+        }
+        std.debug.print("checking failed for {s}: {any}\n", .{ spec.tla, err });
+        return error.CheckFailed;
+    };
+
     const elapsed = elapsed_ms(io, start);
 
-    const states = parse_after_keyword(result.stdout, "generated=") orelse {
-        // Treat successful exploration that exhausts memory or finds a counterexample as
-        // still producing a comparable state count if one is available.
-        const alt = parse_after_keyword(result.stderr, "generated=") orelse {
-            allocator.free(result.stdout);
-            return error.TlzigFailed;
-        };
-        allocator.free(result.stdout);
-        return RunResult{
-            .elapsed_ms = elapsed,
-            .states = alt,
-            .output = &.{},
-        };
-    };
+    const output = try std.fmt.allocPrint(allocator, "generated={d} distinct={d}", .{ result.generated, result.distinct });
     return RunResult{
         .elapsed_ms = elapsed,
-        .states = states,
-        .output = result.stdout,
+        .states = result.distinct,
+        .output = output,
     };
 }
 
@@ -182,7 +205,7 @@ fn run_tlc(allocator: std.mem.Allocator, io: std.Io, java_cp: []const u8, spec: 
     defer allocator.free(result.stderr);
     const elapsed = elapsed_ms(io, start);
 
-    const states = parse_before_keyword(result.stdout, " states generated") orelse {
+    const states = parse_before_keyword(result.stdout, " distinct states found") orelse {
         allocator.free(result.stdout);
         return error.TlcFailed;
     };
@@ -193,31 +216,53 @@ fn run_tlc(allocator: std.mem.Allocator, io: std.Io, java_cp: []const u8, spec: 
     };
 }
 
-fn parse_after_keyword(output: []const u8, keyword: []const u8) ?u64 {
-    var pos: usize = 0;
-    while (true) {
-        const idx = std.mem.indexOfPos(u8, output, pos, keyword) orelse return null;
-        const after = idx + keyword.len;
-        var end: usize = after;
-        while (end < output.len and std.ascii.isDigit(output[end])) end += 1;
-        if (end > after) {
-            const num_str = output[after..end];
-            if (std.fmt.parseInt(u64, num_str, 10)) |n| return n else |_| {}
-        }
-        pos = after + 1;
-    }
-}
-
 fn parse_before_keyword(output: []const u8, keyword: []const u8) ?u64 {
     var pos: usize = 0;
     while (true) {
         const idx = std.mem.indexOfPos(u8, output, pos, keyword) orelse return null;
         var start: usize = idx;
-        while (start > 0 and std.ascii.isDigit(output[start - 1])) start -= 1;
+        while (start > 0 and (std.ascii.isDigit(output[start - 1]) or output[start - 1] == ',')) start -= 1;
         if (start < idx) {
             const num_str = output[start..idx];
-            if (std.fmt.parseInt(u64, num_str, 10)) |n| return n else |_| {}
+            var buf: [64]u8 = undefined;
+            if (num_str.len > buf.len) {
+                pos = idx + keyword.len;
+                continue;
+            }
+            var len: usize = 0;
+            for (num_str) |c| {
+                if (c == ',') continue;
+                buf[len] = c;
+                len += 1;
+            }
+            if (std.fmt.parseInt(u64, buf[0..len], 10)) |n| return n else |_| {}
         }
         pos = idx + keyword.len;
     }
+}
+
+fn cap_u32(v: u64) u32 {
+    const max = std.math.maxInt(u32);
+    return if (v > max) max else @intCast(v);
+}
+
+fn read_file(arena: *Arena, path: []const u8) ![]u8 {
+    const path_z = try arena.alloc(u8, path.len + 1);
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+
+    const file = std.c.fopen(@ptrCast(path_z.ptr), "rb") orelse return error.IoError;
+    defer _ = std.c.fclose(file);
+
+    var temp = std.ArrayList(u8).empty;
+    defer temp.deinit(std.heap.page_allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.fread(&buf, 1, buf.len, file);
+        if (n == 0) break;
+        try temp.appendSlice(std.heap.page_allocator, buf[0..n]);
+    }
+    const result = try arena.alloc(u8, temp.items.len);
+    @memcpy(result, temp.items);
+    return result;
 }

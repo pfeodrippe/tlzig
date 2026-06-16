@@ -2,6 +2,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 pub const Arena = struct {
+    raw: [*]u8,
+    raw_len: usize,
     base: [*]u8,
     len: u64,
     cap: u64,
@@ -13,6 +15,8 @@ pub const Arena = struct {
         const aligned: [*]u8 = @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(raw.ptr), 64));
         assert(@intFromPtr(aligned) >= @intFromPtr(raw.ptr));
         var arena: Arena = undefined;
+        arena.raw = raw.ptr;
+        arena.raw_len = raw.len;
         arena.base = aligned;
         arena.len = 0;
         arena.cap = capacity_bytes;
@@ -23,7 +27,7 @@ pub const Arena = struct {
     pub fn deinit(self: *Arena) void {
         assert(self.cap > 0);
         assert(self.len <= self.cap);
-        std.heap.page_allocator.free(self.base[0..self.cap]);
+        std.heap.page_allocator.free(self.raw[0..self.raw_len]);
         self.* = undefined;
     }
 

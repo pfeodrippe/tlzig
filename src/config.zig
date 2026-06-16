@@ -96,30 +96,89 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
         if (is_comment(trimmed)) continue;
 
         const first_word = first_token(trimmed);
-        var rest = trim(trimmed[first_word.len..]);
-        if (rest.len == 0 and i + 1 < lines.len) {
-            i += 1;
-            rest = trim(lines[i]);
-        }
+        const rest = trim(trimmed[first_word.len..]);
         if (eql(first_word, "SPECIFICATION")) {
-            cfg.spec_name = try arena_dup(arena, rest);
-        } else if (eql(first_word, "INIT")) {
-            cfg.init_name = try arena_dup(arena, rest);
-        } else if (eql(first_word, "NEXT")) {
-            cfg.next_name = try arena_dup(arena, rest);
-        } else if (eql(first_word, "INVARIANT")) {
-            try invariants.append(std.heap.page_allocator, try arena_dup(arena, rest));
-        } else if (eql(first_word, "INVARIANTS")) {
-            i += 1;
-            while (i < lines.len) : (i += 1) {
-                const t = trim(lines[i]);
-                if (t.len == 0) continue;
-                if (is_comment(t)) continue;
-                if (is_directive(t)) {
-                    i -= 1; // let outer loop process the directive
+            if (rest.len > 0) {
+                cfg.spec_name = try arena_dup(arena, rest);
+            } else {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
+                    if (t.len == 0) continue;
+                    if (is_comment(t)) continue;
+                    if (is_directive(t)) {
+                        i -= 1;
+                        break;
+                    }
+                    cfg.spec_name = try arena_dup(arena, t);
                     break;
                 }
-                try invariants.append(std.heap.page_allocator, try arena_dup(arena, t));
+            }
+        } else if (eql(first_word, "INIT")) {
+            if (rest.len > 0) {
+                cfg.init_name = try arena_dup(arena, rest);
+            } else {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
+                    if (t.len == 0) continue;
+                    if (is_comment(t)) continue;
+                    if (is_directive(t)) {
+                        i -= 1;
+                        break;
+                    }
+                    cfg.init_name = try arena_dup(arena, t);
+                    break;
+                }
+            }
+        } else if (eql(first_word, "NEXT")) {
+            if (rest.len > 0) {
+                cfg.next_name = try arena_dup(arena, rest);
+            } else {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
+                    if (t.len == 0) continue;
+                    if (is_comment(t)) continue;
+                    if (is_directive(t)) {
+                        i -= 1;
+                        break;
+                    }
+                    cfg.next_name = try arena_dup(arena, t);
+                    break;
+                }
+            }
+        } else if (eql(first_word, "INVARIANT")) {
+            if (rest.len > 0) {
+                try parse_name_list(arena, rest, &invariants);
+            } else {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
+                    if (t.len == 0) continue;
+                    if (is_comment(t)) continue;
+                    if (is_directive(t)) {
+                        i -= 1;
+                        break;
+                    }
+                    try invariants.append(std.heap.page_allocator, try arena_dup(arena, t));
+                }
+            }
+        } else if (eql(first_word, "INVARIANTS")) {
+            if (rest.len > 0) {
+                try parse_name_list(arena, rest, &invariants);
+            } else {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
+                    if (t.len == 0) continue;
+                    if (is_comment(t)) continue;
+                    if (is_directive(t)) {
+                        i -= 1; // let outer loop process the directive
+                        break;
+                    }
+                    try parse_name_list(arena, t, &invariants);
+                }
             }
         } else if (eql(first_word, "CONSTANT") or eql(first_word, "CONSTANTS")) {
             if (rest.len > 0) {
@@ -137,32 +196,68 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
                 try parse_constant_assignment(arena, t, &constants);
             }
         } else if (eql(first_word, "PROPERTY")) {
-            try properties.append(std.heap.page_allocator, try arena_dup(arena, rest));
-        } else if (eql(first_word, "PROPERTIES")) {
-            i += 1;
-            while (i < lines.len) : (i += 1) {
-                const t = trim(lines[i]);
-                if (t.len == 0) continue;
-                if (is_comment(t)) continue;
-                if (is_directive(t)) {
-                    i -= 1;
-                    break;
+            if (rest.len > 0) {
+                try parse_name_list(arena, rest, &properties);
+            } else {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
+                    if (t.len == 0) continue;
+                    if (is_comment(t)) continue;
+                    if (is_directive(t)) {
+                        i -= 1;
+                        break;
+                    }
+                    try properties.append(std.heap.page_allocator, try arena_dup(arena, t));
                 }
-                try properties.append(std.heap.page_allocator, try arena_dup(arena, t));
+            }
+        } else if (eql(first_word, "PROPERTIES")) {
+            if (rest.len > 0) {
+                try parse_name_list(arena, rest, &properties);
+            } else {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
+                    if (t.len == 0) continue;
+                    if (is_comment(t)) continue;
+                    if (is_directive(t)) {
+                        i -= 1;
+                        break;
+                    }
+                    try parse_name_list(arena, t, &properties);
+                }
             }
         } else if (eql(first_word, "CONSTRAINT")) {
-            try constraints.append(std.heap.page_allocator, try arena_dup(arena, rest));
-        } else if (eql(first_word, "CONSTRAINTS")) {
-            i += 1;
-            while (i < lines.len) : (i += 1) {
-                const t = trim(lines[i]);
-                if (t.len == 0) continue;
-                if (is_comment(t)) continue;
-                if (is_directive(t)) {
-                    i -= 1;
-                    break;
+            if (rest.len > 0) {
+                try parse_name_list(arena, rest, &constraints);
+            } else {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
+                    if (t.len == 0) continue;
+                    if (is_comment(t)) continue;
+                    if (is_directive(t)) {
+                        i -= 1;
+                        break;
+                    }
+                    try constraints.append(std.heap.page_allocator, try arena_dup(arena, t));
                 }
-                try constraints.append(std.heap.page_allocator, try arena_dup(arena, t));
+            }
+        } else if (eql(first_word, "CONSTRAINTS")) {
+            if (rest.len > 0) {
+                try parse_name_list(arena, rest, &constraints);
+            } else {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
+                    if (t.len == 0) continue;
+                    if (is_comment(t)) continue;
+                    if (is_directive(t)) {
+                        i -= 1;
+                        break;
+                    }
+                    try parse_name_list(arena, t, &constraints);
+                }
             }
         } else if (eql(first_word, "ALIAS") or
             eql(first_word, "VIEW") or
@@ -216,6 +311,15 @@ fn split_lines(arena: *Arena, source: []const u8) ![]const []const u8 {
     }
     if (i > start) try result.append(std.heap.page_allocator, source[start..i]);
     return try dup_slice(arena, []const u8, result.items);
+}
+
+fn parse_name_list(arena: *Arena, line: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var it = std.mem.splitScalar(u8, line, ' ');
+    while (it.next()) |part| {
+        const t = trim(part);
+        if (t.len == 0) continue;
+        try out.append(std.heap.page_allocator, try arena_dup(arena, t));
+    }
 }
 
 fn parse_constant_assignment(arena: *Arena, line: []const u8, out: *std.ArrayList(ConstantAssignment)) !void {

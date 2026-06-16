@@ -121,9 +121,12 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
         },
         .set_filter => |sf| {
             const sfp = try arena.alloc_object(ast.SetFilter);
+            const vars = try arena.alloc(ast.BoundVar, sf.vars.len);
+            for (sf.vars, 0..) |v, i| {
+                vars[i] = .{ .name = try arena.dup(v.name), .domain = try inline_expr(arena, v.domain, params, args) };
+            }
             sfp.* = .{
-                .var_name = try arena.dup(sf.var_name),
-                .domain = try inline_expr(arena, sf.domain, params, args),
+                .vars = vars,
                 .pred = try inline_expr(arena, sf.pred, params, args),
             };
             const ptr = try arena.alloc_object(ast.Expr);
@@ -132,9 +135,12 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
         },
         .set_map => |sm| {
             const smp = try arena.alloc_object(ast.SetMap);
+            const vars = try arena.alloc(ast.BoundVar, sm.vars.len);
+            for (sm.vars, 0..) |v, i| {
+                vars[i] = .{ .name = try arena.dup(v.name), .domain = try inline_expr(arena, v.domain, params, args) };
+            }
             smp.* = .{
-                .var_name = try arena.dup(sm.var_name),
-                .domain = try inline_expr(arena, sm.domain, params, args),
+                .vars = vars,
                 .value = try inline_expr(arena, sm.value, params, args),
             };
             const ptr = try arena.alloc_object(ast.Expr);
@@ -287,7 +293,7 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
         .box_action => |ba| {
             const bap = try arena.alloc_object(ast.BoxAction);
             bap.* = .{
-                .action_name = try arena.dup(ba.action_name),
+                .action = try inline_expr(arena, ba.action, params, args),
                 .vars = try inline_expr(arena, ba.vars, params, args),
             };
             const ptr = try arena.alloc_object(ast.Expr);
@@ -602,8 +608,10 @@ pub const ActionExecutor = struct {
         switch (step) {
             .assign_var => |a| {
                 const val = try self.evaluator.eval_expr(a.expr, ctx, s0, self.eval_pool, &self.state_store.values_pool);
-                if (a.is_membership and val == .set_v) {
-                    const items = val.set_v.items(self.eval_pool);
+                if (a.is_membership and val.is_set_like()) {
+                    const mat = try self.evaluator.materialize_set(val, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                    if (mat != .set_v) return Error.TypeError;
+                    const items = mat.set_v.items(self.eval_pool);
                     const snap = self.eval_pool.snapshot();
                     for (items) |it| {
                         const new_ctx = ctx.extend(a.var_name, it);
@@ -617,8 +625,10 @@ pub const ActionExecutor = struct {
             },
             .assign_prime => |a| {
                 const val = try self.evaluator.eval_expr(a.expr, ctx, s0, self.eval_pool, &self.state_store.values_pool);
-                if (a.is_membership and val == .set_v) {
-                    const items = val.set_v.items(self.eval_pool);
+                if (a.is_membership and val.is_set_like()) {
+                    const mat = try self.evaluator.materialize_set(val, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                    if (mat != .set_v) return Error.TypeError;
+                    const items = mat.set_v.items(self.eval_pool);
                     const snap = self.eval_pool.snapshot();
                     for (items) |it| {
                         const new_ctx = ctx.extend(a.var_name, it);
@@ -637,8 +647,10 @@ pub const ActionExecutor = struct {
             },
             .choose => |c| {
                 const set_v = try self.evaluator.eval_expr(c.domain, ctx, s0, self.eval_pool, &self.state_store.values_pool);
-                if (set_v != .set_v) return Error.TypeError;
-                const items = set_v.set_v.items(self.eval_pool);
+                if (!set_v.is_set_like()) return Error.TypeError;
+                const mat = try self.evaluator.materialize_set(set_v, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                if (mat != .set_v) return Error.TypeError;
+                const items = mat.set_v.items(self.eval_pool);
                 var combined = std.ArrayList(ActionStep).empty;
                 defer combined.deinit(std.heap.page_allocator);
                 try combined.appendSlice(std.heap.page_allocator, c.body_steps);
@@ -727,20 +739,19 @@ pub const ActionExecutor = struct {
             new_state.level = 0;
             new_state.pred = 0;
         }
-        for (new_state.values) |*v| v.* = Value{ .bool_v = false };
+        if (s0) |parent| {
+            for (new_state.values, 0..) |*v, vi| {
+                v.* = try parent.values[vi].clone(&self.state_store.values_pool, &self.state_store.values_pool);
+            }
+        } else {
+            for (new_state.values) |*v| v.* = Value{ .bool_v = false };
+        }
         var i: u32 = 0;
         while (i < ctx.len) : (i += 1) {
             const name = ctx.names[i];
             const v = ctx.values[i];
             const var_idx = self.evaluator.find_variable(name) orelse continue;
             new_state.values[var_idx] = try v.clone(self.eval_pool, &self.state_store.values_pool);
-        }
-        if (s0) |parent| {
-            for (new_state.values, 0..) |*v, vi| {
-                if (v.* == .bool_v) {
-                    v.* = try parent.values[vi].clone(&self.state_store.values_pool, &self.state_store.values_pool);
-                }
-            }
         }
         try out_states.append(std.heap.page_allocator, new_idx);
     }

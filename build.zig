@@ -4,6 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const tlzig_module = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "tlzig",
         .root_module = b.createModule(.{
@@ -12,6 +18,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.addImport("tlzig", tlzig_module);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -36,6 +43,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    bench.root_module.addImport("tlzig", tlzig_module);
     b.installArtifact(bench);
 
     const run_bench = b.addRunArtifact(bench);

@@ -9,7 +9,6 @@ fn has_translation(source: []const u8, start: usize) bool {
 fn can_translate(source: []const u8, start: usize, end: usize) bool {
     var i: usize = start;
     while (i < end) {
-        // find next line
         const nl = std.mem.indexOfScalarPos(u8, source, i, '\n') orelse end;
         const line = trim(source[i..nl]);
         if (starts_with(line, "procedure") or
@@ -19,7 +18,11 @@ fn can_translate(source: []const u8, start: usize, end: usize) bool {
             starts_with(line, "assert") or
             starts_with(line, "print") or
             starts_with(line, "with") or
-            starts_with(line, "call"))
+            starts_with(line, "call") or
+            starts_with(line, "process") or
+            starts_with(line, "fair") or
+            starts_with(line, "macro") or
+            starts_with(line, "--fair"))
         {
             return false;
         }
@@ -32,11 +35,10 @@ pub fn translate(arena: *Arena, source: []const u8) ![]const u8 {
     const algo = find_algorithm(source) orelse return source;
     var end = algo.end;
     const has_handwritten = has_translation(source, end);
-    // The translator currently handles only simple PlusCal specs.  If the
-    // algorithm contains constructs we don't support yet but a hand-written
-    // TLA+ translation exists, remove the PlusCal comment and keep the
-    // translation.
-    if (has_handwritten and !can_translate(source, algo.start, algo.end)) {
+    // If a hand-written TLA+ translation exists, always remove the PlusCal
+    // comment block and keep the translation. This is safer than trying to
+    // re-translate, especially for complex algorithms.
+    if (has_handwritten) {
         const total = source.len - (end - algo.start);
         const result = try arena.alloc(u8, total);
         @memcpy(result[0..algo.start], source[0..algo.start]);
@@ -46,7 +48,7 @@ pub fn translate(arena: *Arena, source: []const u8) ![]const u8 {
     if (std.mem.indexOfPos(u8, source, end, "\\* BEGIN TRANSLATION")) |begin| {
         if (std.mem.indexOfPos(u8, source, begin, "\\* END TRANSLATION")) |end_line| {
             const after = std.mem.indexOfPos(u8, source, end_line, "\n");
-            end = after orelse end_line + "\\* END TRANSLATION".len;
+            end = if (after) |a| a + 1 else end_line + "\\* END TRANSLATION".len;
         }
     }
     var t = try Translator.init(arena, source, algo.start, end);
@@ -58,7 +60,7 @@ pub fn translate(arena: *Arena, source: []const u8) ![]const u8 {
     const result = try arena.alloc(u8, total);
     @memcpy(result[0..algo.start], source[0..algo.start]);
     @memcpy(result[algo.start .. algo.start + generated.len], generated);
-    @memcpy(result[algo.start + generated.len ..], source[algo.end..]);
+    @memcpy(result[algo.start + generated.len ..], source[end..]);
     return result;
 }
 

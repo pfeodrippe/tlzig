@@ -4,12 +4,32 @@ const Value = value.Value;
 const ValuePool = value.ValuePool;
 const Error = @import("err.zig").Error;
 
+pub const OverrideContext = struct {
+    max_seq_len: u32,
+    max_nat: i64,
+    min_int: i64,
+    max_int: i64,
+
+    pub fn default() OverrideContext {
+        return .{
+            .max_seq_len = 5,
+            .max_nat = 10,
+            .min_int = -10,
+            .max_int = 10,
+        };
+    }
+};
+
 pub const OverrideFn = *const fn (
+    ctx: OverrideContext,
     pool: *ValuePool,
     args: []const Value,
 ) Error!Value;
 
-pub const ValueOverrideFn = *const fn (pool: *ValuePool) Error!Value;
+pub const ValueOverrideFn = *const fn (
+    ctx: OverrideContext,
+    pool: *ValuePool,
+) Error!Value;
 
 pub const OverrideEntry = struct {
     name: []const u8,
@@ -22,6 +42,7 @@ pub const ValueOverrideEntry = struct {
 };
 
 pub const Registry = struct {
+    ctx: OverrideContext,
     entries: []const OverrideEntry,
     values: []const ValueOverrideEntry,
 
@@ -40,28 +61,8 @@ pub const Registry = struct {
     }
 };
 
-pub fn default_registry() Registry {
-    return Registry{ .entries = &default_overrides, .values = &default_value_overrides };
-}
-
-var g_max_seq_len: u32 = 5;
-var g_max_nat: i64 = 10;
-var g_min_int: i64 = -10;
-var g_max_int: i64 = 10;
-
-pub fn set_max_seq_len(n: u32) void {
-    g_max_seq_len = n;
-}
-
-pub fn set_nat_bound(n: i64) void {
-    std.debug.assert(n >= 0);
-    g_max_nat = n;
-}
-
-pub fn set_int_bounds(min: i64, max: i64) void {
-    std.debug.assert(min <= max);
-    g_min_int = min;
-    g_max_int = max;
+pub fn default_registry(ctx: OverrideContext) Registry {
+    return Registry{ .ctx = ctx, .entries = &default_overrides, .values = &default_value_overrides };
 }
 
 const default_overrides = [_]OverrideEntry{
@@ -103,7 +104,7 @@ const default_value_overrides = [_]ValueOverrideEntry{
     .{ .name = "BOOLEAN", .func = boolean_set },
 };
 
-fn cardinality(pool: *ValuePool, args: []const Value) Error!Value {
+fn cardinality(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     _ = pool;
     if (args.len != 1) return Error.TypeError;
     const s = args[0];
@@ -111,12 +112,12 @@ fn cardinality(pool: *ValuePool, args: []const Value) Error!Value {
     return Value{ .int_v = @intCast(s.set_v.len) };
 }
 
-fn is_finite_set(_: *ValuePool, args: []const Value) Error!Value {
+fn is_finite_set(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     return Value{ .bool_v = true };
 }
 
-fn sequence_len(pool: *ValuePool, args: []const Value) Error!Value {
+fn sequence_len(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     _ = pool;
     return switch (args[0]) {
@@ -127,7 +128,7 @@ fn sequence_len(pool: *ValuePool, args: []const Value) Error!Value {
     };
 }
 
-fn head(pool: *ValuePool, args: []const Value) Error!Value {
+fn head(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     return switch (args[0]) {
         .function_v => |f| f.apply(pool, Value{ .int_v = 1 }) orelse Error.IndexOutOfBounds,
@@ -137,7 +138,7 @@ fn head(pool: *ValuePool, args: []const Value) Error!Value {
     };
 }
 
-fn tail(pool: *ValuePool, args: []const Value) Error!Value {
+fn tail(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     return switch (args[0]) {
         .function_v => |f| {
@@ -167,15 +168,15 @@ fn tail(pool: *ValuePool, args: []const Value) Error!Value {
     };
 }
 
-fn append(pool: *ValuePool, args: []const Value) Error!Value {
+fn append(ctx: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
     const elem = try pool.alloc_values(1);
     elem[0] = args[1];
     const singleton = Value{ .tuple_v = make_tuple(pool, elem) };
-    return sequence_concat(pool, args[0], singleton);
+    return sequence_concat(ctx, pool, args[0], singleton);
 }
 
-fn sub_seq(pool: *ValuePool, args: []const Value) Error!Value {
+fn sub_seq(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 3) return Error.TypeError;
     const lo = args[1].as_int() orelse return Error.TypeError;
     const hi = args[2].as_int() orelse return Error.TypeError;
@@ -206,7 +207,7 @@ fn sub_seq(pool: *ValuePool, args: []const Value) Error!Value {
     };
 }
 
-fn union_all(pool: *ValuePool, args: []const Value) Error!Value {
+fn union_all(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     const s = args[0];
     if (s != .set_v) return Error.TypeError;
@@ -228,41 +229,41 @@ fn union_all(pool: *ValuePool, args: []const Value) Error!Value {
     return Value{ .set_v = make_set(pool, dest) };
 }
 
-fn tlc_assert(_: *ValuePool, args: []const Value) Error!Value {
+fn tlc_assert(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
     if (!args[0].is_truthy()) return Error.AssertionFailed;
     return Value{ .bool_v = true };
 }
 
-fn nat_set(pool: *ValuePool) Error!Value {
-    return Value{ .set_v = make_range_set(pool, 0, g_max_nat) };
+fn nat_set(ctx: OverrideContext, pool: *ValuePool) Error!Value {
+    return Value{ .set_v = make_range_set(pool, 0, ctx.max_nat) };
 }
 
-fn int_set(pool: *ValuePool) Error!Value {
-    return Value{ .set_v = make_range_set(pool, g_min_int, g_max_int) };
+fn int_set(ctx: OverrideContext, pool: *ValuePool) Error!Value {
+    return Value{ .set_v = make_range_set(pool, ctx.min_int, ctx.max_int) };
 }
 
-fn boolean_set(pool: *ValuePool) Error!Value {
+fn boolean_set(_: OverrideContext, pool: *ValuePool) Error!Value {
     const dest = pool.alloc_values(2) catch return error.OutOfMemory;
     dest[0] = Value{ .bool_v = false };
     dest[1] = Value{ .bool_v = true };
     return Value{ .set_v = make_set(pool, dest) };
 }
 
-fn seq_set(pool: *ValuePool, args: []const Value) Error!Value {
+fn seq_set(ctx: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     const s = args[0];
     if (s != .set_v) return Error.TypeError;
     const items = s.set_v.items(pool);
     const m: u64 = items.len;
-    const total = try seq_set_size(m, g_max_seq_len);
+    const total = try seq_set_size(m, ctx.max_seq_len);
     const dest = try pool.alloc_values(@intCast(total));
     var pos: u32 = 0;
     const empty = try pool.alloc_values(0);
     dest[pos] = make_sequence(pool, empty, 0);
     pos += 1;
     var len: u32 = 1;
-    while (len <= g_max_seq_len) : (len += 1) {
+    while (len <= ctx.max_seq_len) : (len += 1) {
         const count = int_pow(m, len);
         var combo: u64 = 0;
         while (combo < count) : (combo += 1) {
@@ -305,7 +306,7 @@ fn int_pow(base: u64, exp: u32) u64 {
     return result;
 }
 
-pub fn ooverride(pool: *ValuePool, a: Value, b: Value) Error!Value {
+pub fn ooverride(_: OverrideContext, pool: *ValuePool, a: Value, b: Value) Error!Value {
     // Combine two records/functions; right-hand side overrides left for matching keys.
     const fa = if (a == .function_v) a.function_v else return Error.TypeError;
     const fb = if (b == .function_v) b.function_v else return Error.TypeError;
@@ -345,7 +346,7 @@ pub fn ooverride(pool: *ValuePool, a: Value, b: Value) Error!Value {
     } };
 }
 
-pub fn recordto(pool: *ValuePool, key: Value, val: Value) Error!Value {
+pub fn recordto(_: OverrideContext, pool: *ValuePool, key: Value, val: Value) Error!Value {
     const keys = try pool.alloc_values(1);
     keys[0] = key;
     const vals = try pool.alloc_values(1);
@@ -357,7 +358,7 @@ pub fn recordto(pool: *ValuePool, key: Value, val: Value) Error!Value {
     } };
 }
 
-pub fn sequence_concat(pool: *ValuePool, a: Value, b: Value) Error!Value {
+pub fn sequence_concat(_: OverrideContext, pool: *ValuePool, a: Value, b: Value) Error!Value {
     if (a == .tuple_v and b == .tuple_v) {
         const ta = a.tuple_v.items(pool);
         const tb = b.tuple_v.items(pool);
@@ -422,7 +423,7 @@ fn make_range_set(pool: *ValuePool, lo: i64, hi: i64) value.Set {
 // SelectSeq(seq, test) returns the subsequence of elements for which test is true.
 // TLA+ expects test to be a unary operator/function. We accept either a function value
 // (treated as a lambda to apply) or return the original sequence as a conservative stub.
-fn select_seq(_: *ValuePool, args: []const Value) Error!Value {
+fn select_seq(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
     // Real implementation needs access to the evaluator/AST context for the predicate.
     return args[0];
@@ -431,7 +432,7 @@ fn select_seq(_: *ValuePool, args: []const Value) Error!Value {
 // SortSeq(seq, op) sorts the sequence using the comparison operator.
 // Without access to the evaluator/AST context, we can only sort primitive values when the
 // operator is the standard `\leq` relation. Otherwise return the sequence unchanged.
-fn sort_seq(pool: *ValuePool, args: []const Value) Error!Value {
+fn sort_seq(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
     const seq = args[0];
     const op = args[1];
@@ -485,7 +486,7 @@ fn needs_swap(a: Value, b: Value) bool {
     return false;
 }
 
-fn permutations(pool: *ValuePool, args: []const Value) Error!Value {
+fn permutations(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     const s = args[0];
     if (s != .set_v) return Error.TypeError;
@@ -538,7 +539,7 @@ fn next_permutation(order: []usize) bool {
     return true;
 }
 
-fn random_element(pool: *ValuePool, args: []const Value) Error!Value {
+fn random_element(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     const s = args[0];
     if (s != .set_v) return Error.TypeError;
@@ -547,33 +548,33 @@ fn random_element(pool: *ValuePool, args: []const Value) Error!Value {
     return items[0];
 }
 
-fn to_string(pool: *ValuePool, args: []const Value) Error!Value {
+fn to_string(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     return Value{ .string_v = try pool.push_string("__str") };
 }
 
-fn java_time(_: *ValuePool, _: []const Value) Error!Value {
+fn java_time(_: OverrideContext, _: *ValuePool, _: []const Value) Error!Value {
     return Value{ .int_v = 0 };
 }
 
-fn tlc_get(_: *ValuePool, _: []const Value) Error!Value {
+fn tlc_get(_: OverrideContext, _: *ValuePool, _: []const Value) Error!Value {
     return Value{ .int_v = 0 };
 }
 
-fn tlc_set(_: *ValuePool, _: []const Value) Error!Value {
+fn tlc_set(_: OverrideContext, _: *ValuePool, _: []const Value) Error!Value {
     return Value{ .bool_v = true };
 }
 
-fn tlc_print(_: *ValuePool, args: []const Value) Error!Value {
+fn tlc_print(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
     return args[1];
 }
 
-fn tlc_print_t(_: *ValuePool, _: []const Value) Error!Value {
+fn tlc_print_t(_: OverrideContext, _: *ValuePool, _: []const Value) Error!Value {
     return Value{ .bool_v = true };
 }
 
-fn empty_bag(pool: *ValuePool, _: []const Value) Error!Value {
+fn empty_bag(_: OverrideContext, pool: *ValuePool, _: []const Value) Error!Value {
     return Value{ .function_v = .{
         .domain = make_set(pool, &[_]Value{}),
         .offset = value_offset(pool, pool.values.ptr),
@@ -581,11 +582,11 @@ fn empty_bag(pool: *ValuePool, _: []const Value) Error!Value {
     } };
 }
 
-fn bag_in(_: *ValuePool, _: []const Value) Error!Value {
+fn bag_in(_: OverrideContext, _: *ValuePool, _: []const Value) Error!Value {
     return Value{ .bool_v = false };
 }
 
-fn bag_of_set(pool: *ValuePool, args: []const Value) Error!Value {
+fn bag_of_set(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     const s = args[0];
     if (s != .set_v) return Error.TypeError;
@@ -599,22 +600,22 @@ fn bag_of_set(pool: *ValuePool, args: []const Value) Error!Value {
     } };
 }
 
-fn bag_cardinality(_: *ValuePool, args: []const Value) Error!Value {
+fn bag_cardinality(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     return Value{ .int_v = 0 };
 }
 
-fn bag_cup(_: *ValuePool, args: []const Value) Error!Value {
+fn bag_cup(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
     return args[0];
 }
 
-fn bag_cap(_: *ValuePool, args: []const Value) Error!Value {
+fn bag_cap(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
     return args[0];
 }
 
-fn bag_difference(pool: *ValuePool, args: []const Value) Error!Value {
+fn bag_difference(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
     const a = args[0];
     const b = args[1];
@@ -650,12 +651,12 @@ fn bag_difference(pool: *ValuePool, args: []const Value) Error!Value {
     } };
 }
 
-fn wf_vars(_: *ValuePool, args: []const Value) Error!Value {
+fn wf_vars(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
     _ = args;
     return Value{ .bool_v = true };
 }
 
-fn sf_vars(_: *ValuePool, args: []const Value) Error!Value {
+fn sf_vars(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
     _ = args;
     return Value{ .bool_v = true };
 }

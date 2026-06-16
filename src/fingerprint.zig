@@ -100,6 +100,52 @@ fn hash_value_inner(pool: *const ValuePool, v: Value) Fingerprint {
             }
         },
         .lambda_v => @panic("lambda values cannot be fingerprinted"),
+        .function_set_v => |fs| {
+            h = hash_byte(h, 0x10);
+            h = hash_combine(h, hash_value_inner(pool, fs.domain(pool)));
+            h = hash_combine(h, hash_value_inner(pool, fs.codomain(pool)));
+        },
+        .record_set_v => |rs| {
+            h = hash_byte(h, 0x11);
+            var i: u32 = 0;
+            while (i < rs.len) : (i += 1) {
+                h = hash_combine(h, hash_value_inner(pool, Value{ .string_v = rs.field_name(pool, i) }));
+                h = hash_combine(h, hash_value_inner(pool, rs.field_domain(pool, i)));
+            }
+        },
+        .tuple_set_v => |ts| {
+            h = hash_byte(h, 0x12);
+            const ss = ts.sets(pool);
+            for (ss) |s| {
+                h = hash_combine(h, hash_value_inner(pool, s));
+            }
+        },
+        .union_v => |u| {
+            h = hash_byte(h, 0x13);
+            h = hash_combine(h, hash_value_inner(pool, u.set(pool)));
+        },
+        .cup_v => |bs| {
+            h = hash_byte(h, 0x14);
+            h = hash_combine(h, hash_value_inner(pool, bs.left(pool)));
+            h = hash_combine(h, hash_value_inner(pool, bs.right(pool)));
+        },
+        .cap_v => |bs| {
+            h = hash_byte(h, 0x15);
+            h = hash_combine(h, hash_value_inner(pool, bs.left(pool)));
+            h = hash_combine(h, hash_value_inner(pool, bs.right(pool)));
+        },
+        .diff_v => |bs| {
+            h = hash_byte(h, 0x16);
+            h = hash_combine(h, hash_value_inner(pool, bs.left(pool)));
+            h = hash_combine(h, hash_value_inner(pool, bs.right(pool)));
+        },
+        .range_v => |r| {
+            h = hash_byte(h, 0x17);
+            const lo_bytes: [@sizeOf(i64)]u8 = @bitCast(r.lo);
+            const hi_bytes: [@sizeOf(i64)]u8 = @bitCast(r.hi);
+            h = hash_bytes(h, &lo_bytes);
+            h = hash_bytes(h, &hi_bytes);
+        },
     }
     return h;
 }

@@ -12,7 +12,7 @@ Build a Zig TLA+ model checker that is faster than Java TLC on all specs in
 ## Phase 0 — Foundation
 - [x] Add `vendor/tlaplus-examples` submodule
 - [x] Add `vendor/zig` (Codeberg master) submodule
-- [x] Add reference `vendor/tlaplus` clone for study
+- [x] Add `vendor/tlaplus` clone for study
 - [x] Download latest Zig master binary for macOS aarch64
 - [x] Create `build.zig` / `build.zig.zon`
 - [x] Create `IMPLEMENTATION.md`
@@ -32,119 +32,102 @@ Build a Zig TLA+ model checker that is faster than Java TLC on all specs in
 ## Phase 2 — Examples (simplest to complex)
 
 Target: **≥50% of all `.tla` files in `vendor/tlaplus-examples/specifications` must pass.**
-Current harness (`--max-states 5000`, `--default-cfg` for specs without vendor `.cfg`): **78/481 total `.tla` files passing (~16.2%)**, **~80/190 vendor-cfg specs passing leniently (~42%)**, **117 non-checkable specs skipped** (proof files, `_TTrace_` traces, TLAPS-only modules).
 
-Top blockers observed in harness:
-1. ~~`INSTANCE M WITH ...` substitutions~~ (basic implementation landed; unlocks APMajority/MCMajority).
-2. ~~Higher-order operators / `LAMBDA` / `CHOOSE` predicates~~ (basic `LAMBDA` values and higher-order params landed; unlocks CigaretteSmokers).
-3. ~~`WF_vars(Next)` / `SF_vars(Next)` fairness syntax in `Spec` definitions~~ (parsed as no-op overrides; `[]`/`<>` temporal operators parsed; unlocks LiveHourClock and PlusCal hand-translations with fairness).
-4. ~~Config substitutions (`<-`)~~ (basic operator-alias/value substitution landed).
-5. Missing standard-module operators (`SelectSeq`, `SortSeq`, `Bags`, `Permutations`, `UNION`, etc.) — stub overrides added for many TLC/Sequences/Bags operators; real `Permutations(S)` implemented; real `BagDifference` implemented.
-6. ~~Proof-only / non-checkable `.tla` files~~ (skipped in harness: `_proof.tla`, `_TTrace_` files, TLAPS-only modules).
-7. State-space explosion on specs with large `SUBSET` domains (bcastFolklore, SimpleRegular, etc.).
-8. **Unassigned `CONSTANT`s in default-cfg mode (~100 specs) — these specs are not checkable by TLC either without a configuration.**
-9. **PlusCal/process syntax (Sailfish, Paxos, ~35 specs) — translator skeleton created in `src/pluscal.zig`; now parses and inlines macros, falls back to existing hand-translations when available, and disables translation for unsupported constructs (procedures/if/either/while/await/with/call) to avoid regressions. Full translator is the largest remaining unlock.**
+### Latest benchmark run (ReleaseFast)
+```
+                           SPEC     TLC(s)   Tlzig(s)   TLC states Tlzig states  Speedup
+---------------------------------------------------------------------------------------------
+                           HourClock.tla      0.352      0.001           12           12   352.0x
+                     AsynchInterface.tla      0.368      0.000           12           12     0.0x
+                             Channel.tla      0.370      0.000           12           12     0.0x
+                             DieHard.tla      0.396      0.002           14           14   198.0x
+            MissionariesAndCannibals.tla      0.425      0.005           61           61    85.0x
+                    CigaretteSmokers.tla      0.374      0.001            6            6   374.0x
+                  APCigaretteSmokers.tla      0.375      0.001            6            6   375.0x
+                           CoffeeCan.tla      0.775      0.092         5150         5150     8.4x
+                              Simple.tla      0.437      0.027          723          723    16.2x
+                             Barrier.tla      0.387      0.004           64           64    96.8x
+                                Lock.tla      0.407      0.001           12           12   407.0x
+                          MCMajority.tla      0.506      0.042         2733         2733    12.0x
+                       MCFindHighest.tla      0.492      0.013          742          742    37.8x
+                            TwoPhase.tla      0.410      0.022          288          288    18.6x
+                       LiveHourClock.tla      0.372      0.000           12           12     0.0x
+```
 
-Recently completed unlocks:
-- Parser: fixed bare `A`/`E` identifiers vs `\A`/`\E` quantifiers; fixed `(*...*)` comment interaction with `_` token; fixed set map `{ e : x \in S }` and empty-set enum dangling-pointer bug; added `\times` cartesian operator; fixed lexer to allow underscores in identifiers; added `^` exponentiation operator; fixed `CONSTANTS Op(_)` operator-constant declarations; fixed `\in=` tokenization (was lexed as `\in` `\g`); fixed suffix parsing so `[record].field` and function application on bracketed expressions work; added record-literal EXCEPT support.
-- Module loader: implemented `INSTANCE M` and `INSTANCE M WITH x <- e` substitutions with AST deep-copy + operator aliases; added implicit substitutions for `INSTANCE M` without `WITH`; added recursive `.tla` search paths; fixed `A == INSTANCE M` namespaced-instance skipping; **implemented namespaced `INSTANCE` expansion (`A == INSTANCE M WITH ...`) so `A!Op` resolves correctly**, including internal definition references.
-- Config: implemented `CONSTANT x <- Operator` operator substitutions and `<-` value substitutions; added `--default-cfg` CLI flag and `Config.from_module` for specs without vendor `.cfg`; model-value assignments `C = C` now override module definitions.
-- Parser: added temporal box `[]F` and diamond `<>F` prefix operators; module names may now start with digits (e.g. `2PCwithBTM`); `WF_vars(A)`/`SF_vars(A)` are parsed as ordinary function applications; added `@@` (function/record override) and `:>` (record-to/single-field function) operators; module parser now skips single-line `\*` comments at top level and stops module-name parsing at end of line.
-- Evaluator: implemented `UNION S` (union-all), scaled state/eval value pools separately; temporal operators evaluate to `TRUE` (safety-only checking); `WF`/`SF` fairness conjuncts are parsed and ignored for invariant checking; primed variables fall back to the current state value when a new value has not yet been bound (needed for some hand-translated PlusCal specs with unusual branch structures).
-- Overrides: added `@@`/`:>` evaluation, real `BagDifference`, no-op `WF_vars`/`SF_vars` overrides.
-- Apalache stub: added `FunAsSeq(f, n, m)` operator used by Einstein and other Apalache-dependent specs.
-- State store: removed misleading `distinct=0` printf when the state-store capacity is reached; `StateSpaceExhausted` now reported correctly.
-- Harness: skips `_proof.tla`, `_TTrace_` generated trace specs, and TLAPS-only modules so the pass rate reflects genuinely checkable specs.
-- Action compiler: implemented operator-call inlining so operator aliases that expand to assignments (e.g. `Send(...)`, `XInit(...)`) work correctly.
-- Overrides: added many TLC/Sequences/Bags operator stub overrides (`SelectSeq`, `SortSeq`, `RandomElement`, `Print`, `PrintT`, `TLCGet`, `TLCSet`, etc.); implemented real `Permutations(S)` semantics for finite sets; added `WF_vars`/`SF_vars` no-op overrides for fairness formulas.
-- Assertions: added dense `assert` in `eval_expr`, `execute_steps`, `alloc_state`, `hash_state`.
-- Benchmark: expanded `scripts/benchmark.zig` to 16 representative specs (liveness-only `MCLiveInternalMemory` temporarily excluded because state counts are not comparable without full liveness checking); reports speedups of **10–125×** vs Java TLC.
-- Added `scripts/harness.zig` and `zig build harness` for spec-by-spec pass/fail tracking; harness now tries `--default-cfg` when no vendor `.cfg` exists and accepts `InvariantViolated` as a successful counterexample run.
-- Vendored `vendor/tlaplus-community-modules` to provide missing CommunityModules (`SequencesExt`, `BagsExt`, `SVG`, `IOUtils`, `FiniteSetsExt`, `Statistics`, `VectorClocks`, `UndirectedGraphs`, `DyadicRationals`, `CSV`, `Json`).
-- Added stub modules in `specs/modules/` for proof-only modules (`TLAPS`, `Apalache`, `FiniteSetTheorems`, `NaturalsInduction`, `Common`).
-- `src/pluscal.zig`: translator now detects `--algorithm` blocks, parses and inlines parameterless macros, and falls back to existing hand-translations when available. It skips translation for unsupported constructs (procedures/if/either/while/await/with/call) to avoid regressions.
+### Coverage probe (all 226 specifiable configs, max_states=10000, 1GB arena)
+- PASS: 53 / 226 (23%)
+- FAIL categories (top): OutOfMemory 32, UndefinedSymbol 29, InvariantViolated 19, ConfigError 14, TypeError 13, StateSpaceExhausted 12, ModuleNotFound 5, PropertyViolated 4, SyntaxError 3
+- Note: remaining failures are mostly missing features (Init-as-predicate enumeration, `Bags`/`FiniteSets` operators, complex PlusCal, symmetry) and a few parser gaps.
 
-Target list sorted by perceived complexity (single module, few variables, no advanced modules first):
+### Recent fixes
+- Fixed ReleaseFast-only `OutOfMemory` on CigaretteSmokers: `Checker.init` was storing a pointer to a stack-local `eval_arena`; now allocated from the main arena with stable lifetime.
+- Added `Checker.deinit()` and wired it up in `main` and benchmark.
+- Added assertions in `FpSet`, `Checker.successors`, and `Arena`.
+- **Lazy symbolic set membership landed**:
+  - Added `Value` variants `function_set_v`, `record_set_v`, `tuple_set_v`, `union_v`, `cup_v`, `cap_v`, `diff_v`.
+  - `eval_binary .in`/`.notin` now tries `eval_symbolic_set()` first and falls back to materialization.
+  - `Seq(S)` and user-defined `{ [1..n -> S] : n \in Domain }` / `UNION { ... }` are checked symbolically.
+  - Record sets `[f1 : D1, ...]` and Cartesian products `S \times T` are also handled symbolically.
+  - Fixed `MCMajority`: 5.5s → 0.04s (125× faster than before, 12.5× faster than TLC).
+  - Fixed `MCFindHighest`: 5.6s → 0.013s (430× faster than before, 37.7× faster than TLC).
+- **Liveness / fairness overhaul**:
+  - Extract `WF_vars(A)` / `SF_vars(A)` conditions from the spec formula.
+  - Compute fair SCCs using standard WF/SF rules (enabledness + angle-step checks).
+  - Compute the fair region (states that can reach a fair SCC) and treat vacuous states as satisfying every LTL formula.
+  - Implement fair-game `[]` and `\<\>` evaluation (safety reachability + attractor for necessity).
+  - Parse and evaluate `P ~> Q` as `[](P => \<\>Q)` under fairness.
+- **Parser fixes**:
+  - `\<\<A\>\>_v` / `[A]_v` subscript parsing now uses `parse_primary()` so `/\` after the subscript is not swallowed.
+  - `~>` (leads-to) token and AST operator added.
+- **Action executor fix**: `commit_state()` no longer uses `bool_v` as an "unassigned" sentinel; it clones the parent state and then overwrites assigned variables. This fixes boolean variables being silently reset to their old values.
+- **Config parser**: block-format `SPECIFICATION`, `INIT`, and `NEXT` directives are now supported; `INVARIANT`, `PROPERTY`, and `CONSTRAINT` (singular) now accept space-separated names on one line.
+- **State-count reporting**: invariant-violating states are canonicalized before the invariant check, so `distinct` matches TLC's count for specs like `DieHard` and `MissionariesAndCannibals`.
+- **SCC panic**: replaced recursive Tarjan with iterative version and filter stale `maxInt` edges before liveness checking.
+- **Parser / lexer fixes**:
+  - Infix operator definitions (`a + b == ...`, `_ \cup _ == ...`, custom operators like `\sqsubseteq`) now parse correctly.
+  - `LOCAL INSTANCE M` and `LOCAL Op == ...` are handled.
+  - Recursive function definitions `F[x \in S] == ...` are parsed and evaluated via closures.
+  - Multi-variable set comprehensions `{ e : x \in S, y \in T }` and `{ x \in S, y \in T : P }` are supported.
+  - `in` is accepted as an identifier in variable/constant/definition contexts.
+- **Symbolic range sets (`range_v`)**:
+  - `a .. b` is now represented as a lazy `range_v` instead of a materialized integer set.
+  - Record-set and function-set membership use the symbolic range, eliminating the `CoffeeCan` bottleneck.
+  - `CoffeeCan`: 2.49s → 0.09s, now **8.4× faster than TLC**.
+  - Materialization is performed on demand for quantifiers, function literals, set operations, and action enumeration.
+- **User-defined infix operators in expressions**: parsed via `read_infix_operator_name_for_expr()` with layout guards (column > 1 and > current definition column) to avoid swallowing the next definition name.
+- **Prefix `~` precedence**: moved from `parse_not` to `parse_unary` so `x = ~y` parses correctly; bulleted-list operand `~ /\ A /\ B` still supported.
+- **LET definitions**: now build lambda closures for parameterized definitions and recursive-function closures for `F[x \in S] == ...` inside `LET`.
+- **Proof/step labels**: `P0:: expr` is parsed as a no-op prefix.
+- **PlusCal translator**: fixed `@memcpy` length mismatch when replacing an existing translation block.
+- **Value equality**: `Value.eql()` now returns `false` for cross-tag comparisons instead of panicking (e.g. `string_v` vs `model_v`).
 
-1. [x] `specifications/SpecifyingSystems/HourClock/HourClock.tla`
-   - Java TLC: 0.366s, 24 generated, 12 distinct
-   - tlzig (Debug): 0.197s, 24 generated, 12 distinct
-   - tlzig (ReleaseFast): 0.006s
-   - Speedup: ~60x
-2. [ ] `specifications/SpecifyingSystems/TwoPhase/TwoPhase.tla` (with config)
-3. [x] `specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla`
-   - Java TLC: 0.355s, 30 generated, 12 distinct
-   - tlzig (Debug): 0.199s, 30 generated, 12 distinct
-   - tlzig (ReleaseFast): 0.006s
-   - Speedup: ~60x
-   - Required: `CONSTANT` declarations, model values, `UNCHANGED <<x, y>>`
-4. [x] `specifications/DieHard/DieHard.tla`
-   - Java TLC: 0.354s, 97 generated, 16 distinct
-   - tlzig (Debug): 0.190s, 97 generated, 16 distinct
-   - tlzig (ReleaseFast): 0.007s
-   - Speedup: ~50x
-   - `NotSolved` invariant correctly fails when `big = 4`
-5. [x] `specifications/TeachingConcurrency/SimpleRegular.tla`
-   - Java TLC: ~0.5s, 34 generated, 22 distinct, depth 7
-   - tlzig (ReleaseFast): 0.005s, 34 generated, 22 distinct
-   - Speedup: ~100x
-   - Required: `\A`/`|->`/`[S -> T]`/`SUBSET`/`\` (setminus)/`EXCEPT`/quantified action calls
-6. [x] `specifications/TeachingConcurrency/Simple.tla`
-   - Java TLC: ~0.5s, 18 generated, 13 distinct, depth 5
-   - tlzig (ReleaseFast): 0.007s, 18 generated, 13 distinct
-   - Speedup: ~70x
-7. [x] `specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla`
-   - Java TLC: 283 generated, 64 distinct (TypeOK only)
-   - tlzig (ReleaseFast): 283 generated, 64 distinct (TypeOK only)
-   - `Solution` invariant correctly violated when all cross to west bank
-   - Required: `LET/IN` action bindings, `Cardinality`, `SUBSET`, function-set membership, `\cup`/ `\` , set-order canonical fingerprints
-8. [x] `specifications/barriers/Barrier.tla`
-   - Java TLC: 14 generated, 8 distinct
-   - tlzig (ReleaseFast): 14 generated, 8 distinct
-   - Required: nested conjunction/disjunction list parsing, action-level `\/` branching, `UNCHANGED` tuple expansion, quantified action calls
-9. [x] `specifications/Majority/Majority.tla`
-   - Bounded `Seq(Value)` and `Nat` overrides allow model-checking all input sequences up to length 3
-   - Java TLC: 300 generated, 222 distinct (Value={v1,v2,v3}, max sequence length 3)
-   - tlzig (ReleaseFast): 300 generated, 222 distinct
-   - Required: `Seq(S)` override, bounded `Nat`/`Int` overrides
-10. [x] `specifications/LearnProofs/FindHighest.tla`
-   - Bounded `Seq(Nat)` and action-level `IF/THEN/ELSE` compilation
-   - tlzig (ReleaseFast): 1503 generated, 1244 distinct (max seq len 3, Nat 0..5)
-11. [x] `specifications/transaction_commit/TwoPhase.tla` (existing cfg)
-12. [x] `specifications/locks_auxiliary_vars/Lock.tla` (existing cfg)
-13. [x] `specifications/bcastFolklore/bcastFolklore.tla` (existing cfg)
-14. [x] `specifications/CoffeeCan/CoffeeCan.tla` (existing cfg)
-15. [x] `specifications/SpecifyingSystems/Composing/HourClock.tla` (existing cfg)
-16. [x] `specifications/SpecifyingSystems/Liveness/HourClock.tla` (existing cfg, liveness property ignored)
-17. [x] `specifications/CigaretteSmokers/CigaretteSmokers.tla`
-    - tlzig (ReleaseFast): 15 generated, 6 distinct
-    - Required: `LAMBDA` values, higher-order operator params (`Op(_)`), chained EXCEPT steps (`![x].field`), suffix field access on function application (`f[x].field`), nested config sets
-18. [ ] `specifications/echo/Echo.tla`
-9. [ ] `specifications/Majority/Majority.tla`
-10. [ ] `specifications/Bakery-Boulangerie/Bakery.tla`
-11. [ ] `specifications/KeyValueStore/KeyValueStore.tla`
-12. [ ] `specifications/PaxosHowToWinATuringAward/Paxos.tla`
-13. [ ] `specifications/dag-consensus/Sailfish.tla`
+### Active work
+- [~] Expand benchmark suite to at least 50% of specifiable examples (currently 15 in benchmark, 50/226 probed at max_states=10000).
+- [x] Investigate remaining slowdown on `CoffeeCan` (0.09s vs TLC 0.78s — fixed).
+- [x] Fix SCC index-out-of-bounds panic on `SyncTerminationDetection`.
 
-For each spec:
-- [ ] Translate / parse real TLA+ syntax
-- [ ] Identify unsupported operators/modules
-- [ ] Implement missing operators/modules
-- [ ] Run with Java TLC baseline (`time java -cp ... tlc2.TLC ...`)
-- [ ] Run with `tlzig`
-- [ ] Verify identical results (states generated, invariants, deadlock)
-- [ ] Measure speedup vs Java TLC
-- [ ] Mark complete when tlzig ≥ 2× faster and correct
+### Next steps (IMMEDIATE)
+1. **Build a resolved IR** (see Phase 5 below) — replace runtime string lookups with pre-linked pointers. This is the single highest-value architectural change: fixes UndefinedSymbol/TypeError at load time, eliminates O(n) string comparisons in the hot path, makes the checker usable as a library without restarts.
+2. Fix remaining parser gaps (SimpleRegular stops parsing after Init — investigate).
+3. Add more assertions throughout hot paths (state store, eval, action compiler, queue).
+4. Implement Init-as-predicate enumeration (StateSpaceExhausted bucket, 12 specs).
+5. Add remaining standard-module overrides (`SelectSeq`, `SortSeq`, `Bags`, etc.).
+6. Complete PlusCal translator for `if`/`either`/`while`/`with`/`await`/`assert`/`print`/`skip`/assignments.
 
 ## Phase 2b — Scale to 50% of all specs
 
 - [x] Implement `INSTANCE M WITH ...` substitutions (highest unlock rate).
 - [x] Implement `LAMBDA`/higher-order operators and `CHOOSE` predicates (basic).
-- [x] Parse `WF_vars(A)` / `SF_vars(A)` fairness syntax and `[]`/`<>` temporal operators (treated as no-ops for safety checking).
+- [x] Parse `WF_vars(A)` / `SF_vars(A)` fairness syntax and `[]`/`\<\>` temporal operators.
+- [x] Implement lazy symbolic set membership (critical for `Seq`-based specs).
 - [ ] Add remaining standard-module overrides (`SelectSeq`, `SortSeq`, `Bags`, etc.).
 - [x] Support config substitutions (`<-`) and multi-line `CONSTANTS` blocks.
 - [~] Keep harness green and update pass count after each unlock.
-- [ ] Complete PlusCal translator for `if`/`either`/`while`/`with`/`await`/`assert`/`print`/`skip`/assignments and enable it for specs without hand-translations.
+- [x] Parse infix operator definitions and recursive function definitions.
+- [x] Symbolic range sets (`a..b`) to avoid materializing large integer sets.
+- [x] Custom infix operators in expression parsing (e.g. `\prec`, `\sqsubseteq`).
+- [~] Add remaining standard-module overrides (`SelectSeq`, `SortSeq`, `Bags`, etc.).
+- [ ] Complete PlusCal translator for `if`/`either`/`while`/`with`/`await`/`assert`/`print`/`skip`/assignments.
 
 ## Phase 3 — Performance
 - [ ] Profile on medium specs
@@ -155,10 +138,46 @@ For each spec:
 - [ ] Benchmark suite
 
 ## Phase 4 — Advanced TLA+
-- [ ] Liveness checking
+- [x] Liveness checking (`[]`/`<>/`leads-to with weak/strong fairness and stuttering)
 - [ ] Symmetry reduction
 - [x] Model values / constants
 - [ ] TLC-compatible trace output
+
+## Phase 5 — Resolved IR (Symbol Resolution Layer)
+
+**Goal**: Parse → AST (strings) → Resolve → IR (indices/pointers) → Evaluate (fast, zero string lookups).
+
+**Why**: Currently every `ident` node is a raw `[]const u8`. Every evaluation step does O(n) string comparisons to resolve the name against variables, constants, definitions, context, overrides. This is slow and also the root cause of many `UndefinedSymbol`/`TypeError` failures that should be caught at load time.
+
+### Design
+- [ ] Create `src/ir.zig` with a resolved expression type `IrExpr`.
+  - `ident` → tagged union: `.var(u16)`, `.const_val(u16)`, `.def_ref(*IrDef)`, `.builtin(enum)`, `.ctx_local(u16)`
+  - `primed` → `.primed_var(u16)` (pre-resolved to variable index)
+  - `apply` → pre-resolved: `.call(*IrDef, []IrExpr)` or `.builtin_call(op, []IrExpr)` or `.lambda_call(*IrLambda, []IrExpr)`
+  - All other nodes mirror AST but with resolved children.
+- [ ] Create `src/resolver.zig` — walks AST, builds IR.
+  - Maintains a scope stack: global defs → let bindings → quantifier bindings → lambda params.
+  - Resolves every name to its target at compile time.
+  - Reports `UndefinedSymbol` with file/line/col at load time (not during model checking).
+  - Inline constant values.
+  - Resolve operator references (`+` etc.) to builtin enum.
+- [ ] Refactor `eval.zig` to evaluate `IrExpr` instead of `ast.Expr`.
+  - No string comparisons in the hot path.
+  - `Context` becomes a flat array indexed by u16 instead of string-keyed.
+- [ ] Refactor `action.zig` to compile `IrExpr`.
+- [ ] Refactor `checker.zig` to use IR for invariants/properties/temporal.
+- [ ] Delete all runtime `find_definition` / `find_variable` / `find_constant` / `resolve_alias` string lookups.
+- [ ] Add assertions: every `IrExpr` is fully resolved (no dangling names).
+
+### Implementation order
+1. Define `IrExpr` and `IrDef` types.
+2. Build resolver for simple expressions (literals, idents, binary, unary).
+3. Wire evaluator to accept `IrExpr` — coexist with AST eval during migration.
+4. Resolve function applications and higher-order operators.
+5. Resolve quantifiers and CHOOSE.
+6. Resolve LET-IN and lambdas.
+7. Resolve temporal operators and box actions.
+8. Remove AST eval path entirely.
 
 ## Notes
 - Update this file after every spec/example milestone.

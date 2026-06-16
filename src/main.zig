@@ -68,9 +68,12 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     }
 
-    overrides.set_max_seq_len(max_seq_len);
-    overrides.set_nat_bound(max_nat);
-    overrides.set_int_bounds(min_int, max_int);
+    const override_ctx = overrides.OverrideContext{
+        .max_seq_len = max_seq_len,
+        .max_nat = max_nat,
+        .min_int = min_int,
+        .max_int = max_int,
+    };
 
     var arena = Arena.init(arena_bytes) catch {
         std.debug.print("failed to allocate arena\n", .{});
@@ -118,14 +121,15 @@ pub fn main(init: std.process.Init.Minimal) void {
         state_value_cap,
         state_string_cap,
         eval_arena_bytes,
+        override_ctx,
     ) catch |err| {
         std.debug.print("failed to initialize checker: {any}\n", .{err});
         std.process.exit(1);
     };
+    defer ch.deinit();
 
     const result = ch.check() catch |err| {
         std.debug.print("checking failed: {any}\n", .{err});
-        if (err == error.TypeError) std.debug.dumpCurrentStackTrace(.{});
         std.process.exit(1);
     };
 

@@ -15,12 +15,12 @@ pub const ModuleLoader = struct {
 
     pub fn load(self: ModuleLoader, path: []const u8) !ast.Module {
         const raw = try self.read_file(path);
-        const source = pluscal.translate(self.arena, raw) catch |err| blk: {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            break :blk raw;
-        };
+        const source = try self.translate_source(path, raw);
         var p = parser.Parser.init(self.arena, source);
-        var module = try p.parse_module();
+        var module = p.parse_module() catch |err| {
+            std.debug.print("Parse error in {s}: {any} at line {d} col {d}\n", .{ path, err, p.current.line, p.current.col });
+            return err;
+        };
         const dir = std.fs.path.dirname(path) orelse ".";
         var loaded = std.ArrayList([]const u8).empty;
         defer loaded.deinit(std.heap.page_allocator);
@@ -33,11 +33,24 @@ pub const ModuleLoader = struct {
     fn load_extends(self: ModuleLoader, module: *ast.Module, dir: []const u8, loaded: *std.ArrayList([]const u8)) !void {
         for (module.extends) |name| {
             if (self.already_loaded(loaded.items, name)) continue;
+            // Skip modules we can't find (e.g. TLAPS, community modules not
+            // in our search path). TLC has these built-in; we treat them as
+            // providing no additional definitions.
+            const path = self.find_module(name, dir) catch |err| {
+                if (err == error.ModuleNotFound) {
+                    try loaded.append(std.heap.page_allocator, try self.dup(name));
+                    continue;
+                }
+                return err;
+            };
             try loaded.append(std.heap.page_allocator, try self.dup(name));
-            const path = try self.find_module(name, dir);
-            const source = try self.read_file(path);
+            const raw = try self.read_file(path);
+            const source = try self.translate_source(path, raw);
             var p = parser.Parser.init(self.arena, source);
-            var child = try p.parse_module();
+            var child = p.parse_module() catch |err| {
+                std.debug.print("Parse error in EXTENDS {s} ({s}): {any}\n", .{ name, path, err });
+                return err;
+            };
             try self.load_extends(&child, std.fs.path.dirname(path) orelse ".", loaded);
             try self.merge(module, child);
         }
@@ -191,11 +204,21 @@ pub const ModuleLoader = struct {
     fn load_instances(self: ModuleLoader, module: *ast.Module, dir: []const u8, loaded: *std.ArrayList([]const u8)) !void {
         for (module.instances) |inst| {
             if (self.already_loaded(loaded.items, inst.module_name)) continue;
+            const path = self.find_module(inst.module_name, dir) catch |err| {
+                if (err == error.ModuleNotFound) {
+                    try loaded.append(std.heap.page_allocator, try self.dup(inst.module_name));
+                    continue;
+                }
+                return err;
+            };
             try loaded.append(std.heap.page_allocator, try self.dup(inst.module_name));
-            const path = try self.find_module(inst.module_name, dir);
-            const source = try self.read_file(path);
+            const raw = try self.read_file(path);
+            const source = try self.translate_source(path, raw);
             var p = parser.Parser.init(self.arena, source);
-            var child = try p.parse_module();
+            var child = p.parse_module() catch |err| {
+                std.debug.print("Parse error in INSTANCE {s} ({s}): {any}\n", .{ inst.module_name, path, err });
+                return err;
+            };
             try self.load_extends(&child, std.fs.path.dirname(path) orelse ".", loaded);
             try self.load_instances(&child, std.fs.path.dirname(path) orelse ".", loaded);
             try self.merge_instance(module, child, inst.substitutions);
@@ -271,11 +294,31 @@ pub const ModuleLoader = struct {
             };
         }
         try loaded.append(std.heap.page_allocator, try self.dup(name));
-        const path = try self.find_module(name, dir);
-        const source = try self.read_file(path);
+        const path = self.find_module(name, dir) catch |err| {
+            if (err == error.ModuleNotFound) {
+                return ast.Module{
+                    .name = try self.dup(name),
+                    .extends = &.{},
+                    .variables = &.{},
+                    .constants = &.{},
+                    .definitions = &.{},
+                    .instances = &.{},
+                    .namespace_instances = &.{},
+                    .init_name = try self.dup("Init"),
+                    .next_name = try self.dup("Next"),
+                    .invariants = &.{},
+                };
+            }
+            return err;
+        };
+        const raw = try self.read_file(path);
+        const source = try self.translate_source(path, raw);
         var p = parser.Parser.init(self.arena, source);
-        var child = try p.parse_module();
-        const child_dir = std.fs.path.dirname(path) orelse ".";
+        var child = p.parse_module() catch |err| {
+            std.debug.print("Parse error in namespace INSTANCE {s} ({s}): {any}\n", .{ name, path, err });
+            return err;
+        };
+        const child_dir = std.fs.path.dirname(path) orelse "./";
         try self.load_extends(&child, child_dir, loaded);
         try self.load_instances(&child, child_dir, loaded);
         return child;
@@ -288,6 +331,16 @@ pub const ModuleLoader = struct {
         @memcpy(result[a.len .. a.len + sep.len], sep);
         @memcpy(result[a.len + sep.len ..], b);
         return result;
+    }
+
+    fn translate_source(self: ModuleLoader, path: []const u8, raw: []const u8) ![]const u8 {
+        return pluscal.translate(self.arena, raw) catch |err| {
+            if (err != error.OutOfMemory) {
+                std.debug.print("PlusCal translation failed for {s}: {any}\n", .{ path, err });
+            }
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return raw;
+        };
     }
 
     fn read_file(self: ModuleLoader, path: []const u8) ![]u8 {
@@ -471,9 +524,12 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
         },
         .set_filter => |sf| {
             const sp = try arena.alloc_object(ast.SetFilter);
+            const vars = try arena.alloc(ast.BoundVar, sf.vars.len);
+            for (sf.vars, 0..) |v, i| {
+                vars[i] = .{ .name = try arena.dup(v.name), .domain = try copy_expr(arena, v.domain, subs) };
+            }
             sp.* = .{
-                .var_name = try arena.dup(sf.var_name),
-                .domain = try copy_expr(arena, sf.domain, subs),
+                .vars = vars,
                 .pred = try copy_expr(arena, sf.pred, subs),
             };
             const ptr = try arena.alloc_object(ast.Expr);
@@ -482,9 +538,12 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
         },
         .set_map => |sm| {
             const sp = try arena.alloc_object(ast.SetMap);
+            const vars = try arena.alloc(ast.BoundVar, sm.vars.len);
+            for (sm.vars, 0..) |v, i| {
+                vars[i] = .{ .name = try arena.dup(v.name), .domain = try copy_expr(arena, v.domain, subs) };
+            }
             sp.* = .{
-                .var_name = try arena.dup(sm.var_name),
-                .domain = try copy_expr(arena, sm.domain, subs),
+                .vars = vars,
                 .value = try copy_expr(arena, sm.value, subs),
             };
             const ptr = try arena.alloc_object(ast.Expr);
@@ -616,7 +675,7 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
         .box_action => |ba| {
             const bp = try arena.alloc_object(ast.BoxAction);
             bp.* = .{
-                .action_name = try arena.dup(ba.action_name),
+                .action = try copy_expr(arena, ba.action, subs),
                 .vars = try copy_expr(arena, ba.vars, subs),
             };
             const ptr = try arena.alloc_object(ast.Expr);

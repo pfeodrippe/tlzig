@@ -12,12 +12,192 @@ pub const ValueTag = enum(u8) {
     string_v,
     model_v,
     lambda_v,
+    // Lazy symbolic set constructors (never enumerate unless forced).
+    function_set_v,
+    record_set_v,
+    tuple_set_v,
+    union_v,
+    cup_v,
+    cap_v,
+    diff_v,
+    range_v,
 };
 
 pub const Lambda = struct {
     params: []const []const u8,
     body: *anyopaque,
     ctx: *anyopaque,
+};
+
+pub const FunctionSet = extern struct {
+    domain_offset: u32,
+    codomain_offset: u32,
+
+    pub fn domain(self: FunctionSet, pool: *const ValuePool) Value {
+        assert(self.domain_offset < pool.value_count);
+        return pool.values[self.domain_offset];
+    }
+
+    pub fn codomain(self: FunctionSet, pool: *const ValuePool) Value {
+        assert(self.codomain_offset < pool.value_count);
+        return pool.values[self.codomain_offset];
+    }
+};
+
+pub const RecordSet = extern struct {
+    offset: u32,
+    len: u32,
+
+    pub fn field_name(self: RecordSet, pool: *const ValuePool, i: u32) String {
+        assert(i < self.len);
+        const v = pool.values[self.offset + i * 2];
+        assert(v == .string_v);
+        return v.string_v;
+    }
+
+    pub fn field_domain(self: RecordSet, pool: *const ValuePool, i: u32) Value {
+        assert(i < self.len);
+        return pool.values[self.offset + i * 2 + 1];
+    }
+
+    pub fn member(self: RecordSet, pool: *const ValuePool, elem: Value) bool {
+        assert(self.offset + self.len * 2 <= pool.value_count);
+        if (elem != .record_v) return false;
+        const r = elem.record_v;
+        if (r.len != self.len) return false;
+        const rfs = r.fields(pool);
+        var i: u32 = 0;
+        while (i < self.len) : (i += 1) {
+            if (!rfs[i * 2].string_v.eql(self.field_name(pool, i), pool)) return false;
+            const val = rfs[i * 2 + 1];
+            if (!self.field_domain(pool, i).member(pool, val)) return false;
+        }
+        return true;
+    }
+
+    pub fn eql(self: RecordSet, other: RecordSet, pool: *const ValuePool) bool {
+        assert(self.offset + self.len * 2 <= pool.value_count);
+        assert(other.offset + other.len * 2 <= pool.value_count);
+        if (self.len != other.len) return false;
+        var i: u32 = 0;
+        while (i < self.len) : (i += 1) {
+            if (!self.field_name(pool, i).eql(other.field_name(pool, i), pool)) return false;
+            if (!self.field_domain(pool, i).eql(other.field_domain(pool, i), pool)) return false;
+        }
+        return true;
+    }
+
+    pub fn clone(self: RecordSet, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!RecordSet {
+        assert(self.offset + self.len * 2 <= source.value_count);
+        assert(target.value_count + self.len * 2 <= target.value_cap);
+        const dest = try target.alloc_values(self.len * 2);
+        var i: u32 = 0;
+        while (i < self.len) : (i += 1) {
+            const name = try self.field_name(source, i).clone(source, target);
+            const dom = try self.field_domain(source, i).clone(source, target);
+            dest[i * 2] = Value{ .string_v = name };
+            dest[i * 2 + 1] = dom;
+        }
+        const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
+        return RecordSet{ .offset = offset, .len = self.len };
+    }
+};
+
+pub const TupleSet = extern struct {
+    offset: u32,
+    len: u32,
+
+    pub fn sets(self: TupleSet, pool: *const ValuePool) []const Value {
+        assert(self.offset + self.len <= pool.value_count);
+        return pool.values[self.offset..][0..self.len];
+    }
+
+    pub fn member(self: TupleSet, pool: *const ValuePool, elem: Value) bool {
+        assert(self.offset + self.len <= pool.value_count);
+        if (elem == .tuple_v) {
+            const t = elem.tuple_v;
+            if (t.len != self.len) return false;
+            const items = t.items(pool);
+            const ss = self.sets(pool);
+            for (items, ss) |it, s| {
+                if (!s.member(pool, it)) return false;
+            }
+            return true;
+        }
+        // Tuples are functions with domain 1..n; accept function form too.
+        if (elem != .function_v) return false;
+        const f = elem.function_v;
+        if (f.len != self.len) return false;
+        const ss = self.sets(pool);
+        var i: i64 = 1;
+        while (i <= self.len) : (i += 1) {
+            const v = f.apply(pool, Value{ .int_v = i }) orelse return false;
+            if (!ss[@intCast(i - 1)].member(pool, v)) return false;
+        }
+        return true;
+    }
+
+    pub fn eql(self: TupleSet, other: TupleSet, pool: *const ValuePool) bool {
+        assert(self.offset + self.len <= pool.value_count);
+        assert(other.offset + other.len <= pool.value_count);
+        if (self.len != other.len) return false;
+        const a = self.sets(pool);
+        const b = other.sets(pool);
+        for (a, b) |x, y| {
+            if (!x.eql(y, pool)) return false;
+        }
+        return true;
+    }
+
+    pub fn clone(self: TupleSet, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!TupleSet {
+        assert(self.offset + self.len <= source.value_count);
+        assert(target.value_count + self.len <= target.value_cap);
+        const src = self.sets(source);
+        const dest = try target.alloc_values(self.len);
+        for (src, 0..) |v, i| {
+            dest[i] = try v.clone(source, target);
+        }
+        const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
+        return TupleSet{ .offset = offset, .len = self.len };
+    }
+};
+
+pub const UnionSet = extern struct {
+    set_offset: u32,
+
+    pub fn set(self: UnionSet, pool: *const ValuePool) Value {
+        assert(self.set_offset < pool.value_count);
+        return pool.values[self.set_offset];
+    }
+};
+
+pub const BinarySet = extern struct {
+    left_offset: u32,
+    right_offset: u32,
+
+    pub fn left(self: BinarySet, pool: *const ValuePool) Value {
+        assert(self.left_offset < pool.value_count);
+        return pool.values[self.left_offset];
+    }
+
+    pub fn right(self: BinarySet, pool: *const ValuePool) Value {
+        assert(self.right_offset < pool.value_count);
+        return pool.values[self.right_offset];
+    }
+};
+
+pub const Range = extern struct {
+    lo: i64,
+    hi: i64,
+
+    pub fn member(self: Range, elem: Value) bool {
+        const i = elem.as_int() orelse return false;
+        return i >= self.lo and i <= self.hi;
+    }
+
+    pub fn eql(self: Range, other: Range) bool {
+        return self.lo == other.lo and self.hi == other.hi;
+    }
 };
 
 pub const Value = union(ValueTag) {
@@ -30,6 +210,14 @@ pub const Value = union(ValueTag) {
     string_v: String,
     model_v: u32,
     lambda_v: *Lambda,
+    function_set_v: FunctionSet,
+    record_set_v: RecordSet,
+    tuple_set_v: TupleSet,
+    union_v: UnionSet,
+    cup_v: BinarySet,
+    cap_v: BinarySet,
+    diff_v: BinarySet,
+    range_v: Range,
 
     pub fn is_truthy(self: Value) bool {
         return switch (self) {
@@ -56,20 +244,55 @@ pub const Value = union(ValueTag) {
         return std.meta.activeTag(self);
     }
 
+    pub fn is_set_like(self: Value) bool {
+        return switch (self) {
+            .set_v,
+            .function_set_v,
+            .record_set_v,
+            .tuple_set_v,
+            .union_v,
+            .cup_v,
+            .cap_v,
+            .diff_v,
+            .range_v,
+            => true,
+            else => false,
+        };
+    }
+
     pub fn eql(a: Value, b: Value, pool: *const ValuePool) bool {
         assert(pool.value_count <= pool.value_cap);
         assert(pool.string_count <= pool.string_cap);
-        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        const tag_a = std.meta.activeTag(a);
+        const tag_b = std.meta.activeTag(b);
+        const tags_equal = tag_a == tag_b;
         return switch (a) {
-            .bool_v => |ba| ba == b.bool_v,
-            .int_v => |ia| ia == b.int_v,
-            .model_v => |ma| ma == b.model_v,
-            .set_v => |sa| sa.eql(b.set_v, pool),
-            .function_v => |fa| fa.eql(b.function_v, pool),
-            .tuple_v => |ta| ta.eql(b.tuple_v, pool),
-            .record_v => |ra| ra.eql(b.record_v, pool),
-            .string_v => |sa| sa.eql(b.string_v, pool),
-            .lambda_v => return false,
+            .set_v => |sa| blk: {
+                if (!tags_equal and b == .range_v) break :blk range_equals_set(b.range_v, sa, pool);
+                if (!tags_equal) break :blk false;
+                break :blk sa.eql(b.set_v, pool);
+            },
+            .range_v => |ra| blk: {
+                if (!tags_equal and b == .set_v) break :blk range_equals_set(ra, b.set_v, pool);
+                if (!tags_equal) break :blk false;
+                break :blk ra.eql(b.range_v);
+            },
+            .bool_v => |ba| tags_equal and ba == b.bool_v,
+            .int_v => |ia| tags_equal and ia == b.int_v,
+            .model_v => |ma| tags_equal and ma == b.model_v,
+            .function_v => |fa| tags_equal and fa.eql(b.function_v, pool),
+            .tuple_v => |ta| tags_equal and ta.eql(b.tuple_v, pool),
+            .record_v => |ra| tags_equal and ra.eql(b.record_v, pool),
+            .string_v => |sa| tags_equal and sa.eql(b.string_v, pool),
+            .lambda_v => false,
+            .function_set_v => tags_equal and a.function_set_v.domain(pool).eql(b.function_set_v.domain(pool), pool) and
+                a.function_set_v.codomain(pool).eql(b.function_set_v.codomain(pool), pool),
+            .record_set_v => tags_equal and a.record_set_v.eql(b.record_set_v, pool),
+            .tuple_set_v => tags_equal and a.tuple_set_v.eql(b.tuple_set_v, pool),
+            .union_v => tags_equal and a.union_v.set(pool).eql(b.union_v.set(pool), pool),
+            .cup_v => tags_equal and a.cup_v.left(pool).eql(b.cup_v.left(pool), pool) and a.cup_v.right(pool).eql(b.cup_v.right(pool), pool),
+            .cap_v => tags_equal and a.cap_v.left(pool).eql(b.cap_v.left(pool), pool) and a.cap_v.right(pool).eql(b.cap_v.right(pool), pool),
+            .diff_v => tags_equal and a.diff_v.left(pool).eql(b.diff_v.left(pool), pool) and a.diff_v.right(pool).eql(b.diff_v.right(pool), pool),
         };
     }
 
@@ -104,9 +327,109 @@ pub const Value = union(ValueTag) {
             .tuple_v => |t| Value{ .tuple_v = try t.clone(source, target) },
             .record_v => |r| Value{ .record_v = try r.clone(source, target) },
             .lambda_v => return error.NotImplemented,
+            .function_set_v => |fs| Value{
+                .function_set_v = .{
+                    .domain_offset = try target.push_value(try fs.domain(source).clone(source, target)),
+                    .codomain_offset = try target.push_value(try fs.codomain(source).clone(source, target)),
+                },
+            },
+            .record_set_v => |rs| Value{ .record_set_v = try rs.clone(source, target) },
+            .tuple_set_v => |ts| Value{ .tuple_set_v = try ts.clone(source, target) },
+            .union_v => |u| Value{ .union_v = .{ .set_offset = try target.push_value(try u.set(source).clone(source, target)) } },
+            .cup_v => |bs| Value{
+                .cup_v = .{
+                    .left_offset = try target.push_value(try bs.left(source).clone(source, target)),
+                    .right_offset = try target.push_value(try bs.right(source).clone(source, target)),
+                },
+            },
+            .cap_v => |bs| Value{
+                .cap_v = .{
+                    .left_offset = try target.push_value(try bs.left(source).clone(source, target)),
+                    .right_offset = try target.push_value(try bs.right(source).clone(source, target)),
+                },
+            },
+            .diff_v => |bs| Value{
+                .diff_v = .{
+                    .left_offset = try target.push_value(try bs.left(source).clone(source, target)),
+                    .right_offset = try target.push_value(try bs.right(source).clone(source, target)),
+                },
+            },
+            .range_v => |r| Value{ .range_v = r },
+        };
+    }
+
+    /// Check if `elem` is a member of this set-like value without materializing
+    /// the set.  This mirrors TLC's symbolic membership tests.
+    pub fn member(self: Value, pool: *const ValuePool, elem: Value) bool {
+        return switch (self) {
+            .set_v => |s| s.contains(pool, elem),
+            .function_set_v => |fs| function_set_member(pool, fs, elem),
+            .record_set_v => |rs| rs.member(pool, elem),
+            .tuple_set_v => |ts| ts.member(pool, elem),
+            .union_v => |u| union_member(pool, u.set(pool), elem),
+            .cup_v => |bs| bs.left(pool).member(pool, elem) or bs.right(pool).member(pool, elem),
+            .cap_v => |bs| bs.left(pool).member(pool, elem) and bs.right(pool).member(pool, elem),
+            .diff_v => |bs| bs.left(pool).member(pool, elem) and !bs.right(pool).member(pool, elem),
+            .range_v => |r| r.member(elem),
+            else => {
+                assert(false); // member called on non-set value
+                return false;
+            },
         };
     }
 };
+
+fn range_equals_set(r: Range, s: Set, pool: *const ValuePool) bool {
+    const items = s.items(pool);
+    if (items.len != @as(u64, @intCast(r.hi - r.lo + 1))) return false;
+    for (items, 0..) |it, i| {
+        const expected = r.lo + @as(i64, @intCast(i));
+        if (it.as_int() != expected) return false;
+    }
+    return true;
+}
+
+fn function_set_member(pool: *const ValuePool, fs: FunctionSet, elem: Value) bool {
+    if (elem != .function_v) return false;
+    const f = elem.function_v;
+    const domain = fs.domain(pool);
+    const codomain = fs.codomain(pool);
+    if (!domain_matches_function_domain(domain, f, pool)) return false;
+    const keys = f.domain.items(pool);
+    for (keys) |k| {
+        const v = f.apply(pool, k) orelse return false;
+        if (!codomain.member(pool, v)) return false;
+    }
+    return true;
+}
+
+fn domain_matches_function_domain(domain: Value, f: Function, pool: *const ValuePool) bool {
+    switch (domain) {
+        .set_v => return f.domain.eql(domain.set_v, pool),
+        .range_v => |r| {
+            const keys = f.domain.items(pool);
+            if (keys.len != @as(u64, @intCast(r.hi - r.lo + 1))) return false;
+            for (keys, 0..) |k, i| {
+                const expected = r.lo + @as(i64, @intCast(i));
+                if (k.as_int() != expected) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn union_member(pool: *const ValuePool, set: Value, elem: Value) bool {
+    if (set != .set_v) {
+        assert(false); // UNION operand must be an enumerated set of sets
+        return false;
+    }
+    const items = set.set_v.items(pool);
+    for (items) |it| {
+        if (it.member(pool, elem)) return true;
+    }
+    return false;
+}
 
 pub const Set = extern struct {
     offset: u32,
@@ -328,6 +651,7 @@ pub const String = extern struct {
     }
 };
 
+
 pub const ModelTable = struct {
     arena: *Arena,
     names: [][]const u8,
@@ -405,6 +729,16 @@ pub const ValuePool = struct {
         self.value_count += 1;
         assert(self.value_count <= self.value_cap);
         return idx;
+    }
+
+    pub fn push_values(self: *ValuePool, vs: []const Value) !u32 {
+        assert(self.value_count <= self.value_cap);
+        if (self.value_count + vs.len > self.value_cap) return error.OutOfMemory;
+        const start = self.value_count;
+        @memcpy(self.values[start..][0..vs.len], vs);
+        self.value_count += @intCast(vs.len);
+        assert(self.value_count <= self.value_cap);
+        return start;
     }
 
     pub fn alloc_values(self: *ValuePool, count: u32) ![]Value {

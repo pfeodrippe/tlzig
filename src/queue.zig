@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Arena = @import("arena.zig").Arena;
 
 pub const StateQueue = struct {
@@ -19,26 +20,39 @@ pub const StateQueue = struct {
     }
 
     pub fn enqueue(self: *StateQueue, state_idx: u32) bool {
+        assert(self.cap > 0);
+        assert(self.count <= self.cap);
+        assert(self.head < self.cap);
+        assert(self.tail < self.cap);
         if (self.count >= self.cap) return false;
         self.buffer[self.tail] = state_idx;
         self.tail = (self.tail + 1) % self.cap;
         self.count += 1;
+        assert(self.count <= self.cap);
         return true;
     }
 
     pub fn dequeue(self: *StateQueue) ?u32 {
+        assert(self.cap > 0);
+        assert(self.count <= self.cap);
+        assert(self.head < self.cap);
+        assert(self.tail < self.cap);
         if (self.count == 0) return null;
         const idx = self.buffer[self.head];
         self.head = (self.head + 1) % self.cap;
         self.count -= 1;
+        assert(idx < self.cap);
+        assert(self.count <= self.cap);
         return idx;
     }
 
     pub fn is_empty(self: StateQueue) bool {
+        assert(self.count <= self.cap);
         return self.count == 0;
     }
 
     pub fn len(self: StateQueue) u32 {
+        assert(self.count <= self.cap);
         return self.count;
     }
 };

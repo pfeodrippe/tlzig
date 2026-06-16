@@ -33,6 +33,9 @@ pub const Definition = struct {
     name: []const u8,
     params: []const []const u8,
     body: *Expr,
+    is_function: bool = false,
+    function_var: []const u8 = "",
+    function_domain: ?*Expr = null,
 };
 
 pub const Expr = union(ExprTag) {
@@ -124,6 +127,7 @@ pub const BinaryOp = enum(u8) {
     concat,
     ooverride,
     recordto,
+    leads_to,
 };
 
 pub const UnaryOp = enum(u8) {
@@ -134,6 +138,7 @@ pub const UnaryOp = enum(u8) {
     domain,
     temporal_box,
     temporal_diamond,
+    enabled,
 };
 
 pub const Binary = struct {
@@ -188,14 +193,12 @@ pub const FieldInit = struct {
 };
 
 pub const SetFilter = struct {
-    var_name: []const u8,
-    domain: *Expr,
+    vars: []const BoundVar,
     pred: *Expr,
 };
 
 pub const SetMap = struct {
-    var_name: []const u8,
-    domain: *Expr,
+    vars: []const BoundVar,
     value: *Expr,
 };
 
@@ -253,7 +256,7 @@ pub const CaseExpr = struct {
 };
 
 pub const BoxAction = struct {
-    action_name: []const u8,
+    action: *Expr,
     vars: *Expr,
 };
 

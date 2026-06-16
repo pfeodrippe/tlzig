@@ -400,6 +400,23 @@ pub const ActionCompiler = struct {
         return self.is_action_expr_inner(expr);
     }
 
+    fn is_init_action(self: ActionCompiler, expr: *ast.Expr) bool {
+        switch (expr.*) {
+            .binary => |b| {
+                if (b.op == .eq and b.left.* == .ident) {
+                    const name = b.left.ident;
+                    if (self.evaluator.find_variable(name) != null) return true;
+                }
+                if (b.op == .in and b.left.* == .ident) {
+                    const name = b.left.ident;
+                    if (self.evaluator.find_variable(name) != null) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
     fn is_action_expr_inner(self: ActionCompiler, expr: *ast.Expr) bool {
         switch (expr.*) {
             .primed, .unchanged => return true,
@@ -409,7 +426,8 @@ pub const ActionCompiler = struct {
             },
             .binary => |b| {
                 if (b.op == .or_op) return self.is_action_expr(b.left) and self.is_action_expr(b.right);
-                return self.is_action_expr(b.left) or self.is_action_expr(b.right);
+                if (b.op == .and_op) return self.is_action_expr(b.left) or self.is_action_expr(b.right);
+                return self.is_action_expr(b.left) or self.is_action_expr(b.right) or self.is_init_action(expr);
             },
             .let_in => |l| return self.is_action_expr_inner(l.body),
             .if_then_else => |ite| return self.is_action_expr(ite.then_branch) or self.is_action_expr(ite.else_branch),
@@ -575,6 +593,8 @@ pub const ActionExecutor = struct {
         compiled: CompiledInit,
         out_states: *std.ArrayList(u32),
     ) !void {
+        assert(compiled.steps.len >= 0);
+        assert(out_states.items.len == 0);
         try self.execute_steps(compiled.steps, Context.empty(), null, out_states, true);
     }
 

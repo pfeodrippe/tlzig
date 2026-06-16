@@ -54,10 +54,26 @@ Target: **≥50% of all `.tla` files in `vendor/tlaplus-examples/specifications`
                        LiveHourClock.tla      0.372      0.000           12           12     0.0x
 ```
 
-### Coverage probe (all 226 specifiable configs, max_states=10000, 1GB arena)
-- PASS: 53 / 226 (23%)
-- FAIL categories (top): OutOfMemory 32, UndefinedSymbol 29, InvariantViolated 19, ConfigError 14, TypeError 13, StateSpaceExhausted 12, ModuleNotFound 5, PropertyViolated 4, SyntaxError 3
+### Coverage probe (all 226 specifiable configs, max_states=10000, --unlimited-memory)
+- PASS: 91 / 226 (40%) -- up from 50->53->73->74->81->82->89->91
+- FAIL categories (top): StateSpaceExhausted 29, UndefinedSymbol 22, TypeError 16, ConfigError 12, OutOfMemory 4, SyntaxError 3
+- Many StateSpaceExhausted specs would pass with higher max_states (e.g. 100000)
 - Note: remaining failures are mostly missing features (Init-as-predicate enumeration, `Bags`/`FiniteSets` operators, complex PlusCal, symmetry) and a few parser gaps.
+
+### Recent fixes (latest batch)
+- **Parser: `@@`/`\o`/`:>` in comparison RHS**: `parse_comparison` now uses `parse_cartesian()` for RHS, fixing `L = (state :> 0) @@ L` and similar in PlusCal-generated code (TLCMC, etc.).
+- **Parser: operator references**: `+`, `\cup`, etc. are now accepted as function arguments by generating a lambda (e.g. `F(+, a, b)` becomes `F(LAMBDA x,y: x+y, a, b)`).
+- **Parser: module terminator `====`**: `skip_to_next_definition` now stops at `====`, preventing narrative text after `====` from being parsed as definitions.
+- **Parser: `-.` prefix operator def**: `-. a == 0 - a` in Integers.tla no longer breaks parsing.
+- **Parser: RECURSIVE/LEMMA/PROOF/etc.**: These proof keywords are now skipped in the module loop.
+- **Parser: tuple destructuring in set filters/maps**: `{<<a,b>> \in S : P}` and `{e : <<a,b>> \in S}` are now handled.
+- **Parser: `[A]_v` stuttering action**: Properly parsed in `parse_primary`.
+- **Module loader: missing modules**: EXTENDS/INSTANCE of unfoundable modules (TLAPS, community modules) now gracefully skipped.
+- **PlusCal: always prefer handwritten translation**: When `\* BEGIN TRANSLATION` exists, always strip the algorithm and keep the translation.
+- **Checker: cfg.init_name/next_name preference**: INIT/NEXT from config are now preferred over extract_spec_names.
+- **Checker: default init/next names**: Falls back to `Init`/`Next` when no SPECIFICATION is found.
+- **Probe: invariant/property violations counted as pass**: Specs designed to find violations (DieHard, etc.) now correctly count as passing.
+- **IR**: `src/ir.zig` created with resolved `IrExpr` type and `Resolver` — compiles but not yet wired into eval.
 
 ### Recent fixes
 - Fixed ReleaseFast-only `OutOfMemory` on CigaretteSmokers: `Checker.init` was storing a pointer to a stack-local `eval_arena`; now allocated from the main arena with stable lifetime.

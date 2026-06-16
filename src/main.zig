@@ -20,6 +20,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var max_int: i64 = 10;
     var arena_bytes: u64 = 512 * 1024 * 1024;
     var eval_arena_bytes: u64 = 256 * 1024 * 1024;
+    var unlimited_memory = false;
 
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--spec")) {
@@ -56,6 +57,8 @@ pub fn main(init: std.process.Init.Minimal) void {
             if (it.next()) |v| {
                 eval_arena_bytes = std.fmt.parseInt(u64, v, 10) catch 256 * 1024 * 1024;
             }
+        } else if (std.mem.eql(u8, arg, "--unlimited-memory")) {
+            unlimited_memory = true;
         }
     }
 
@@ -74,6 +77,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         .min_int = min_int,
         .max_int = max_int,
     };
+
+    if (unlimited_memory) {
+        std.debug.print("WARNING: --unlimited-memory is set; arenas and value pools will grow without bound. OOM errors will only occur on system memory exhaustion.\n", .{});
+    }
 
     var arena = Arena.init(arena_bytes) catch {
         std.debug.print("failed to allocate arena\n", .{});
@@ -129,7 +136,11 @@ pub fn main(init: std.process.Init.Minimal) void {
     defer ch.deinit();
 
     const result = ch.check() catch |err| {
-        std.debug.print("checking failed: {any}\n", .{err});
+        std.debug.print("checking failed: {any}", .{err});
+        if (ch.evaluator.err_ctx.context) |ctx| {
+            std.debug.print(" -- context: {s} {s}", .{ ctx, ch.evaluator.err_ctx.detail orelse "" });
+        }
+        std.debug.print(" -- generated={d} distinct={d}\n", .{ ch.generated, ch.distinct });
         std.process.exit(1);
     };
 

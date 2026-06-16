@@ -326,6 +326,16 @@ pub const Lexer = struct {
             '"' => return self.read_string(start_line, start_col),
             '0'...'9' => return self.read_number(start_line, start_col),
             '_' => {
+                // If _ is followed by an ident char AND the preceding character
+                // is not a closing bracket (like ] or >), it's part of an
+                // identifier (e.g. _msgs).  But [A]_v subscripts need _ to be
+                // a standalone underscore after ].
+                if (self.pos + 1 < self.source.len and self.is_ident_char(self.source[self.pos + 1]) and self.pos > 0) {
+                    const prev = self.source[self.pos - 1];
+                    if (prev != ']' and prev != '>' and prev != ')' and !self.is_ident_char(prev)) {
+                        return self.read_ident_or_keyword(start_line, start_col);
+                    }
+                }
                 self.advance();
                 return self.mk(.underscore, "_", start_line, start_col);
             },
@@ -1255,7 +1265,8 @@ pub const Parser = struct {
             self.advance(); // first colon
             if (self.current.kind == .colon) {
                 self.advance(); // second colon
-                return try self.parse_unary();
+                // Use parse_expr to handle bulleted lists after labels.
+                return try self.parse_expr();
             }
             self.* = saved;
         }
@@ -1477,9 +1488,10 @@ pub const Parser = struct {
             try names.append(std.heap.page_allocator, try self.dup(name));
             if (!self.match(.comma)) break;
         }
-        try self.expect(.rangle);
+        if (self.current.kind != .rangle) return error.SyntaxError;
+        self.advance(); // >>
         self.group_depth -= 1;
-        try self.expect(.in);
+        if (self.current.kind != .in) return error.SyntaxError;
         const domain = try self.parse_expr();
         try self.expect(.colon);
         const pred = try self.parse_expr();
@@ -1647,23 +1659,31 @@ pub const Parser = struct {
             return try self.expr_record_set(fields);
         }
         if (self.current.kind == .ident and self.next.kind == .in) {
-            var names = std.ArrayList([]const u8).empty;
-            defer names.deinit(std.heap.page_allocator);
+            var vars = std.ArrayList(ast.BoundVar).empty;
+            defer vars.deinit(std.heap.page_allocator);
             while (true) {
-                const name = try self.expect_ident_text();
-                try names.append(std.heap.page_allocator, try self.dup(name));
+                // Read one or more names sharing a domain: n, m \in S
+                var names = std.ArrayList([]const u8).empty;
+                defer names.deinit(std.heap.page_allocator);
+                while (true) {
+                    const name = try self.expect_ident_text();
+                    try names.append(std.heap.page_allocator, try self.dup(name));
+                    if (!self.match(.comma)) break;
+                    // Peek: if next after comma is \in, the comma separates
+                    // names with same domain. If next is ident+\in, it's a
+                    // new variable group.
+                    if (self.next.kind == .in) continue;
+                }
+                try self.expect(.in);
+                const domain = try self.parse_expr();
+                for (names.items) |name| {
+                    try vars.append(std.heap.page_allocator, .{ .name = name, .domain = domain });
+                }
                 if (!self.match(.comma)) break;
             }
-            try self.expect(.in);
-            const domain = try self.parse_expr();
             try self.expect(.mapsto);
             const body = try self.parse_expr();
             try self.expect(.rbracket);
-            var vars = std.ArrayList(ast.BoundVar).empty;
-            defer vars.deinit(std.heap.page_allocator);
-            for (names.items) |name| {
-                try vars.append(std.heap.page_allocator, .{ .name = name, .domain = domain });
-            }
             return try self.expr_function_literal(vars.items, body);
         }
         const func = try self.parse_expr();
@@ -1701,9 +1721,23 @@ pub const Parser = struct {
                 const field = try self.expect_ident_text();
                 try steps.append(std.heap.page_allocator, ast.AccessStep{ .field = try self.dup(field) });
             } else if (self.match(.lbracket)) {
-                const idx = try self.parse_expr();
-                try self.expect(.rbracket);
-                try steps.append(std.heap.page_allocator, ast.AccessStep{ .index = idx });
+                // Handle tuple indices: ![a, b] means access at <<a, b>>.
+                const first = try self.parse_expr();
+                if (self.match(.comma)) {
+                    var tuple_items = std.ArrayList(*ast.Expr).empty;
+                    defer tuple_items.deinit(std.heap.page_allocator);
+                    try tuple_items.append(std.heap.page_allocator, first);
+                    while (true) {
+                        try tuple_items.append(std.heap.page_allocator, try self.parse_expr());
+                        if (!self.match(.comma)) break;
+                    }
+                    try self.expect(.rbracket);
+                    const tup = try self.expr_tuple(try self.dup_slice(*ast.Expr, tuple_items.items));
+                    try steps.append(std.heap.page_allocator, ast.AccessStep{ .index = tup });
+                } else {
+                    try self.expect(.rbracket);
+                    try steps.append(std.heap.page_allocator, ast.AccessStep{ .index = first });
+                }
             } else {
                 return error.SyntaxError;
             }

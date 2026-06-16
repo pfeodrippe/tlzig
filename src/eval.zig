@@ -57,6 +57,11 @@ pub const EvalLambda = struct {
     ctx: Context,
 };
 
+pub const ErrorContext = struct {
+    context: ?[]const u8 = null,
+    detail: ?[]const u8 = null,
+};
+
 pub const Evaluator = struct {
     module: ast.Module,
     constants: []const Constant,
@@ -65,10 +70,14 @@ pub const Evaluator = struct {
     override_registry: overrides.Registry,
     treat_unknown_as_model: bool,
     next_state: ?*state.StateStore.State,
+    /// Error context stored via pointer so all by-value copies share state.
+    err_ctx: *ErrorContext,
 
     pub fn init(module: ast.Module, arena: *Arena, override_ctx: overrides.OverrideContext) !Evaluator {
         const models = try arena.alloc_object(ModelTable);
         models.* = try ModelTable.init(arena, 1024);
+        const err_ctx = try arena.alloc_object(ErrorContext);
+        err_ctx.* = .{};
         return Evaluator{
             .module = module,
             .constants = &[_]Constant{},
@@ -77,6 +86,7 @@ pub const Evaluator = struct {
             .override_registry = overrides.default_registry(override_ctx),
             .treat_unknown_as_model = false,
             .next_state = null,
+            .err_ctx = err_ctx,
         };
     }
 
@@ -94,6 +104,14 @@ pub const Evaluator = struct {
 
     pub fn set_aliases(self: *Evaluator, aliases: []const Alias) void {
         self.aliases = aliases;
+    }
+
+    /// Record error context and return the error. Always use this in hot paths
+    /// so the top-level handler can print what went wrong.
+    pub fn fail(self: Evaluator, err: Error, context: []const u8, detail: []const u8) Error {
+        self.err_ctx.context = context;
+        self.err_ctx.detail = detail;
+        return err;
     }
 
     pub fn resolve_alias(self: Evaluator, name: []const u8) []const u8 {
@@ -137,6 +155,18 @@ pub const Evaluator = struct {
                 if (self.override_registry.find_value(aliased)) |func| {
                     return try func(self.override_registry.ctx, eval_pool);
                 }
+                // Built-in constant sets.
+                if (std.mem.eql(u8, aliased, "BOOLEAN")) {
+                    const dest = try eval_pool.alloc_values(2);
+                    dest[0] = Value{ .bool_v = false };
+                    dest[1] = Value{ .bool_v = true };
+                    return Value{ .set_v = make_set(eval_pool, dest) };
+                }
+                if (std.mem.eql(u8, aliased, "STRING")) {
+                    // STRING (set of all strings) — represented as a model value
+                    // that can be checked for membership.
+                    return Value{ .string_v = try eval_pool.push_string("__STRING_SET__") };
+                }
                 if (self.find_definition(aliased)) |def| {
                     if (def.params.len != 0) return Error.TypeError;
                     return try self.eval_expr(def.body, ctx, s0, eval_pool, state_pool);
@@ -145,8 +175,7 @@ pub const Evaluator = struct {
                     const id = try self.models.intern(name);
                     return Value{ .model_v = id };
                 }
-                std.debug.print("UndefinedSymbol(ident): {s}\n", .{name});
-                return Error.UndefinedSymbol;
+                return self.fail(Error.UndefinedSymbol, "ident", name);
             },
             .primed => |name| {
                 if (ctx.lookup(name)) |v| return v;
@@ -171,8 +200,7 @@ pub const Evaluator = struct {
                     if (def.params.len != 0) return Error.TypeError;
                     return try self.eval_expr(def.body, ctx, ns orelse s0, eval_pool, state_pool);
                 }
-                std.debug.print("UndefinedSymbol(primed): {s}\n", .{name});
-                return Error.UndefinedSymbol;
+                return self.fail(Error.UndefinedSymbol, "primed", name);
             },
             .binary => |b| return try self.eval_binary(b, ctx, s0, eval_pool, state_pool),
             .unary => |u| {
@@ -279,6 +307,17 @@ pub const Evaluator = struct {
                 return Value{ .bool_v = left.is_truthy() == right.is_truthy() };
             },
             .in => {
+                // Lazy SUBSET membership: x \in SUBSET S ⟺ x ⊆ S.
+                if (b.right.* == .unary and b.right.unary.op == .subset) {
+                    const inner = b.right.unary.operand;
+                    const s = try self.eval_expr(inner, ctx, s0, eval_pool, state_pool);
+                    if (!s.is_set_like()) return self.fail(Error.TypeError, "\\in SUBSET", "rhs not set");
+                    if (!left.is_set_like()) return Value{ .bool_v = false };
+                    const lmat = try self.materialize_set(left, ctx, s0, eval_pool, state_pool);
+                    const smat = try self.materialize_set(s, ctx, s0, eval_pool, state_pool);
+                    if (lmat != .set_v or smat != .set_v) return self.fail(Error.TypeError, "\\in SUBSET", "materialize failed");
+                    return Value{ .bool_v = lmat.set_v.is_subset(eval_pool, smat.set_v) };
+                }
                 if (try eval_symbolic_set(self, b.right, ctx, s0, eval_pool, state_pool)) |right| {
                     assert(right.is_set_like());
                     return Value{ .bool_v = right.member(eval_pool, left) };
@@ -293,7 +332,7 @@ pub const Evaluator = struct {
                     return Value{ .bool_v = !right.member(eval_pool, left) };
                 }
                 const right = try self.eval_expr(b.right, ctx, s0, eval_pool, state_pool);
-                if (!right.is_set_like()) return Error.TypeError;
+                if (!right.is_set_like()) return self.fail(Error.TypeError, "\\notin: rhs not a set", @tagName(right));
                 return Value{ .bool_v = !right.member(eval_pool, left) };
             },
             else => {},
@@ -302,33 +341,33 @@ pub const Evaluator = struct {
         return switch (b.op) {
             .eq => Value{ .bool_v = left.eql(right, eval_pool) },
             .ne => Value{ .bool_v = !left.eql(right, eval_pool) },
-            .lt => Value{ .bool_v = (left.as_int() orelse return Error.TypeError) < (right.as_int() orelse return Error.TypeError) },
-            .le => Value{ .bool_v = (left.as_int() orelse return Error.TypeError) <= (right.as_int() orelse return Error.TypeError) },
-            .gt => Value{ .bool_v = (left.as_int() orelse return Error.TypeError) > (right.as_int() orelse return Error.TypeError) },
-            .ge => Value{ .bool_v = (left.as_int() orelse return Error.TypeError) >= (right.as_int() orelse return Error.TypeError) },
+            .lt => Value{ .bool_v = (left.as_int() orelse return self.fail(Error.TypeError, "<", @tagName(left))) < (right.as_int() orelse return self.fail(Error.TypeError, "<", @tagName(right))) },
+            .le => Value{ .bool_v = (left.as_int() orelse return self.fail(Error.TypeError, "<=", @tagName(left))) <= (right.as_int() orelse return self.fail(Error.TypeError, "<=", @tagName(right))) },
+            .gt => Value{ .bool_v = (left.as_int() orelse return self.fail(Error.TypeError, ">", @tagName(left))) > (right.as_int() orelse return self.fail(Error.TypeError, ">", @tagName(right))) },
+            .ge => Value{ .bool_v = (left.as_int() orelse return self.fail(Error.TypeError, ">=", @tagName(left))) >= (right.as_int() orelse return self.fail(Error.TypeError, ">=", @tagName(right))) },
             .subseteq => {
-                if (!left.is_set_like() or !right.is_set_like()) return Error.TypeError;
+                if (!left.is_set_like() or !right.is_set_like()) return self.fail(Error.TypeError, "\\subseteq", "non-set operand");
                 const lmat = try self.materialize_set(left, ctx, s0, eval_pool, state_pool);
                 const rmat = try self.materialize_set(right, ctx, s0, eval_pool, state_pool);
-                if (lmat != .set_v or rmat != .set_v) return Error.TypeError;
+                if (lmat != .set_v or rmat != .set_v) return self.fail(Error.TypeError, "\\subseteq", "materialize failed");
                 return Value{ .bool_v = lmat.set_v.is_subset(eval_pool, rmat.set_v) };
             },
-            .plus => Value{ .int_v = (left.as_int() orelse return Error.TypeError) + (right.as_int() orelse return Error.TypeError) },
-            .minus => Value{ .int_v = (left.as_int() orelse return Error.TypeError) - (right.as_int() orelse return Error.TypeError) },
-            .times => Value{ .int_v = (left.as_int() orelse return Error.TypeError) * (right.as_int() orelse return Error.TypeError) },
+            .plus => Value{ .int_v = (left.as_int() orelse return self.fail(Error.TypeError, "+", @tagName(left))) + (right.as_int() orelse return self.fail(Error.TypeError, "+", @tagName(right))) },
+            .minus => Value{ .int_v = (left.as_int() orelse return self.fail(Error.TypeError, "-", @tagName(left))) - (right.as_int() orelse return self.fail(Error.TypeError, "-", @tagName(right))) },
+            .times => Value{ .int_v = (left.as_int() orelse return self.fail(Error.TypeError, "*", @tagName(left))) * (right.as_int() orelse return self.fail(Error.TypeError, "*", @tagName(right))) },
             .div => {
-                const denom = right.as_int() orelse return Error.TypeError;
+                const denom = right.as_int() orelse return self.fail(Error.TypeError, "\\div", @tagName(right));
                 if (denom == 0) return Error.DivisionByZero;
-                return Value{ .int_v = @divTrunc(left.as_int() orelse return Error.TypeError, denom) };
+                return Value{ .int_v = @divTrunc(left.as_int() orelse return self.fail(Error.TypeError, "\\div", @tagName(left)), denom) };
             },
             .mod => {
-                const denom = right.as_int() orelse return Error.TypeError;
+                const denom = right.as_int() orelse return self.fail(Error.TypeError, "%", @tagName(right));
                 if (denom == 0) return Error.DivisionByZero;
-                return Value{ .int_v = @mod(left.as_int() orelse return Error.TypeError, denom) };
+                return Value{ .int_v = @mod(left.as_int() orelse return self.fail(Error.TypeError, "%", @tagName(left)), denom) };
             },
             .power => {
-                const base = left.as_int() orelse return Error.TypeError;
-                const exp = right.as_int() orelse return Error.TypeError;
+                const base = left.as_int() orelse return self.fail(Error.TypeError, "^", @tagName(left));
+                const exp = right.as_int() orelse return self.fail(Error.TypeError, "^", @tagName(right));
                 if (exp < 0) return Error.DivisionByZero;
                 var result: i64 = 1;
                 var i: i64 = 0;
@@ -336,8 +375,8 @@ pub const Evaluator = struct {
                 return Value{ .int_v = result };
             },
             .range => {
-                const lo = left.as_int() orelse return Error.TypeError;
-                const hi = right.as_int() orelse return Error.TypeError;
+                const lo = left.as_int() orelse return self.fail(Error.TypeError, "..", @tagName(left));
+                const hi = right.as_int() orelse return self.fail(Error.TypeError, "..", @tagName(right));
                 return Value{ .range_v = .{ .lo = lo, .hi = hi } };
             },
             .concat => return try overrides.sequence_concat(self.override_registry.ctx, eval_pool, left, right),
@@ -349,7 +388,9 @@ pub const Evaluator = struct {
                 // to avoid errors during state/action evaluation.
                 return Value{ .bool_v = true };
             },
-            else => Error.NotImplemented,
+            else => {
+                return self.fail(Error.NotImplemented, "binary", @tagName(b.op));
+            },
         };
     }
 
@@ -364,19 +405,19 @@ pub const Evaluator = struct {
         const operand = try self.eval_expr(u.operand, ctx, s0, eval_pool, state_pool);
         return switch (u.op) {
             .not => Value{ .bool_v = !operand.is_truthy() },
-            .neg => Value{ .int_v = -(operand.as_int() orelse return Error.TypeError) },
+            .neg => Value{ .int_v = -(operand.as_int() orelse return self.fail(Error.TypeError, "-", @tagName(operand))) },
             .subset => blk: {
-                if (!operand.is_set_like()) return Error.TypeError;
+                if (!operand.is_set_like()) return self.fail(Error.TypeError, "SUBSET", "non-set operand");
                 const mat = try self.materialize_set(operand, ctx, s0, eval_pool, state_pool);
                 break :blk try eval_subset(eval_pool, mat);
             },
             .union_all => blk: {
-                if (!operand.is_set_like()) return Error.TypeError;
+                if (!operand.is_set_like()) return self.fail(Error.TypeError, "UNION", "non-set operand");
                 const mat = try self.materialize_set(operand, ctx, s0, eval_pool, state_pool);
                 break :blk try eval_union_all(eval_pool, mat);
             },
             .domain => {
-                if (operand != .function_v) return Error.TypeError;
+                if (operand != .function_v) return self.fail(Error.TypeError, "DOMAIN", @tagName(operand));
                 return Value{ .set_v = operand.function_v.domain };
             },
             .temporal_box, .temporal_diamond, .enabled => {
@@ -1397,7 +1438,10 @@ fn eval_union_all(eval_pool: *ValuePool, operand: Value) Error!Value {
 fn eval_subset(eval_pool: *ValuePool, operand: Value) Error!Value {
     if (operand != .set_v) return Error.TypeError;
     const items = operand.set_v.items(eval_pool);
-    if (items.len > 20) return Error.NotImplemented;
+    if (items.len > 24) {
+        std.debug.print("NotImplemented: SUBSET with {d} elements (max 24)\n", .{items.len});
+        return Error.NotImplemented;
+    }
     const count: u32 = @as(u32, 1) << @intCast(items.len);
     const dest = try eval_pool.alloc_values(count);
     for (0..count) |mask| {

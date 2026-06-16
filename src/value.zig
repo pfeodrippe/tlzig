@@ -89,7 +89,6 @@ pub const RecordSet = extern struct {
 
     pub fn clone(self: RecordSet, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!RecordSet {
         assert(self.offset + self.len * 2 <= source.value_count);
-        assert(target.value_count + self.len * 2 <= target.value_cap);
         const dest = try target.alloc_values(self.len * 2);
         var i: u32 = 0;
         while (i < self.len) : (i += 1) {
@@ -151,7 +150,6 @@ pub const TupleSet = extern struct {
 
     pub fn clone(self: TupleSet, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!TupleSet {
         assert(self.offset + self.len <= source.value_count);
-        assert(target.value_count + self.len <= target.value_cap);
         const src = self.sets(source);
         const dest = try target.alloc_values(self.len);
         for (src, 0..) |v, i| {
@@ -315,7 +313,6 @@ pub const Value = union(ValueTag) {
     pub fn clone(self: Value, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!Value {
         assert(source.value_count <= source.value_cap);
         assert(source.string_count <= source.string_cap);
-        assert(target.value_count <= target.value_cap);
         assert(target.string_count <= target.string_cap);
         return switch (self) {
             .bool_v => |b| Value{ .bool_v = b },
@@ -326,7 +323,7 @@ pub const Value = union(ValueTag) {
             .function_v => |f| Value{ .function_v = try f.clone(source, target) },
             .tuple_v => |t| Value{ .tuple_v = try t.clone(source, target) },
             .record_v => |r| Value{ .record_v = try r.clone(source, target) },
-            .lambda_v => return error.NotImplemented,
+            .lambda_v => |l| Value{ .lambda_v = l },
             .function_set_v => |fs| Value{
                 .function_set_v = .{
                     .domain_offset = try target.push_value(try fs.domain(source).clone(source, target)),
@@ -466,7 +463,6 @@ pub const Set = extern struct {
 
     pub fn clone(self: Set, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!Set {
         assert(self.offset + self.len <= source.value_count);
-        assert(target.value_count <= target.value_cap);
         const src_items = self.items(source);
         const dest = try target.alloc_values(@intCast(src_items.len));
         assert(dest.len == src_items.len);
@@ -515,7 +511,6 @@ pub const Function = extern struct {
 
     pub fn clone(self: Function, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!Function {
         assert(self.offset + self.len <= source.value_count);
-        assert(target.value_count <= target.value_cap);
         const dom = try self.domain.clone(source, target);
         const vals = self.entries(source);
         const dest = try target.alloc_values(@intCast(vals.len));
@@ -554,7 +549,6 @@ pub const Tuple = extern struct {
 
     pub fn clone(self: Tuple, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!Tuple {
         assert(self.offset + self.len <= source.value_count);
-        assert(target.value_count <= target.value_cap);
         const src_items = self.items(source);
         const dest = try target.alloc_values(@intCast(src_items.len));
         assert(dest.len == src_items.len);
@@ -605,7 +599,6 @@ pub const Record = extern struct {
 
     pub fn clone(self: Record, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!Record {
         assert(self.offset + self.len * 2 <= source.value_count);
-        assert(target.value_count <= target.value_cap);
         const fs = self.fields(source);
         const dest = try target.alloc_values(@intCast(fs.len));
         assert(dest.len == fs.len);
@@ -702,14 +695,14 @@ pub const ValuePool = struct {
     string_count: u32,
     value_cap: u32,
     string_cap: u32,
+    /// Whether this pool is allowed to grow its backing arrays.
+    growable: bool = true,
 
     pub fn init(arena: *Arena, value_cap: u32, string_cap: u32) !ValuePool {
         assert(value_cap > 0);
         assert(string_cap > 0);
         const values = try arena.alloc(Value, value_cap);
-        assert(values.len == value_cap);
         const strings = try arena.alloc(u8, string_cap);
-        assert(strings.len == string_cap);
         return ValuePool{
             .arena = arena,
             .values = values,
@@ -721,42 +714,74 @@ pub const ValuePool = struct {
         };
     }
 
+    fn grow_values(self: *ValuePool) !void {
+        const new_cap = self.value_cap * 2;
+        const new_values = try self.arena.alloc(Value, new_cap);
+        @memcpy(new_values[0..self.value_count], self.values[0..self.value_count]);
+        self.values = new_values;
+        self.value_cap = new_cap;
+    }
+
+    fn grow_strings(self: *ValuePool) !void {
+        const new_cap = self.string_cap * 2;
+        const new_strings = try self.arena.alloc(u8, new_cap);
+        @memcpy(new_strings[0..self.string_count], self.strings[0..self.string_count]);
+        self.strings = new_strings;
+        self.string_cap = new_cap;
+    }
+
     pub fn push_value(self: *ValuePool, v: Value) !u32 {
-        assert(self.value_count <= self.value_cap);
-        if (self.value_count >= self.value_cap) return error.OutOfMemory;
+        if (self.value_count >= self.value_cap) {
+            if (self.growable) {
+                try self.grow_values();
+            } else {
+                return error.OutOfMemory;
+            }
+        }
         const idx = self.value_count;
         self.values[idx] = v;
         self.value_count += 1;
-        assert(self.value_count <= self.value_cap);
         return idx;
     }
 
     pub fn push_values(self: *ValuePool, vs: []const Value) !u32 {
-        assert(self.value_count <= self.value_cap);
-        if (self.value_count + vs.len > self.value_cap) return error.OutOfMemory;
+        while (self.value_count + vs.len > self.value_cap) {
+            if (self.growable) {
+                try self.grow_values();
+            } else {
+                return error.OutOfMemory;
+            }
+        }
         const start = self.value_count;
         @memcpy(self.values[start..][0..vs.len], vs);
         self.value_count += @intCast(vs.len);
-        assert(self.value_count <= self.value_cap);
         return start;
     }
 
     pub fn alloc_values(self: *ValuePool, count: u32) ![]Value {
-        assert(self.value_count <= self.value_cap);
-        if (self.value_count + count > self.value_cap) return error.OutOfMemory;
+        while (self.value_count + count > self.value_cap) {
+            if (self.growable) {
+                try self.grow_values();
+            } else {
+                return error.OutOfMemory;
+            }
+        }
         const start = self.value_count;
         self.value_count += count;
-        assert(self.value_count <= self.value_cap);
         return self.values[start..][0..count];
     }
 
     pub fn push_string(self: *ValuePool, s: []const u8) !String {
-        assert(self.string_count <= self.string_cap);
-        if (self.string_count + s.len > self.string_cap) return error.OutOfMemory;
+        while (self.string_count + s.len > self.string_cap) {
+            if (self.growable) {
+                try self.grow_strings();
+            } else {
+                return error.OutOfMemory;
+            }
+        }
         const start = self.string_count;
         @memcpy(self.strings[start..][0..s.len], s);
         self.string_count += @intCast(s.len);
-        assert(self.string_count <= self.string_cap);
         return String{ .offset = start, .len = @intCast(s.len) };
     }
 

@@ -40,6 +40,7 @@ pub const Checker = struct {
     init_spec: action.CompiledInit,
     next_spec: action.CompiledNext,
     invariants: []const *ast.Expr,
+    invariant_names: []const []const u8,
     constraints: []const *ast.Expr,
     properties: []const *ast.Expr,
     safety_properties: []const *ast.Expr,
@@ -133,6 +134,8 @@ pub const Checker = struct {
             try invariant_exprs.append(std.heap.page_allocator, def.body);
         }
 
+        const invariant_names: []const []const u8 = cfg.invariants;
+
         const invariants: []const *ast.Expr = if (invariant_exprs.items.len == 0) &[_]*ast.Expr{} else blk: {
             const result = try arena.alloc(*ast.Expr, invariant_exprs.items.len);
             for (invariant_exprs.items, 0..) |inv, i| {
@@ -208,6 +211,7 @@ pub const Checker = struct {
             .init_spec = compiled_init,
             .next_spec = compiled_next,
             .invariants = invariants,
+            .invariant_names = invariant_names,
             .constraints = constraints,
             .properties = properties,
             .safety_properties = safety_properties,
@@ -1077,8 +1081,13 @@ pub const Checker = struct {
     }
 
     fn check_invariants(self: *Checker, st: *StateStore.State) !bool {
-        for (self.invariants) |inv| {
-            const v = try self.evaluator.eval_expr(inv, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool);
+        for (self.invariants, 0..) |inv, i| {
+            const v = self.evaluator.eval_expr(inv, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool) catch |err| {
+                if (i < self.invariant_names.len) {
+                    std.debug.print("Error evaluating invariant {s}: {any}\n", .{ self.invariant_names[i], err });
+                }
+                return err;
+            };
             if (!v.is_truthy()) return false;
         }
         return true;

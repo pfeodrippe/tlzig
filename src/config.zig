@@ -88,7 +88,9 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
     var constraints = std.ArrayList([]const u8).empty;
     defer constraints.deinit(std.heap.page_allocator);
 
-    const lines = try split_lines(arena, source);
+    // Pre-process: strip all (* ... *) block comments from the config source.
+    const cleaned = strip_block_comments(arena, source) catch return error.OutOfMemory;
+    const lines = try split_lines(arena, cleaned);
     var i: usize = 0;
     while (i < lines.len) : (i += 1) {
         const trimmed = trim(lines[i]);
@@ -96,7 +98,23 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
         if (is_comment(trimmed)) continue;
 
         const first_word = first_token(trimmed);
-        const rest = trim(trimmed[first_word.len..]);
+        const rest_raw = trim(trimmed[first_word.len..]);
+        // Strip block comments (* ... *) from the rest of the line.
+        const rest = blk: {
+            if (std.mem.indexOf(u8, rest_raw, "(*")) |start| {
+                if (std.mem.indexOf(u8, rest_raw[start..], "*)")) |end_rel| {
+                    var combined = std.ArrayList(u8).empty;
+                    defer combined.deinit(std.heap.page_allocator);
+                    combined.appendSlice(std.heap.page_allocator, rest_raw[0..start]) catch return error.OutOfMemory;
+                    const after = start + end_rel + 2;
+                    if (after < rest_raw.len) {
+                        combined.appendSlice(std.heap.page_allocator, rest_raw[after..]) catch return error.OutOfMemory;
+                    }
+                    break :blk try arena_dup(arena, trim(combined.items));
+                }
+            }
+            break :blk rest_raw;
+        };
         if (eql(first_word, "SPECIFICATION")) {
             if (rest.len > 0) {
                 cfg.spec_name = try arena_dup(arena, rest);
@@ -314,7 +332,12 @@ fn split_lines(arena: *Arena, source: []const u8) ![]const []const u8 {
 }
 
 fn parse_name_list(arena: *Arena, line: []const u8, out: *std.ArrayList([]const u8)) !void {
-    var it = std.mem.splitScalar(u8, line, ' ');
+    // Strip trailing line comments (\* ...).
+    const commentless = blk: {
+        if (std.mem.indexOf(u8, line, "\\*")) |idx| break :blk line[0..idx];
+        break :blk line;
+    };
+    var it = std.mem.splitScalar(u8, commentless, ' ');
     while (it.next()) |part| {
         const t = trim(part);
         if (t.len == 0) continue;
@@ -351,6 +374,36 @@ fn is_directive(line: []const u8) bool {
         if (eql(first, d)) return true;
     }
     return false;
+}
+
+fn strip_block_comments(arena: *Arena, source: []const u8) ![]const u8 {
+    var result = std.ArrayList(u8).empty;
+    defer result.deinit(std.heap.page_allocator);
+    var i: usize = 0;
+    while (i < source.len) {
+        if (i + 1 < source.len and source[i] == '(' and source[i + 1] == '*') {
+            i += 2;
+            var depth: u32 = 1;
+            while (i + 1 < source.len and depth > 0) : (i += 1) {
+                if (source[i] == '(' and source[i + 1] == '*') {
+                    depth += 1;
+                    i += 1;
+                } else if (source[i] == '*' and source[i + 1] == ')') {
+                    depth -= 1;
+                    i += 1;
+                    if (depth == 0) break;
+                }
+            }
+            try result.append(std.heap.page_allocator, ' ');
+            i += 1;
+        } else if (source[i] == '\\' and i + 1 < source.len and source[i + 1] == '*') {
+            while (i < source.len and source[i] != '\n') i += 1;
+        } else {
+            try result.append(std.heap.page_allocator, source[i]);
+            i += 1;
+        }
+    }
+    return try arena.dup(result.items);
 }
 
 fn is_comment(line: []const u8) bool {

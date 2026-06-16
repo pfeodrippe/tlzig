@@ -152,7 +152,9 @@ pub const ModuleLoader = struct {
     }
 
     fn merge_instance(self: ModuleLoader, parent: *ast.Module, child: ast.Module, subs: []const ast.Substitution) !void {
-        if (child.definitions.len == 0) return;
+        if (child.definitions.len == 0) {
+            // Still need to carry over namespace instances.
+        }
         const total = parent.definitions.len + child.definitions.len;
         const merged = try self.arena.alloc(ast.Definition, total);
         @memcpy(merged[0..parent.definitions.len], parent.definitions);
@@ -166,6 +168,14 @@ pub const ModuleLoader = struct {
             };
         }
         parent.definitions = merged;
+        // Also carry over namespace instances from the child.
+        if (child.namespace_instances.len > 0) {
+            const ns_total = parent.namespace_instances.len + child.namespace_instances.len;
+            const merged_ns = try self.arena.alloc(ast.NamespaceInstance, ns_total);
+            @memcpy(merged_ns[0..parent.namespace_instances.len], parent.namespace_instances);
+            @memcpy(merged_ns[parent.namespace_instances.len..], child.namespace_instances);
+            parent.namespace_instances = merged_ns;
+        }
     }
 
     fn implicit_substitutions(self: ModuleLoader, parent: ast.Module, child: ast.Module) ![]const ast.Substitution {

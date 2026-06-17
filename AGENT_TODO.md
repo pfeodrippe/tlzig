@@ -54,10 +54,9 @@ Target: **≥50% of all `.tla` files in `vendor/tlaplus-examples/specifications`
                        LiveHourClock.tla      0.372      0.000           12           12     0.0x
 ```
 
-### Coverage probe (all 226 specifiable configs, max_states=50000, --unlimited-memory)
-- PASS: 100 / 226 (44%) -- up from 50->53->73->74->81->82->89->91->98->100
-- FAIL categories: StateSpaceExhausted 25, TypeError 23, UndefinedSymbol 18, ConfigError 12, SyntaxError 9, NotImplemented 4, OOM 2
-- Many StateSpaceExhausted specs would pass with higher max_states (e.g. 100000+)
+### Coverage probe (all 226 specifiable configs, max_states=200000, --unlimited-memory)
+- PASS: 111 / 226 (49%) -- up from 50->53->73->74->81->82->89->91->98->100->103->104->108->109->111
+- FAIL categories: StateSpaceExhausted 20, TypeError 13, UndefinedSymbol 15, ConfigError 12, SyntaxError 7, NotImplemented 2, OOM 2
 - Note: remaining failures are mostly missing features (Init-as-predicate enumeration, `Bags`/`FiniteSets` operators, complex PlusCal, symmetry) and a few parser gaps.
 
 ### Recent fixes (latest batch)

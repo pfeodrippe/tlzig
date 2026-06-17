@@ -384,10 +384,18 @@ fn range_equals_set(r: Range, s: Set, pool: *const ValuePool) bool {
 }
 
 fn function_set_member(pool: *const ValuePool, fs: FunctionSet, elem: Value) bool {
-    if (elem != .function_v) return false;
-    const f = elem.function_v;
     const domain = fs.domain(pool);
     const codomain = fs.codomain(pool);
+    if (elem == .tuple_v) {
+        const t = elem.tuple_v;
+        if (!domain_matches_tuple_domain(domain, t, pool)) return false;
+        for (t.items(pool)) |v| {
+            if (!codomain.member(pool, v)) return false;
+        }
+        return true;
+    }
+    if (elem != .function_v) return false;
+    const f = elem.function_v;
     if (!domain_matches_function_domain(domain, f, pool)) return false;
     const keys = f.domain.items(pool);
     for (keys) |k| {
@@ -395,6 +403,21 @@ fn function_set_member(pool: *const ValuePool, fs: FunctionSet, elem: Value) boo
         if (!codomain.member(pool, v)) return false;
     }
     return true;
+}
+
+fn domain_matches_tuple_domain(domain: Value, t: Tuple, pool: *const ValuePool) bool {
+    switch (domain) {
+        .set_v => |s| {
+            const keys = s.items(pool);
+            if (keys.len != t.len) return false;
+            for (keys, 0..) |k, i| {
+                if (k.as_int() != @as(i64, @intCast(i + 1))) return false;
+            }
+            return true;
+        },
+        .range_v => |r| return r.lo == 1 and r.hi == @as(i64, @intCast(t.len)),
+        else => return false,
+    }
 }
 
 fn domain_matches_function_domain(domain: Value, f: Function, pool: *const ValuePool) bool {
@@ -409,7 +432,35 @@ fn domain_matches_function_domain(domain: Value, f: Function, pool: *const Value
             }
             return true;
         },
+        .tuple_set_v => {
+            const keys = f.domain.items(pool);
+            const cardinality = finite_cardinality(pool, domain) orelse return false;
+            if (keys.len != cardinality) return false;
+            for (keys) |k| {
+                if (!domain.member(pool, k)) return false;
+            }
+            return true;
+        },
         else => return false,
+    }
+}
+
+fn finite_cardinality(pool: *const ValuePool, set: Value) ?u64 {
+    switch (set) {
+        .set_v => |s| return s.len,
+        .range_v => |r| {
+            if (r.hi < r.lo) return 0;
+            return @intCast(r.hi - r.lo + 1);
+        },
+        .tuple_set_v => |ts| {
+            var total: u64 = 1;
+            for (ts.sets(pool)) |component| {
+                const c = finite_cardinality(pool, component) orelse return null;
+                total = std.math.mul(u64, total, c) catch return null;
+            }
+            return total;
+        },
+        else => return null,
     }
 }
 
@@ -712,6 +763,7 @@ pub const ValuePool = struct {
     }
 
     fn grow_values(self: *ValuePool) !void {
+        assert(self.value_count <= self.value_cap);
         const new_cap = self.value_cap * 2;
         const new_values = try self.arena.alloc(Value, new_cap);
         @memcpy(new_values[0..self.value_count], self.values[0..self.value_count]);
@@ -725,6 +777,18 @@ pub const ValuePool = struct {
         @memcpy(new_strings[0..self.string_count], self.strings[0..self.string_count]);
         self.strings = new_strings;
         self.string_cap = new_cap;
+    }
+
+    pub fn ensure_value_capacity(self: *ValuePool, additional: u64) !void {
+        assert(self.value_count <= self.value_cap);
+        const needed = @as(u64, self.value_count) + additional;
+        while (needed > self.value_cap) {
+            if (self.growable) {
+                try self.grow_values();
+            } else {
+                return error.OutOfMemory;
+            }
+        }
     }
 
     pub fn push_value(self: *ValuePool, v: Value) !u32 {

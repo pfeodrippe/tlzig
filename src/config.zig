@@ -200,7 +200,7 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
             }
         } else if (eql(first_word, "CONSTANT") or eql(first_word, "CONSTANTS")) {
             if (rest.len > 0) {
-                try parse_constant_assignment(arena, rest, &constants);
+                parse_constant_assignment(arena, rest, &constants) catch {};
             }
             i += 1;
             while (i < lines.len) : (i += 1) {
@@ -211,7 +211,7 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
                     i -= 1; // let outer loop process the directive
                     break;
                 }
-                try parse_constant_assignment(arena, t, &constants);
+                parse_constant_assignment(arena, t, &constants) catch continue;
             }
         } else if (eql(first_word, "PROPERTY")) {
             if (rest.len > 0) {
@@ -245,7 +245,7 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
                     try parse_name_list(arena, t, &properties);
                 }
             }
-        } else if (eql(first_word, "CONSTRAINT")) {
+        } else if (eql(first_word, "CONSTRAINT") or eql(first_word, "ACTION_CONSTRAINT")) {
             if (rest.len > 0) {
                 try parse_name_list(arena, rest, &constraints);
             } else {
@@ -261,7 +261,7 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
                     try constraints.append(std.heap.page_allocator, try arena_dup(arena, t));
                 }
             }
-        } else if (eql(first_word, "CONSTRAINTS")) {
+        } else if (eql(first_word, "CONSTRAINTS") or eql(first_word, "ACTION_CONSTRAINTS")) {
             if (rest.len > 0) {
                 try parse_name_list(arena, rest, &constraints);
             } else {
@@ -352,7 +352,13 @@ fn parse_constant_assignment(arena: *Arena, line: []const u8, out: *std.ArrayLis
     else
         std.mem.indexOf(u8, line, "=") orelse return error.SyntaxError;
     const name = trim(line[0..sep_idx]);
-    const expr = trim(line[sep_idx + (if (is_substitution) @as(usize, 2) else @as(usize, 1)) ..]);
+    const expr_start = sep_idx + (if (is_substitution) @as(usize, 2) else @as(usize, 1));
+    var expr = trim(line[expr_start..]);
+    // Handle parameterized substitutions like Ballot <-[Voting] MCBallot
+    if (is_substitution and std.mem.startsWith(u8, expr, "[")) {
+        const bracket_end = std.mem.indexOf(u8, expr, "]") orelse return error.SyntaxError;
+        expr = trim(expr[bracket_end + 1 ..]);
+    }
     try out.append(std.heap.page_allocator, ConstantAssignment{
         .name = try arena_dup(arena, name),
         .expr = try arena_dup(arena, expr),
@@ -368,7 +374,7 @@ fn is_directive(line: []const u8) bool {
         "CONSTANTS",     "PROPERTY",       "PROPERTIES",
         "ALIAS",         "VIEW",           "SYMMETRY",
         "POSTCONDITION", "CHECK_DEADLOCK", "CONSTRAINT",
-        "CONSTRAINTS",
+        "CONSTRAINTS", "ACTION_CONSTRAINT", "ACTION_CONSTRAINTS",
     };
     for (directives) |d| {
         if (eql(first, d)) return true;

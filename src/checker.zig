@@ -51,9 +51,11 @@ pub const Checker = struct {
     distinct: u64,
     // Transition graph for liveness/property checking.
     succ_offsets: []u32,
+    succ_counts: []u32,
     succ_edges: []u32,
     succ_count: u32,
     succ_cap: u32,
+    canonical_states: []bool,
     // We record total allocated max_states for successor arrays because the
     // graph is built on at most max_states distinct states.  Some consumers
     // assume `idx < distinct`; callers must keep successor indices within this
@@ -198,7 +200,11 @@ pub const Checker = struct {
         const succ_cap: u32 = max_states * 32;
         const succ_offsets = try arena.alloc(u32, max_states + 1);
         @memset(succ_offsets, 0);
+        const succ_counts = try arena.alloc(u32, max_states);
+        @memset(succ_counts, 0);
         const succ_edges = try arena.alloc(u32, succ_cap);
+        const canonical_states = try arena.alloc(bool, max_states);
+        @memset(canonical_states, false);
 
         const fairness = if (spec_name_v) |sn| try extract_fairness(arena, module, sn) else &[_]FairnessCondition{};
 
@@ -221,9 +227,11 @@ pub const Checker = struct {
             .generated = 0,
             .distinct = 0,
             .succ_offsets = succ_offsets,
+            .succ_counts = succ_counts,
             .succ_edges = succ_edges,
             .succ_count = 0,
             .succ_cap = succ_cap,
+            .canonical_states = canonical_states,
             .max_states_limit = max_states,
             .fairness = fairness,
         };
@@ -294,6 +302,7 @@ pub const Checker = struct {
             if (is_new) {
                 self.distinct += 1;
                 assert(self.distinct <= self.max_states_limit);
+                self.canonical_states[state_idx] = true;
             }
             const invariants_hold = try self.check_invariants(self.state_store.get(state_idx));
             self.eval_pool.restore(snap);
@@ -315,6 +324,8 @@ pub const Checker = struct {
         if (parent_idx) |pidx| {
             const count: u32 = @intCast(out_states.items.len);
             if (self.succ_count + count > self.succ_cap) return Error.OutOfMemory;
+            self.succ_offsets[pidx] = self.succ_count;
+            self.succ_counts[pidx] = count;
             for (out_states.items, 0..) |idx, i| {
                 assert(idx < self.state_store.count);
                 self.succ_edges[self.succ_count + i] = idx;
@@ -406,41 +417,12 @@ pub const Checker = struct {
     }
 
     fn check_properties(self: *Checker) !void {
-        // Finalize successor offsets: ensure monotonic non-decreasing ranges.
-        // We also filter out any stale maxInt(u32) entries that may have been
-        // left in succ_edges when successors were canonicalized to a duplicate.
-        const n = self.distinct;
+        // Finalize graph bounds. Successor ranges use explicit per-state
+        // counts because raw state ids can have gaps from deduped allocations.
+        const n = self.state_store.count;
         if (n > 0) {
-            var last: u32 = 0;
-            for (0..n) |i| {
-                const idx: u32 = @intCast(i);
-                if (self.succ_offsets[idx] >= last) {
-                    last = self.succ_offsets[idx];
-                } else {
-                    self.succ_offsets[idx] = last;
-                }
-            }
-            assert(n + 1 < self.succ_offsets.len);
+            assert(n + 1 <= self.succ_offsets.len);
             self.succ_offsets[n] = self.succ_count;
-
-            // Compact: keep only edges whose target is a valid distinct state.
-            var write: u32 = 0;
-            for (0..self.succ_count) |e| {
-                const t = self.succ_edges[e];
-                if (t == std.math.maxInt(u32) or t >= n) {
-                    // Drop invalid edges and adjust offsets of all nodes that
-                    // point past this edge. We do a linear scan; n and edges
-                    // are bounded by max_states so this is O(n + edges).
-                    for (0..n + 1) |off| {
-                        if (self.succ_offsets[off] > write) self.succ_offsets[off] -= 1;
-                    }
-                    continue;
-                }
-                self.succ_edges[write] = t;
-                write += 1;
-            }
-            self.succ_count = write;
-            self.succ_offsets[n] = write;
         }
 
         const scc_data = try self.build_scc_data();
@@ -450,6 +432,7 @@ pub const Checker = struct {
         for (self.properties) |prop| {
             const results = try self.eval_temporal_property_all(prop, &scc_data, &cache);
             for (0..n) |i| {
+                if (!self.canonical_states[i]) continue;
                 if (!results[i]) {
                     std.debug.print("PropertyViolated: property at state={d}\n", .{i});
                     return Error.PropertyViolated;
@@ -506,7 +489,7 @@ pub const Checker = struct {
     };
 
     fn build_scc_data(self: *Checker) !SccData {
-        const n = self.distinct;
+        const n = self.state_store.count;
         const scc_ids = try self.compute_sccs();
         var scc_count: u32 = 0;
         for (scc_ids) |id| {
@@ -664,7 +647,7 @@ pub const Checker = struct {
         scc_states_edges: []u32,
         allocator: std.mem.Allocator,
     ) Error![]bool {
-        const n = self.distinct;
+        const n = self.state_store.count;
         const fair_sccs = try allocator.alloc(bool, scc_count);
         @memset(fair_sccs, true);
         if (self.fairness.len == 0) return fair_sccs;
@@ -684,8 +667,12 @@ pub const Checker = struct {
                 for (self.successors(@intCast(s))) |succ| {
                     const child = self.state_store.get(succ);
                     if (try self.eval_action(fc.action, state, child)) {
-                        enabled[fi][s] = true;
-                        if (!(try self.eval_vars_equal(fc.vars, state, child))) {
+                        const changes_vars = !(try self.eval_vars_equal(fc.vars, state, child));
+                        // WF_v(A) and SF_v(A) are defined over <<A>>_v, not
+                        // over A alone. A stuttering A transition does not make
+                        // the fairness action enabled.
+                        if (changes_vars) {
+                            enabled[fi][s] = true;
                             const from_scc = scc_ids[s];
                             const to_scc = scc_ids[succ];
                             if (from_scc == to_scc) {
@@ -753,7 +740,7 @@ pub const Checker = struct {
     ) Error![]bool {
         if (cache.get(prop)) |cached| return cached;
 
-        const n = self.distinct;
+        const n = self.state_store.count;
         const results = try std.heap.page_allocator.alloc(bool, n);
         errdefer std.heap.page_allocator.free(results);
 
@@ -860,7 +847,7 @@ pub const Checker = struct {
     }
 
     fn eval_box_all(self: *Checker, operand: []const bool, scc_data: *const SccData) Error![]bool {
-        const n = self.distinct;
+        const n = self.state_store.count;
         assert(n > 0);
         assert(n == operand.len);
         assert(n == scc_data.scc_ids.len);
@@ -905,7 +892,7 @@ pub const Checker = struct {
     }
 
     fn eval_diamond_all(self: *Checker, operand: []const bool, scc_data: *const SccData) Error![]bool {
-        const n = self.distinct;
+        const n = self.state_store.count;
         assert(n > 0);
         assert(n == operand.len);
         assert(n == scc_data.scc_ids.len);
@@ -913,30 +900,34 @@ pub const Checker = struct {
         const results = try std.heap.page_allocator.alloc(bool, n);
         errdefer std.heap.page_allocator.free(results);
 
-        // Compute the fair-game attractor to `operand`.  A state is good iff
-        // every fair-game path from it reaches a state satisfying `operand`.
-        var good = try std.heap.page_allocator.alloc(bool, n);
-        defer std.heap.page_allocator.free(good);
-        @memset(good, false);
-        var pending = try std.heap.page_allocator.alloc(u32, n);
-        defer std.heap.page_allocator.free(pending);
-        @memset(pending, 0);
-
+        // <>P is false exactly when there is a fair infinite behavior that
+        // avoids P forever. Such a behavior exists from a state iff a fair SCC
+        // containing no P is reachable through states that also do not satisfy P.
+        var bad = try std.heap.page_allocator.alloc(bool, n);
+        defer std.heap.page_allocator.free(bad);
+        @memset(bad, false);
         var work = try std.heap.page_allocator.alloc(u32, n);
         defer std.heap.page_allocator.free(work);
         var work_len: u32 = 0;
 
-        for (0..n) |s| {
-            const idx: u32 = @intCast(s);
-            if (!scc_data.fair_region[idx]) continue;
-            var count: u32 = 0;
-            for (self.successors(idx)) |succ| {
-                if (self.is_fair_game_edge(scc_data, succ)) count += 1;
+        for (0..scc_data.scc_count) |scc_index| {
+            const scc: u32 = @intCast(scc_index);
+            if (!scc_data.fair_sccs[scc]) continue;
+            var has_operand = false;
+            const begin = scc_data.scc_states_offsets[scc];
+            const end = scc_data.scc_states_offsets[scc + 1];
+            for (scc_data.scc_states_edges[begin..end]) |state_idx| {
+                if (operand[state_idx]) {
+                    has_operand = true;
+                    break;
+                }
             }
-            pending[idx] = count;
-            if (operand[idx]) {
-                good[idx] = true;
-                work[work_len] = idx;
+            if (has_operand) continue;
+            for (scc_data.scc_states_edges[begin..end]) |state_idx| {
+                if (bad[state_idx]) continue;
+                assert(!operand[state_idx]);
+                bad[state_idx] = true;
+                work[work_len] = state_idx;
                 work_len += 1;
             }
         }
@@ -946,34 +937,29 @@ pub const Checker = struct {
             const cur = work[work_len];
             for (0..n) |s| {
                 const pred: u32 = @intCast(s);
-                if (!scc_data.fair_region[pred]) continue;
-                if (good[pred]) continue;
+                if (bad[pred] or operand[pred]) continue;
                 var has_edge = false;
                 for (self.successors(pred)) |succ| {
-                    if (succ == cur and self.is_fair_game_edge(scc_data, succ)) {
+                    if (succ == cur) {
                         has_edge = true;
                         break;
                     }
                 }
                 if (!has_edge) continue;
-                assert(pending[pred] > 0);
-                pending[pred] -= 1;
-                if (pending[pred] == 0) {
-                    good[pred] = true;
-                    work[work_len] = pred;
-                    work_len += 1;
-                }
+                bad[pred] = true;
+                work[work_len] = pred;
+                work_len += 1;
             }
         }
 
         for (0..n) |i| {
-            results[i] = !scc_data.fair_region[i] or good[i];
+            results[i] = !bad[i];
         }
         return results;
     }
 
     fn compute_sccs(self: *Checker) ![]u32 {
-        const n = self.distinct;
+        const n = self.state_store.count;
         assert(n > 0);
         assert(n <= self.max_states_limit);
         const allocator = std.heap.page_allocator;
@@ -1062,13 +1048,14 @@ pub const Checker = struct {
 
     fn successors(self: *Checker, idx: u32) []const u32 {
         assert(idx + 1 <= self.succ_offsets.len);
-        assert(idx < self.distinct);
+        assert(idx < self.state_store.count);
         const begin = self.succ_offsets[idx];
-        const end = self.succ_offsets[idx + 1];
+        const end = begin + self.succ_counts[idx];
         assert(begin <= end);
         assert(end <= self.succ_edges.len);
+        assert(end <= self.succ_count);
         const slice = self.succ_edges[begin..end];
-        for (slice) |s| assert(s < self.distinct);
+        for (slice) |s| assert(s < self.state_store.count);
         return slice;
     }
 
@@ -1081,6 +1068,7 @@ pub const Checker = struct {
     }
 
     fn check_invariants(self: *Checker, st: *StateStore.State) !bool {
+        assert(self.invariant_names.len == self.invariants.len);
         for (self.invariants, 0..) |inv, i| {
             const v = self.evaluator.eval_expr(inv, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool) catch |err| {
                 if (i < self.invariant_names.len) {
@@ -1088,9 +1076,35 @@ pub const Checker = struct {
                 }
                 return err;
             };
-            if (!v.is_truthy()) return false;
+            if (!v.is_truthy()) {
+                std.debug.print("Invariant false: {s}\n", .{self.invariant_names[i]});
+                try self.print_first_false_conjunct(inv, st);
+                return false;
+            }
         }
         return true;
+    }
+
+    fn print_first_false_conjunct(self: *Checker, expr: *ast.Expr, st: *StateStore.State) !void {
+        var index: u32 = 0;
+        _ = try self.print_first_false_conjunct_inner(expr, st, &index);
+    }
+
+    fn print_first_false_conjunct_inner(self: *Checker, expr: *ast.Expr, st: *StateStore.State, index: *u32) !bool {
+        if (expr.* == .binary and expr.*.binary.op == .and_op) {
+            if (try self.print_first_false_conjunct_inner(expr.*.binary.left, st, index)) return true;
+            return try self.print_first_false_conjunct_inner(expr.*.binary.right, st, index);
+        }
+        const current = index.*;
+        index.* += 1;
+        const snap = self.eval_pool.snapshot();
+        defer self.eval_pool.restore(snap);
+        const v = try self.evaluator.eval_expr(expr, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool);
+        if (!v.is_truthy()) {
+            std.debug.print("First false conjunct #{d}: {s}\n", .{ current, @tagName(expr.*) });
+            return true;
+        }
+        return false;
     }
 };
 

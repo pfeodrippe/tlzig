@@ -192,7 +192,11 @@ fn sub_seq(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Valu
     if (args.len != 3) return Error.TypeError;
     const lo = args[1].as_int() orelse return Error.TypeError;
     const hi = args[2].as_int() orelse return Error.TypeError;
-    if (lo > hi or lo < 1) return Error.IndexOutOfBounds;
+    if (lo < 1) return Error.IndexOutOfBounds;
+    if (hi < lo) {
+        const empty = try pool.alloc_values(0);
+        return make_sequence(pool, empty, 0);
+    }
     const len_i: u32 = @intCast(hi - lo + 1);
     return switch (args[0]) {
         .function_v => |f| {

@@ -546,6 +546,7 @@ pub const Parser = struct {
     list_cols: [8]u32,
     list_cols_len: u32,
     def_col: u32,
+    suppress_errors: bool = false,
     group_depth: u32,
 
     pub fn init(arena: *Arena, source: []const u8) Parser {
@@ -637,6 +638,7 @@ pub const Parser = struct {
             if (self.current.kind == .keyword_variables) {
                 self.advance();
                 while (true) {
+                    if (self.current.kind != .ident) break;
                     try variables.append(std.heap.page_allocator, try self.dup(try self.expect_ident_text()));
                     if (!self.match(.comma)) break;
                 }
@@ -645,6 +647,7 @@ pub const Parser = struct {
             if (self.current.kind == .keyword_constants) {
                 self.advance();
                 while (true) {
+                    if (self.current.kind != .ident) break;
                     try constants.append(std.heap.page_allocator, try self.dup(try self.expect_ident_text()));
                     // Operator constants may be declared with parameters: Op(_,_).
                     if (self.current.kind == .lparen) {
@@ -663,6 +666,13 @@ pub const Parser = struct {
                         }
                     }
                     if (!self.match(.comma)) break;
+                    while (self.current.kind == .setminus) {
+                        const start_line = self.current.line;
+                        self.advance();
+                        while (self.current.kind != .eof and self.current.line == start_line) {
+                            self.advance();
+                        }
+                    }
                 }
                 continue;
             }
@@ -671,7 +681,17 @@ pub const Parser = struct {
                 if (self.current.kind == .ident and self.next.kind == .defeq) {
                     _ = try self.parse_definition();
                 } else {
-                    _ = try self.parse_expr();
+                    // ASSUME can have labels (e.g. ASSUME Theorem!: body).
+                    // Skip label if present.
+                    if (self.current.kind == .ident and self.next.kind == .bang) {
+                        self.advance(); // ident
+                        self.advance(); // !
+                        if (self.current.kind == .colon) self.advance(); // :
+                    }
+                    _ = self.parse_expr() catch {
+                        self.skip_to_next_definition();
+                        continue;
+                    };
                 }
                 if (self.current.kind == .semi) self.advance();
                 continue;
@@ -1550,6 +1570,30 @@ pub const Parser = struct {
         return try self.expr_set_filter(single_var, wrapped_pred);
     }
 
+    fn try_parse_function_literal(self: *Parser) !*ast.Expr {
+        var vars = std.ArrayList(ast.BoundVar).empty;
+        defer vars.deinit(std.heap.page_allocator);
+        while (true) {
+            var names = std.ArrayList([]const u8).empty;
+            defer names.deinit(std.heap.page_allocator);
+            while (true) {
+                const name = try self.expect_ident_text();
+                try names.append(std.heap.page_allocator, try self.dup(name));
+                if (!self.match(.comma)) break;
+            }
+            try self.expect(.in);
+            const domain = try self.parse_expr();
+            for (names.items) |name| {
+                try vars.append(std.heap.page_allocator, .{ .name = name, .domain = domain });
+            }
+            if (!self.match(.comma)) break;
+        }
+        try self.expect(.mapsto);
+        const body = try self.parse_expr();
+        try self.expect(.rbracket);
+        return try self.expr_function_literal(vars.items, body);
+    }
+
     fn parse_set(self: *Parser) !*ast.Expr {
         try self.expect(.lbrace);
         if (self.current.kind == .rbrace) {
@@ -1690,33 +1734,15 @@ pub const Parser = struct {
             try self.expect(.rbracket);
             return try self.expr_record_set(fields);
         }
-        if (self.current.kind == .ident and self.next.kind == .in) {
-            var vars = std.ArrayList(ast.BoundVar).empty;
-            defer vars.deinit(std.heap.page_allocator);
-            while (true) {
-                // Read one or more names sharing a domain: n, m \in S
-                var names = std.ArrayList([]const u8).empty;
-                defer names.deinit(std.heap.page_allocator);
-                while (true) {
-                    const name = try self.expect_ident_text();
-                    try names.append(std.heap.page_allocator, try self.dup(name));
-                    if (!self.match(.comma)) break;
-                    // Peek: if next after comma is \in, the comma separates
-                    // names with same domain. If next is ident+\in, it's a
-                    // new variable group.
-                    if (self.next.kind == .in) continue;
-                }
-                try self.expect(.in);
-                const domain = try self.parse_expr();
-                for (names.items) |name| {
-                    try vars.append(std.heap.page_allocator, .{ .name = name, .domain = domain });
-                }
-                if (!self.match(.comma)) break;
+        // Function literal: [x \in S |-> body] or [x, y \in S |-> body]
+        if (self.current.kind == .ident) {
+            const saved = self.*;
+            self.suppress_errors = true;
+            const result = self.try_parse_function_literal();
+            self.suppress_errors = false;
+            if (result) |r| return r else |_| {
+                self.* = saved;
             }
-            try self.expect(.mapsto);
-            const body = try self.parse_expr();
-            try self.expect(.rbracket);
-            return try self.expr_function_literal(vars.items, body);
         }
         const func = try self.parse_expr();
         if (self.match(.arrow)) {
@@ -2002,7 +2028,9 @@ pub const Parser = struct {
 
     fn expect(self: *Parser, kind: Token.Kind) !void {
         if (self.current.kind != kind) {
-            std.debug.print("SyntaxError: expected {s}, got {s} ({s}) at line {d} col {d}\n", .{ @tagName(kind), @tagName(self.current.kind), self.current.text, self.current.line, self.current.col });
+            if (!self.suppress_errors) {
+                std.debug.print("SyntaxError: expected {s}, got {s} ({s}) at line {d} col {d}\n", .{ @tagName(kind), @tagName(self.current.kind), self.current.text, self.current.line, self.current.col });
+            }
             return error.SyntaxError;
         }
         self.advance();

@@ -173,7 +173,22 @@ pub const Evaluator = struct {
                 if (self.override_registry.find_value(aliased)) |func| {
                     return try func(self.override_registry.ctx, eval_pool);
                 }
+                // Check if the aliased name is a constant.
+                if (!std.mem.eql(u8, aliased, name)) {
+                    if (self.find_constant(aliased)) |v| return try v.clone(state_pool, eval_pool);
+                }
                 // Built-in constant sets.
+                if (std.mem.eql(u8, aliased, "Nat")) {
+                    // Nat = set of all natural numbers. Represent as a special
+                    // range_v with hi = maxInt so membership checks work.
+                    return Value{ .range_v = .{ .lo = 0, .hi = std.math.maxInt(i64) } };
+                }
+                if (std.mem.eql(u8, aliased, "Int")) {
+                    // Int = set of all integers. No good representation; use
+                    // a model value that reports false for all membership.
+                    // TODO: proper symbolic Int type.
+                    return Value{ .string_v = try eval_pool.push_string("__INT_SET__") };
+                }
                 if (std.mem.eql(u8, aliased, "BOOLEAN")) {
                     const dest = try eval_pool.alloc_values(2);
                     dest[0] = Value{ .bool_v = false };
@@ -376,7 +391,11 @@ pub const Evaluator = struct {
                 if (lmat != .set_v or rmat != .set_v) return self.fail(Error.TypeError, "\\subseteq", "materialize failed");
                 return Value{ .bool_v = lmat.set_v.is_subset(eval_pool, rmat.set_v) };
             },
-            .plus => Value{ .int_v = (left.as_int() orelse return self.fail(Error.TypeError, "+", @tagName(left))) + (right.as_int() orelse return self.fail(Error.TypeError, "+", @tagName(right))) },
+            .plus => {
+                const lv = left.as_int() orelse return self.fail(Error.TypeError, "+", @tagName(left));
+                const rv = right.as_int() orelse return self.fail(Error.TypeError, "+ right", @tagName(right));
+                return Value{ .int_v = lv + rv };
+            },
             .minus => Value{ .int_v = (left.as_int() orelse return self.fail(Error.TypeError, "-", @tagName(left))) - (right.as_int() orelse return self.fail(Error.TypeError, "-", @tagName(right))) },
             .times => Value{ .int_v = (left.as_int() orelse return self.fail(Error.TypeError, "*", @tagName(left))) * (right.as_int() orelse return self.fail(Error.TypeError, "*", @tagName(right))) },
             .div => {
@@ -441,8 +460,17 @@ pub const Evaluator = struct {
                 break :blk try eval_union_all(eval_pool, mat);
             },
             .domain => {
-                if (operand != .function_v) return self.fail(Error.TypeError, "DOMAIN", @tagName(operand));
-                return Value{ .set_v = operand.function_v.domain };
+                if (operand == .function_v) return Value{ .set_v = operand.function_v.domain };
+                // Tuples (sequences) have domain 1..Len.
+                if (operand == .tuple_v) {
+                    const n = operand.tuple_v.len;
+                    if (n == 0) {
+                        const empty = try eval_pool.alloc_values(0);
+                        return Value{ .set_v = make_set(eval_pool, empty) };
+                    }
+                    return Value{ .range_v = .{ .lo = 1, .hi = @intCast(n) } };
+                }
+                return self.fail(Error.TypeError, "DOMAIN", @tagName(operand));
             },
             .temporal_box, .temporal_diamond, .enabled => {
                 // Liveness/temporal/ENABLED operators are checked after state-space
@@ -462,19 +490,25 @@ pub const Evaluator = struct {
     ) Error!Value {
         if (sf.vars.len == 1) {
             const bv = sf.vars[0];
+            if (try self.eval_sorted_sequence_filter(sf, bv, ctx, s0, eval_pool, state_pool)) |sorted| {
+                return sorted;
+            }
             const domain = try self.eval_set_materialized(bv.domain, ctx, s0, eval_pool, state_pool);
-            const items = domain.set_v.items(eval_pool);
-            var count: u32 = 0;
-            const dest = try eval_pool.alloc_values(@intCast(items.len));
-            for (items) |it| {
+            var items = std.ArrayList(Value).empty;
+            defer items.deinit(std.heap.page_allocator);
+            try items.appendSlice(std.heap.page_allocator, domain.set_v.items(eval_pool));
+            var accepted = std.ArrayList(Value).empty;
+            defer accepted.deinit(std.heap.page_allocator);
+            for (items.items) |it| {
                 const new_ctx = ctx.extend(bv.name, it);
                 const pred = try self.eval_expr(sf.pred, new_ctx, s0, eval_pool, state_pool);
                 if (pred.is_truthy()) {
-                    dest[count] = it;
-                    count += 1;
+                    try accepted.append(std.heap.page_allocator, it);
                 }
             }
-            return Value{ .set_v = make_set(eval_pool, dest[0..count]) };
+            const dest = try eval_pool.alloc_values(@intCast(accepted.items.len));
+            @memcpy(dest, accepted.items);
+            return Value{ .set_v = make_set(eval_pool, dest) };
         }
         return try self.eval_set_filter_tuples(sf, 0, ctx, s0, eval_pool, state_pool);
     }
@@ -494,20 +528,26 @@ pub const Evaluator = struct {
         }
         const bv = sf.vars[var_idx];
         const domain = try self.eval_set_materialized(bv.domain, ctx, s0, eval_pool, state_pool);
-        const items = domain.set_v.items(eval_pool);
+        var items = std.ArrayList(Value).empty;
+        defer items.deinit(std.heap.page_allocator);
+        try items.appendSlice(std.heap.page_allocator, domain.set_v.items(eval_pool));
         var tuples = std.ArrayList(Value).empty;
         defer tuples.deinit(std.heap.page_allocator);
-        for (items) |it| {
+        for (items.items) |it| {
             const new_ctx = ctx.extend(bv.name, it);
             const nested = try self.eval_set_filter_tuples(sf, var_idx + 1, new_ctx, s0, eval_pool, state_pool);
             if (var_idx + 1 < sf.vars.len) {
                 if (nested != .set_v) return Error.TypeError;
-                const sub = nested.set_v.items(eval_pool);
-                for (sub) |t| {
-                    const tuple_items = t.tuple_v.items(eval_pool);
-                    const extended = try eval_pool.alloc_values(@intCast(tuple_items.len + 1));
+                var sub = std.ArrayList(Value).empty;
+                defer sub.deinit(std.heap.page_allocator);
+                try sub.appendSlice(std.heap.page_allocator, nested.set_v.items(eval_pool));
+                for (sub.items) |t| {
+                    var tuple_items = std.ArrayList(Value).empty;
+                    defer tuple_items.deinit(std.heap.page_allocator);
+                    try tuple_items.appendSlice(std.heap.page_allocator, t.tuple_v.items(eval_pool));
+                    const extended = try eval_pool.alloc_values(@intCast(tuple_items.items.len + 1));
                     extended[0] = it;
-                    @memcpy(extended[1..], tuple_items);
+                    @memcpy(extended[1..], tuple_items.items);
                     try tuples.append(std.heap.page_allocator, Value{ .tuple_v = make_tuple(eval_pool, extended) });
                 }
             } else if (nested.is_truthy()) {
@@ -518,6 +558,43 @@ pub const Evaluator = struct {
         }
         const dest = try eval_pool.alloc_values(@intCast(tuples.items.len));
         @memcpy(dest, tuples.items);
+        return Value{ .set_v = make_set(eval_pool, dest) };
+    }
+
+    fn eval_sorted_sequence_filter(
+        self: Evaluator,
+        sf: *ast.SetFilter,
+        bv: ast.BoundVar,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!?Value {
+        if (!is_sorted_sequence_predicate(sf.pred, bv.name)) return null;
+        const symbolic_domain = (try eval_symbolic_set(self, bv.domain, ctx, s0, eval_pool, state_pool)) orelse return null;
+
+        var lengths = std.ArrayList(u32).empty;
+        defer lengths.deinit(std.heap.page_allocator);
+        const codomain = (try extract_sequence_codomain_and_lengths(eval_pool, symbolic_domain, &lengths)) orelse return null;
+        if (lengths.items.len == 0) return null;
+
+        const codomain_mat = try self.materialize_set(codomain, ctx, s0, eval_pool, state_pool);
+        if (codomain_mat != .set_v) return null;
+        var values = std.ArrayList(Value).empty;
+        defer values.deinit(std.heap.page_allocator);
+        try values.appendSlice(std.heap.page_allocator, codomain_mat.set_v.items(eval_pool));
+        sort_values(eval_pool, values.items) orelse return null;
+
+        var generated = std.ArrayList(Value).empty;
+        defer generated.deinit(std.heap.page_allocator);
+        var current = std.ArrayList(Value).empty;
+        defer current.deinit(std.heap.page_allocator);
+        for (lengths.items) |len| {
+            try generate_sorted_sequences(eval_pool, values.items, len, 0, &current, &generated);
+        }
+
+        const dest = try eval_pool.alloc_values(@intCast(generated.items.len));
+        @memcpy(dest, generated.items);
         return Value{ .set_v = make_set(eval_pool, dest) };
     }
 
@@ -625,8 +702,9 @@ pub const Evaluator = struct {
                 var count: u64 = 1;
                 for (domains.items) |d| {
                     count *= d.set_v.len;
-                    if (count > eval_pool.value_cap) return Error.OutOfMemory;
+                    if (count > std.math.maxInt(u32)) return Error.OutOfMemory;
                 }
+                try eval_pool.ensure_value_capacity(count + count * rs.len * 2);
                 const dest = try eval_pool.alloc_values(@intCast(count));
                 var combo: u64 = 0;
                 while (combo < count) : (combo += 1) {
@@ -657,8 +735,9 @@ pub const Evaluator = struct {
                 var count: u64 = 1;
                 for (domains.items) |d| {
                     count *= d.set_v.len;
-                    if (count > eval_pool.value_cap) return Error.OutOfMemory;
+                    if (count > std.math.maxInt(u32)) return Error.OutOfMemory;
                 }
+                try eval_pool.ensure_value_capacity(count + count * domains.items.len);
                 const dest = try eval_pool.alloc_values(@intCast(count));
                 var combo: u64 = 0;
                 while (combo < count) : (combo += 1) {
@@ -680,10 +759,8 @@ pub const Evaluator = struct {
                 const dmat = try self.materialize_set(domain, ctx, s0, eval_pool, state_pool);
                 const cmat = try self.materialize_set(codomain, ctx, s0, eval_pool, state_pool);
                 if (dmat != .set_v or cmat != .set_v) return Error.TypeError;
-                const keys = dmat.set_v.items(eval_pool);
-                const values = cmat.set_v.items(eval_pool);
-                const n: u32 = @intCast(keys.len);
-                const m: u32 = @intCast(values.len);
+                const n = dmat.set_v.len;
+                const m = cmat.set_v.len;
                 if (n == 0) {
                     const empty = try eval_pool.alloc_values(0);
                     const func = Value{ .function_v = .{
@@ -698,8 +775,10 @@ pub const Evaluator = struct {
                 var count: u64 = 1;
                 for (0..n) |_| {
                     count *= m;
-                    if (count > eval_pool.value_cap) return Error.OutOfMemory;
+                    if (count > std.math.maxInt(u32)) return Error.OutOfMemory;
                 }
+                try eval_pool.ensure_value_capacity(count + count * n);
+                const values = cmat.set_v.items(eval_pool);
                 const func_values = try eval_pool.alloc_values(@intCast(count));
                 var combo: u64 = 0;
                 while (combo < count) : (combo += 1) {
@@ -723,20 +802,30 @@ pub const Evaluator = struct {
                 const inner = u.set(eval_pool);
                 const mat = try self.materialize_set(inner, ctx, s0, eval_pool, state_pool);
                 if (mat != .set_v) return Error.TypeError;
-                const sets = mat.set_v.items(eval_pool);
+                var sets = std.ArrayList(Value).empty;
+                defer sets.deinit(std.heap.page_allocator);
+                try sets.appendSlice(std.heap.page_allocator, mat.set_v.items(eval_pool));
+                var materialized = std.ArrayList(Value).empty;
+                defer materialized.deinit(std.heap.page_allocator);
                 var total: u64 = 0;
-                for (sets) |s| {
+                for (sets.items) |s| {
                     const smat = try self.materialize_set(s, ctx, s0, eval_pool, state_pool);
                     if (smat != .set_v) return Error.TypeError;
+                    try materialized.append(std.heap.page_allocator, smat);
                     total += smat.set_v.len;
-                    if (total > eval_pool.value_cap) return Error.OutOfMemory;
+                    if (total > std.math.maxInt(u32)) return Error.OutOfMemory;
                 }
                 const dest = try eval_pool.alloc_values(@intCast(total));
                 var pos: u32 = 0;
-                for (sets) |s| {
-                    const smat = try self.materialize_set(s, ctx, s0, eval_pool, state_pool);
+                const disjoint = function_sets_have_distinct_domain_sizes(eval_pool, sets.items);
+                for (materialized.items) |smat| {
                     const items = smat.set_v.items(eval_pool);
                     for (items) |it| {
+                        if (disjoint) {
+                            dest[pos] = it;
+                            pos += 1;
+                            continue;
+                        }
                         var found = false;
                         var j: u32 = 0;
                         while (j < pos) : (j += 1) {
@@ -873,10 +962,8 @@ pub const Evaluator = struct {
         domain = try self.materialize_set(domain, ctx, s0, eval_pool, state_pool);
         codomain = try self.materialize_set(codomain, ctx, s0, eval_pool, state_pool);
         if (domain != .set_v or codomain != .set_v) return Error.TypeError;
-        const keys = domain.set_v.items(eval_pool);
-        const values = codomain.set_v.items(eval_pool);
-        const n: u32 = @intCast(keys.len);
-        const m: u32 = @intCast(values.len);
+        const n = domain.set_v.len;
+        const m = codomain.set_v.len;
         if (n == 0) {
             const empty = try eval_pool.alloc_values(0);
             const func = Value{ .function_v = .{
@@ -891,8 +978,10 @@ pub const Evaluator = struct {
         var count: u64 = 1;
         for (0..n) |_| {
             count *= m;
-            if (count > eval_pool.value_cap) return Error.OutOfMemory;
+            if (count > std.math.maxInt(u32)) return Error.OutOfMemory;
         }
+        try eval_pool.ensure_value_capacity(count + count * n);
+        const values = codomain.set_v.items(eval_pool);
         const func_values = try eval_pool.alloc_values(@intCast(count));
         var combo: u64 = 0;
         while (combo < count) : (combo += 1) {
@@ -931,6 +1020,16 @@ pub const Evaluator = struct {
         const b = right.set_v.items(eval_pool);
         return switch (sb.op) {
             .cartesian_op => {
+                // Flatten nested \X: collect all component sets, then product.
+                var components = std.ArrayList(Value).empty;
+                defer components.deinit(std.heap.page_allocator);
+                collect_cartesian_sets(eval_pool, left, &components) catch return Error.TypeError;
+                collect_cartesian_sets(eval_pool, right, &components) catch return Error.TypeError;
+                if (components.items.len > 1) {
+                    const product = try self.cartesian_product(eval_pool, components.items);
+                    return Value{ .set_v = make_set(eval_pool, product) };
+                }
+                // Fallback: simple 2-way product.
                 const product = try self.cartesian_product(eval_pool, &[_]Value{ left, right });
                 return Value{ .set_v = make_set(eval_pool, product) };
             },
@@ -1025,19 +1124,40 @@ pub const Evaluator = struct {
             one[0] = Value{ .tuple_v = make_tuple(eval_pool, empty) };
             return one;
         }
+        // If the first set's elements are tuples (from nested \X),
+        // flatten them. Compute the effective tuple length.
+        var first_elem_len: u32 = 1;
+        if (sets[0].set_v.len > 0) {
+            const first_items = sets[0].set_v.items(eval_pool);
+            if (first_items[0] == .tuple_v) {
+                first_elem_len = first_items[0].tuple_v.len;
+            }
+        }
+        const flat_len: u32 = first_elem_len + @as(u32, @intCast(sets.len - 1));
         var count: u64 = 1;
         for (sets) |s| count *= s.set_v.len;
         const dest = try eval_pool.alloc_values(@intCast(count));
         var combo: u64 = 0;
         while (combo < count) : (combo += 1) {
-            const tuple_values = try eval_pool.alloc_values(@intCast(sets.len));
+            const tuple_values = try eval_pool.alloc_values(flat_len);
             var tmp = combo;
+            var pos: u32 = 0;
             var i: u32 = 0;
             while (i < sets.len) : (i += 1) {
                 const items = sets[i].set_v.items(eval_pool);
                 const vi: usize = @intCast(tmp % items.len);
                 tmp /= items.len;
-                tuple_values[i] = items[vi];
+                if (i == 0 and first_elem_len > 1 and items[vi] == .tuple_v) {
+                    // Flatten the first element's inner tuple.
+                    const inner = items[vi].tuple_v.items(eval_pool);
+                    for (inner) |it| {
+                        tuple_values[pos] = it;
+                        pos += 1;
+                    }
+                } else {
+                    tuple_values[pos] = items[vi];
+                    pos += 1;
+                }
             }
             dest[combo] = Value{ .tuple_v = make_tuple(eval_pool, tuple_values) };
         }
@@ -1100,7 +1220,7 @@ pub const Evaluator = struct {
                     return try self.apply_values(func, values, eval_pool, state_pool, s0);
                 }
                 if (def.params.len != ap.args.len) return Error.TypeError;
-                var new_ctx = Context{ .names = undefined, .values = undefined, .len = 0 };
+                var new_ctx = ctx;
                 for (def.params, 0..) |p, i| {
                     new_ctx = new_ctx.extend(p, values[i]);
                 }
@@ -1151,10 +1271,10 @@ pub const Evaluator = struct {
 
     fn apply_value(self: Evaluator, func: Value, arg: Value, eval_pool: *ValuePool, state_pool: *ValuePool, s0: ?*StateStore.State) Error!Value {
         switch (func) {
-            .function_v => |f| return f.apply(eval_pool, arg) orelse Error.UndefinedSymbol,
+            .function_v => |f| return f.apply(eval_pool, arg) orelse self.fail(Error.IndexOutOfBounds, "apply function", @tagName(arg)),
             .tuple_v => |t| {
                 const idx = (arg.as_int() orelse return Error.TypeError) - 1;
-                if (idx < 0 or idx >= t.len) return Error.IndexOutOfBounds;
+                if (idx < 0 or idx >= t.len) return self.fail(Error.IndexOutOfBounds, "apply tuple", @tagName(arg));
                 return t.items(eval_pool)[@intCast(idx)];
             },
             .record_v => |r| {
@@ -1218,9 +1338,11 @@ pub const Evaluator = struct {
         }
         const bv = q.vars[idx];
         const domain = try self.eval_set_materialized(bv.domain, ctx, s0, eval_pool, state_pool);
-        const items = domain.set_v.items(eval_pool);
+        var items = std.ArrayList(Value).empty;
+        defer items.deinit(std.heap.page_allocator);
+        try items.appendSlice(std.heap.page_allocator, domain.set_v.items(eval_pool));
         const expected = q.kind == .forall;
-        for (items) |it| {
+        for (items.items) |it| {
             const new_ctx = ctx.extend(bv.name, it);
             const result = try self.eval_quantifier_vars(q, idx + 1, new_ctx, s0, eval_pool, state_pool);
             if (result.is_truthy() != expected) {
@@ -1375,12 +1497,11 @@ pub const Evaluator = struct {
     }
 
     fn except_lookup_index(self: Evaluator, original: Value, key: Value, eval_pool: *ValuePool) Error!Value {
-        _ = self;
         switch (original) {
-            .function_v => |f| return f.apply(eval_pool, key) orelse Error.IndexOutOfBounds,
+            .function_v => |f| return f.apply(eval_pool, key) orelse self.fail(Error.IndexOutOfBounds, "except lookup function", @tagName(key)),
             .tuple_v => |t| {
                 const i = (key.as_int() orelse return Error.TypeError) - 1;
-                if (i < 0 or i >= t.len) return Error.IndexOutOfBounds;
+                if (i < 0 or i >= t.len) return self.fail(Error.IndexOutOfBounds, "except lookup tuple", @tagName(key));
                 return t.items(eval_pool)[@intCast(i)];
             },
             else => return Error.TypeError,
@@ -1388,7 +1509,6 @@ pub const Evaluator = struct {
     }
 
     fn except_update_index(self: Evaluator, original: Value, key: Value, new_value: Value, eval_pool: *ValuePool) Error!Value {
-        _ = self;
         switch (original) {
             .function_v => |f| {
                 const entries = f.entries(eval_pool);
@@ -1405,7 +1525,7 @@ pub const Evaluator = struct {
             },
             .tuple_v => |t| {
                 const i = (key.as_int() orelse return Error.TypeError) - 1;
-                if (i < 0 or i >= t.len) return Error.IndexOutOfBounds;
+                if (i < 0 or i >= t.len) return self.fail(Error.IndexOutOfBounds, "except update tuple", @tagName(key));
                 const items = t.items(eval_pool);
                 const dest = try eval_pool.alloc_values(@intCast(items.len));
                 @memcpy(dest, items);
@@ -1454,6 +1574,174 @@ pub const Evaluator = struct {
     }
 };
 
+fn function_sets_have_distinct_domain_sizes(pool: *ValuePool, sets: []const Value) bool {
+    var seen: [64]bool = undefined;
+    @memset(&seen, false);
+    for (sets) |set| {
+        if (set != .function_set_v) return false;
+        const domain = set.function_set_v.domain(pool);
+        const size: usize = switch (domain) {
+            .set_v => |s| s.len,
+            .range_v => |r| blk: {
+                if (r.hi < r.lo) break :blk 0;
+                break :blk @intCast(r.hi - r.lo + 1);
+            },
+            else => return false,
+        };
+        if (size >= seen.len) return false;
+        if (seen[size]) return false;
+        seen[size] = true;
+    }
+    return true;
+}
+
+fn is_sorted_sequence_predicate(expr: *ast.Expr, seq_name: []const u8) bool {
+    if (expr.* != .quantifier) return false;
+    const q = expr.quantifier;
+    if (q.kind != .forall or q.vars.len != 2) return false;
+    const i_name = q.vars[0].name;
+    const j_name = q.vars[1].name;
+    if (!is_one_to_len_range(q.vars[0].domain, seq_name)) return false;
+    if (!is_one_to_len_range(q.vars[1].domain, seq_name)) return false;
+    if (q.body.* != .binary) return false;
+    const implies = q.body.binary;
+    if (implies.op != .implies) return false;
+    if (!is_binary_ident_ident(implies.left, .lt, i_name, j_name)) return false;
+    return is_sequence_index_order(implies.right, .le, seq_name, i_name, j_name);
+}
+
+fn is_one_to_len_range(expr: *ast.Expr, seq_name: []const u8) bool {
+    if (expr.* != .binary) return false;
+    const b = expr.binary;
+    if (b.op != .range) return false;
+    if (b.left.* != .int_literal or b.left.int_literal != 1) return false;
+    if (b.right.* != .apply) return false;
+    const ap = b.right.apply;
+    if (ap.func.* != .ident or !std.mem.eql(u8, ap.func.ident, "Len")) return false;
+    return ap.args.len == 1 and is_ident(ap.args[0], seq_name);
+}
+
+fn is_binary_ident_ident(expr: *ast.Expr, op: ast.BinaryOp, left_name: []const u8, right_name: []const u8) bool {
+    if (expr.* != .binary) return false;
+    const b = expr.binary;
+    return b.op == op and is_ident(b.left, left_name) and is_ident(b.right, right_name);
+}
+
+fn is_sequence_index_order(expr: *ast.Expr, op: ast.BinaryOp, seq_name: []const u8, left_index: []const u8, right_index: []const u8) bool {
+    if (expr.* != .binary) return false;
+    const b = expr.binary;
+    return b.op == op and
+        is_sequence_index(b.left, seq_name, left_index) and
+        is_sequence_index(b.right, seq_name, right_index);
+}
+
+fn is_sequence_index(expr: *ast.Expr, seq_name: []const u8, index_name: []const u8) bool {
+    if (expr.* != .apply) return false;
+    const ap = expr.apply;
+    return is_ident(ap.func, seq_name) and ap.args.len == 1 and is_ident(ap.args[0], index_name);
+}
+
+fn is_ident(expr: *ast.Expr, name: []const u8) bool {
+    return expr.* == .ident and std.mem.eql(u8, expr.ident, name);
+}
+
+fn extract_sequence_codomain_and_lengths(pool: *ValuePool, seq_set: Value, lengths: *std.ArrayList(u32)) Error!?Value {
+    if (seq_set != .union_v) return null;
+    const inner = seq_set.union_v.set(pool);
+    if (inner != .set_v) return null;
+
+    var codomain: ?Value = null;
+    const sets = inner.set_v.items(pool);
+    for (sets) |set| {
+        if (set != .function_set_v) return null;
+        const fs = set.function_set_v;
+        const len = sequence_domain_size(pool, fs.domain(pool)) orelse return null;
+        const fs_codomain = fs.codomain(pool);
+        if (codomain) |existing| {
+            if (!existing.eql(fs_codomain, pool)) return null;
+        } else {
+            codomain = fs_codomain;
+        }
+        try lengths.append(std.heap.page_allocator, len);
+    }
+    return codomain;
+}
+
+fn sequence_domain_size(pool: *ValuePool, domain: Value) ?u32 {
+    return switch (domain) {
+        .set_v => |s| blk: {
+            const items = s.items(pool);
+            for (items, 0..) |it, i| {
+                if (it != .int_v or it.int_v != @as(i64, @intCast(i + 1))) return null;
+            }
+            break :blk s.len;
+        },
+        .range_v => |r| blk: {
+            if (r.lo != 1 or r.hi < 0) return null;
+            break :blk @intCast(@max(r.hi, 0));
+        },
+        else => null,
+    };
+}
+
+fn sort_values(pool: *ValuePool, items: []Value) ?void {
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        const key = items[i];
+        var j = i;
+        while (j > 0) {
+            const cmp = items[j - 1].compare(key, pool) orelse return null;
+            if (cmp <= 0) break;
+            items[j] = items[j - 1];
+            j -= 1;
+        }
+        items[j] = key;
+    }
+}
+
+fn generate_sorted_sequences(
+    eval_pool: *ValuePool,
+    values: []const Value,
+    target_len: u32,
+    start: usize,
+    current: *std.ArrayList(Value),
+    generated: *std.ArrayList(Value),
+) Error!void {
+    if (current.items.len == target_len) {
+        try generated.append(std.heap.page_allocator, try make_sequence_function(eval_pool, current.items));
+        return;
+    }
+    var i = start;
+    while (i < values.len) : (i += 1) {
+        try current.append(std.heap.page_allocator, values[i]);
+        try generate_sorted_sequences(eval_pool, values, target_len, i, current, generated);
+        current.items.len -= 1;
+    }
+}
+
+fn make_sequence_function(eval_pool: *ValuePool, items: []const Value) Error!Value {
+    const len: u32 = @intCast(items.len);
+    const entries = try eval_pool.alloc_values(len);
+    @memcpy(entries, items);
+    const entries_offset = value_offset(eval_pool, entries.ptr);
+
+    const dom = try eval_pool.alloc_values(len);
+    var i: u32 = 0;
+    while (i < len) : (i += 1) {
+        dom[i] = Value{ .int_v = @as(i64, @intCast(i + 1)) };
+    }
+    return Value{ .function_v = .{
+        .domain = make_set(eval_pool, dom),
+        .offset = entries_offset,
+        .len = len,
+    } };
+}
+
+fn collect_cartesian_sets(pool: *ValuePool, val: Value, out: *std.ArrayList(Value)) !void {
+    _ = pool;
+    try out.append(std.heap.page_allocator, val);
+}
+
 fn eval_union_all(eval_pool: *ValuePool, operand: Value) Error!Value {
     if (operand != .set_v) return Error.TypeError;
     const sets = operand.set_v.items(eval_pool);
@@ -1487,8 +1775,8 @@ fn eval_union_all(eval_pool: *ValuePool, operand: Value) Error!Value {
 fn eval_subset(eval_pool: *ValuePool, operand: Value) Error!Value {
     if (operand != .set_v) return Error.TypeError;
     const items = operand.set_v.items(eval_pool);
-    if (items.len > 24) {
-        std.debug.print("NotImplemented: SUBSET with {d} elements (max 24)\n", .{items.len});
+    if (items.len > 40) {
+        std.debug.print("NotImplemented: SUBSET with {d} elements (max 40)\n", .{items.len});
         return Error.NotImplemented;
     }
     const count: u32 = @as(u32, 1) << @intCast(items.len);
@@ -1530,8 +1818,14 @@ fn make_record(eval_pool: *ValuePool, values: []Value) value.Record {
 }
 
 fn value_offset(eval_pool: *const ValuePool, ptr: [*]Value) u32 {
-    const bytes = @intFromPtr(ptr) - @intFromPtr(eval_pool.values.ptr);
-    return @intCast(bytes / @sizeOf(Value));
+    const base = @intFromPtr(eval_pool.values.ptr);
+    const addr = @intFromPtr(ptr);
+    assert(addr >= base);
+    const bytes = addr - base;
+    assert(bytes % @sizeOf(Value) == 0);
+    const offset: u32 = @intCast(bytes / @sizeOf(Value));
+    assert(offset <= eval_pool.value_count);
+    return offset;
 }
 
 /// Try to evaluate an expression to a symbolic set value without materializing
@@ -1572,6 +1866,18 @@ fn eval_symbolic_set(
                     const left = try self.eval_expr(sb.left, ctx, s0, eval_pool, state_pool);
                     const right = try self.eval_expr(sb.right, ctx, s0, eval_pool, state_pool);
                     if (!left.is_set_like() or !right.is_set_like()) return null;
+                    // Flatten: if left is a tuple_set_v, extend it with right.
+                    if (left == .tuple_set_v) {
+                        const ts = left.tuple_set_v;
+                        const ss = ts.sets(eval_pool);
+                        const dest = try eval_pool.alloc_values(@intCast(ss.len + 1));
+                        @memcpy(dest[0..ss.len], ss);
+                        dest[ss.len] = right;
+                        return Value{ .tuple_set_v = .{
+                            .offset = value_offset(eval_pool, dest.ptr),
+                            .len = @intCast(ss.len + 1),
+                        } };
+                    }
                     const dest = try eval_pool.alloc_values(2);
                     dest[0] = left;
                     dest[1] = right;
@@ -1774,4 +2080,3 @@ fn make_symbolic_function_set(eval_pool: *ValuePool, n: u32, codomain: Value) er
         .codomain_offset = try eval_pool.push_value(codomain),
     } };
 }
-

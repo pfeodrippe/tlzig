@@ -534,10 +534,25 @@ pub const ActionCompiler = struct {
                 try steps.append(std.heap.page_allocator, ActionStep{ .condition = expr });
             },
             .let_in => |l| {
+                var body = l.body;
+                var let_names = std.ArrayList([]const u8).empty;
+                defer let_names.deinit(std.heap.page_allocator);
+                var let_exprs = std.ArrayList(*ast.Expr).empty;
+                defer let_exprs.deinit(std.heap.page_allocator);
                 for (l.defs) |def| {
-                    try steps.append(std.heap.page_allocator, ActionStep{ .let_bind = .{ .name = def.name, .expr = def.body } });
+                    if (def.params.len == 0 and !def.is_function) {
+                        var def_body = def.body;
+                        for (let_names.items, let_exprs.items) |name, local_expr| {
+                            def_body = try inline_expr(self.arena, def_body, &.{name}, &.{local_expr});
+                        }
+                        try let_names.append(std.heap.page_allocator, def.name);
+                        try let_exprs.append(std.heap.page_allocator, def_body);
+                        body = try inline_expr(self.arena, body, &.{def.name}, &.{def_body});
+                    } else {
+                        try steps.append(std.heap.page_allocator, ActionStep{ .let_bind = .{ .name = def.name, .expr = def.body } });
+                    }
                 }
-                try self.collect_steps(l.body, steps, is_init);
+                try self.collect_steps(body, steps, is_init);
             },
             .apply => |ap| {
                 if (ap.func.* == .ident) {

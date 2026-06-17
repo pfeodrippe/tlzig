@@ -1473,6 +1473,38 @@ pub const Parser = struct {
                 result = try self.expr_field(result, field);
                 continue;
             }
+            // Primed suffix: f[x]' means (f[x])' which equals f'[x].
+            // Transform the expression: if it's apply(primed_var, args),
+            // change to apply(primed, args). If it's just ident, make primed.
+            if (self.match(.prime)) {
+                switch (result.*) {
+                    .ident => |name| {
+                        result = try self.expr_primed(name);
+                    },
+                    .apply => |ap| {
+                        // Transform f[x]' into f'[x]
+                        const func = ap.func;
+                        switch (func.*) {
+                            .ident => |name| {
+                                const primed_func = try self.expr_primed(name);
+                                const new_ap = try self.arena.alloc_object(ast.Apply);
+                                new_ap.* = ast.Apply{ .func = primed_func, .args = ap.args };
+                                const ptr = try self.arena.alloc_object(ast.Expr);
+                                ptr.* = ast.Expr{ .apply = new_ap };
+                                result = ptr;
+                            },
+                            else => {
+                                // Can't prime a complex expression.
+                                // Leave as-is (error will surface during eval).
+                            },
+                        }
+                    },
+                    else => {
+                        // Can't prime other expression types.
+                    },
+                }
+                continue;
+            }
             break;
         }
         return result;

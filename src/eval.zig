@@ -139,6 +139,24 @@ pub const Evaluator = struct {
         assert(@intFromPtr(expr) != 0);
         assert(eval_pool.value_count <= eval_pool.value_cap);
         assert(state_pool.value_count <= state_pool.value_cap);
+        const result = self.eval_expr_inner(expr, ctx, s0, eval_pool, state_pool);
+        return result catch |err| {
+            if (err == Error.TypeError and self.err_ctx.context == null) {
+                self.err_ctx.context = "expr";
+                self.err_ctx.detail = @tagName(expr.*);
+            }
+            return err;
+        };
+    }
+
+    fn eval_expr_inner(
+        self: Evaluator,
+        expr: *ast.Expr,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!Value {
         switch (expr.*) {
             .bool_literal => |b| return Value{ .bool_v = b },
             .int_literal => |i| return Value{ .int_v = i },
@@ -308,15 +326,21 @@ pub const Evaluator = struct {
             },
             .in => {
                 // Lazy SUBSET membership: x \in SUBSET S ⟺ x ⊆ S.
+                // Check each element of x for membership in S without
+                // materializing S (S could be Seq(...) or another lazy set).
                 if (b.right.* == .unary and b.right.unary.op == .subset) {
                     const inner = b.right.unary.operand;
                     const s = try self.eval_expr(inner, ctx, s0, eval_pool, state_pool);
                     if (!s.is_set_like()) return self.fail(Error.TypeError, "\\in SUBSET", "rhs not set");
                     if (!left.is_set_like()) return Value{ .bool_v = false };
                     const lmat = try self.materialize_set(left, ctx, s0, eval_pool, state_pool);
-                    const smat = try self.materialize_set(s, ctx, s0, eval_pool, state_pool);
-                    if (lmat != .set_v or smat != .set_v) return self.fail(Error.TypeError, "\\in SUBSET", "materialize failed");
-                    return Value{ .bool_v = lmat.set_v.is_subset(eval_pool, smat.set_v) };
+                    if (lmat != .set_v) return self.fail(Error.TypeError, "\\in SUBSET", "lhs materialize failed");
+                    // Check each element of left is a member of s.
+                    const items = lmat.set_v.items(eval_pool);
+                    for (items) |item| {
+                        if (!s.member(eval_pool, item)) return Value{ .bool_v = false };
+                    }
+                    return Value{ .bool_v = true };
                 }
                 if (try eval_symbolic_set(self, b.right, ctx, s0, eval_pool, state_pool)) |right| {
                     assert(right.is_set_like());
@@ -346,7 +370,7 @@ pub const Evaluator = struct {
             .gt => Value{ .bool_v = (left.as_int() orelse return self.fail(Error.TypeError, ">", @tagName(left))) > (right.as_int() orelse return self.fail(Error.TypeError, ">", @tagName(right))) },
             .ge => Value{ .bool_v = (left.as_int() orelse return self.fail(Error.TypeError, ">=", @tagName(left))) >= (right.as_int() orelse return self.fail(Error.TypeError, ">=", @tagName(right))) },
             .subseteq => {
-                if (!left.is_set_like() or !right.is_set_like()) return self.fail(Error.TypeError, "\\subseteq", "non-set operand");
+                if (!left.is_set_like() or !right.is_set_like()) return self.fail(Error.TypeError, "\\subseteq", @tagName(left));
                 const lmat = try self.materialize_set(left, ctx, s0, eval_pool, state_pool);
                 const rmat = try self.materialize_set(right, ctx, s0, eval_pool, state_pool);
                 if (lmat != .set_v or rmat != .set_v) return self.fail(Error.TypeError, "\\subseteq", "materialize failed");
@@ -1030,12 +1054,37 @@ pub const Evaluator = struct {
     ) Error!Value {
         if (ap.func.* == .ident) {
             const name = self.resolve_alias(ap.func.*.ident);
+            // For set operations that require materialized sets, materialize
+            // the arguments first.
+            if (std.mem.eql(u8, name, "Cardinality") and ap.args.len == 1) {
+                const arg_val = try self.eval_expr(ap.args[0], ctx, s0, eval_pool, state_pool);
+                const mat = try self.materialize_set(arg_val, ctx, s0, eval_pool, state_pool);
+                if (mat == .set_v) return Value{ .int_v = @intCast(mat.set_v.len) };
+                if (mat == .range_v) return Value{ .int_v = @max(mat.range_v.hi - mat.range_v.lo + 1, 0) };
+                return self.fail(Error.TypeError, "Cardinality", @tagName(mat));
+            }
             if (self.override_registry.find(name)) |func| {
                 const values = try eval_pool.alloc_values(@intCast(ap.args.len));
                 for (ap.args, 0..) |arg, i| {
                     values[i] = try self.eval_expr(arg, ctx, s0, eval_pool, state_pool);
                 }
-                return func(self.override_registry.ctx, eval_pool, values);
+                return func(self.override_registry.ctx, eval_pool, values) catch |err| blk: {
+                    if (err == Error.NotImplemented) {
+                        const mat_values = try eval_pool.alloc_values(@intCast(ap.args.len));
+                        for (values, 0..) |v2, i| {
+                            mat_values[i] = if (v2.is_set_like())
+                                try self.materialize_set(v2, ctx, s0, eval_pool, state_pool)
+                            else
+                                v2;
+                        }
+                        break :blk func(self.override_registry.ctx, eval_pool, mat_values) catch |err2| {
+                            if (err2 == Error.TypeError) return self.fail(Error.TypeError, "apply override", name);
+                            return err2;
+                        };
+                    }
+                    if (err == Error.TypeError) return self.fail(Error.TypeError, "apply override", name);
+                    return err;
+                };
             }
             if (self.find_definition(name)) |def| {
                 const values = try eval_pool.alloc_values(@intCast(ap.args.len));

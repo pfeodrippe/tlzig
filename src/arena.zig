@@ -83,13 +83,12 @@ pub const Arena = struct {
     }
 
     pub fn reset(self: *Arena) void {
-        // Only reset eval-arena style: free all extra chunks, reset first chunk.
-        while (self.chunks.items.len > 1) {
-            const c = self.chunks.pop();
-            std.heap.page_allocator.free(c.raw[0..c.raw_len]);
+        // Reset all chunks' bump pointers to 0 without freeing them.
+        // This preserves any allocated memory for reuse.
+        for (self.chunks.items) |*c| {
+            c.len = 0;
         }
         self.cur_chunk = 0;
-        self.chunks.items[0].len = 0;
         self.total_len = 0;
     }
 

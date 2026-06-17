@@ -368,10 +368,7 @@ pub const Value = union(ValueTag) {
             .cap_v => |bs| bs.left(pool).member(pool, elem) and bs.right(pool).member(pool, elem),
             .diff_v => |bs| bs.left(pool).member(pool, elem) and !bs.right(pool).member(pool, elem),
             .range_v => |r| r.member(elem),
-            else => {
-                assert(false); // member called on non-set value
-                return false;
-            },
+            else => return false,
         };
     }
 };

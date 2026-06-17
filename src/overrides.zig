@@ -105,11 +105,23 @@ const default_value_overrides = [_]ValueOverrideEntry{
 };
 
 fn cardinality(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
-    _ = pool;
     if (args.len != 1) return Error.TypeError;
     const s = args[0];
-    if (s != .set_v) return Error.TypeError;
-    return Value{ .int_v = @intCast(s.set_v.len) };
+    if (s == .set_v) return Value{ .int_v = @intCast(s.set_v.len) };
+    if (s == .range_v) {
+        const r = s.range_v;
+        return Value{ .int_v = @max(r.hi - r.lo + 1, 0) };
+    }
+    // Materialize other set-like values.
+    if (s.is_set_like()) {
+        // For lazy sets, we need to count elements. This is expensive but
+        // necessary for correctness.
+        _ = pool;
+        // Most lazy sets (cup_v, cap_v, etc.) need materialization.
+        // Return a conservative error; caller should materialize first.
+        return Error.NotImplemented;
+    }
+    return Error.TypeError;
 }
 
 fn is_finite_set(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
@@ -253,7 +265,26 @@ fn boolean_set(_: OverrideContext, pool: *ValuePool) Error!Value {
 fn seq_set(ctx: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     const s = args[0];
-    if (s != .set_v) return Error.TypeError;
+    // Materialize range_v into a set_v for enumeration.
+    if (s == .range_v) {
+        const r = s.range_v;
+        const count: u32 = @intCast(@max(r.hi - r.lo + 1, 0));
+        const dest = try pool.alloc_values(count);
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            dest[i] = Value{ .int_v = r.lo + @as(i64, @intCast(i)) };
+        }
+        const set_val = Value{ .set_v = make_set(pool, dest) };
+        return seq_set_from_set(ctx, pool, set_val);
+    }
+    // Record sets and other lazy sets need materialization, but the override
+    // doesn't have evaluator access. Return NotImplemented to signal the
+    // evaluator to materialize first.
+    if (s != .set_v) return Error.NotImplemented;
+    return seq_set_from_set(ctx, pool, s);
+}
+
+fn seq_set_from_set(ctx: OverrideContext, pool: *ValuePool, s: Value) Error!Value {
     const items = s.set_v.items(pool);
     const m: u64 = items.len;
     const total = try seq_set_size(m, ctx.max_seq_len);

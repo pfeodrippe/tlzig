@@ -32,7 +32,15 @@ fn can_translate(source: []const u8, start: usize, end: usize) bool {
 }
 
 pub fn translate(arena: *Arena, source: []const u8) ![]const u8 {
-    const algo = find_algorithm(source) orelse return source;
+    const algo = find_algorithm(source) orelse {
+        if (has_translation(source, 0)) {
+            // There's a handwritten translation but no algorithm block found.
+            // This happens when the algorithm uses (**) comment style.
+            // Just return the source as-is; the translation is already there.
+            return source;
+        }
+        return source;
+    };
     var end = algo.end;
     const has_handwritten = has_translation(source, end);
     // If a hand-written TLA+ translation exists, always remove the PlusCal

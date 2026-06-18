@@ -872,7 +872,7 @@ pub const Checker = struct {
                 self.evaluator.set_next_state(parent);
                 const vars_parent = try self.evaluator.eval_expr(ba.vars, Context.empty(), parent, &self.eval_pool, &self.state_store.values_pool);
                 self.evaluator.set_next_state(child);
-                const vars_child = try self.evaluator.eval_expr(ba.vars, Context.empty(), parent, &self.eval_pool, &self.state_store.values_pool);
+                const vars_child = try self.evaluator.eval_expr(ba.vars, Context.empty(), child, &self.eval_pool, &self.state_store.values_pool);
                 return vars_parent.eql(vars_child, &self.eval_pool);
             },
             else => {},

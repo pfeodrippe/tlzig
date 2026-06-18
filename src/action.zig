@@ -46,11 +46,21 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
             ptr.* = .at;
             return ptr;
         },
+        .primed_expr => |operand| {
+            const ptr = try arena.alloc_object(ast.Expr);
+            ptr.* = .{ .primed_expr = try inline_expr(arena, operand, params, args) };
+            return ptr;
+        },
         .unchanged => |names| {
             const ptr = try arena.alloc_object(ast.Expr);
             const copy = try arena.alloc([]const u8, names.len);
             for (names, 0..) |n, i| copy[i] = try arena.dup(n);
             ptr.* = .{ .unchanged = copy };
+            return ptr;
+        },
+        .unchanged_expr => |operand| {
+            const ptr = try arena.alloc_object(ast.Expr);
+            ptr.* = .{ .unchanged_expr = try inline_expr(arena, operand, params, args) };
             return ptr;
         },
         .binary => |b| {
@@ -462,7 +472,7 @@ pub const ActionCompiler = struct {
 
     fn is_action_expr_inner(self: ActionCompiler, expr: *ast.Expr) bool {
         switch (expr.*) {
-            .primed, .unchanged => return true,
+            .primed, .primed_expr, .unchanged, .unchanged_expr => return true,
             .ident => |name| {
                 if (self.evaluator.find_definition(name)) |def| return self.is_action_expr_inner(def.body);
                 return false;
@@ -688,6 +698,9 @@ pub const ActionCompiler = struct {
                         try steps.append(std.heap.page_allocator, ActionStep{ .unchanged = v });
                     }
                 }
+            },
+            .unchanged_expr => {
+                try steps.append(std.heap.page_allocator, ActionStep{ .condition = expr });
             },
             else => {
                 try steps.append(std.heap.page_allocator, ActionStep{ .condition = expr });

@@ -760,6 +760,61 @@ test "compound temporal property checks boxed action transitions" {
     try std.testing.expectError(error.PropertyViolated, model_checker.check());
 }
 
+test "UNCHANGED expression checks parent and next state" {
+    const source =
+        \\---------------------- MODULE TestUnchangedExpression ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLES x, y
+        \\vars == <<x, y>>
+        \\Init == /\ x = 0
+        \\        /\ y = 0
+        \\Next == /\ x = 0
+        \\        /\ x' = 1
+        \\        /\ y' = 0
+        \\CountUnchanged == UNCHANGED (x + y)
+        \\Preservation == [][CountUnchanged]_vars
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    const count_unchanged = evaluator.find_definition("CountUnchanged") orelse
+        return error.UndefinedSymbol;
+    try std.testing.expect(count_unchanged.body.* == .unchanged_expr);
+    const cfg = config.Config{
+        .spec_name = null,
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{"Preservation"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expectError(error.PropertyViolated, model_checker.check());
+}
+
 test "numeric subexpression selectors resolve list conjuncts" {
     const source =
         \\---------------------- MODULE TestSubexpression ----------------------

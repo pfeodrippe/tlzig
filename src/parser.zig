@@ -2120,6 +2120,9 @@ pub const Parser = struct {
 
     fn parse_unchanged(self: *Parser) !*ast.Expr {
         try self.expect(.keyword_unchanged);
+        if (self.current.kind == .lparen) {
+            return try self.expr_unchanged_expr(try self.parse_primary());
+        }
         if (self.match(.langle)) {
             var vars = std.ArrayList([]const u8).empty;
             defer vars.deinit(std.heap.page_allocator);
@@ -2293,6 +2296,12 @@ pub const Parser = struct {
     fn expr_unchanged(self: *Parser, names: []const []const u8) !*ast.Expr {
         const ptr = try self.arena.alloc_object(ast.Expr);
         ptr.* = ast.Expr{ .unchanged = names };
+        return ptr;
+    }
+
+    fn expr_unchanged_expr(self: *Parser, operand: *ast.Expr) !*ast.Expr {
+        const ptr = try self.arena.alloc_object(ast.Expr);
+        ptr.* = ast.Expr{ .unchanged_expr = operand };
         return ptr;
     }
 

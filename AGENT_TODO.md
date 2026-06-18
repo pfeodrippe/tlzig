@@ -52,7 +52,7 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   instances, primed function applications, record `DOMAIN`, nested function
   sets, action composition, and lexical `LET` shadowing.
 
-### Latest benchmark run (ReleaseFast)
+### Representative benchmark run (ReleaseFast)
 ```
                             SPEC      TLC-1   TLC-auto    tlzig-1 tlzig-auto       states
 ----------------------------------------------------------------------------------------
@@ -332,6 +332,17 @@ the same counterexample.
 - [x] Implement `DOMAIN` for records as the set of record field-name strings.
   - `SpecifyingSystems/AdvancedExamples/MCInnerSerial` now completes:
     `11136/972`.
+- [x] Evaluate `UNCHANGED (expression)` across parent and next states.
+  - Fixed `glowingRaccoon/clean`: Java TLC and tlzig both `99/63`.
+  - Fixed boxed-action stuttering checks that previously compared the parent
+    state to itself instead of comparing parent to child.
+- [x] Keep `ENABLED` and temporal operands lazy in ordinary expression
+  evaluation; action operands must not be evaluated without a next state.
+  - CoffeeCan remains exact at `20002/5150` generated/distinct and the
+    benchmark reports 0.530s tlzig worker 1 versus 0.795s TLC worker 1.
+- [x] Prime arbitrary `INSTANCE ... WITH` substitution expressions.
+  - `dna <- sumList(doubles)` now rewrites `dna'` as a next-state expression.
+  - Fixed `glowingRaccoon/product`: Java TLC and tlzig both `376/305`.
 - [x] Verify bounded no-witness `CHOOSE` against Java TLC.
   - TLC raises an evaluation error; tlzig intentionally retains
     `error.EmptyChoose` for compatibility.

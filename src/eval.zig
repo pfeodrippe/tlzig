@@ -260,6 +260,17 @@ pub const Evaluator = struct {
                 }
                 return self.fail(Error.UndefinedSymbol, "primed", name);
             },
+            .primed_expr => |operand| {
+                const child = self.next_state orelse
+                    return self.fail(Error.TypeError, "primed expression", "missing next state");
+                return try self.eval_expr(
+                    operand,
+                    ctx,
+                    child,
+                    eval_pool,
+                    state_pool,
+                );
+            },
             .binary => |b| return try self.eval_binary(b, ctx, s0, eval_pool, state_pool),
             .unary => |u| {
                 if (try eval_symbolic_set(self, expr, ctx, s0, eval_pool, state_pool)) |sv| return sv;
@@ -323,7 +334,64 @@ pub const Evaluator = struct {
             },
             .quantifier => |q| return try self.eval_quantifier(q, ctx, s0, eval_pool, state_pool),
             .choose => |c| return try self.eval_choose(c, ctx, s0, eval_pool, state_pool),
-            .unchanged => return Value{ .bool_v = true },
+            .unchanged => |names| {
+                const parent = s0 orelse
+                    return self.fail(Error.TypeError, "UNCHANGED", "missing parent state");
+                const child = self.next_state orelse
+                    return self.fail(Error.TypeError, "UNCHANGED", "missing next state");
+                for (names) |name| {
+                    if (self.find_variable(name)) |idx| {
+                        if (!parent.values[idx].eql(child.values[idx], state_pool)) {
+                            return Value{ .bool_v = false };
+                        }
+                        continue;
+                    }
+                    const def = self.find_definition(name) orelse
+                        return self.fail(Error.UndefinedSymbol, "UNCHANGED", name);
+                    if (def.params.len != 0) {
+                        return self.fail(Error.TypeError, "UNCHANGED", name);
+                    }
+                    const parent_value = try self.eval_expr(
+                        def.body,
+                        ctx,
+                        parent,
+                        eval_pool,
+                        state_pool,
+                    );
+                    const child_value = try self.eval_expr(
+                        def.body,
+                        ctx,
+                        child,
+                        eval_pool,
+                        state_pool,
+                    );
+                    if (!parent_value.eql(child_value, eval_pool)) {
+                        return Value{ .bool_v = false };
+                    }
+                }
+                return Value{ .bool_v = true };
+            },
+            .unchanged_expr => |operand| {
+                const parent = s0 orelse
+                    return self.fail(Error.TypeError, "UNCHANGED", "missing parent state");
+                const child = self.next_state orelse
+                    return self.fail(Error.TypeError, "UNCHANGED", "missing next state");
+                const parent_value = try self.eval_expr(
+                    operand,
+                    ctx,
+                    parent,
+                    eval_pool,
+                    state_pool,
+                );
+                const child_value = try self.eval_expr(
+                    operand,
+                    ctx,
+                    child,
+                    eval_pool,
+                    state_pool,
+                );
+                return Value{ .bool_v = parent_value.eql(child_value, eval_pool) };
+            },
             .except => |e| return try self.eval_except(e, ctx, s0, eval_pool, state_pool),
             .let_in => |l| return try self.eval_let_in(l, ctx, s0, eval_pool, state_pool),
             .case_expr => |c| return try self.eval_case_expr(c, ctx, s0, eval_pool, state_pool),
@@ -544,6 +612,17 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!Value {
+        switch (u.op) {
+            .enabled => return Value{ .bool_v = self.enabled_result orelse true },
+            .temporal_box, .temporal_diamond => {
+                // These operators are interpreted over the completed state
+                // graph. Their operands must not be evaluated as state
+                // expressions here (notably ENABLED actions have no next
+                // state in this path).
+                return Value{ .bool_v = true };
+            },
+            else => {},
+        }
         const operand = try self.eval_expr(u.operand, ctx, s0, eval_pool, state_pool);
         return switch (u.op) {
             .not => Value{ .bool_v = !operand.is_truthy() },
@@ -583,14 +662,7 @@ pub const Evaluator = struct {
                 }
                 return self.fail(Error.TypeError, "DOMAIN", @tagName(operand));
             },
-            .enabled => {
-                return Value{ .bool_v = self.enabled_result orelse true };
-            },
-            .temporal_box, .temporal_diamond => {
-                // Liveness/temporal/ENABLED operators are checked after state-space
-                // exploration; during ordinary expression evaluation treat as true.
-                return Value{ .bool_v = true };
-            },
+            .enabled, .temporal_box, .temporal_diamond => unreachable,
         };
     }
 

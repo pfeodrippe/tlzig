@@ -512,21 +512,66 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
             return ptr;
         },
         .primed => |name| {
+            if (find_substitution(subs, name)) |sub_expr| {
+                const copied = try copy_expr(
+                    arena,
+                    sub_expr,
+                    &[_]ast.Substitution{},
+                );
+                const ptr = try arena.alloc_object(ast.Expr);
+                if (copied.* == .ident) {
+                    ptr.* = .{ .primed = copied.ident };
+                } else {
+                    ptr.* = .{ .primed_expr = copied };
+                }
+                return ptr;
+            }
             const ptr = try arena.alloc_object(ast.Expr);
-            const mapped = substitution_ident(subs, name) orelse name;
-            ptr.* = .{ .primed = try arena.dup(mapped) };
+            ptr.* = .{ .primed = try arena.dup(name) };
+            return ptr;
+        },
+        .primed_expr => |operand| {
+            const ptr = try arena.alloc_object(ast.Expr);
+            ptr.* = .{ .primed_expr = try copy_expr(arena, operand, subs) };
             return ptr;
         },
         .unchanged => |names| {
-            const ptr = try arena.alloc_object(ast.Expr);
-            const copy: []const []const u8 = if (names.len == 0) &[_][]const u8{} else blk: {
-                const c = try arena.alloc([]const u8, names.len);
-                for (names, 0..) |n, i| {
-                    c[i] = try arena.dup(substitution_ident(subs, n) orelse n);
+            var result: ?*ast.Expr = null;
+            for (names) |name| {
+                const item = try arena.alloc_object(ast.Expr);
+                if (find_substitution(subs, name)) |sub_expr| {
+                    const copied = try copy_expr(
+                        arena,
+                        sub_expr,
+                        &[_]ast.Substitution{},
+                    );
+                    if (copied.* == .ident) {
+                        const one = try arena.alloc([]const u8, 1);
+                        one[0] = copied.ident;
+                        item.* = .{ .unchanged = one };
+                    } else {
+                        item.* = .{ .unchanged_expr = copied };
+                    }
+                } else {
+                    const one = try arena.alloc([]const u8, 1);
+                    one[0] = try arena.dup(name);
+                    item.* = .{ .unchanged = one };
                 }
-                break :blk c;
-            };
-            ptr.* = .{ .unchanged = copy };
+                if (result) |left| {
+                    const binary = try arena.alloc_object(ast.Binary);
+                    binary.* = .{ .op = .and_op, .left = left, .right = item };
+                    const combined = try arena.alloc_object(ast.Expr);
+                    combined.* = .{ .binary = binary };
+                    result = combined;
+                } else {
+                    result = item;
+                }
+            }
+            return result orelse error.SyntaxError;
+        },
+        .unchanged_expr => |operand| {
+            const ptr = try arena.alloc_object(ast.Expr);
+            ptr.* = .{ .unchanged_expr = try copy_expr(arena, operand, subs) };
             return ptr;
         },
         .at => {
@@ -848,6 +893,16 @@ fn substitution_ident(subs: []const ast.Substitution, name: []const u8) ?[]const
         if (!std.mem.eql(u8, name, sub.local_name)) continue;
         if (sub.expr.* == .ident) return sub.expr.ident;
         return null;
+    }
+    return null;
+}
+
+fn find_substitution(
+    subs: []const ast.Substitution,
+    name: []const u8,
+) ?*ast.Expr {
+    for (subs) |sub| {
+        if (std.mem.eql(u8, name, sub.local_name)) return sub.expr;
     }
     return null;
 }

@@ -472,6 +472,7 @@ pub const Resolver = struct {
                 }
                 return try self.alloc_expr(.{ .string_literal = name });
             },
+            .primed_expr => return error.NotImplemented,
 
             .unchanged => |names| {
                 const indices = try self.arena.alloc(u16, names.len);
@@ -480,6 +481,7 @@ pub const Resolver = struct {
                 }
                 return try self.alloc_expr(.{ .unchanged = indices });
             },
+            .unchanged_expr => return error.NotImplemented,
 
             .binary => |b| {
                 const left = try self.resolve(b.left);

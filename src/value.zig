@@ -21,6 +21,8 @@ pub const ValueTag = enum(u8) {
     cap_v,
     diff_v,
     range_v,
+    seq_set_v,
+    power_set_v,
 };
 
 pub const Lambda = struct {
@@ -198,6 +200,15 @@ pub const Range = extern struct {
     }
 };
 
+pub const SequenceSet = extern struct {
+    element_set_offset: u32,
+
+    pub fn element_set(self: SequenceSet, pool: *const ValuePool) Value {
+        assert(self.element_set_offset < pool.value_count);
+        return pool.values[self.element_set_offset];
+    }
+};
+
 pub const Value = union(ValueTag) {
     bool_v: bool,
     int_v: i64,
@@ -216,6 +227,8 @@ pub const Value = union(ValueTag) {
     cap_v: BinarySet,
     diff_v: BinarySet,
     range_v: Range,
+    seq_set_v: SequenceSet,
+    power_set_v: UnionSet,
 
     pub fn is_truthy(self: Value) bool {
         return switch (self) {
@@ -253,6 +266,8 @@ pub const Value = union(ValueTag) {
             .cap_v,
             .diff_v,
             .range_v,
+            .seq_set_v,
+            .power_set_v,
             => true,
             else => false,
         };
@@ -278,8 +293,16 @@ pub const Value = union(ValueTag) {
             .bool_v => |ba| tags_equal and ba == b.bool_v,
             .int_v => |ia| tags_equal and ia == b.int_v,
             .model_v => |ma| tags_equal and ma == b.model_v,
-            .function_v => |fa| tags_equal and fa.eql(b.function_v, pool),
-            .tuple_v => |ta| tags_equal and ta.eql(b.tuple_v, pool),
+            .function_v => |fa| blk: {
+                if (tags_equal) break :blk fa.eql(b.function_v, pool);
+                if (b == .tuple_v) break :blk function_equals_tuple(fa, b.tuple_v, pool);
+                break :blk false;
+            },
+            .tuple_v => |ta| blk: {
+                if (tags_equal) break :blk ta.eql(b.tuple_v, pool);
+                if (b == .function_v) break :blk function_equals_tuple(b.function_v, ta, pool);
+                break :blk false;
+            },
             .record_v => |ra| tags_equal and ra.eql(b.record_v, pool),
             .string_v => |sa| tags_equal and sa.eql(b.string_v, pool),
             .lambda_v => false,
@@ -291,6 +314,10 @@ pub const Value = union(ValueTag) {
             .cup_v => tags_equal and a.cup_v.left(pool).eql(b.cup_v.left(pool), pool) and a.cup_v.right(pool).eql(b.cup_v.right(pool), pool),
             .cap_v => tags_equal and a.cap_v.left(pool).eql(b.cap_v.left(pool), pool) and a.cap_v.right(pool).eql(b.cap_v.right(pool), pool),
             .diff_v => tags_equal and a.diff_v.left(pool).eql(b.diff_v.left(pool), pool) and a.diff_v.right(pool).eql(b.diff_v.right(pool), pool),
+            .seq_set_v => tags_equal and
+                a.seq_set_v.element_set(pool).eql(b.seq_set_v.element_set(pool), pool),
+            .power_set_v => tags_equal and
+                a.power_set_v.set(pool).eql(b.power_set_v.set(pool), pool),
         };
     }
 
@@ -314,6 +341,7 @@ pub const Value = union(ValueTag) {
         assert(source.value_count <= source.value_cap);
         assert(source.string_count <= source.string_cap);
         assert(target.string_count <= target.string_cap);
+        try target.ensure_value_capacity(self.clone_value_count(source));
         return switch (self) {
             .bool_v => |b| Value{ .bool_v = b },
             .int_v => |i| Value{ .int_v = i },
@@ -352,6 +380,49 @@ pub const Value = union(ValueTag) {
                 },
             },
             .range_v => |r| Value{ .range_v = r },
+            .seq_set_v => |ss| Value{ .seq_set_v = .{
+                .element_set_offset = try target.push_value(
+                    try ss.element_set(source).clone(source, target),
+                ),
+            } },
+            .power_set_v => |ps| Value{ .power_set_v = .{
+                .set_offset = try target.push_value(try ps.set(source).clone(source, target)),
+            } },
+        };
+    }
+
+    fn clone_value_count(self: Value, source: *const ValuePool) u64 {
+        return switch (self) {
+            .bool_v, .int_v, .model_v, .string_v, .lambda_v, .range_v => 0,
+            .set_v => |s| clone_slice_value_count(s.items(source), source),
+            .tuple_v => |t| clone_slice_value_count(t.items(source), source),
+            .record_v => |r| clone_slice_value_count(r.fields(source), source),
+            .function_v => |f| clone_slice_value_count(f.domain.items(source), source) +
+                clone_slice_value_count(f.entries(source), source),
+            .function_set_v => |fs| 2 +
+                fs.domain(source).clone_value_count(source) +
+                fs.codomain(source).clone_value_count(source),
+            .record_set_v => |rs| blk: {
+                var count: u64 = rs.len * 2;
+                var i: u32 = 0;
+                while (i < rs.len) : (i += 1) {
+                    count += rs.field_domain(source, i).clone_value_count(source);
+                }
+                break :blk count;
+            },
+            .tuple_set_v => |ts| clone_slice_value_count(ts.sets(source), source),
+            .union_v => |u| 1 + u.set(source).clone_value_count(source),
+            .cup_v => |bs| 2 +
+                bs.left(source).clone_value_count(source) +
+                bs.right(source).clone_value_count(source),
+            .cap_v => |bs| 2 +
+                bs.left(source).clone_value_count(source) +
+                bs.right(source).clone_value_count(source),
+            .diff_v => |bs| 2 +
+                bs.left(source).clone_value_count(source) +
+                bs.right(source).clone_value_count(source),
+            .seq_set_v => |ss| 1 + ss.element_set(source).clone_value_count(source),
+            .power_set_v => |ps| 1 + ps.set(source).clone_value_count(source),
         };
     }
 
@@ -368,10 +439,60 @@ pub const Value = union(ValueTag) {
             .cap_v => |bs| bs.left(pool).member(pool, elem) and bs.right(pool).member(pool, elem),
             .diff_v => |bs| bs.left(pool).member(pool, elem) and !bs.right(pool).member(pool, elem),
             .range_v => |r| r.member(elem),
+            .seq_set_v => |ss| sequence_set_member(pool, ss.element_set(pool), elem),
+            .power_set_v => |ps| power_set_member(pool, ps.set(pool), elem),
             else => return false,
         };
     }
 };
+
+fn power_set_member(pool: *const ValuePool, base: Value, elem: Value) bool {
+    assert(base.is_set_like());
+    if (elem != .set_v) return false;
+    for (elem.set_v.items(pool)) |item| {
+        if (!base.member(pool, item)) return false;
+    }
+    return true;
+}
+
+fn sequence_set_member(pool: *const ValuePool, element_set: Value, elem: Value) bool {
+    assert(element_set.is_set_like());
+    switch (elem) {
+        .tuple_v => |tuple| {
+            for (tuple.items(pool)) |item| {
+                if (!element_set.member(pool, item)) return false;
+            }
+            return true;
+        },
+        .function_v => |function| {
+            assert(function.domain.len == function.len);
+            var i: u32 = 0;
+            while (i < function.len) : (i += 1) {
+                const item = function.apply(
+                    pool,
+                    Value{ .int_v = @as(i64, @intCast(i)) + 1 },
+                ) orelse return false;
+                if (!element_set.member(pool, item)) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn function_equals_tuple(function: Function, tuple: Tuple, pool: *const ValuePool) bool {
+    if (function.len != tuple.len or function.domain.len != function.len) return false;
+    const tuple_items = tuple.items(pool);
+    var i: u32 = 0;
+    while (i < function.len) : (i += 1) {
+        const function_item = function.apply(
+            pool,
+            Value{ .int_v = @as(i64, @intCast(i)) + 1 },
+        ) orelse return false;
+        if (!function_item.eql(tuple_items[i], pool)) return false;
+    }
+    return true;
+}
 
 fn range_equals_set(r: Range, s: Set, pool: *const ValuePool) bool {
     const items = s.items(pool);
@@ -692,6 +813,11 @@ pub const String = extern struct {
     }
 };
 
+fn clone_slice_value_count(values: []const Value, source: *const ValuePool) u64 {
+    var count: u64 = values.len;
+    for (values) |v| count += v.clone_value_count(source);
+    return count;
+}
 
 pub const ModelTable = struct {
     arena: *Arena,

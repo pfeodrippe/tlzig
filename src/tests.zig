@@ -9,6 +9,7 @@ const fp_set = @import("fp_set.zig");
 const StateQueue = @import("queue.zig").StateQueue;
 
 comptime {
+    _ = @import("config.zig");
     _ = @import("parser_test.zig");
 }
 
@@ -39,6 +40,34 @@ test "fingerprint stable" {
     const fp1 = fingerprint.hash_value(&pool, v, fingerprint.hash_init());
     const fp2 = fingerprint.hash_value(&pool, v, fingerprint.hash_init());
     try std.testing.expectEqual(fp1, fp2);
+}
+
+test "equal tuple and function sequences have equal fingerprints" {
+    var arena = try make_test_arena();
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 32, 32);
+    const tuple_items = try pool.alloc_values(2);
+    tuple_items[0] = .{ .int_v = 10 };
+    tuple_items[1] = .{ .int_v = 20 };
+    const tuple = Value{ .tuple_v = .{ .offset = 0, .len = 2 } };
+
+    const keys = try pool.alloc_values(2);
+    keys[0] = .{ .int_v = 1 };
+    keys[1] = .{ .int_v = 2 };
+    const values = try pool.alloc_values(2);
+    values[0] = .{ .int_v = 10 };
+    values[1] = .{ .int_v = 20 };
+    const function = Value{ .function_v = .{
+        .domain = .{ .offset = 2, .len = 2 },
+        .offset = 4,
+        .len = 2,
+    } };
+
+    try std.testing.expect(tuple.eql(function, &pool));
+    try std.testing.expectEqual(
+        fingerprint.hash_value(&pool, tuple, fingerprint.hash_init()),
+        fingerprint.hash_value(&pool, function, fingerprint.hash_init()),
+    );
 }
 
 test "fp set insert and dedup" {

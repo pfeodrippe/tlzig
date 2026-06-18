@@ -322,6 +322,7 @@ pub const ActionStep = union(enum(u8)) {
     choose: Choose,
     branch: Branch,
     if_branch: IfBranch,
+    case_branch: CaseBranch,
     call: Call,
     let_bind: LetBind,
     unchanged: []const u8,
@@ -364,6 +365,16 @@ pub const IfBranch = struct {
     cond: *ast.Expr,
     then_steps: []const ActionStep,
     else_steps: []const ActionStep,
+};
+
+pub const CaseActionArm = struct {
+    cond: *ast.Expr,
+    steps: []const ActionStep,
+};
+
+pub const CaseBranch = struct {
+    arms: []const CaseActionArm,
+    otherwise_steps: ?[]const ActionStep,
 };
 
 pub const CompiledInit = struct {
@@ -431,6 +442,13 @@ pub const ActionCompiler = struct {
             },
             .let_in => |l| return self.is_action_expr_inner(l.body),
             .if_then_else => |ite| return self.is_action_expr(ite.then_branch) or self.is_action_expr(ite.else_branch),
+            .case_expr => |case| {
+                for (case.arms) |arm| {
+                    if (self.is_action_expr(arm.value)) return true;
+                }
+                if (case.otherwise) |otherwise| return self.is_action_expr(otherwise);
+                return false;
+            },
             .apply => |ap| {
                 if (ap.func.* == .ident) {
                     if (self.evaluator.find_definition(ap.func.*.ident)) |def| return self.is_action_expr_inner(def.body);
@@ -501,15 +519,12 @@ pub const ActionCompiler = struct {
                 }
             },
             .quantifier => |q| {
-                if (q.kind == .exists and q.vars.len == 1) {
+                if (q.kind == .exists and q.vars.len > 0) {
                     var body_steps = std.ArrayList(ActionStep).empty;
                     defer body_steps.deinit(std.heap.page_allocator);
                     try self.collect_steps(q.body, &body_steps, is_init);
-                    try steps.append(std.heap.page_allocator, ActionStep{ .choose = .{
-                        .var_name = q.vars[0].name,
-                        .domain = q.vars[0].domain,
-                        .body_steps = try self.dup_slice(ActionStep, body_steps.items),
-                    } });
+                    const body = try self.dup_slice(ActionStep, body_steps.items);
+                    try steps.append(std.heap.page_allocator, try self.compile_existential(q.vars, body));
                     return;
                 }
                 try steps.append(std.heap.page_allocator, ActionStep{ .condition = expr });
@@ -533,6 +548,32 @@ pub const ActionCompiler = struct {
                 }
                 try steps.append(std.heap.page_allocator, ActionStep{ .condition = expr });
             },
+            .case_expr => |case| {
+                if (!self.is_action_expr(expr)) {
+                    try steps.append(std.heap.page_allocator, ActionStep{ .condition = expr });
+                    return;
+                }
+                const arms = try self.arena.alloc(CaseActionArm, case.arms.len);
+                for (case.arms, 0..) |arm, i| {
+                    var arm_steps = std.ArrayList(ActionStep).empty;
+                    defer arm_steps.deinit(std.heap.page_allocator);
+                    try self.collect_steps(arm.value, &arm_steps, is_init);
+                    arms[i] = .{
+                        .cond = arm.cond,
+                        .steps = try self.dup_slice(ActionStep, arm_steps.items),
+                    };
+                }
+                const otherwise_steps: ?[]const ActionStep = if (case.otherwise) |otherwise| blk: {
+                    var otherwise_list = std.ArrayList(ActionStep).empty;
+                    defer otherwise_list.deinit(std.heap.page_allocator);
+                    try self.collect_steps(otherwise, &otherwise_list, is_init);
+                    break :blk try self.dup_slice(ActionStep, otherwise_list.items);
+                } else null;
+                try steps.append(std.heap.page_allocator, .{ .case_branch = .{
+                    .arms = arms,
+                    .otherwise_steps = otherwise_steps,
+                } });
+            },
             .let_in => |l| {
                 var body = l.body;
                 var let_names = std.ArrayList([]const u8).empty;
@@ -540,16 +581,20 @@ pub const ActionCompiler = struct {
                 var let_exprs = std.ArrayList(*ast.Expr).empty;
                 defer let_exprs.deinit(std.heap.page_allocator);
                 for (l.defs) |def| {
+                    var def_body = def.body;
+                    for (let_names.items, let_exprs.items) |name, local_expr| {
+                        def_body = try inline_expr(self.arena, def_body, &.{name}, &.{local_expr});
+                    }
                     if (def.params.len == 0 and !def.is_function) {
-                        var def_body = def.body;
-                        for (let_names.items, let_exprs.items) |name, local_expr| {
-                            def_body = try inline_expr(self.arena, def_body, &.{name}, &.{local_expr});
-                        }
                         try let_names.append(std.heap.page_allocator, def.name);
                         try let_exprs.append(std.heap.page_allocator, def_body);
                         body = try inline_expr(self.arena, body, &.{def.name}, &.{def_body});
                     } else {
-                        try steps.append(std.heap.page_allocator, ActionStep{ .let_bind = .{ .name = def.name, .expr = def.body } });
+                        const binding = if (def.params.len > 0)
+                            try self.lambda_expr(def.params, def_body)
+                        else
+                            def_body;
+                        try steps.append(std.heap.page_allocator, ActionStep{ .let_bind = .{ .name = def.name, .expr = binding } });
                     }
                 }
                 try self.collect_steps(body, steps, is_init);
@@ -591,6 +636,43 @@ pub const ActionCompiler = struct {
         }
     }
 
+    fn lambda_expr(self: ActionCompiler, params: []const []const u8, body: *ast.Expr) !*ast.Expr {
+        assert(params.len > 0);
+        const lambda = try self.arena.alloc_object(ast.Lambda);
+        lambda.* = .{
+            .params = params,
+            .body = body,
+        };
+        const expr = try self.arena.alloc_object(ast.Expr);
+        expr.* = .{ .lambda = lambda };
+        return expr;
+    }
+
+    fn compile_existential(
+        self: ActionCompiler,
+        vars: []const ast.BoundVar,
+        body_steps: []const ActionStep,
+    ) !ActionStep {
+        assert(vars.len > 0);
+        var nested = body_steps;
+        var i = vars.len;
+        while (i > 1) {
+            i -= 1;
+            const wrapper = try self.arena.alloc(ActionStep, 1);
+            wrapper[0] = .{ .choose = .{
+                .var_name = vars[i].name,
+                .domain = vars[i].domain,
+                .body_steps = nested,
+            } };
+            nested = wrapper;
+        }
+        return .{ .choose = .{
+            .var_name = vars[0].name,
+            .domain = vars[0].domain,
+            .body_steps = nested,
+        } };
+    }
+
     fn dup_slice(self: ActionCompiler, comptime T: type, items: []const T) ![]const T {
         const copy = try self.arena.alloc(T, items.len);
         @memcpy(copy, items);
@@ -600,8 +682,14 @@ pub const ActionCompiler = struct {
 
 pub const ActionExecutor = struct {
     evaluator: Evaluator,
-    state_store: *StateStore,
+    source_state_store: *StateStore,
+    candidate_store: *StateStore,
     eval_pool: *ValuePool,
+
+    const Continuation = struct {
+        steps: []const ActionStep,
+        next: ?*const Continuation,
+    };
 
     pub fn execute_init(
         self: ActionExecutor,
@@ -610,7 +698,7 @@ pub const ActionExecutor = struct {
     ) !void {
         assert(compiled.steps.len >= 0);
         assert(out_states.items.len == 0);
-        try self.execute_steps(compiled.steps, Context.empty(), null, out_states, true);
+        try self.execute_steps(compiled.steps, null, Context.empty(), null, out_states, true);
     }
 
     pub fn execute_next(
@@ -619,21 +707,29 @@ pub const ActionExecutor = struct {
         s0_idx: u32,
         out_states: *std.ArrayList(u32),
     ) !void {
-        const s0 = self.state_store.get(s0_idx);
-        try self.execute_steps(compiled.steps, Context.empty(), s0, out_states, false);
+        const s0 = self.source_state_store.get(s0_idx);
+        try self.execute_steps(compiled.steps, null, Context.empty(), s0, out_states, false);
     }
 
     fn execute_steps(
         self: ActionExecutor,
         steps: []const ActionStep,
+        continuation: ?*const Continuation,
         ctx: Context,
         s0: ?*StateStore.State,
         out_states: *std.ArrayList(u32),
         is_init: bool,
     ) !void {
         assert(self.eval_pool.value_count <= self.eval_pool.value_cap);
-        assert(self.state_store.values_pool.value_count <= self.state_store.values_pool.value_cap);
+        assert(self.source_state_store.values_pool.value_count <=
+            self.source_state_store.values_pool.value_cap);
+        assert(self.candidate_store.values_pool.value_count <=
+            self.candidate_store.values_pool.value_cap);
         if (steps.len == 0) {
+            if (continuation) |next| {
+                try self.execute_steps(next.steps, next.next, ctx, s0, out_states, is_init);
+                return;
+            }
             try self.commit_state(ctx, s0, out_states, is_init);
             return;
         }
@@ -642,106 +738,111 @@ pub const ActionExecutor = struct {
         assert(rest.len == steps.len - 1);
         switch (step) {
             .assign_var => |a| {
-                const val = try self.evaluator.eval_expr(a.expr, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                const val = try self.evaluator.eval_expr(a.expr, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                 if (a.is_membership and val.is_set_like()) {
-                    const mat = try self.evaluator.materialize_set(val, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                        const mat = try self.evaluator.materialize_set(val, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                     if (mat != .set_v) return Error.TypeError;
                     const items = mat.set_v.items(self.eval_pool);
                     const snap = self.eval_pool.snapshot();
                     for (items) |it| {
                         const new_ctx = ctx.extend(a.var_name, it);
-                        try self.execute_steps(rest, new_ctx, s0, out_states, is_init);
+                        try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
                         self.eval_pool.restore(snap);
                     }
                 } else {
                     const new_ctx = ctx.extend(a.var_name, val);
-                    try self.execute_steps(rest, new_ctx, s0, out_states, is_init);
+                    try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
                 }
             },
             .assign_prime => |a| {
-                const val = try self.evaluator.eval_expr(a.expr, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                const val = try self.evaluator.eval_expr(a.expr, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                 if (a.is_membership and val.is_set_like()) {
-                    const mat = try self.evaluator.materialize_set(val, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                    const mat = try self.evaluator.materialize_set(val, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                     if (mat != .set_v) return Error.TypeError;
                     const items = mat.set_v.items(self.eval_pool);
                     const snap = self.eval_pool.snapshot();
                     for (items) |it| {
                         const new_ctx = ctx.extend(a.var_name, it);
-                        try self.execute_steps(rest, new_ctx, s0, out_states, is_init);
+                        try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
                         self.eval_pool.restore(snap);
                     }
                 } else {
                     const new_ctx = ctx.extend(a.var_name, val);
-                    try self.execute_steps(rest, new_ctx, s0, out_states, is_init);
+                    try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
                 }
             },
             .condition => |e| {
-                const v = try self.evaluator.eval_expr(e, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                const v = try self.evaluator.eval_expr(e, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                 if (!v.is_truthy()) return;
-                try self.execute_steps(rest, ctx, s0, out_states, is_init);
+                try self.execute_steps(rest, continuation, ctx, s0, out_states, is_init);
             },
             .choose => |c| {
-                const set_v = try self.evaluator.eval_expr(c.domain, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                const set_v = try self.evaluator.eval_expr(c.domain, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                 if (!set_v.is_set_like()) return Error.TypeError;
-                const mat = try self.evaluator.materialize_set(set_v, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                const mat = try self.evaluator.materialize_set(set_v, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                 if (mat != .set_v) return Error.TypeError;
                 const items = mat.set_v.items(self.eval_pool);
-                var combined = std.ArrayList(ActionStep).empty;
-                defer combined.deinit(std.heap.page_allocator);
-                try combined.appendSlice(std.heap.page_allocator, c.body_steps);
-                try combined.appendSlice(std.heap.page_allocator, rest);
+                const next = Continuation{ .steps = rest, .next = continuation };
                 const snap = self.eval_pool.snapshot();
                 for (items) |it| {
                     const new_ctx = ctx.extend(c.var_name, it);
-                    try self.execute_steps(combined.items, new_ctx, s0, out_states, is_init);
+                    try self.execute_steps(c.body_steps, &next, new_ctx, s0, out_states, is_init);
                     self.eval_pool.restore(snap);
                 }
             },
             .let_bind => |l| {
-                const v = try self.evaluator.eval_expr(l.expr, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                const v = try self.evaluator.eval_expr(l.expr, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                 const new_ctx = ctx.extend(l.name, v);
-                try self.execute_steps(rest, new_ctx, s0, out_states, is_init);
+                try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
             },
             .call => |c| {
                 if (c.def.params.len != c.args.len) return Error.TypeError;
                 const values = try self.eval_pool.alloc_values(@intCast(c.args.len));
                 for (c.args, 0..) |arg, i| {
-                    values[i] = try self.evaluator.eval_expr(arg, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                    values[i] = try self.evaluator.eval_expr(arg, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                 }
                 var call_ctx = ctx;
                 for (c.def.params, 0..) |p, i| {
                     call_ctx = call_ctx.extend(p, values[i]);
                 }
-                var combined = std.ArrayList(ActionStep).empty;
-                defer combined.deinit(std.heap.page_allocator);
-                try combined.appendSlice(std.heap.page_allocator, c.body_steps);
-                try combined.appendSlice(std.heap.page_allocator, rest);
+                const next = Continuation{ .steps = rest, .next = continuation };
                 const snap = self.eval_pool.snapshot();
-                try self.execute_steps(combined.items, call_ctx, s0, out_states, is_init);
+                try self.execute_steps(c.body_steps, &next, call_ctx, s0, out_states, is_init);
                 self.eval_pool.restore(snap);
             },
             .branch => |b| {
-                var combined = std.ArrayList(ActionStep).empty;
-                defer combined.deinit(std.heap.page_allocator);
+                const next = Continuation{ .steps = rest, .next = continuation };
                 const snap = self.eval_pool.snapshot();
                 for (b.options) |opt| {
-                    combined.clearRetainingCapacity();
-                    try combined.appendSlice(std.heap.page_allocator, opt);
-                    try combined.appendSlice(std.heap.page_allocator, rest);
-                    try self.execute_steps(combined.items, ctx, s0, out_states, is_init);
+                    try self.execute_steps(opt, &next, ctx, s0, out_states, is_init);
                     self.eval_pool.restore(snap);
                 }
             },
             .if_branch => |ib| {
-                const cond_val = try self.evaluator.eval_expr(ib.cond, ctx, s0, self.eval_pool, &self.state_store.values_pool);
+                const cond_val = try self.evaluator.eval_expr(ib.cond, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                 const taken = if (cond_val.is_truthy()) ib.then_steps else ib.else_steps;
-                var combined = std.ArrayList(ActionStep).empty;
-                defer combined.deinit(std.heap.page_allocator);
-                try combined.appendSlice(std.heap.page_allocator, taken);
-                try combined.appendSlice(std.heap.page_allocator, rest);
+                const next = Continuation{ .steps = rest, .next = continuation };
                 const snap = self.eval_pool.snapshot();
-                try self.execute_steps(combined.items, ctx, s0, out_states, is_init);
+                try self.execute_steps(taken, &next, ctx, s0, out_states, is_init);
                 self.eval_pool.restore(snap);
+            },
+            .case_branch => |case| {
+                const next = Continuation{ .steps = rest, .next = continuation };
+                const snap = self.eval_pool.snapshot();
+                for (case.arms) |arm| {
+                    const cond = try self.evaluator.eval_expr(arm.cond, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
+                    if (!cond.is_truthy()) {
+                        self.eval_pool.restore(snap);
+                        continue;
+                    }
+                    try self.execute_steps(arm.steps, &next, ctx, s0, out_states, is_init);
+                    self.eval_pool.restore(snap);
+                    return;
+                }
+                if (case.otherwise_steps) |otherwise| {
+                    try self.execute_steps(otherwise, &next, ctx, s0, out_states, is_init);
+                    self.eval_pool.restore(snap);
+                }
             },
             .unchanged => |name| {
                 if (s0 == null) return Error.TypeError;
@@ -749,9 +850,9 @@ pub const ActionExecutor = struct {
                     std.debug.print("UndefinedVariable in UNCHANGED: {s}\n", .{name});
                     return Error.UndefinedSymbol;
                 };
-                const v = try s0.?.values[idx].clone(&self.state_store.values_pool, self.eval_pool);
+                const v = try s0.?.values[idx].clone(&self.source_state_store.values_pool, self.eval_pool);
                 const new_ctx = ctx.extend(name, v);
-                try self.execute_steps(rest, new_ctx, s0, out_states, is_init);
+                try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
             },
         }
     }
@@ -764,11 +865,14 @@ pub const ActionExecutor = struct {
         is_init: bool,
     ) !void {
         _ = is_init;
-        const new_idx = try self.state_store.alloc_state();
-        const new_state = self.state_store.get(new_idx);
+        const new_idx = try self.candidate_store.alloc_state();
+        const new_state = self.candidate_store.get(new_idx);
         if (s0) |parent| {
             new_state.level = parent.level + 1;
-            const pred_idx = @divExact(@intFromPtr(parent) - @intFromPtr(self.state_store.states.ptr), @sizeOf(StateStore.State));
+            const pred_idx = @divExact(
+                @intFromPtr(parent) - @intFromPtr(self.source_state_store.states.ptr),
+                @sizeOf(StateStore.State),
+            );
             new_state.pred = @intCast(pred_idx);
         } else {
             new_state.level = 0;
@@ -776,7 +880,10 @@ pub const ActionExecutor = struct {
         }
         if (s0) |parent| {
             for (new_state.values, 0..) |*v, vi| {
-                v.* = try parent.values[vi].clone(&self.state_store.values_pool, &self.state_store.values_pool);
+                v.* = try parent.values[vi].clone(
+                    &self.source_state_store.values_pool,
+                    &self.candidate_store.values_pool,
+                );
             }
         } else {
             for (new_state.values) |*v| v.* = Value{ .bool_v = false };
@@ -786,7 +893,10 @@ pub const ActionExecutor = struct {
             const name = ctx.names[i];
             const v = ctx.values[i];
             const var_idx = self.evaluator.find_variable(name) orelse continue;
-            new_state.values[var_idx] = try v.clone(self.eval_pool, &self.state_store.values_pool);
+            new_state.values[var_idx] = try v.clone(
+                self.eval_pool,
+                &self.candidate_store.values_pool,
+            );
         }
         try out_states.append(std.heap.page_allocator, new_idx);
     }

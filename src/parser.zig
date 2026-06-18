@@ -534,6 +534,7 @@ fn switch_word(word: []const u8) Token.Kind {
         .{ "leq", .le },
         .{ "geq", .ge },
         .{ "div", .slash },
+        .{ "circ", .concat },
     });
     return map.get(word) orelse .ident;
 }
@@ -546,6 +547,9 @@ pub const Parser = struct {
     list_cols: [8]u32,
     list_cols_len: u32,
     def_col: u32,
+    let_definition_depth: u16,
+    hoisted_namespace_instances: [32]ast.NamespaceInstance,
+    hoisted_namespace_count: u8,
     suppress_errors: bool = false,
     group_depth: u32,
 
@@ -561,6 +565,9 @@ pub const Parser = struct {
             .list_cols = undefined,
             .list_cols_len = 0,
             .def_col = 0,
+            .let_definition_depth = 0,
+            .hoisted_namespace_instances = undefined,
+            .hoisted_namespace_count = 0,
             .group_depth = 0,
         };
     }
@@ -615,6 +622,8 @@ pub const Parser = struct {
 
         var definitions = std.ArrayList(ast.Definition).empty;
         defer definitions.deinit(std.heap.page_allocator);
+        var assumptions = std.ArrayList(*ast.Expr).empty;
+        defer assumptions.deinit(std.heap.page_allocator);
         var instances = std.ArrayList(ast.Instance).empty;
         defer instances.deinit(std.heap.page_allocator);
         var namespace_instances = std.ArrayList(ast.NamespaceInstance).empty;
@@ -679,7 +688,8 @@ pub const Parser = struct {
             if (self.current.kind == .keyword_assume) {
                 self.advance();
                 if (self.current.kind == .ident and self.next.kind == .defeq) {
-                    _ = try self.parse_definition();
+                    const assumption = try self.parse_definition();
+                    try assumptions.append(std.heap.page_allocator, assumption.body);
                 } else {
                     // ASSUME can have labels (e.g. ASSUME Theorem!: body).
                     // Skip label if present.
@@ -688,10 +698,11 @@ pub const Parser = struct {
                         self.advance(); // !
                         if (self.current.kind == .colon) self.advance(); // :
                     }
-                    _ = self.parse_expr() catch {
+                    const assumption = self.parse_expr() catch {
                         self.skip_to_next_definition();
                         continue;
                     };
+                    try assumptions.append(std.heap.page_allocator, assumption);
                 }
                 if (self.current.kind == .semi) self.advance();
                 continue;
@@ -772,14 +783,25 @@ pub const Parser = struct {
         var invariants = std.ArrayList([]const u8).empty;
         defer invariants.deinit(std.heap.page_allocator);
 
+        const namespace_count = namespace_instances.items.len + self.hoisted_namespace_count;
+        const all_namespace_instances = try self.arena.alloc(ast.NamespaceInstance, namespace_count);
+        @memcpy(
+            all_namespace_instances[0..namespace_instances.items.len],
+            namespace_instances.items,
+        );
+        for (self.hoisted_namespace_instances[0..self.hoisted_namespace_count], namespace_instances.items.len..) |instance, i| {
+            all_namespace_instances[i] = instance;
+        }
+
         return ast.Module{
             .name = try self.dup(name),
             .extends = try self.dup_slice([]const u8, extends.items),
             .variables = try self.dup_slice([]const u8, variables.items),
             .constants = try self.dup_slice([]const u8, constants.items),
             .definitions = try self.dup_slice(ast.Definition, definitions.items),
+            .assumptions = try self.dup_slice(*ast.Expr, assumptions.items),
             .instances = try self.dup_slice(ast.Instance, instances.items),
-            .namespace_instances = try self.dup_slice(ast.NamespaceInstance, namespace_instances.items),
+            .namespace_instances = all_namespace_instances,
             .init_name = init_name,
             .next_name = next_name,
             .invariants = try self.dup_slice([]const u8, invariants.items),
@@ -818,9 +840,41 @@ pub const Parser = struct {
         // Recursive function definition: F[x \in S] == body.
         if (self.current.kind == .lbracket) {
             try self.expect(.lbracket);
-            const var_name = try self.expect_ident_text();
-            try self.expect(.in);
-            const domain = try self.parse_expr();
+            var function_vars = std.ArrayList([]const u8).empty;
+            defer function_vars.deinit(std.heap.page_allocator);
+            var function_domain: ?*ast.Expr = null;
+            var binder_count: u32 = 0;
+            while (true) {
+                var binder_vars: u32 = 0;
+                if (self.match(.langle)) {
+                    while (true) {
+                        try function_vars.append(
+                            std.heap.page_allocator,
+                            try self.dup(try self.expect_ident_text()),
+                        );
+                        binder_vars += 1;
+                        if (!self.match(.comma)) break;
+                    }
+                    try self.expect(.rangle);
+                } else {
+                    try function_vars.append(
+                        std.heap.page_allocator,
+                        try self.dup(try self.expect_ident_text()),
+                    );
+                    binder_vars = 1;
+                }
+                std.debug.assert(binder_vars > 0);
+                try self.expect(.in);
+                const binder_domain = try self.parse_expr();
+                function_domain = if (function_domain) |domain|
+                    try self.expr_set_binary(.cartesian_op, domain, binder_domain)
+                else
+                    binder_domain;
+                binder_count += 1;
+                if (!self.match(.comma)) break;
+            }
+            std.debug.assert(function_vars.items.len > 0);
+            std.debug.assert(binder_count > 0);
             try self.expect(.rbracket);
             try self.expect(.defeq);
             const body = try self.parse_definition_body();
@@ -829,8 +883,9 @@ pub const Parser = struct {
                 .params = &.{},
                 .body = body,
                 .is_function = true,
-                .function_var = try self.dup(var_name),
-                .function_domain = domain,
+                .function_var = function_vars.items[0],
+                .function_vars = try self.dup_slice([]const u8, function_vars.items),
+                .function_domain = function_domain.?,
             };
         }
 
@@ -916,11 +971,10 @@ pub const Parser = struct {
         }
         // Single-character operator tokens that are valid infix operators.
         const single_op_kinds = [_]Token.Kind{
-            .plus,    .minus,   .star,    .slash,   .percent, .power,
-            .range,   .concat,  .ooverride, .recordto, .cartesian,
-            .le,      .ge,      .lt,      .gt,      .eq,      .neq,
-            .in,      .notin,   .subseteq, .leads_to, .cup,     .cap,
-            .setminus,
+            .plus,  .minus,    .star,      .slash,    .percent,   .power,
+            .range, .concat,   .ooverride, .recordto, .cartesian, .le,
+            .ge,    .lt,       .gt,        .eq,       .neq,       .in,
+            .notin, .subseteq, .leads_to,  .cup,      .cap,       .setminus,
         };
         for (single_op_kinds) |kind| {
             if (self.current.kind == kind and (self.next.kind == .ident or self.next.kind == .underscore)) {
@@ -1004,8 +1058,8 @@ pub const Parser = struct {
     }
 
     fn parse_definition_body(self: *Parser) !*ast.Expr {
-        if (self.current.kind == .and_op) return try self.parse_item_list(.and_op);
-        if (self.current.kind == .or_op) return try self.parse_item_list(.or_op);
+        if (self.current.kind == .and_op) return try self.parse_item_list(.and_op, true);
+        if (self.current.kind == .or_op) return try self.parse_item_list(.or_op, true);
         return try self.parse_expr();
     }
 
@@ -1017,21 +1071,20 @@ pub const Parser = struct {
         return self.current.col == 1 and self.group_depth == 0 and self.def_col > 1;
     }
 
-    fn max_list_col(self: *Parser) u32 {
-        var max: u32 = 0;
+    fn has_active_list_col(self: *Parser, col: u32) bool {
         var i: u32 = 0;
         while (i < self.list_cols_len) : (i += 1) {
-            if (self.list_cols[i] > max) max = self.list_cols[i];
+            if (self.list_cols[i] == col) return true;
         }
-        return max;
+        return false;
     }
 
     fn parse_expr(self: *Parser) anyerror!*ast.Expr {
-        if (self.current.kind == .and_op and self.current.col > self.max_list_col()) {
-            return try self.parse_item_list(.and_op);
+        if (self.current.kind == .and_op and !self.has_active_list_col(self.current.col)) {
+            return try self.parse_item_list(.and_op, false);
         }
-        if (self.current.kind == .or_op and self.current.col > self.max_list_col()) {
-            return try self.parse_item_list(.or_op);
+        if (self.current.kind == .or_op and !self.has_active_list_col(self.current.col)) {
+            return try self.parse_item_list(.or_op, false);
         }
         return try self.parse_implies();
     }
@@ -1047,18 +1100,49 @@ pub const Parser = struct {
         self.list_cols_len -= 1;
     }
 
-    fn parse_item_list(self: *Parser, op: ast.BinaryOp) !*ast.Expr {
-        const col = self.current.col;
+    fn parse_item_list(
+        self: *Parser,
+        op: ast.BinaryOp,
+        allow_initial_dedent: bool,
+    ) anyerror!*ast.Expr {
+        var col = self.current.col;
         self.push_list_col(col);
+        const first_line = self.current.line;
         self.advance();
-        var left = try self.parse_expr();
+        var left = try self.parse_list_item(first_line);
         const op_kind: Token.Kind = if (op == .and_op) .and_op else .or_op;
+        if (allow_initial_dedent and
+            self.current.kind == op_kind and
+            self.current.col < col)
+        {
+            col = self.current.col;
+            self.list_cols[self.list_cols_len - 1] = col;
+        }
         while (self.current.kind == op_kind and self.current.col == col) {
+            const item_line = self.current.line;
             self.advance();
-            const right = try self.parse_expr();
+            const right = try self.parse_list_item(item_line);
             left = try self.expr_binary(op, left, right);
         }
         self.pop_list_col();
+        if (self.match(.implies)) {
+            return try self.expr_binary(.implies, left, try self.parse_implies());
+        }
+        if (self.match(.leads_to)) {
+            return try self.expr_binary(.leads_to, left, try self.parse_implies());
+        }
+        return left;
+    }
+
+    fn parse_list_item(self: *Parser, bullet_line: u32) !*ast.Expr {
+        const left = try self.parse_equiv();
+        if (self.current.line != bullet_line) return left;
+        if (self.match(.implies)) {
+            return try self.expr_binary(.implies, left, try self.parse_implies());
+        }
+        if (self.match(.leads_to)) {
+            return try self.expr_binary(.leads_to, left, try self.parse_implies());
+        }
         return left;
     }
 
@@ -1117,11 +1201,11 @@ pub const Parser = struct {
         // TLA+ allows a bulleted conjunction/disjunction to appear as a
         // standalone primary.  The list column must be outside any enclosing
         // list scope.
-        if (self.current.kind == .and_op and self.current.col > self.max_list_col()) {
-            return try self.parse_item_list(.and_op);
+        if (self.current.kind == .and_op and !self.has_active_list_col(self.current.col)) {
+            return try self.parse_item_list(.and_op, false);
         }
-        if (self.current.kind == .or_op and self.current.col > self.max_list_col()) {
-            return try self.parse_item_list(.or_op);
+        if (self.current.kind == .or_op and !self.has_active_list_col(self.current.col)) {
+            return try self.parse_item_list(.or_op, false);
         }
         return try self.parse_comparison();
     }
@@ -1137,6 +1221,14 @@ pub const Parser = struct {
 
     fn parse_comparison(self: *Parser) !*ast.Expr {
         const left = try self.parse_cartesian();
+        if (self.current.kind == .in and
+            self.let_definition_depth > 0 and
+            self.group_depth == 0 and
+            self.def_col > 0 and
+            self.current.col < self.def_col)
+        {
+            return left;
+        }
         const op: ?ast.BinaryOp = switch (self.current.kind) {
             .eq => .eq,
             .neq => .ne,
@@ -1194,18 +1286,24 @@ pub const Parser = struct {
     }
 
     fn parse_concat(self: *Parser) !*ast.Expr {
-        var left = try self.parse_union();
+        var left = try self.parse_recordto();
         while (true) {
             if (self.match(.concat)) {
-                const right = try self.parse_union();
+                const right = try self.parse_recordto();
                 left = try self.expr_binary(.concat, left, right);
             } else if (self.match(.ooverride)) {
-                const right = try self.parse_union();
+                const right = try self.parse_recordto();
                 left = try self.expr_binary(.ooverride, left, right);
-            } else if (self.match(.recordto)) {
-                const right = try self.parse_union();
-                left = try self.expr_binary(.recordto, left, right);
             } else break;
+        }
+        return left;
+    }
+
+    fn parse_recordto(self: *Parser) !*ast.Expr {
+        var left = try self.parse_union();
+        while (self.match(.recordto)) {
+            const right = try self.parse_union();
+            left = try self.expr_binary(.recordto, left, right);
         }
         return left;
     }
@@ -1294,10 +1392,10 @@ pub const Parser = struct {
             // A prefix ~ can apply to a bulleted conjunction/disjunction, e.g.
             //   ~ /\ A /\ B
             if ((self.current.kind == .and_op or self.current.kind == .or_op) and
-                self.current.col > self.max_list_col())
+                !self.has_active_list_col(self.current.col))
             {
                 const op: ast.BinaryOp = if (self.current.kind == .and_op) .and_op else .or_op;
-                const operand = try self.parse_item_list(op);
+                const operand = try self.parse_item_list(op, false);
                 return try self.expr_unary(.not, operand);
             }
             return try self.expr_unary(.not, try self.parse_unary());
@@ -1334,12 +1432,7 @@ pub const Parser = struct {
                 return try self.expr_string(text[1 .. text.len - 1]);
             },
             .ident => {
-                var name = try self.expect_ident_text();
-                if (self.match(.bang)) {
-                    // Namespaced instance access: A!Op is represented as a single identifier A!Op.
-                    const field = try self.expect_ident_text();
-                    name = try self.arena_concat_three(name, "!", field);
-                }
+                const name = try self.parse_qualified_ident_name();
                 var expr = try self.expr_ident(name);
                 if (self.match(.prime)) {
                     expr = try self.expr_primed(name);
@@ -1408,10 +1501,7 @@ pub const Parser = struct {
             },
             // Operator references: `+`, `\cup`, etc. used as values.
             // We generate a 2-parameter lambda so higher-order application works.
-            .plus, .minus, .cup, .cap, .setminus, .concat, .ooverride,
-            .recordto, .star, .slash, .power, .range, .subseteq, .in, .notin,
-            .lt, .le, .gt, .ge, .eq, .neq, .equiv, .implies, .leads_to,
-            .and_op, .or_op, .cartesian => return try self.parse_operator_ref(),
+            .plus, .minus, .cup, .cap, .setminus, .concat, .ooverride, .recordto, .star, .slash, .power, .range, .subseteq, .in, .notin, .lt, .le, .gt, .ge, .eq, .neq, .equiv, .implies, .leads_to, .and_op, .or_op, .cartesian => return try self.parse_operator_ref(),
             else => return error.SyntaxError,
         }
     }
@@ -1543,7 +1633,7 @@ pub const Parser = struct {
         if (self.current.kind != .rangle) return error.SyntaxError;
         self.advance(); // >>
         self.group_depth -= 1;
-        if (self.current.kind != .in) return error.SyntaxError;
+        try self.expect(.in);
         const domain = try self.parse_expr();
         try self.expect(.colon);
         const pred = try self.parse_expr();
@@ -1864,7 +1954,31 @@ pub const Parser = struct {
         self.advance();
         var vars = std.ArrayList(ast.BoundVar).empty;
         defer vars.deinit(std.heap.page_allocator);
+        var tuple_names = std.ArrayList([]const []const u8).empty;
+        defer tuple_names.deinit(std.heap.page_allocator);
+        var tuple_vars = std.ArrayList([]const u8).empty;
+        defer tuple_vars.deinit(std.heap.page_allocator);
         while (true) {
+            if (self.match(.langle)) {
+                var names = std.ArrayList([]const u8).empty;
+                defer names.deinit(std.heap.page_allocator);
+                while (true) {
+                    try names.append(std.heap.page_allocator, try self.dup(try self.expect_ident_text()));
+                    if (!self.match(.comma)) break;
+                }
+                try self.expect(.rangle);
+                try self.expect(.in);
+                const domain = try self.parse_expr();
+                const tuple_var = try self.synthetic_name("__quant_tuple_", tuple_vars.items.len);
+                try vars.append(std.heap.page_allocator, .{ .name = tuple_var, .domain = domain });
+                try tuple_vars.append(std.heap.page_allocator, tuple_var);
+                try tuple_names.append(
+                    std.heap.page_allocator,
+                    try self.dup_slice([]const u8, names.items),
+                );
+                if (!self.match(.comma)) break;
+                continue;
+            }
             var names = std.ArrayList([]const u8).empty;
             defer names.deinit(std.heap.page_allocator);
             while (true) {
@@ -1880,8 +1994,32 @@ pub const Parser = struct {
             if (!self.match(.comma)) break;
         }
         try self.expect(.colon);
-        const body = try self.parse_expr();
+        var body = try self.parse_expr();
+        if (tuple_vars.items.len > 0) {
+            var defs = std.ArrayList(ast.Definition).empty;
+            defer defs.deinit(std.heap.page_allocator);
+            for (tuple_vars.items, tuple_names.items) |tuple_var, names| {
+                for (names, 0..) |name, i| {
+                    const tuple_expr = try self.expr_ident(tuple_var);
+                    const index_expr = try self.expr_int(@intCast(i + 1));
+                    const args = try self.arena.alloc(*ast.Expr, 1);
+                    args[0] = index_expr;
+                    try defs.append(std.heap.page_allocator, .{
+                        .name = name,
+                        .params = &.{},
+                        .body = try self.expr_apply(tuple_expr, args),
+                    });
+                }
+            }
+            body = try self.expr_let_in(defs.items, body);
+        }
         return try self.expr_quantifier(kind, vars.items, body);
+    }
+
+    fn synthetic_name(self: *Parser, prefix: []const u8, index: usize) ![]const u8 {
+        var buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buffer, "{s}{d}", .{ prefix, index });
+        return try self.dup(name);
     }
 
     fn parse_let_in(self: *Parser) !*ast.Expr {
@@ -1889,7 +2027,32 @@ pub const Parser = struct {
         var defs = std.ArrayList(ast.Definition).empty;
         defer defs.deinit(std.heap.page_allocator);
         while (true) {
-            const def = try self.parse_definition();
+            if (self.current.kind == .keyword_in) break;
+            if (self.current.kind == .ident and self.next.kind == .defeq) {
+                const saved = self.*;
+                const alias = self.current.text;
+                self.advance();
+                self.advance();
+                if (self.current.kind == .keyword_instance) {
+                    const instance = try self.parse_instance();
+                    if (instance.substitutions.len != 0) return error.NotImplemented;
+                    std.debug.assert(self.hoisted_namespace_count < self.hoisted_namespace_instances.len);
+                    self.hoisted_namespace_instances[self.hoisted_namespace_count] = .{
+                        .alias = try self.dup(alias),
+                        .module_name = instance.module_name,
+                        .substitutions = instance.substitutions,
+                    };
+                    self.hoisted_namespace_count += 1;
+                    continue;
+                }
+                self.* = saved;
+            }
+            self.let_definition_depth += 1;
+            const def = self.parse_definition() catch |err| {
+                self.let_definition_depth -= 1;
+                return err;
+            };
+            self.let_definition_depth -= 1;
             try defs.append(std.heap.page_allocator, def);
             if (self.current.kind == .keyword_in) break;
         }
@@ -1953,17 +2116,33 @@ pub const Parser = struct {
             var vars = std.ArrayList([]const u8).empty;
             defer vars.deinit(std.heap.page_allocator);
             while (true) {
-                const name = try self.expect_ident_text();
+                const name = try self.parse_qualified_ident_name();
                 try vars.append(std.heap.page_allocator, try self.dup(name));
                 if (!self.match(.comma)) break;
             }
             try self.expect(.rangle);
             return try self.expr_unchanged(try self.dup_slice([]const u8, vars.items));
         }
-        const name = try self.expect_ident_text();
+        const name = try self.parse_qualified_ident_name();
         const arr = try self.arena.alloc([]const u8, 1);
         arr[0] = try self.dup(name);
         return try self.expr_unchanged(arr);
+    }
+
+    fn parse_qualified_ident_name(self: *Parser) ![]const u8 {
+        var name = try self.expect_ident_text();
+        while (self.match(.bang)) {
+            const field = switch (self.current.kind) {
+                .ident, .number => blk: {
+                    const text = self.current.text;
+                    self.advance();
+                    break :blk text;
+                },
+                else => return error.SyntaxError,
+            };
+            name = try self.arena_concat_three(name, "!", field);
+        }
+        return name;
     }
 
     fn parse_expr_list(self: *Parser, end: Token.Kind) ![]const *ast.Expr {
@@ -2306,19 +2485,7 @@ pub const Parser = struct {
                 .ident => if (self.current.col == 1) return,
                 .keyword_variables, .keyword_constants, .keyword_theorem => return,
                 .keyword_module => return,
-                .keyword_instance => {
-                    // Skip a top-level INSTANCE statement so it is not re-parsed by the module loop.
-                    self.advance();
-                    while (self.current.kind != .eof and self.current.kind != .ident) self.advance();
-                    if (self.current.kind == .ident) self.advance();
-                    if (self.current.kind == .keyword_with) {
-                        self.advance();
-                        while (self.current.kind != .eof and !(self.current.kind == .ident and self.current.col == 1)) {
-                            self.advance();
-                        }
-                    }
-                    continue;
-                },
+                .keyword_instance => return,
                 .lbracket, .langle => {
                     self.advance();
                     continue;

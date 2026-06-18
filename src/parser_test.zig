@@ -4,6 +4,8 @@ const parser = @import("parser.zig");
 const ModuleLoader = @import("module_loader.zig").ModuleLoader;
 const eval = @import("eval.zig");
 const action = @import("action.zig");
+const checker = @import("checker.zig");
+const config = @import("config.zig");
 const overrides = @import("overrides.zig");
 const value = @import("value.zig");
 
@@ -298,6 +300,85 @@ test "load real btree preserves root variables" {
     try std.testing.expect(found_is_leaf);
 }
 
+test "repeated namespace instances load every qualified definition" {
+    var arena = try Arena.init(64 * 1024 * 1024);
+    defer arena.deinit();
+    const search_paths = [_][]const u8{
+        "vendor/tlaplus-examples/specifications/SpecifyingSystems/FIFO",
+        "specs/modules",
+        "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+        "vendor/tlaplus-examples/specifications",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = try loader.load("vendor/tlaplus-examples/specifications/SpecifyingSystems/FIFO/APInnerFIFO.tla");
+    var found_in = false;
+    var found_out = false;
+    for (module.definitions) |def| {
+        if (std.mem.eql(u8, def.name, "InChan!Init")) found_in = true;
+        if (std.mem.eql(u8, def.name, "OutChan!Init")) found_out = true;
+    }
+    try std.testing.expect(found_in);
+    try std.testing.expect(found_out);
+}
+
+test "embedded modules take precedence over external modules with the same name" {
+    var arena = try Arena.init(32 * 1024 * 1024);
+    defer arena.deinit();
+    const search_paths = [_][]const u8{
+        "specs/modules",
+        "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+        "vendor/tlaplus-examples/specifications",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = try loader.load(
+        "vendor/tlaplus-examples/specifications/braf/BufferedRandomAccessFile.tla",
+    );
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    try std.testing.expect(evaluator.find_definition("Array") != null);
+    try std.testing.expect(evaluator.find_definition("RAF!Write") != null);
+}
+
+test "top-level instance after theorem remains visible to the loader" {
+    var arena = try Arena.init(32 * 1024 * 1024);
+    defer arena.deinit();
+    const search_paths = [_][]const u8{
+        "vendor/tlaplus-examples/specifications/byihive",
+        "specs/modules",
+        "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+        "vendor/tlaplus-examples/specifications",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = try loader.load(
+        "vendor/tlaplus-examples/specifications/byihive/VoucherIssue.tla",
+    );
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    try std.testing.expect(evaluator.find_definition("VSpec") != null);
+}
+
+test "instance substitutions rewrite primed variables in both copies" {
+    var arena = try Arena.init(128 * 1024 * 1024);
+    defer arena.deinit();
+    const search_paths = [_][]const u8{
+        "vendor/tlaplus-examples/specifications/DieHard",
+        "specs/modules",
+        "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+        "vendor/tlaplus-community-modules/modules",
+        "vendor/tlaplus-examples/specifications",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = try loader.load("vendor/tlaplus-examples/specifications/DieHard/MCDieHardest.tla");
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    const compiler = action.ActionCompiler.init(&arena, evaluator);
+    const d1 = evaluator.find_definition("D1!Next") orelse return error.UndefinedSymbol;
+    const d2 = evaluator.find_definition("D2!Next") orelse return error.UndefinedSymbol;
+    const d1_next = try compiler.compile_next(d1.body);
+    const d2_next = try compiler.compile_next(d2.body);
+    try std.testing.expect(steps_assign_primed(d1_next.steps, "c1"));
+    try std.testing.expect(steps_assign_primed(d2_next.steps, "c2"));
+    try std.testing.expect(!steps_assign_primed(d1_next.steps, "contents"));
+    try std.testing.expect(!steps_assign_primed(d2_next.steps, "contents"));
+}
+
 test "compile real btree init as assignments" {
     var arena = try Arena.init(64 * 1024 * 1024);
     defer arena.deinit();
@@ -357,7 +438,8 @@ test "action if false branch commits done state" {
     var eval_pool = try value.ValuePool.init(&eval_arena, 1024, 1024);
     const executor = action.ActionExecutor{
         .evaluator = evaluator,
-        .state_store = &store,
+        .source_state_store = &store,
+        .candidate_store = &store,
         .eval_pool = &eval_pool,
     };
     var out = std.ArrayList(u32).empty;
@@ -369,6 +451,417 @@ test "action if false branch commits done state" {
     try std.testing.expectEqual(@as(i64, 4), next.values[1].int_v);
     try std.testing.expectEqual(@as(i64, 0), next.values[2].int_v);
     try std.testing.expectEqualStrings("Done", next.values[3].string_v.slice(&store.values_pool));
+}
+
+test "multi-variable existential action expands every binding" {
+    const source =
+        \\---------------------- MODULE TestMultiChoose ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLES x, y
+        \\Next == \E a \in 1..2, b \in 3..4:
+        \\          /\ x' = a
+        \\          /\ y' = b
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    const compiler = action.ActionCompiler.init(&arena, evaluator);
+    const next_def = evaluator.find_definition("Next").?;
+    const compiled = try compiler.compile_next(next_def.body);
+    try std.testing.expectEqual(@as(usize, 1), compiled.steps.len);
+    try std.testing.expect(compiled.steps[0] == .choose);
+    try std.testing.expect(compiled.steps[0].choose.body_steps[0] == .choose);
+
+    var store = try @import("state.zig").StateStore.init(&arena, module.variables, 8, 256, 64);
+    const s0_idx = try store.alloc_state();
+    const s0 = store.get(s0_idx);
+    s0.values[0] = .{ .int_v = 0 };
+    s0.values[1] = .{ .int_v = 0 };
+
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var eval_pool = try value.ValuePool.init(&eval_arena, 1024, 64);
+    const executor = action.ActionExecutor{
+        .evaluator = evaluator,
+        .source_state_store = &store,
+        .candidate_store = &store,
+        .eval_pool = &eval_pool,
+    };
+    var out = std.ArrayList(u32).empty;
+    defer out.deinit(std.heap.page_allocator);
+    try executor.execute_next(compiled, s0_idx, &out);
+    try std.testing.expectEqual(@as(usize, 4), out.items.len);
+
+    var seen: u4 = 0;
+    for (out.items) |state_idx| {
+        const next = store.get(state_idx);
+        const x: u2 = @intCast(next.values[0].int_v - 1);
+        const y: u2 = @intCast(next.values[1].int_v - 3);
+        seen |= @as(u4, 1) << @intCast(x * 2 + y);
+    }
+    try std.testing.expectEqual(@as(u4, 0b1111), seen);
+}
+
+test "parameterized LET operator remains in action scope" {
+    const source =
+        \\---------------------- MODULE TestActionLet ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Next ==
+        \\  LET Max(a, b) == IF a > b THEN a ELSE b IN
+        \\  x' = Max(1, 2)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    const compiler = action.ActionCompiler.init(&arena, evaluator);
+    const next_def = evaluator.find_definition("Next").?;
+    const compiled = try compiler.compile_next(next_def.body);
+
+    var store = try @import("state.zig").StateStore.init(&arena, module.variables, 4, 128, 64);
+    const s0_idx = try store.alloc_state();
+    store.get(s0_idx).values[0] = .{ .int_v = 0 };
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var eval_pool = try value.ValuePool.init(&eval_arena, 256, 64);
+    const executor = action.ActionExecutor{
+        .evaluator = evaluator,
+        .source_state_store = &store,
+        .candidate_store = &store,
+        .eval_pool = &eval_pool,
+    };
+    var out = std.ArrayList(u32).empty;
+    defer out.deinit(std.heap.page_allocator);
+    try executor.execute_next(compiled, s0_idx, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqual(@as(i64, 2), store.get(out.items[0]).values[0].int_v);
+}
+
+test "CASE action executes first matching branch" {
+    const source =
+        \\---------------------- MODULE TestActionCase ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Next == CASE x = 0 -> x' = 1
+        \\         [] x = 1 -> x' = 2
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    const compiler = action.ActionCompiler.init(&arena, evaluator);
+    const next_def = evaluator.find_definition("Next").?;
+    const compiled = try compiler.compile_next(next_def.body);
+
+    var store = try @import("state.zig").StateStore.init(&arena, module.variables, 4, 128, 64);
+    const s0_idx = try store.alloc_state();
+    store.get(s0_idx).values[0] = .{ .int_v = 0 };
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var eval_pool = try value.ValuePool.init(&eval_arena, 256, 64);
+    const executor = action.ActionExecutor{
+        .evaluator = evaluator,
+        .source_state_store = &store,
+        .candidate_store = &store,
+        .eval_pool = &eval_pool,
+    };
+    var out = std.ArrayList(u32).empty;
+    defer out.deinit(std.heap.page_allocator);
+    try executor.execute_next(compiled, s0_idx, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqual(@as(i64, 1), store.get(out.items[0]).values[0].int_v);
+}
+
+test "spec-shaped temporal property is checked from initial states" {
+    const source =
+        \\---------------------- MODULE TestSpecProperty ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Next == x' = 1
+        \\Spec == Init /\ [][Next]_x
+        \\Refinement == Spec
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Refinement"},
+        .constants = &.{},
+        .constraints = &.{},
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "compound temporal property checks boxed action transitions" {
+    const source =
+        \\---------------------- MODULE TestBadRefinement ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Next == x' = 1
+        \\Spec == Init /\ [][Next]_x
+        \\BadNext == x' = x
+        \\BadRefinement == Init /\ [][BadNext]_x
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"BadRefinement"},
+        .constants = &.{},
+        .constraints = &.{},
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+    );
+    defer model_checker.deinit();
+    try std.testing.expectError(error.PropertyViolated, model_checker.check());
+}
+
+test "numeric subexpression selectors resolve list conjuncts" {
+    const source =
+        \\---------------------- MODULE TestSubexpression ----------------------
+        \\Inv == /\ TRUE
+        \\       /\ FALSE
+        \\       /\ TRUE
+        \\First == Inv!1
+        \\Second == Inv!2
+        \\Third == Inv!3
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 128, 64);
+    var state_pool = try value.ValuePool.init(&arena, 128, 64);
+
+    const first = evaluator.find_definition("First") orelse return error.UndefinedSymbol;
+    const second = evaluator.find_definition("Second") orelse return error.UndefinedSymbol;
+    const third = evaluator.find_definition("Third") orelse return error.UndefinedSymbol;
+    try std.testing.expect((try evaluator.eval_expr(first.body, eval.Context.empty(), null, &pool, &state_pool)).is_truthy());
+    try std.testing.expect(!(try evaluator.eval_expr(second.body, eval.Context.empty(), null, &pool, &state_pool)).is_truthy());
+    try std.testing.expect((try evaluator.eval_expr(third.body, eval.Context.empty(), null, &pool, &state_pool)).is_truthy());
+}
+
+test "quantifiers destructure tuple-bound variables" {
+    const source =
+        \\---------------------- MODULE TestTupleQuantifier ----------------------
+        \\EXTENDS Naturals
+        \\Ok == \A <<x, y>> \in {<<1, 2>>, <<2, 3>>} : x < y
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 128, 64);
+    var state_pool = try value.ValuePool.init(&arena, 128, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "implication scopes over a bulleted conjunction" {
+    const source =
+        \\---------------------- MODULE TestBulletImplies ----------------------
+        \\Formula == /\ FALSE
+        \\           /\ TRUE
+        \\           => FALSE
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 64, 64);
+    var state_pool = try value.ValuePool.init(&arena, 64, 64);
+    const formula = evaluator.find_definition("Formula") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(formula.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "same-line implication stays inside its bullet item" {
+    const source =
+        \\---------------------- MODULE TestBulletItemImplies ----------------------
+        \\Action == /\ FALSE => FALSE
+        \\          /\ FALSE
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 64, 64);
+    var state_pool = try value.ValuePool.init(&arena, 64, 64);
+    const action_def = evaluator.find_definition("Action") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(action_def.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(!result.is_truthy());
+}
+
+test "inline first bullet may dedent to the definition list column" {
+    const source =
+        \\---------------------- MODULE TestDedentedList ----------------------
+        \\EXTENDS Naturals
+        \\Op(p) == /\ p = 1
+        \\         /\ \E q \in 1..2 :
+        \\               /\ q = 2
+        \\               /\ p + q = 3
+        \\         /\ p < 2
+        \\Ok == Op(1)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 128, 64);
+    var state_pool = try value.ValuePool.init(&arena, 128, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "recursive function definition accepts multiple bounded arguments" {
+    const source =
+        \\---------------------- MODULE TestMultiFunction ----------------------
+        \\EXTENDS Naturals
+        \\F[n \in 0..2, v \in 1..2] ==
+        \\    IF n = 0 THEN v ELSE F[n - 1, v] + 1
+        \\Ok == F[2, 1] = 3
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 256, 64);
+    var state_pool = try value.ValuePool.init(&arena, 256, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "UNCHANGED accepts an instance-qualified tuple name" {
+    const source =
+        \\---------------------- MODULE TestQualifiedUnchanged ----------------------
+        \\VARIABLE x
+        \\Ok == [][TRUE => UNCHANGED RAF!vars]_x
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    var found = false;
+    for (module.definitions) |def| {
+        if (std.mem.eql(u8, def.name, "Ok")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "singleton function binds tighter than function override" {
+    const source =
+        \\---------------------- MODULE TestFunctionOverride ----------------------
+        \\F == "j1" :> 5 @@ "j2" :> 3
+        \\Ok == /\ F["j1"] = 5
+        \\      /\ F["j2"] = 3
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 128, 128);
+    var state_pool = try value.ValuePool.init(&arena, 128, 128);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "function definition destructures tuple domain element" {
+    const source =
+        \\---------------------- MODULE TestTupleFunction ----------------------
+        \\F[<<x, y>> \in {<<1, 2>>}] == x + y
+        \\Apply(g) == g[<<1, 2>>]
+        \\Ok == Apply(F) = 3
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 128, 64);
+    var state_pool = try value.ValuePool.init(&arena, 128, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
 }
 
 test "parameterized definitions inherit caller context" {
@@ -389,6 +882,70 @@ test "parameterized definitions inherit caller context" {
     var state_pool = try value.ValuePool.init(&arena, 64, 64);
     const ctx = eval.Context.empty().extend("x", .{ .int_v = 1 });
     const result = try evaluator.eval_expr(expr, ctx, null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "parse transitive closure definition with local operator" {
+    const source =
+        \\---------------- MODULE TestTransitiveClosure ----------------
+        \\Support(R) == {r[1] : r \in R} \cup {r[2] : r \in R}
+        \\TC1(R) ==
+        \\  LET BoundedSeq(S, n) == UNION {[1..i -> S] : i \in 0..n}
+        \\      S == Support(R)
+        \\  IN  {<<s, t>> \in S \X S :
+        \\        \E p \in BoundedSeq(S, Cardinality(S)+1) :
+        \\          /\ Len(p) > 1
+        \\          /\ p[1] = s
+        \\          /\ p[Len(p)] = t
+        \\          /\ \A i \in 1..(Len(p)-1) : <<p[i], p[i+1]>> \in R}
+        \\===============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    try std.testing.expectEqual(@as(usize, 2), module.definitions.len);
+    try std.testing.expectEqualStrings("TC1", module.definitions[1].name);
+}
+
+test "parse primed temporal function application" {
+    const source =
+        \\---------------- MODULE TestTemporalPrime ----------------
+        \\NoNewSource ==
+        \\  [][\A n \in Nodes : kind(n)' = "source" => kind(n) = "source"]_vars
+        \\Termination == \A n \in Nodes : mailbox[n] = {}
+        \\FinishIffTerminated == ~(ENABLED Next) <=> Termination
+        \\===========================================================
+        \\
+    ;
+    var arena = try Arena.init(2 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    try std.testing.expectEqual(@as(usize, 3), module.definitions.len);
+    try std.testing.expectEqualStrings("NoNewSource", module.definitions[0].name);
+    try std.testing.expectEqualStrings("FinishIffTerminated", module.definitions[2].name);
+}
+
+test "parameterized operator can be passed as a value" {
+    const source =
+        \\---------------------- MODULE TestHigherOrder ----------------------
+        \\Inc(x) == x + 1
+        \\Apply(op) == op(1)
+        \\Ok == Apply(Inc) = 2
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 128, 64);
+    var state_pool = try value.ValuePool.init(&arena, 128, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
     try std.testing.expect(result.is_truthy());
 }
 
@@ -434,6 +991,68 @@ test "tuple sequence literals belong to Seq" {
     try std.testing.expect((try evaluator.eval_expr(non_empty_ok.body, eval.Context.empty(), null, &pool, &state_pool)).is_truthy());
 }
 
+test "Seq membership is not limited by the enumeration bound" {
+    const source =
+        \\---------------------- MODULE TestUnboundedSeqMember ----------------------
+        \\EXTENDS Sequences
+        \\Ok == <<1, 1, 1, 1, 1, 1>> \in Seq({1})
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 128, 64);
+    var state_pool = try value.ValuePool.init(&arena, 128, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "Seq membership remains symbolic inside a record set" {
+    const source =
+        \\---------------------- MODULE TestNestedSeqMember ----------------------
+        \\EXTENDS Sequences
+        \\Value == [elems |-> <<1, 1, 1, 1, 1, 1>>]
+        \\Ok == Value \in [elems: Seq({1})]
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 128, 64);
+    var state_pool = try value.ValuePool.init(&arena, 128, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "SUBSET membership remains symbolic inside a function set" {
+    const source =
+        \\---------------------- MODULE TestNestedSubsetMember ----------------------
+        \\EXTENDS Naturals
+        \\F == [i \in 1..2 |-> {i}]
+        \\Ok == F \in [1..2 -> SUBSET (1..35)]
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 256, 64);
+    var state_pool = try value.ValuePool.init(&arena, 256, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
 test "SubSeq returns empty sequence when hi is below lo" {
     const source =
         \\---------------------- MODULE TestSubSeq ----------------------
@@ -452,6 +1071,152 @@ test "SubSeq returns empty sequence when hi is below lo" {
     const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
     const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
     try std.testing.expect(result.is_truthy());
+}
+
+test "SubSeq and Tail renumber function-backed sequences from one" {
+    const source =
+        \\---------------------- MODULE TestRenumberedSequences ----------------------
+        \\EXTENDS Naturals, Sequences
+        \\F == [i \in 1..3 |-> i]
+        \\Ok == /\ SubSeq(F, 2, 3) = <<2, 3>>
+        \\      /\ Tail(F) = <<2, 3>>
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 256, 64);
+    var state_pool = try value.ValuePool.init(&arena, 256, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "tuple and function sequence representations interoperate" {
+    const source =
+        \\---------------------- MODULE TestSequenceInterop ----------------------
+        \\EXTENDS Naturals, Sequences
+        \\F == [i \in 1..2 |-> i]
+        \\Ok == /\ F = <<1, 2>>
+        \\      /\ <<>> \o F = <<1, 2>>
+        \\      /\ F \o <<3>> = <<1, 2, 3>>
+        \\      /\ <<1>> \circ <<2>> = <<1, 2>>
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 256, 64);
+    var state_pool = try value.ValuePool.init(&arena, 256, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "SelectSeq applies a unary operator to each sequence element" {
+    const source =
+        \\---------------------- MODULE TestSelectSeq ----------------------
+        \\EXTENDS Sequences
+        \\Read(pair) == pair[1] = "read"
+        \\Input == <<<<"read", 1>>, <<"write", 2>>, <<"read", 3>>>>
+        \\Expected == <<<<"read", 1>>, <<"read", 3>>>>
+        \\Ok == SelectSeq(Input, Read) = Expected
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 32, 64);
+    var state_pool = try value.ValuePool.init(&arena, 32, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "sets are canonical and infinite Nat stays symbolic" {
+    const source =
+        \\---------------------- MODULE TestSetSemantics ----------------------
+        \\DuplicateSetOk == {1, 2, 2, 3, 3, 3} = {3, 2, 1}
+        \\NatDifferenceOk == 40 \in Nat \ {0}
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 128, 64);
+    var state_pool = try value.ValuePool.init(&arena, 128, 64);
+    for (&[_][]const u8{ "DuplicateSetOk", "NatDifferenceOk" }) |name| {
+        const def = evaluator.find_definition(name) orelse return error.UndefinedSymbol;
+        const result = try evaluator.eval_expr(def.body, eval.Context.empty(), null, &pool, &state_pool);
+        try std.testing.expect(result.is_truthy());
+    }
+}
+
+test "FoldFunctionOnSet folds without recursive set allocation" {
+    const source =
+        \\---------------------- MODULE TestFoldFunction ----------------------
+        \\F == [i \in 1..4 |-> i]
+        \\Ok == FoldFunctionOnSet(+, 0, F, 1..4) = 10
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 128, 64);
+    var state_pool = try value.ValuePool.init(&arena, 128, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "parser retains assumptions" {
+    const source =
+        \\---------------------- MODULE TestAssumptions ----------------------
+        \\ASSUME 40 \in Nat \ {0}
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    try std.testing.expectEqual(@as(usize, 1), module.assumptions.len);
+}
+
+test "local namespace instance is hoisted for module expansion" {
+    const source =
+        \\---------------------- MODULE TestLocalInstance ----------------------
+        \\Tree ==
+        \\  LET E == {}
+        \\      G == INSTANCE Graphs
+        \\  IN G!IsTreeWithRoot([node |-> {}, edge |-> E], 1)
+        \\After == TRUE
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    try std.testing.expectEqual(@as(usize, 2), module.definitions.len);
+    try std.testing.expectEqual(@as(usize, 1), module.namespace_instances.len);
+    try std.testing.expectEqualStrings("G", module.namespace_instances[0].alias);
+    try std.testing.expectEqualStrings("After", module.definitions[1].name);
 }
 
 fn read_test_file(arena: *Arena, path: []const u8) ![]u8 {
@@ -473,4 +1238,39 @@ fn read_test_file(arena: *Arena, path: []const u8) ![]u8 {
     const result = try arena.alloc(u8, temp.items.len);
     @memcpy(result, temp.items);
     return result;
+}
+
+fn steps_assign_primed(steps: []const action.ActionStep, name: []const u8) bool {
+    for (steps) |step| {
+        switch (step) {
+            .assign_prime => |assign| {
+                if (std.mem.eql(u8, assign.var_name, name)) return true;
+            },
+            .choose => |choose| {
+                if (steps_assign_primed(choose.body_steps, name)) return true;
+            },
+            .branch => |branch| {
+                for (branch.options) |option| {
+                    if (steps_assign_primed(option, name)) return true;
+                }
+            },
+            .if_branch => |if_branch| {
+                if (steps_assign_primed(if_branch.then_steps, name)) return true;
+                if (steps_assign_primed(if_branch.else_steps, name)) return true;
+            },
+            .case_branch => |case_branch| {
+                for (case_branch.arms) |arm| {
+                    if (steps_assign_primed(arm.steps, name)) return true;
+                }
+                if (case_branch.otherwise_steps) |otherwise| {
+                    if (steps_assign_primed(otherwise, name)) return true;
+                }
+            },
+            .call => |call| {
+                if (steps_assign_primed(call.body_steps, name)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
 }

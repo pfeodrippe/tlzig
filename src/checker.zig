@@ -34,11 +34,15 @@ fn starts_with(haystack: []const u8, needle: []const u8) bool {
 pub const Checker = struct {
     arena: *Arena,
     state_store: StateStore,
+    candidate_arena: *Arena,
+    candidate_store: StateStore,
+    candidate_evaluator: Evaluator,
+    candidate_pool_base: ValuePool.Snapshot,
     queue: StateQueue,
     fp_set: FpSet,
     evaluator: Evaluator,
-    init_spec: action.CompiledInit,
-    next_spec: action.CompiledNext,
+    init_spec: ?action.CompiledInit,
+    next_spec: ?action.CompiledNext,
     invariants: []const *ast.Expr,
     invariant_names: []const []const u8,
     constraints: []const *ast.Expr,
@@ -56,6 +60,7 @@ pub const Checker = struct {
     succ_count: u32,
     succ_cap: u32,
     canonical_states: []bool,
+    initial_states: []bool,
     // We record total allocated max_states for successor arrays because the
     // graph is built on at most max_states distinct states.  Some consumers
     // assume `idx < distinct`; callers must keep successor indices within this
@@ -94,43 +99,95 @@ pub const Checker = struct {
         evaluator.set_treat_unknown_as_model(false);
         const compiler = ActionCompiler.init(arena, evaluator);
 
+        const eval_arena = try arena.alloc_object(Arena);
+        eval_arena.* = try Arena.init(eval_arena_bytes);
+        var eval_pool = try ValuePool.init(eval_arena, eval_value_cap, eval_string_cap);
+        for (module.assumptions, 0..) |assumption, assumption_index| {
+            const snapshot = eval_pool.snapshot();
+            const result = evaluator.eval_expr(
+                assumption,
+                Context.empty(),
+                null,
+                &eval_pool,
+                &state_store.values_pool,
+            ) catch |err| {
+                std.debug.print("ASSUME[{d}] evaluation failed: {any}", .{ assumption_index, err });
+                if (evaluator.err_ctx.context) |context| {
+                    std.debug.print(" -- context: {s} {s}", .{
+                        context,
+                        evaluator.err_ctx.detail orelse "",
+                    });
+                }
+                std.debug.print("\n", .{});
+                return err;
+            };
+            if (result != .bool_v) {
+                return evaluator.fail(Error.TypeError, "ASSUME", @tagName(result));
+            }
+            if (!result.bool_v) {
+                std.debug.print("ASSUME[{d}] evaluated to FALSE\n", .{assumption_index});
+                return Error.AssumptionViolated;
+            }
+            eval_pool.restore(snapshot);
+        }
+
+        const candidate_arena = try arena.alloc_object(Arena);
+        candidate_arena.* = try Arena.init(@max(eval_arena_bytes / 4, 16 * 1024 * 1024));
+        var candidate_store = try StateStore.init(
+            candidate_arena,
+            module.variables,
+            max_states,
+            @min(state_value_cap, 262_144),
+            @min(state_string_cap, 65_536),
+        );
+        var candidate_evaluator = evaluator;
+        candidate_evaluator.set_constants(try clone_constants(
+            arena,
+            constants,
+            &state_store.values_pool,
+            &candidate_store.values_pool,
+        ));
+        const candidate_pool_base = candidate_store.values_pool.snapshot();
+
         const spec_name_v: ?[]const u8 = cfg.spec_name orelse find_spec_name(module);
-        const init_name_v: []const u8 = blk: {
+        const init_name_v: ?[]const u8 = blk: {
             if (cfg.init_name) |n| break :blk n;
             if (spec_name_v) |sn| {
                 if (extract_spec_names(module, sn)) |snames| break :blk snames.init else |_| {}
             }
-            break :blk find_init_name(module) orelse find_def_fallback(module, &.{ "Init", "Initial", "InitialState" }) orelse {
-                return Error.ConfigError;
-            };
+            break :blk find_init_name(module) orelse
+                find_def_fallback(module, &.{ "Init", "Initial", "InitialState" });
         };
-        const next_name_v: []const u8 = blk: {
+        const next_name_v: ?[]const u8 = blk: {
             if (cfg.next_name) |n| break :blk n;
             if (spec_name_v) |sn| {
                 if (extract_spec_names(module, sn)) |snames| break :blk snames.next else |_| {}
             }
-            break :blk find_next_name(module) orelse find_def_fallback(module, &.{ "Next", "Step" }) orelse {
-                return Error.ConfigError;
+            break :blk find_next_name(module) orelse find_def_fallback(module, &.{ "Next", "Step" });
+        };
+
+        if ((init_name_v == null) != (next_name_v == null)) return Error.ConfigError;
+        const compiled_init: ?action.CompiledInit = if (init_name_v) |name| blk: {
+            const init_def = evaluator.find_definition(name) orelse {
+                std.debug.print("undefined init def: {s}\n", .{name});
+                return Error.UndefinedSymbol;
             };
-        };
-
-        const init_def = evaluator.find_definition(init_name_v) orelse {
-            std.debug.print("undefined init def: {s}\n", .{init_name_v});
-            return Error.UndefinedSymbol;
-        };
-        const next_def = evaluator.find_definition(next_name_v) orelse {
-            std.debug.print("undefined next def: {s}\n", .{next_name_v});
-            return Error.UndefinedSymbol;
-        };
-
-        const compiled_init = try compiler.compile_init(init_def.body);
-        const compiled_next = try compiler.compile_next(next_def.body);
+            break :blk try compiler.compile_init(init_def.body);
+        } else null;
+        const compiled_next: ?action.CompiledNext = if (next_name_v) |name| blk: {
+            const next_def = evaluator.find_definition(name) orelse {
+                std.debug.print("undefined next def: {s}\n", .{name});
+                return Error.UndefinedSymbol;
+            };
+            break :blk try compiler.compile_next(next_def.body);
+        } else null;
 
         var invariant_exprs = std.ArrayList(*ast.Expr).empty;
         defer invariant_exprs.deinit(std.heap.page_allocator);
         for (cfg.invariants) |inv_name| {
             const def = evaluator.find_definition(inv_name) orelse {
                 std.debug.print("undefined invariant: {s}\n", .{inv_name});
+                print_definition_tail(module);
                 return Error.UndefinedSymbol;
             };
             try invariant_exprs.append(std.heap.page_allocator, def.body);
@@ -170,6 +227,7 @@ pub const Checker = struct {
         for (cfg.properties) |pname| {
             const def = evaluator.find_definition(pname) orelse {
                 std.debug.print("undefined property: {s}\n", .{pname});
+                print_definition_tail(module);
                 return Error.UndefinedSymbol;
             };
             if (classify_temporal(def.body) == .safety) {
@@ -193,10 +251,6 @@ pub const Checker = struct {
             break :blk result;
         };
 
-        const eval_arena = try arena.alloc_object(Arena);
-        eval_arena.* = try Arena.init(eval_arena_bytes);
-        const eval_pool = try ValuePool.init(eval_arena, eval_value_cap, eval_string_cap);
-
         const succ_cap: u32 = max_states * 32;
         const succ_offsets = try arena.alloc(u32, max_states + 1);
         @memset(succ_offsets, 0);
@@ -205,12 +259,18 @@ pub const Checker = struct {
         const succ_edges = try arena.alloc(u32, succ_cap);
         const canonical_states = try arena.alloc(bool, max_states);
         @memset(canonical_states, false);
+        const initial_states = try arena.alloc(bool, max_states);
+        @memset(initial_states, false);
 
         const fairness = if (spec_name_v) |sn| try extract_fairness(arena, module, sn) else &[_]FairnessCondition{};
 
         return Checker{
             .arena = arena,
             .state_store = state_store,
+            .candidate_arena = candidate_arena,
+            .candidate_store = candidate_store,
+            .candidate_evaluator = candidate_evaluator,
+            .candidate_pool_base = candidate_pool_base,
             .queue = queue,
             .fp_set = fp_set,
             .evaluator = evaluator,
@@ -232,6 +292,7 @@ pub const Checker = struct {
             .succ_count = 0,
             .succ_cap = succ_cap,
             .canonical_states = canonical_states,
+            .initial_states = initial_states,
             .max_states_limit = max_states,
             .fairness = fairness,
         };
@@ -239,19 +300,32 @@ pub const Checker = struct {
 
     pub fn deinit(self: *Checker) void {
         self.eval_arena.deinit();
+        self.candidate_arena.deinit();
     }
 
     pub fn check(self: *Checker) !Result {
+        if (self.init_spec == null) {
+            assert(self.next_spec == null);
+            return Result{
+                .generated = 0,
+                .distinct = 0,
+                .error_state = null,
+            };
+        }
+        assert(self.next_spec != null);
+
         var out_states = std.ArrayList(u32).empty;
         defer out_states.deinit(std.heap.page_allocator);
 
         var executor = ActionExecutor{
             .evaluator = self.evaluator,
-            .state_store = &self.state_store,
+            .source_state_store = &self.state_store,
+            .candidate_store = &self.candidate_store,
             .eval_pool = &self.eval_pool,
         };
 
-        try executor.execute_init(self.init_spec, &out_states);
+        self.candidate_store.reset(self.candidate_pool_base);
+        try executor.execute_init(self.init_spec.?, &out_states);
         try self.process_generated(null, &out_states);
 
         while (self.queue.dequeue()) |idx| {
@@ -259,9 +333,11 @@ pub const Checker = struct {
             assert(idx < self.max_states_limit);
             out_states.clearRetainingCapacity();
             self.succ_offsets[idx] = self.succ_count;
+            self.candidate_store.reset(self.candidate_pool_base);
             self.eval_pool.restore(self.eval_pool.snapshot());
-            try executor.execute_next(self.next_spec, idx, &out_states);
+            try executor.execute_next(self.next_spec.?, idx, &out_states);
             self.eval_pool.restore(self.eval_pool.snapshot());
+            try self.check_enabled_invariants(idx, out_states.items.len > 0);
             try self.process_generated(idx, &out_states);
         }
 
@@ -283,31 +359,41 @@ pub const Checker = struct {
         // contains canonical indices for graph edges.
         var kept_count: u32 = 0;
         for (out_states.items) |*idx| {
-            assert(idx.* < self.state_store.count);
+            assert(idx.* < self.candidate_store.count);
             self.generated += 1;
-            const st = self.state_store.get(idx.*);
+            const candidate = self.candidate_store.get(idx.*);
             const snap = self.eval_pool.snapshot();
-            const constraints_hold = try self.check_constraints(st);
+            const constraints_hold = try self.check_candidate_constraints(candidate);
             if (!constraints_hold) {
                 self.eval_pool.restore(snap);
                 idx.* = std.math.maxInt(u32);
                 continue;
             }
-            // Canonicalize before checking invariants so that the violating
-            // state is counted in `distinct`, matching TLC's reporting.
-            const fp = fingerprint.hash_state(&self.state_store.values_pool, st.values);
-            const canonical = self.fp_set.put_with_index(fp, idx.*);
+            const fp = fingerprint.hash_state(
+                &self.candidate_store.values_pool,
+                candidate.values,
+            );
+            const canonical = self.fp_set.find(fp);
             const is_new = canonical == null;
-            const state_idx = canonical orelse idx.*;
+            const state_idx = if (canonical) |existing| existing else blk: {
+                const permanent_idx = try self.clone_candidate_state(candidate);
+                assert(self.fp_set.put_with_index(fp, permanent_idx) == null);
+                break :blk permanent_idx;
+            };
             if (is_new) {
                 self.distinct += 1;
                 assert(self.distinct <= self.max_states_limit);
                 self.canonical_states[state_idx] = true;
             }
+            if (parent_idx == null) {
+                assert(self.canonical_states[state_idx]);
+                self.initial_states[state_idx] = true;
+            }
             const invariants_hold = try self.check_invariants(self.state_store.get(state_idx));
             self.eval_pool.restore(snap);
             if (!invariants_hold) {
                 std.debug.print("InvariantViolated generated={d} distinct={d}\n", .{ self.generated, self.distinct });
+                self.print_trace(state_idx);
                 return Error.InvariantViolated;
             }
             if (is_new) {
@@ -342,6 +428,40 @@ pub const Checker = struct {
                 }
             }
         }
+    }
+
+    fn clone_candidate_state(
+        self: *Checker,
+        candidate: *StateStore.State,
+    ) !u32 {
+        const state_idx = try self.state_store.alloc_state();
+        const state = self.state_store.get(state_idx);
+        state.level = candidate.level;
+        state.pred = candidate.pred;
+        for (candidate.values, state.values) |source, *target| {
+            target.* = try source.clone(
+                &self.candidate_store.values_pool,
+                &self.state_store.values_pool,
+            );
+        }
+        return state_idx;
+    }
+
+    fn check_candidate_constraints(
+        self: *Checker,
+        candidate: *StateStore.State,
+    ) !bool {
+        for (self.constraints) |constraint| {
+            const value = try self.candidate_evaluator.eval_expr(
+                constraint,
+                Context.empty(),
+                candidate,
+                &self.eval_pool,
+                &self.candidate_store.values_pool,
+            );
+            if (!value.is_truthy()) return false;
+        }
+        return true;
     }
 
     fn check_safety_properties(self: *Checker, parent: *StateStore.State, child: *StateStore.State) !bool {
@@ -431,13 +551,16 @@ pub const Checker = struct {
         var cache = PropertyCache.init(self.arena);
         for (self.properties) |prop| {
             const results = try self.eval_temporal_property_all(prop, &scc_data, &cache);
+            var initial_count: u32 = 0;
             for (0..n) |i| {
-                if (!self.canonical_states[i]) continue;
+                if (!self.initial_states[i]) continue;
+                initial_count += 1;
                 if (!results[i]) {
-                    std.debug.print("PropertyViolated: property at state={d}\n", .{i});
+                    std.debug.print("PropertyViolated: property at initial state={d}\n", .{i});
                     return Error.PropertyViolated;
                 }
             }
+            assert(initial_count > 0);
         }
     }
 
@@ -748,6 +871,18 @@ pub const Checker = struct {
         defer self.eval_pool.restore(snap);
 
         switch (prop.*) {
+            .ident => |name| {
+                if (self.evaluator.find_definition(name)) |def| {
+                    const resolved = try self.eval_temporal_property_all(def.body, scc_data, cache);
+                    @memcpy(results, resolved);
+                } else {
+                    for (0..n) |i| {
+                        const st = self.state_store.get(@intCast(i));
+                        const v = try self.evaluator.eval_expr(prop, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool);
+                        results[i] = v.is_truthy();
+                    }
+                }
+            },
             .if_then_else => |ite| {
                 const cond_results = try self.eval_temporal_property_all(ite.cond, scc_data, cache);
                 const then_results = try self.eval_temporal_property_all(ite.then_branch, scc_data, cache);
@@ -822,6 +957,26 @@ pub const Checker = struct {
                             results[i] = v.is_truthy();
                         }
                     },
+                }
+            },
+            .box_action => |ba| {
+                for (0..n) |i| {
+                    const state_idx: u32 = @intCast(i);
+                    if (!self.canonical_states[state_idx]) {
+                        results[i] = true;
+                        continue;
+                    }
+                    const parent = self.state_store.get(state_idx);
+                    var holds = true;
+                    for (self.successors(state_idx)) |succ| {
+                        const child = self.state_store.get(succ);
+                        if (try self.eval_action(ba.action, parent, child)) continue;
+                        if (!try self.eval_vars_equal(ba.vars, parent, child)) {
+                            holds = false;
+                            break;
+                        }
+                    }
+                    results[i] = holds;
                 }
             },
             else => {
@@ -1070,6 +1225,7 @@ pub const Checker = struct {
     fn check_invariants(self: *Checker, st: *StateStore.State) !bool {
         assert(self.invariant_names.len == self.invariants.len);
         for (self.invariants, 0..) |inv, i| {
+            if (contains_enabled(inv)) continue;
             const v = self.evaluator.eval_expr(inv, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool) catch |err| {
                 if (i < self.invariant_names.len) {
                     std.debug.print("Error evaluating invariant {s}: {any}\n", .{ self.invariant_names[i], err });
@@ -1085,12 +1241,54 @@ pub const Checker = struct {
         return true;
     }
 
+    fn check_enabled_invariants(self: *Checker, state_idx: u32, enabled: bool) !void {
+        assert(state_idx < self.state_store.count);
+        self.evaluator.set_enabled_result(enabled);
+        defer self.evaluator.set_enabled_result(null);
+        const st = self.state_store.get(state_idx);
+        for (self.invariants, 0..) |inv, i| {
+            if (!contains_enabled(inv)) continue;
+            const value = self.evaluator.eval_expr(
+                inv,
+                Context.empty(),
+                st,
+                &self.eval_pool,
+                &self.state_store.values_pool,
+            ) catch |err| {
+                std.debug.print("Error evaluating ENABLED invariant {s}: {any}\n", .{
+                    self.invariant_names[i],
+                    err,
+                });
+                return err;
+            };
+            if (!value.is_truthy()) {
+                std.debug.print("Invariant false: {s}\n", .{self.invariant_names[i]});
+                try self.print_first_false_conjunct(inv, st);
+                std.debug.print("InvariantViolated generated={d} distinct={d}\n", .{
+                    self.generated,
+                    self.distinct,
+                });
+                self.print_trace(state_idx);
+                return Error.InvariantViolated;
+            }
+        }
+    }
+
     fn print_first_false_conjunct(self: *Checker, expr: *ast.Expr, st: *StateStore.State) !void {
         var index: u32 = 0;
         _ = try self.print_first_false_conjunct_inner(expr, st, &index);
     }
 
     fn print_first_false_conjunct_inner(self: *Checker, expr: *ast.Expr, st: *StateStore.State, index: *u32) !bool {
+        if (expr.* == .ident) {
+            const name = self.evaluator.resolve_alias(expr.ident);
+            if (self.evaluator.find_definition(name)) |def| {
+                return try self.print_first_false_conjunct_inner(def.body, st, index);
+            }
+            if (self.evaluator.find_subexpression(name)) |body| {
+                return try self.print_first_false_conjunct_inner(body, st, index);
+            }
+        }
         if (expr.* == .binary and expr.*.binary.op == .and_op) {
             if (try self.print_first_false_conjunct_inner(expr.*.binary.left, st, index)) return true;
             return try self.print_first_false_conjunct_inner(expr.*.binary.right, st, index);
@@ -1106,7 +1304,128 @@ pub const Checker = struct {
         }
         return false;
     }
+
+    fn print_trace(self: *Checker, state_idx: u32) void {
+        assert(state_idx < self.state_store.count);
+        var idx = state_idx;
+        var remaining: u32 = self.state_store.get(idx).level + 1;
+        while (remaining > 0) : (remaining -= 1) {
+            const st = self.state_store.get(idx);
+            std.debug.print("State {d} (level {d}):\n", .{ idx, st.level });
+            for (self.state_store.variable_names, st.values) |name, value| {
+                std.debug.print("  {s} = ", .{name});
+                self.print_value(value, 0);
+                std.debug.print("\n", .{});
+            }
+            if (st.level == 0) break;
+            assert(st.pred < self.state_store.count);
+            idx = st.pred;
+        }
+    }
+
+    fn print_value(self: *Checker, value: Value, depth: u8) void {
+        if (depth >= 16) {
+            std.debug.print("...", .{});
+            return;
+        }
+        const pool = &self.state_store.values_pool;
+        switch (value) {
+            .bool_v => |v| std.debug.print("{s}", .{if (v) "TRUE" else "FALSE"}),
+            .int_v => |v| std.debug.print("{d}", .{v}),
+            .string_v => |v| std.debug.print("\"{s}\"", .{v.slice(pool)}),
+            .model_v => |v| std.debug.print("{s}", .{self.evaluator.models.get_name(v)}),
+            .range_v => |v| std.debug.print("{d}..{d}", .{ v.lo, v.hi }),
+            .seq_set_v => std.debug.print("<Seq>", .{}),
+            .power_set_v => std.debug.print("<SUBSET>", .{}),
+            .set_v => |set| {
+                std.debug.print("{{", .{});
+                for (set.items(pool), 0..) |item, i| {
+                    if (i > 0) std.debug.print(", ", .{});
+                    self.print_value(item, depth + 1);
+                }
+                std.debug.print("}}", .{});
+            },
+            .tuple_v => |tuple| {
+                std.debug.print("<<", .{});
+                for (tuple.items(pool), 0..) |item, i| {
+                    if (i > 0) std.debug.print(", ", .{});
+                    self.print_value(item, depth + 1);
+                }
+                std.debug.print(">>", .{});
+            },
+            .record_v => |record| {
+                std.debug.print("[", .{});
+                const fields = record.fields(pool);
+                var i: u32 = 0;
+                while (i < record.len) : (i += 1) {
+                    if (i > 0) std.debug.print(", ", .{});
+                    std.debug.print("{s} |-> ", .{fields[i * 2].string_v.slice(pool)});
+                    self.print_value(fields[i * 2 + 1], depth + 1);
+                }
+                std.debug.print("]", .{});
+            },
+            .function_v => |function| {
+                std.debug.print("[", .{});
+                const keys = function.domain.items(pool);
+                const entries = function.entries(pool);
+                for (keys, entries, 0..) |key, entry, i| {
+                    if (i > 0) std.debug.print(", ", .{});
+                    self.print_value(key, depth + 1);
+                    std.debug.print(" |-> ", .{});
+                    self.print_value(entry, depth + 1);
+                }
+                std.debug.print("]", .{});
+            },
+            else => std.debug.print("<{s}>", .{@tagName(value)}),
+        }
+    }
 };
+
+fn print_definition_tail(module: ast.Module) void {
+    const head_len = @min(module.definitions.len, 20);
+    std.debug.print("first parsed definitions:", .{});
+    for (module.definitions[0..head_len]) |def| {
+        std.debug.print(" {s}", .{def.name});
+    }
+    std.debug.print("\n", .{});
+    const start = module.definitions.len -| 12;
+    std.debug.print("last parsed definitions:", .{});
+    for (module.definitions[start..]) |def| {
+        std.debug.print(" {s}", .{def.name});
+    }
+    std.debug.print("\n", .{});
+}
+
+fn contains_enabled(expr: *ast.Expr) bool {
+    return switch (expr.*) {
+        .unary => |u| u.op == .enabled or contains_enabled(u.operand),
+        .binary => |b| contains_enabled(b.left) or contains_enabled(b.right),
+        .quantifier => |q| contains_enabled(q.body),
+        .if_then_else => |ite| contains_enabled(ite.cond) or
+            contains_enabled(ite.then_branch) or
+            contains_enabled(ite.else_branch),
+        .apply => |ap| blk: {
+            if (contains_enabled(ap.func)) break :blk true;
+            for (ap.args) |arg| {
+                if (contains_enabled(arg)) break :blk true;
+            }
+            break :blk false;
+        },
+        .let_in => |let| blk: {
+            for (let.defs) |def| {
+                if (contains_enabled(def.body)) break :blk true;
+            }
+            break :blk contains_enabled(let.body);
+        },
+        .case_expr => |case| blk: {
+            for (case.arms) |arm| {
+                if (contains_enabled(arm.cond) or contains_enabled(arm.value)) break :blk true;
+            }
+            break :blk if (case.otherwise) |other| contains_enabled(other) else false;
+        },
+        else => false,
+    };
+}
 
 pub const Result = struct {
     generated: u64,
@@ -1305,6 +1624,23 @@ fn dup_slice(arena: *Arena, comptime T: type, items: []const T) ![]const T {
     if (items.len == 0) return &[_]T{};
     const result = try arena.alloc(T, items.len);
     @memcpy(result, items);
+    return result;
+}
+
+fn clone_constants(
+    arena: *Arena,
+    constants: []const Constant,
+    source: *const ValuePool,
+    target: *ValuePool,
+) ![]const Constant {
+    if (constants.len == 0) return &.{};
+    const result = try arena.alloc(Constant, constants.len);
+    for (constants, result) |constant, *copy| {
+        copy.* = .{
+            .name = constant.name,
+            .value = try constant.value.clone(source, target),
+        };
+    }
     return result;
 }
 

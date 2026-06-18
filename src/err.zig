@@ -10,6 +10,7 @@ pub const Error = error{
     InvariantViolated,
     Deadlock,
     ConfigError,
+    AssumptionViolated,
     NotImplemented,
     AssertionFailed,
     PropertyViolated,

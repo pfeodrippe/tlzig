@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const value = @import("value.zig");
 const Value = value.Value;
 const ValuePool = value.ValuePool;
@@ -73,7 +74,6 @@ const default_overrides = [_]OverrideEntry{
     .{ .name = "Tail", .func = tail },
     .{ .name = "Append", .func = append },
     .{ .name = "SubSeq", .func = sub_seq },
-    .{ .name = "SelectSeq", .func = select_seq },
     .{ .name = "SortSeq", .func = sort_seq },
     .{ .name = "Permutations", .func = permutations },
     .{ .name = "RandomElement", .func = random_element },
@@ -99,8 +99,6 @@ const default_overrides = [_]OverrideEntry{
 };
 
 const default_value_overrides = [_]ValueOverrideEntry{
-    .{ .name = "Nat", .func = nat_set },
-    .{ .name = "Int", .func = int_set },
     .{ .name = "BOOLEAN", .func = boolean_set },
 };
 
@@ -155,19 +153,13 @@ fn tail(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     return switch (args[0]) {
         .function_v => |f| {
             if (f.len == 0) return Error.IndexOutOfBounds;
-            const keys = f.domain.items(pool);
-            const vals = f.entries(pool);
-            const new_keys = try pool.alloc_values(@intCast(f.len - 1));
-            const new_vals = try pool.alloc_values(@intCast(f.len - 1));
-            for (keys[1..f.len], 0..) |k, i| {
-                new_keys[i] = k;
-                new_vals[i] = vals[i + 1];
+            const dest = try pool.alloc_values(@intCast(f.len - 1));
+            const dest_offset = value_offset(pool, dest.ptr);
+            var i: u32 = 0;
+            while (i + 1 < f.len) : (i += 1) {
+                pool.values[dest_offset + i] = pool.values[f.offset + i + 1];
             }
-            return Value{ .function_v = .{
-                .domain = make_set(pool, new_keys),
-                .offset = value_offset(pool, new_vals.ptr),
-                .len = @intCast(f.len - 1),
-            } };
+            return Value{ .tuple_v = .{ .offset = dest_offset, .len = f.len - 1 } };
         },
         .tuple_v => |t| {
             if (t.len == 0) return Error.IndexOutOfBounds;
@@ -200,17 +192,14 @@ fn sub_seq(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Valu
     const len_i: u32 = @intCast(hi - lo + 1);
     return switch (args[0]) {
         .function_v => |f| {
-            const vals = f.entries(pool);
+            if (hi > f.len) return Error.IndexOutOfBounds;
             const dest = try pool.alloc_values(len_i);
+            const dest_offset = value_offset(pool, dest.ptr);
             for (0..len_i) |i| {
                 const idx: usize = @intCast(lo - 1 + @as(i64, @intCast(i)));
-                dest[i] = vals[idx];
+                pool.values[dest_offset + i] = pool.values[f.offset + idx];
             }
-            return Value{ .function_v = .{
-                .domain = make_range_set(pool, lo, hi),
-                .offset = value_offset(pool, dest.ptr),
-                .len = len_i,
-            } };
+            return Value{ .tuple_v = .{ .offset = dest_offset, .len = len_i } };
         },
         .tuple_v => |t| {
             if (hi > t.len) return Error.IndexOutOfBounds;
@@ -249,14 +238,6 @@ fn tlc_assert(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Valu
     if (args.len != 2) return Error.TypeError;
     if (!args[0].is_truthy()) return Error.AssertionFailed;
     return Value{ .bool_v = true };
-}
-
-fn nat_set(ctx: OverrideContext, pool: *ValuePool) Error!Value {
-    return Value{ .set_v = make_range_set(pool, 0, ctx.max_nat) };
-}
-
-fn int_set(ctx: OverrideContext, pool: *ValuePool) Error!Value {
-    return Value{ .set_v = make_range_set(pool, ctx.min_int, ctx.max_int) };
 }
 
 fn boolean_set(_: OverrideContext, pool: *ValuePool) Error!Value {
@@ -345,11 +326,12 @@ pub fn ooverride(_: OverrideContext, pool: *ValuePool, a: Value, b: Value) Error
     // Combine two records/functions; right-hand side overrides left for matching keys.
     const fa = if (a == .function_v) a.function_v else return Error.TypeError;
     const fb = if (b == .function_v) b.function_v else return Error.TypeError;
+    const dest_len: u32 = @intCast(fa.len + fb.len);
+    try pool.ensure_value_capacity(@as(u64, dest_len) * 2);
     const ka = fa.domain.items(pool);
     const va = fa.entries(pool);
     const kb = fb.domain.items(pool);
     const vb = fb.entries(pool);
-    const dest_len: u32 = @intCast(ka.len + kb.len);
     const keys = try pool.alloc_values(dest_len);
     const vals = try pool.alloc_values(dest_len);
     var pos: u32 = 0;
@@ -382,6 +364,7 @@ pub fn ooverride(_: OverrideContext, pool: *ValuePool, a: Value, b: Value) Error
 }
 
 pub fn recordto(_: OverrideContext, pool: *ValuePool, key: Value, val: Value) Error!Value {
+    try pool.ensure_value_capacity(2);
     const keys = try pool.alloc_values(1);
     keys[0] = key;
     const vals = try pool.alloc_values(1);
@@ -394,43 +377,64 @@ pub fn recordto(_: OverrideContext, pool: *ValuePool, key: Value, val: Value) Er
 }
 
 pub fn sequence_concat(_: OverrideContext, pool: *ValuePool, a: Value, b: Value) Error!Value {
-    if (a == .tuple_v and b == .tuple_v) {
-        const ta = a.tuple_v.items(pool);
-        const tb = b.tuple_v.items(pool);
-        const dest = try pool.alloc_values(@intCast(ta.len + tb.len));
-        @memcpy(dest[0..ta.len], ta);
-        @memcpy(dest[ta.len..], tb);
-        return Value{ .tuple_v = make_tuple(pool, dest) };
-    }
-    const fa = if (a == .function_v) a.function_v else return Error.TypeError;
-    const fb = if (b == .function_v) b.function_v else return Error.TypeError;
-    const la: i64 = @intCast(fa.len);
-    const lb: i64 = @intCast(fb.len);
-    const dest_len: u32 = @intCast(la + lb);
+    const a_len = sequence_length(a) orelse return Error.TypeError;
+    const b_len = sequence_length(b) orelse return Error.TypeError;
+    const dest_len = std.math.add(u32, a_len, b_len) catch return Error.OutOfMemory;
     const dest = try pool.alloc_values(dest_len);
-    const va = fa.entries(pool);
-    const vb = fb.entries(pool);
-    for (va, 0..) |v, i| {
-        dest[i] = v;
+    const dest_offset = value_offset(pool, dest.ptr);
+    var i: u32 = 0;
+    while (i < a_len) : (i += 1) {
+        pool.values[dest_offset + i] = sequence_item(pool, a, i) orelse return Error.TypeError;
     }
-    for (vb, 0..) |v, i| {
-        dest[va.len + i] = v;
+    i = 0;
+    while (i < b_len) : (i += 1) {
+        pool.values[dest_offset + a_len + i] = sequence_item(pool, b, i) orelse return Error.TypeError;
     }
-    const keys = try pool.alloc_values(dest_len);
-    for (0..dest_len) |i| {
-        keys[i] = Value{ .int_v = @as(i64, @intCast(i)) + 1 };
-    }
-    return Value{ .function_v = .{
-        .domain = make_set(pool, keys),
-        .offset = value_offset(pool, dest.ptr),
-        .len = dest_len,
-    } };
+    assert(dest_offset + dest_len <= pool.value_count);
+    return Value{ .tuple_v = .{ .offset = dest_offset, .len = dest_len } };
+}
+
+fn sequence_length(sequence: Value) ?u32 {
+    return switch (sequence) {
+        .tuple_v => |tuple| tuple.len,
+        .function_v => |function| function.len,
+        else => null,
+    };
+}
+
+fn sequence_item(pool: *ValuePool, sequence: Value, index: u32) ?Value {
+    return switch (sequence) {
+        .tuple_v => |tuple| blk: {
+            assert(index < tuple.len);
+            break :blk tuple.items(pool)[index];
+        },
+        .function_v => |function| function.apply(
+            pool,
+            Value{ .int_v = @as(i64, @intCast(index)) + 1 },
+        ),
+        else => null,
+    };
 }
 
 fn make_set(pool: *ValuePool, values: []Value) value.Set {
+    var unique_len: u32 = 0;
+    for (values) |candidate| {
+        var duplicate = false;
+        for (values[0..unique_len]) |existing| {
+            if (existing.eql(candidate, pool)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            values[unique_len] = candidate;
+            unique_len += 1;
+        }
+    }
+    assert(unique_len <= values.len);
     return .{
         .offset = value_offset(pool, values.ptr),
-        .len = @intCast(values.len),
+        .len = unique_len,
     };
 }
 
@@ -453,15 +457,6 @@ fn make_range_set(pool: *ValuePool, lo: i64, hi: i64) value.Set {
         dest[i] = Value{ .int_v = lo + @as(i64, @intCast(i)) };
     }
     return make_set(pool, dest);
-}
-
-// SelectSeq(seq, test) returns the subsequence of elements for which test is true.
-// TLA+ expects test to be a unary operator/function. We accept either a function value
-// (treated as a lambda to apply) or return the original sequence as a conservative stub.
-fn select_seq(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
-    if (args.len != 2) return Error.TypeError;
-    // Real implementation needs access to the evaluator/AST context for the predicate.
-    return args[0];
 }
 
 // SortSeq(seq, op) sorts the sequence using the comparison operator.

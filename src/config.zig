@@ -200,7 +200,7 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
             }
         } else if (eql(first_word, "CONSTANT") or eql(first_word, "CONSTANTS")) {
             if (rest.len > 0) {
-                parse_constant_assignment(arena, rest, &constants) catch {};
+                parse_constant_assignments_line(arena, rest, &constants) catch {};
             }
             i += 1;
             while (i < lines.len) : (i += 1) {
@@ -211,7 +211,7 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
                     i -= 1; // let outer loop process the directive
                     break;
                 }
-                parse_constant_assignment(arena, t, &constants) catch continue;
+                parse_constant_assignments_line(arena, t, &constants) catch continue;
             }
         } else if (eql(first_word, "PROPERTY")) {
             if (rest.len > 0) {
@@ -359,6 +359,9 @@ fn parse_constant_assignment(arena: *Arena, line: []const u8, out: *std.ArrayLis
         const bracket_end = std.mem.indexOf(u8, expr, "]") orelse return error.SyntaxError;
         expr = trim(expr[bracket_end + 1 ..]);
     }
+    if (name.len == 0 or expr.len == 0) return error.SyntaxError;
+    std.debug.assert(name.len > 0);
+    std.debug.assert(expr.len > 0);
     try out.append(std.heap.page_allocator, ConstantAssignment{
         .name = try arena_dup(arena, name),
         .expr = try arena_dup(arena, expr),
@@ -366,15 +369,121 @@ fn parse_constant_assignment(arena: *Arena, line: []const u8, out: *std.ArrayLis
     });
 }
 
+fn parse_constant_assignments_line(
+    arena: *Arena,
+    line_raw: []const u8,
+    out: *std.ArrayList(ConstantAssignment),
+) !void {
+    const line = trim(line_raw);
+    if (line.len == 0) return;
+
+    var assignment_start: usize = 0;
+    while (assignment_start < line.len) {
+        const assignment_end = find_next_assignment_start(line, assignment_start) orelse line.len;
+        const assignment = trim(line[assignment_start..assignment_end]);
+        if (assignment.len == 0) return error.SyntaxError;
+        try parse_constant_assignment(arena, assignment, out);
+        assignment_start = assignment_end;
+        while (assignment_start < line.len and is_space(line[assignment_start])) {
+            assignment_start += 1;
+        }
+    }
+}
+
+fn find_next_assignment_start(line: []const u8, assignment_start: usize) ?usize {
+    std.debug.assert(assignment_start < line.len);
+
+    var paren_depth: u32 = 0;
+    var bracket_depth: u32 = 0;
+    var brace_depth: u32 = 0;
+    var tuple_depth: u32 = 0;
+    var in_string = false;
+    var escaped = false;
+    var i = assignment_start;
+
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '(') {
+            paren_depth += 1;
+        } else if (c == ')') {
+            if (paren_depth > 0) paren_depth -= 1;
+        } else if (c == '[') {
+            bracket_depth += 1;
+        } else if (c == ']') {
+            if (bracket_depth > 0) bracket_depth -= 1;
+        } else if (c == '{') {
+            brace_depth += 1;
+        } else if (c == '}') {
+            if (brace_depth > 0) brace_depth -= 1;
+        } else if (c == '<' and i + 1 < line.len and line[i + 1] == '<') {
+            tuple_depth += 1;
+            i += 1;
+        } else if (c == '>' and i + 1 < line.len and line[i + 1] == '>') {
+            if (tuple_depth > 0) tuple_depth -= 1;
+            i += 1;
+        } else if (is_space(c) and
+            paren_depth == 0 and
+            bracket_depth == 0 and
+            brace_depth == 0 and
+            tuple_depth == 0)
+        {
+            var candidate = i;
+            while (candidate < line.len and is_space(line[candidate])) {
+                candidate += 1;
+            }
+            if (candidate > assignment_start and is_assignment_start(line, candidate)) {
+                return candidate;
+            }
+        }
+    }
+    return null;
+}
+
+fn is_assignment_start(line: []const u8, start: usize) bool {
+    if (start >= line.len or !is_identifier_start(line[start])) return false;
+
+    var i = start + 1;
+    while (i < line.len and is_identifier_continue(line[i])) : (i += 1) {}
+    while (i < line.len and is_space(line[i])) : (i += 1) {}
+
+    return (i < line.len and line[i] == '=') or
+        (i + 1 < line.len and line[i] == '<' and line[i + 1] == '-');
+}
+
+fn is_identifier_start(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+
+fn is_identifier_continue(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '!';
+}
+
+fn is_space(c: u8) bool {
+    return c == ' ' or c == '\t';
+}
+
 fn is_directive(line: []const u8) bool {
     const first = first_token(line);
     const directives = [_][]const u8{
-        "SPECIFICATION", "INIT",           "NEXT",
-        "INVARIANT",     "INVARIANTS",     "CONSTANT",
-        "CONSTANTS",     "PROPERTY",       "PROPERTIES",
-        "ALIAS",         "VIEW",           "SYMMETRY",
-        "POSTCONDITION", "CHECK_DEADLOCK", "CONSTRAINT",
-        "CONSTRAINTS", "ACTION_CONSTRAINT", "ACTION_CONSTRAINTS",
+        "SPECIFICATION", "INIT",              "NEXT",
+        "INVARIANT",     "INVARIANTS",        "CONSTANT",
+        "CONSTANTS",     "PROPERTY",          "PROPERTIES",
+        "ALIAS",         "VIEW",              "SYMMETRY",
+        "POSTCONDITION", "CHECK_DEADLOCK",    "CONSTRAINT",
+        "CONSTRAINTS",   "ACTION_CONSTRAINT", "ACTION_CONSTRAINTS",
     };
     for (directives) |d| {
         if (eql(first, d)) return true;
@@ -441,4 +550,29 @@ fn dup_slice(arena: *Arena, comptime T: type, items: []const T) ![]const T {
     const result = try arena.alloc(T, items.len);
     @memcpy(result, items);
     return result;
+}
+
+test "parse multiple constant assignments on one line" {
+    const source =
+        \\CONSTANTS
+        \\  a1=a1  a2=a2  Values = {1, 2, {3, 4}} Message = "x = y"
+        \\  Ballot <-[Voting] MCBallot
+        \\SPECIFICATION Spec
+        \\INVARIANT Inv
+    ;
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+
+    const cfg = try parse(&arena, source);
+    try std.testing.expectEqual(@as(usize, 5), cfg.constants.len);
+    try std.testing.expectEqualStrings("a1", cfg.constants[0].name);
+    try std.testing.expectEqualStrings("a1", cfg.constants[0].expr);
+    try std.testing.expectEqualStrings("a2", cfg.constants[1].name);
+    try std.testing.expectEqualStrings("{1, 2, {3, 4}}", cfg.constants[2].expr);
+    try std.testing.expectEqualStrings("\"x = y\"", cfg.constants[3].expr);
+    try std.testing.expectEqualStrings("Ballot", cfg.constants[4].name);
+    try std.testing.expectEqualStrings("MCBallot", cfg.constants[4].expr);
+    try std.testing.expect(cfg.constants[4].is_substitution);
+    try std.testing.expectEqualStrings("Spec", cfg.spec_name.?);
+    try std.testing.expectEqualStrings("Inv", cfg.invariants[0]);
 }

@@ -145,12 +145,66 @@ Target: **≥50% of all `.tla` files in `vendor/tlaplus-examples/specifications`
 - [ ] Complete PlusCal translator for `if`/`either`/`while`/`with`/`await`/`assert`/`print`/`skip`/assignments.
 
 ## Phase 3 — Performance
-- [ ] Profile on medium specs
+- [~] Profile on medium specs
 - [ ] Multi-threaded worker pool
 - [ ] Lock-free / sharded FPSet
 - [ ] Compressed state queue
 - [ ] Disk FPSet spill
-- [ ] Benchmark suite
+- [~] Benchmark suite
+
+### Performance correctness gates
+
+- [x] Benchmark `ewd840/EWD840` and `ewd998/AsyncTerminationDetection`
+  against Java TLC with exact state-count validation.
+  - EWD840: tlzig `1817/302`; TLC `2001/302`.
+  - AsyncTerminationDetection: tlzig `53267/4097`; TLC `53271/4097`.
+- [x] Measure ReleaseFast single-thread baseline for EWD998:
+  - tlzig: 3.15s, approximately 2.48GB peak RSS.
+  - TLC `-workers 1`/default baseline still needs an explicit workers matrix.
+  - TLC observed run: 0.67s, approximately 318MB peak RSS.
+- [ ] Benchmark matrix for every performance claim:
+  - TLC `-workers 1`.
+  - TLC `-workers auto`.
+  - tlzig `--workers 1`.
+  - tlzig `--workers auto`.
+  - Exact generated/distinct counts must match before comparing time.
+
+### Immediate memory/runtime repair
+
+- [x] Stop committing duplicate successors to the permanent state value pool.
+  - Generate successors in a resettable candidate pool.
+  - Fingerprint and check constraints before permanent cloning.
+  - Clone only newly canonical states into `StateStore.values_pool`.
+  - Reset the candidate pool after each expanded parent state.
+- [x] Re-benchmark EWD998 after candidate-state canonicalization:
+  - Exact count preserved: `53267/4097`.
+  - ReleaseFast runtime: 3.15s -> 1.03s.
+  - Peak RSS: approximately 2.48GB -> approximately 17MB.
+  - TLC `-workers 1`: 0.70s, approximately 318MB.
+  - TLC `-workers auto` (16 workers): 0.62s, approximately 324MB.
+- [ ] Replace `max_states * 256` eager value-pool sizing with measured,
+  bounded initial capacities and geometric growth telemetry.
+- [ ] Replace the fixed `max_states * 32` successor edge allocation with
+  chunked graph storage sized from observed outdegree.
+- [ ] Remove runtime `std.ArrayList(page_allocator)` from evaluator/action hot
+  paths; use bounded stack buffers or arena-owned reusable buffers.
+- [ ] Add `--stats` output for permanent values, candidate values, strings,
+  graph edges, generated states, duplicate states, and arena high-water marks.
+- [ ] Add assertions that candidate-pool values never escape into canonical
+  state storage and that canonical values never reference resettable pools.
+
+### Multi-threading prerequisites
+
+- [ ] Add CLI `--workers 1|auto|N`; keep `1` as the correctness baseline.
+- [ ] Give each worker a private evaluator, candidate arena, candidate
+  `ValuePool`, action executor, and successor buffer.
+- [ ] Share immutable AST/compiled actions and canonical states.
+- [ ] Synchronize canonical-state insertion, queue publication, trace
+  predecessor assignment, counters, and transition graph updates.
+- [ ] Shard the fingerprint set before scaling worker count; do not serialize
+  all workers behind one global FPSet lock.
+- [ ] Preserve temporal-property graph completeness and exact state counts
+  under parallel exploration.
 
 ## Phase 4 — Advanced TLA+
 - [x] Liveness checking (`[]`/`<>/`leads-to with weak/strong fairness and stuttering)

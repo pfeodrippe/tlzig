@@ -27,7 +27,9 @@ fn hash_combine(a: Fingerprint, b: Fingerprint) Fingerprint {
 
 fn hash_value_inner(pool: *const ValuePool, v: Value) Fingerprint {
     var h = hash_init();
-    h = hash_byte(h, @intFromEnum(v));
+    const function_is_tuple = v == .function_v and is_sequence_function(pool, v.function_v);
+    const tag = if (function_is_tuple) value_tag_tuple else @intFromEnum(v);
+    h = hash_byte(h, tag);
     switch (v) {
         .bool_v => |b| {
             h = hash_byte(h, if (b) 1 else 0);
@@ -68,6 +70,18 @@ fn hash_value_inner(pool: *const ValuePool, v: Value) Fingerprint {
             }
         },
         .function_v => |f| {
+            if (function_is_tuple) {
+                var i: u32 = 0;
+                while (i < f.len) : (i += 1) {
+                    const item = f.apply(
+                        pool,
+                        Value{ .int_v = @as(i64, @intCast(i)) + 1 },
+                    ) orelse unreachable;
+                    h = hash_byte(h, 0xab);
+                    h = hash_value_inner(pool, item) ^ h;
+                }
+                return h;
+            }
             const keys = f.domain.items(pool);
             const vals = f.entries(pool);
             var buf: [64]Fingerprint = undefined;
@@ -146,8 +160,30 @@ fn hash_value_inner(pool: *const ValuePool, v: Value) Fingerprint {
             h = hash_bytes(h, &lo_bytes);
             h = hash_bytes(h, &hi_bytes);
         },
+        .seq_set_v => |ss| {
+            h = hash_byte(h, 0x18);
+            h = hash_combine(h, hash_value_inner(pool, ss.element_set(pool)));
+        },
+        .power_set_v => |ps| {
+            h = hash_byte(h, 0x19);
+            h = hash_combine(h, hash_value_inner(pool, ps.set(pool)));
+        },
     }
     return h;
+}
+
+const value_tag_tuple: u8 = @intFromEnum(@import("value.zig").ValueTag.tuple_v);
+
+fn is_sequence_function(pool: *const ValuePool, function: @import("value.zig").Function) bool {
+    if (function.domain.len != function.len) return false;
+    var i: u32 = 0;
+    while (i < function.len) : (i += 1) {
+        if (function.apply(
+            pool,
+            Value{ .int_v = @as(i64, @intCast(i)) + 1 },
+        ) == null) return false;
+    }
+    return true;
 }
 
 pub fn hash_value(pool: *const ValuePool, v: Value, fp: Fingerprint) Fingerprint {

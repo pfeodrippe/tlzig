@@ -6,6 +6,7 @@ pub const Module = struct {
     variables: []const []const u8,
     constants: []const []const u8,
     definitions: []const Definition,
+    assumptions: []const *Expr,
     instances: []const Instance,
     namespace_instances: []const NamespaceInstance,
     init_name: []const u8,
@@ -35,6 +36,7 @@ pub const Definition = struct {
     body: *Expr,
     is_function: bool = false,
     function_var: []const u8 = "",
+    function_vars: []const []const u8 = &.{},
     function_domain: ?*Expr = null,
 };
 

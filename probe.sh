@@ -3,13 +3,28 @@ set -euo pipefail
 cd /Users/pfeodrippe/dev/tlzig
 
 MAX_STATES=${MAX_STATES:-200000}
+TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-180}
 PASS=0
 FAIL=0
 SKIP=0
 TOTAL=0
 FAIL_FILE=$(mktemp)
 
-echo "Probing configs with max_states=$MAX_STATES"
+echo "Probing configs with max_states=$MAX_STATES timeout=${TIMEOUT_SECONDS}s"
+
+run_with_timeout() {
+    LC_ALL=C LANG=C /usr/bin/perl -e '
+        use strict;
+        use warnings;
+        my $seconds = shift @ARGV;
+        $SIG{ALRM} = sub {
+            print STDERR "probe timeout after ${seconds}s\n";
+            exit 124;
+        };
+        alarm $seconds;
+        exec @ARGV or die "exec failed: $!\n";
+    ' "$TIMEOUT_SECONDS" "$@"
+}
 
 while IFS= read -r cfg; do
     TOTAL=$((TOTAL+1))
@@ -21,7 +36,7 @@ while IFS= read -r cfg; do
         echo "SKIP $cfg (no $tla)"
         continue
     fi
-    if ./zig-out/bin/tlzig --spec "$tla" --cfg "$cfg" --max-states "$MAX_STATES" --unlimited-memory --arena-bytes 1073741824 --eval-arena-bytes 1073741824 > /tmp/probe.out 2>&1; then
+    if run_with_timeout ./zig-out/bin/tlzig --spec "$tla" --cfg "$cfg" --max-states "$MAX_STATES" --unlimited-memory --arena-bytes 1073741824 --eval-arena-bytes 1073741824 > /tmp/probe.out 2>&1; then
         PASS=$((PASS+1))
         echo "PASS $cfg $(tail -1 /tmp/probe.out)"
     elif grep -q "InvariantViolated" /tmp/probe.out && grep -q "distinct=" /tmp/probe.out; then

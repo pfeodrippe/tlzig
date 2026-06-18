@@ -8,14 +8,21 @@ const pluscal = @import("pluscal.zig");
 pub const ModuleLoader = struct {
     arena: *Arena,
     search_paths: []const []const u8,
+    embedded_source: ?[]const u8,
 
     pub fn init(arena: *Arena, search_paths: []const []const u8) ModuleLoader {
-        return ModuleLoader{ .arena = arena, .search_paths = search_paths };
+        return ModuleLoader{
+            .arena = arena,
+            .search_paths = search_paths,
+            .embedded_source = null,
+        };
     }
 
     pub fn load(self: ModuleLoader, path: []const u8) !ast.Module {
         const raw = try self.read_file(path);
         const source = try self.translate_source(path, raw);
+        var scoped = self;
+        scoped.embedded_source = source;
         var p = parser.Parser.init(self.arena, source);
         var module = p.parse_module() catch |err| {
             std.debug.print("Parse error in {s}: {any} at line {d} col {d}\n", .{ path, err, p.current.line, p.current.col });
@@ -24,15 +31,22 @@ pub const ModuleLoader = struct {
         const dir = std.fs.path.dirname(path) orelse ".";
         var loaded = std.ArrayList([]const u8).empty;
         defer loaded.deinit(std.heap.page_allocator);
-        try self.load_extends(&module, dir, &loaded);
-        try self.load_instances(&module, dir, &loaded);
-        try self.expand_namespace_instances(&module, dir, &loaded);
+        try scoped.load_extends(&module, dir, &loaded);
+        try scoped.load_instances(&module, dir, &loaded);
+        try scoped.expand_namespace_instances(&module, dir, &loaded);
         return module;
     }
 
     fn load_extends(self: ModuleLoader, module: *ast.Module, dir: []const u8, loaded: *std.ArrayList([]const u8)) !void {
         for (module.extends) |name| {
             if (self.already_loaded(loaded.items, name)) continue;
+            if (try self.parse_embedded_module(name)) |embedded| {
+                try loaded.append(std.heap.page_allocator, try self.dup(name));
+                var child = embedded;
+                try self.load_extends(&child, dir, loaded);
+                try self.merge(module, child);
+                continue;
+            }
             // Skip modules we can't find (e.g. TLAPS, community modules not
             // in our search path). TLC has these built-in; we treat them as
             // providing no additional definitions.
@@ -51,7 +65,9 @@ pub const ModuleLoader = struct {
                 std.debug.print("Parse error in EXTENDS {s} ({s}): {any}\n", .{ name, path, err });
                 return err;
             };
-            try self.load_extends(&child, std.fs.path.dirname(path) orelse ".", loaded);
+            var scoped = self;
+            scoped.embedded_source = source;
+            try scoped.load_extends(&child, std.fs.path.dirname(path) orelse ".", loaded);
             try self.merge(module, child);
         }
     }
@@ -118,6 +134,14 @@ pub const ModuleLoader = struct {
         @memcpy(merged_defs[parent.definitions.len..], child.definitions);
         parent.definitions = merged_defs;
 
+        const assumption_total = parent.assumptions.len + child.assumptions.len;
+        if (assumption_total > 0) {
+            const merged_assumptions = try self.arena.alloc(*ast.Expr, assumption_total);
+            @memcpy(merged_assumptions[0..parent.assumptions.len], parent.assumptions);
+            @memcpy(merged_assumptions[parent.assumptions.len..], child.assumptions);
+            parent.assumptions = merged_assumptions;
+        }
+
         const var_total = parent.variables.len + child.variables.len;
         if (var_total > 0) {
             const merged_vars = try self.arena.alloc([]const u8, var_total);
@@ -165,9 +189,23 @@ pub const ModuleLoader = struct {
                 .name = def.name,
                 .params = def.params,
                 .body = new_body,
+                .is_function = def.is_function,
+                .function_var = def.function_var,
+                .function_vars = def.function_vars,
+                .function_domain = if (def.function_domain) |domain| try copy_expr(self.arena, domain, effective_subs) else null,
             };
         }
         parent.definitions = merged;
+        if (child.assumptions.len > 0) {
+            const assumption_total = parent.assumptions.len + child.assumptions.len;
+            const merged_assumptions = try self.arena.alloc(*ast.Expr, assumption_total);
+            @memcpy(merged_assumptions[0..parent.assumptions.len], parent.assumptions);
+            for (child.assumptions, 0..) |assumption, i| {
+                merged_assumptions[parent.assumptions.len + i] =
+                    try copy_expr(self.arena, assumption, effective_subs);
+            }
+            parent.assumptions = merged_assumptions;
+        }
         // Also carry over namespace instances from the child.
         if (child.namespace_instances.len > 0) {
             const ns_total = parent.namespace_instances.len + child.namespace_instances.len;
@@ -214,6 +252,14 @@ pub const ModuleLoader = struct {
     fn load_instances(self: ModuleLoader, module: *ast.Module, dir: []const u8, loaded: *std.ArrayList([]const u8)) !void {
         for (module.instances) |inst| {
             if (self.already_loaded(loaded.items, inst.module_name)) continue;
+            if (try self.parse_embedded_module(inst.module_name)) |embedded| {
+                try loaded.append(std.heap.page_allocator, try self.dup(inst.module_name));
+                var child = embedded;
+                try self.load_extends(&child, dir, loaded);
+                try self.load_instances(&child, dir, loaded);
+                try self.merge_instance(module, child, inst.substitutions);
+                continue;
+            }
             const path = self.find_module(inst.module_name, dir) catch |err| {
                 if (err == error.ModuleNotFound) {
                     try loaded.append(std.heap.page_allocator, try self.dup(inst.module_name));
@@ -229,8 +275,10 @@ pub const ModuleLoader = struct {
                 std.debug.print("Parse error in INSTANCE {s} ({s}): {any}\n", .{ inst.module_name, path, err });
                 return err;
             };
-            try self.load_extends(&child, std.fs.path.dirname(path) orelse ".", loaded);
-            try self.load_instances(&child, std.fs.path.dirname(path) orelse ".", loaded);
+            var scoped = self;
+            scoped.embedded_source = source;
+            try scoped.load_extends(&child, std.fs.path.dirname(path) orelse ".", loaded);
+            try scoped.load_instances(&child, std.fs.path.dirname(path) orelse ".", loaded);
             try self.merge_instance(module, child, inst.substitutions);
         }
     }
@@ -259,6 +307,10 @@ pub const ModuleLoader = struct {
                     .name = qualified,
                     .params = def.params,
                     .body = new_body,
+                    .is_function = def.is_function,
+                    .function_var = def.function_var,
+                    .function_vars = def.function_vars,
+                    .function_domain = if (def.function_domain) |domain| try copy_expr(self.arena, domain, effective_subs) else null,
                 };
                 def_count += 1;
             }
@@ -289,21 +341,18 @@ pub const ModuleLoader = struct {
     }
 
     fn load_module_by_name(self: ModuleLoader, name: []const u8, dir: []const u8, loaded: *std.ArrayList([]const u8)) !ast.Module {
-        if (self.already_loaded(loaded.items, name)) {
-            return ast.Module{
-                .name = try self.dup(name),
-                .extends = &.{},
-                .variables = &.{},
-                .constants = &.{},
-                .definitions = &.{},
-                .instances = &.{},
-                .namespace_instances = &.{},
-                .init_name = try self.dup("Init"),
-                .next_name = try self.dup("Next"),
-                .invariants = &.{},
-            };
+        // The same module may be instantiated under multiple namespaces.
+        // `loaded` prevents recursive dependency work; it is not a module
+        // cache, and a repeated INSTANCE still needs its own qualified defs.
+        if (!self.already_loaded(loaded.items, name)) {
+            try loaded.append(std.heap.page_allocator, try self.dup(name));
         }
-        try loaded.append(std.heap.page_allocator, try self.dup(name));
+        if (try self.parse_embedded_module(name)) |embedded| {
+            var child = embedded;
+            try self.load_extends(&child, dir, loaded);
+            try self.load_instances(&child, dir, loaded);
+            return child;
+        }
         const path = self.find_module(name, dir) catch |err| {
             if (err == error.ModuleNotFound) {
                 return ast.Module{
@@ -312,6 +361,7 @@ pub const ModuleLoader = struct {
                     .variables = &.{},
                     .constants = &.{},
                     .definitions = &.{},
+                    .assumptions = &.{},
                     .instances = &.{},
                     .namespace_instances = &.{},
                     .init_name = try self.dup("Init"),
@@ -328,10 +378,51 @@ pub const ModuleLoader = struct {
             std.debug.print("Parse error in namespace INSTANCE {s} ({s}): {any}\n", .{ name, path, err });
             return err;
         };
+        var scoped = self;
+        scoped.embedded_source = source;
         const child_dir = std.fs.path.dirname(path) orelse "./";
-        try self.load_extends(&child, child_dir, loaded);
-        try self.load_instances(&child, child_dir, loaded);
+        try scoped.load_extends(&child, child_dir, loaded);
+        try scoped.load_instances(&child, child_dir, loaded);
         return child;
+    }
+
+    fn parse_embedded_module(self: ModuleLoader, name: []const u8) !?ast.Module {
+        const source = self.embedded_source orelse return null;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, source, pos, "MODULE")) |module_pos| {
+            const name_start = module_pos + "MODULE".len;
+            var cursor = name_start;
+            while (cursor < source.len and
+                (source[cursor] == ' ' or source[cursor] == '\t'))
+            {
+                cursor += 1;
+            }
+            if (cursor + name.len <= source.len and
+                std.mem.eql(u8, source[cursor .. cursor + name.len], name))
+            {
+                const end = cursor + name.len;
+                if (end == source.len or
+                    source[end] == ' ' or
+                    source[end] == '\t' or
+                    source[end] == '\r' or
+                    source[end] == '\n' or
+                    source[end] == '-')
+                {
+                    var p = parser.Parser.init(self.arena, source[module_pos..]);
+                    const child = p.parse_module() catch |err| {
+                        std.debug.print(
+                            "Parse error in embedded module {s}: {any} at line {d} col {d}\n",
+                            .{ name, err, p.current.line, p.current.col },
+                        );
+                        return err;
+                    };
+                    assert(std.mem.eql(u8, child.name, name));
+                    return child;
+                }
+            }
+            pos = name_start;
+        }
+        return null;
     }
 
     fn arena_concat(self: ModuleLoader, a: []const u8, sep: []const u8, b: []const u8) ![]const u8 {
@@ -422,14 +513,17 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
         },
         .primed => |name| {
             const ptr = try arena.alloc_object(ast.Expr);
-            ptr.* = .{ .primed = try arena.dup(name) };
+            const mapped = substitution_ident(subs, name) orelse name;
+            ptr.* = .{ .primed = try arena.dup(mapped) };
             return ptr;
         },
         .unchanged => |names| {
             const ptr = try arena.alloc_object(ast.Expr);
             const copy: []const []const u8 = if (names.len == 0) &[_][]const u8{} else blk: {
                 const c = try arena.alloc([]const u8, names.len);
-                for (names, 0..) |n, i| c[i] = try arena.dup(n);
+                for (names, 0..) |n, i| {
+                    c[i] = try arena.dup(substitution_ident(subs, n) orelse n);
+                }
                 break :blk c;
             };
             ptr.* = .{ .unchanged = copy };
@@ -650,6 +744,16 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
                         .name = try arena.dup(d.name),
                         .params = params,
                         .body = try copy_expr(arena, d.body, subs),
+                        .is_function = d.is_function,
+                        .function_var = try arena.dup(d.function_var),
+                        .function_vars = if (d.function_vars.len == 0) &.{} else blk_vars: {
+                            const copied_vars = try arena.alloc([]const u8, d.function_vars.len);
+                            for (d.function_vars, 0..) |function_var, j| {
+                                copied_vars[j] = try arena.dup(function_var);
+                            }
+                            break :blk_vars copied_vars;
+                        },
+                        .function_domain = if (d.function_domain) |domain| try copy_expr(arena, domain, subs) else null,
                     };
                 }
                 break :blk c;
@@ -737,4 +841,13 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
             return ptr;
         },
     }
+}
+
+fn substitution_ident(subs: []const ast.Substitution, name: []const u8) ?[]const u8 {
+    for (subs) |sub| {
+        if (!std.mem.eql(u8, name, sub.local_name)) continue;
+        if (sub.expr.* == .ident) return sub.expr.ident;
+        return null;
+    }
+    return null;
 }

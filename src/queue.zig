@@ -46,6 +46,15 @@ pub const StateQueue = struct {
         return idx;
     }
 
+    pub fn peek(self: StateQueue) ?u32 {
+        assert(self.count <= self.cap);
+        assert(self.head < self.cap);
+        if (self.count == 0) return null;
+        const idx = self.buffer[self.head];
+        assert(idx < self.cap);
+        return idx;
+    }
+
     pub fn is_empty(self: StateQueue) bool {
         assert(self.count <= self.cap);
         return self.count == 0;

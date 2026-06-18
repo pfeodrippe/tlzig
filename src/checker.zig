@@ -8,6 +8,7 @@ const Evaluator = eval.Evaluator;
 const action = @import("action.zig");
 const ActionCompiler = action.ActionCompiler;
 const ActionExecutor = action.ActionExecutor;
+const StateBuffer = action.StateBuffer;
 const StateStore = @import("state.zig").StateStore;
 const StateQueue = @import("queue.zig").StateQueue;
 const FpSet = @import("fp_set.zig").FpSet;
@@ -20,6 +21,150 @@ const ConstantAssignment = @import("config.zig").ConstantAssignment;
 const Constant = eval.Constant;
 const parser = @import("parser.zig");
 const overrides = @import("overrides.zig");
+
+const WorkerContext = struct {
+    eval_arena: Arena,
+    eval_pool: ValuePool,
+    evaluator: Evaluator,
+    candidate_arena: Arena,
+    candidate_store: StateStore,
+    candidate_evaluator: Evaluator,
+    candidate_pool_base: ValuePool.Snapshot,
+    eval_pool_base: ValuePool.Snapshot,
+    out_states: StateBuffer,
+    compose_states: StateBuffer,
+    composition_generated: u64,
+    source_snapshot: StateStore,
+
+    fn deinit(self: *WorkerContext) void {
+        self.eval_arena.deinit();
+        self.candidate_arena.deinit();
+    }
+};
+
+const ParallelState = struct {
+    checker: *Checker,
+    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    condition: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+    active: u32 = 0,
+    current_level: u32 = 0,
+    done: bool = false,
+    failure: ?Error = null,
+};
+
+fn parallel_lock(parallel: *ParallelState) void {
+    assert(std.c.pthread_mutex_lock(&parallel.mutex) == .SUCCESS);
+}
+
+fn parallel_unlock(parallel: *ParallelState) void {
+    assert(std.c.pthread_mutex_unlock(&parallel.mutex) == .SUCCESS);
+}
+
+fn parallel_wait(parallel: *ParallelState) void {
+    assert(std.c.pthread_cond_wait(
+        &parallel.condition,
+        &parallel.mutex,
+    ) == .SUCCESS);
+}
+
+fn parallel_broadcast(parallel: *ParallelState) void {
+    assert(std.c.pthread_cond_broadcast(&parallel.condition) == .SUCCESS);
+}
+
+fn parallel_worker(
+    parallel: *ParallelState,
+    worker: *WorkerContext,
+) void {
+    const checker = parallel.checker;
+    while (true) {
+        parallel_lock(parallel);
+        if (parallel.done or parallel.failure != null) {
+            parallel_unlock(parallel);
+            return;
+        }
+
+        const next_idx = checker.queue.peek() orelse {
+            if (parallel.active == 0) {
+                parallel.done = true;
+                parallel_broadcast(parallel);
+                parallel_unlock(parallel);
+                return;
+            }
+            parallel_wait(parallel);
+            parallel_unlock(parallel);
+            continue;
+        };
+        const next_level = checker.state_store.get(next_idx).level;
+        if (next_level > parallel.current_level) {
+            if (parallel.active != 0) {
+                parallel_wait(parallel);
+                parallel_unlock(parallel);
+                continue;
+            }
+            parallel.current_level = next_level;
+        }
+        const state_idx = checker.queue.dequeue().?;
+        assert(state_idx == next_idx);
+        assert(state_idx < checker.state_store.count);
+        worker.source_snapshot = checker.state_store;
+        parallel.active += 1;
+        parallel_unlock(parallel);
+
+        worker.candidate_store.reset(worker.candidate_pool_base);
+        worker.eval_pool.restore(worker.eval_pool_base);
+        worker.out_states.clear();
+        worker.composition_generated = 0;
+        var executor = ActionExecutor{
+            .evaluator = worker.evaluator,
+            .source_state_store = &worker.source_snapshot,
+            .candidate_store = &worker.candidate_store,
+            .eval_pool = &worker.eval_pool,
+            .compose_states = &worker.compose_states,
+            .composition_generated = &worker.composition_generated,
+        };
+        const generation_error: ?Error = blk: {
+            executor.execute_next(
+                checker.next_spec.?,
+                state_idx,
+                &worker.out_states,
+            ) catch |err| break :blk err;
+            break :blk null;
+        };
+
+        parallel_lock(parallel);
+        if (generation_error) |err| {
+            parallel.failure = err;
+        } else if (parallel.failure == null) {
+            checker.generated += worker.composition_generated;
+            checker.succ_offsets[state_idx] = checker.succ_count;
+            checker.check_enabled_invariants(
+                state_idx,
+                worker.out_states.items.len > 0,
+            ) catch |err| {
+                parallel.failure = err;
+            };
+            if (parallel.failure == null) {
+                checker.process_generated(
+                    state_idx,
+                    &worker.out_states,
+                    &worker.candidate_store,
+                    &worker.candidate_evaluator,
+                ) catch |err| {
+                    parallel.failure = err;
+                };
+            }
+        }
+        assert(parallel.active > 0);
+        parallel.active -= 1;
+        if (parallel.failure != null or
+            (checker.queue.is_empty() and parallel.active == 0))
+        {
+            parallel.done = true;
+        }
+        parallel_broadcast(parallel);
+        parallel_unlock(parallel);
+    }
+}
 
 pub const FairnessCondition = struct {
     kind: enum { weak, strong },
@@ -46,10 +191,13 @@ pub const Checker = struct {
     invariants: []const *ast.Expr,
     invariant_names: []const []const u8,
     constraints: []const *ast.Expr,
+    action_constraints: []const *ast.Expr,
     properties: []const *ast.Expr,
     safety_properties: []const *ast.Expr,
     eval_arena: *Arena,
     eval_pool: ValuePool,
+    eval_pool_base: ValuePool.Snapshot,
+    worker_count: u16,
     max_states: u32,
     generated: u64,
     distinct: u64,
@@ -80,7 +228,9 @@ pub const Checker = struct {
         state_string_cap: u32,
         eval_arena_bytes: u64,
         override_ctx: overrides.OverrideContext,
+        worker_count: u16,
     ) !Checker {
+        assert(worker_count > 0);
         var state_store = try StateStore.init(
             arena,
             module.variables,
@@ -130,6 +280,7 @@ pub const Checker = struct {
             }
             eval_pool.restore(snapshot);
         }
+        const eval_pool_base = eval_pool.snapshot();
 
         const candidate_arena = try arena.alloc_object(Arena);
         candidate_arena.* = try Arena.init(@max(eval_arena_bytes / 4, 16 * 1024 * 1024));
@@ -168,15 +319,17 @@ pub const Checker = struct {
 
         if ((init_name_v == null) != (next_name_v == null)) return Error.ConfigError;
         const compiled_init: ?action.CompiledInit = if (init_name_v) |name| blk: {
-            const init_def = evaluator.find_definition(name) orelse {
-                std.debug.print("undefined init def: {s}\n", .{name});
+            const resolved_name = evaluator.resolve_alias(name);
+            const init_def = evaluator.find_definition(resolved_name) orelse {
+                std.debug.print("undefined init def: {s}\n", .{resolved_name});
                 return Error.UndefinedSymbol;
             };
             break :blk try compiler.compile_init(init_def.body);
         } else null;
         const compiled_next: ?action.CompiledNext = if (next_name_v) |name| blk: {
-            const next_def = evaluator.find_definition(name) orelse {
-                std.debug.print("undefined next def: {s}\n", .{name});
+            const resolved_name = evaluator.resolve_alias(name);
+            const next_def = evaluator.find_definition(resolved_name) orelse {
+                std.debug.print("undefined next def: {s}\n", .{resolved_name});
                 return Error.UndefinedSymbol;
             };
             break :blk try compiler.compile_next(next_def.body);
@@ -219,6 +372,27 @@ pub const Checker = struct {
             }
             break :blk result;
         };
+
+        var action_constraint_exprs = std.ArrayList(*ast.Expr).empty;
+        defer action_constraint_exprs.deinit(std.heap.page_allocator);
+        for (cfg.action_constraints) |cname| {
+            const def = evaluator.find_definition(cname) orelse {
+                std.debug.print("undefined action constraint: {s}\n", .{cname});
+                return Error.UndefinedSymbol;
+            };
+            try action_constraint_exprs.append(std.heap.page_allocator, def.body);
+        }
+        const action_constraints: []const *ast.Expr =
+            if (action_constraint_exprs.items.len == 0)
+                &[_]*ast.Expr{}
+            else blk: {
+                const result = try arena.alloc(
+                    *ast.Expr,
+                    action_constraint_exprs.items.len,
+                );
+                @memcpy(result, action_constraint_exprs.items);
+                break :blk result;
+            };
 
         var property_exprs = std.ArrayList(*ast.Expr).empty;
         defer property_exprs.deinit(std.heap.page_allocator);
@@ -279,10 +453,13 @@ pub const Checker = struct {
             .invariants = invariants,
             .invariant_names = invariant_names,
             .constraints = constraints,
+            .action_constraints = action_constraints,
             .properties = properties,
             .safety_properties = safety_properties,
             .eval_arena = eval_arena,
             .eval_pool = eval_pool,
+            .eval_pool_base = eval_pool_base,
+            .worker_count = worker_count,
             .max_states = max_states,
             .generated = 0,
             .distinct = 0,
@@ -314,31 +491,52 @@ pub const Checker = struct {
         }
         assert(self.next_spec != null);
 
-        var out_states = std.ArrayList(u32).empty;
-        defer out_states.deinit(std.heap.page_allocator);
+        var out_states = try StateBuffer.init(self.arena, self.max_states);
+        var compose_states = try StateBuffer.init(self.arena, self.max_states);
+        var composition_generated: u64 = 0;
 
         var executor = ActionExecutor{
             .evaluator = self.evaluator,
             .source_state_store = &self.state_store,
             .candidate_store = &self.candidate_store,
             .eval_pool = &self.eval_pool,
+            .compose_states = &compose_states,
+            .composition_generated = &composition_generated,
         };
 
         self.candidate_store.reset(self.candidate_pool_base);
+        self.eval_pool.restore(self.eval_pool_base);
         try executor.execute_init(self.init_spec.?, &out_states);
-        try self.process_generated(null, &out_states);
+        try self.process_generated(
+            null,
+            &out_states,
+            &self.candidate_store,
+            &self.candidate_evaluator,
+        );
+        self.eval_pool.restore(self.eval_pool_base);
 
-        while (self.queue.dequeue()) |idx| {
-            assert(idx < self.state_store.count);
-            assert(idx < self.max_states_limit);
-            out_states.clearRetainingCapacity();
-            self.succ_offsets[idx] = self.succ_count;
-            self.candidate_store.reset(self.candidate_pool_base);
-            self.eval_pool.restore(self.eval_pool.snapshot());
-            try executor.execute_next(self.next_spec.?, idx, &out_states);
-            self.eval_pool.restore(self.eval_pool.snapshot());
-            try self.check_enabled_invariants(idx, out_states.items.len > 0);
-            try self.process_generated(idx, &out_states);
+        if (self.worker_count == 1) {
+            while (self.queue.dequeue()) |idx| {
+                assert(idx < self.state_store.count);
+                assert(idx < self.max_states_limit);
+                out_states.clear();
+                self.succ_offsets[idx] = self.succ_count;
+                self.candidate_store.reset(self.candidate_pool_base);
+                self.eval_pool.restore(self.eval_pool_base);
+                composition_generated = 0;
+                try executor.execute_next(self.next_spec.?, idx, &out_states);
+                self.generated += composition_generated;
+                try self.check_enabled_invariants(idx, out_states.items.len > 0);
+                try self.process_generated(
+                    idx,
+                    &out_states,
+                    &self.candidate_store,
+                    &self.candidate_evaluator,
+                );
+                self.eval_pool.restore(self.eval_pool_base);
+            }
+        } else {
+            try self.check_parallel();
         }
 
         // After exhaustive safety checking, verify temporal PROPERTIES.
@@ -353,30 +551,158 @@ pub const Checker = struct {
         };
     }
 
-    fn process_generated(self: *Checker, parent_idx: ?u32, out_states: *std.ArrayList(u32)) !void {
+    fn check_parallel(self: *Checker) !void {
+        assert(self.worker_count > 1);
+        const workers = try self.arena.alloc(WorkerContext, self.worker_count);
+        var initialized: u16 = 0;
+        errdefer {
+            for (workers[0..initialized]) |*worker| worker.deinit();
+        }
+        for (workers) |*worker| {
+            try self.init_worker(worker);
+            initialized += 1;
+        }
+        defer for (workers) |*worker| worker.deinit();
+        // Worker cleanup now belongs to the normal defer. The errdefer above
+        // is only for a partially initialized array.
+        initialized = 0;
+
+        // Workers read canonical values without synchronization. Prevent pool
+        // relocation while they are active; capacity exhaustion is explicit.
+        self.state_store.values_pool.growable = false;
+        defer self.state_store.values_pool.growable = true;
+
+        var parallel = ParallelState{ .checker = self };
+        defer {
+            assert(std.c.pthread_cond_destroy(&parallel.condition) == .SUCCESS);
+            assert(std.c.pthread_mutex_destroy(&parallel.mutex) == .SUCCESS);
+        }
+        if (self.queue.peek()) |idx| {
+            parallel.current_level = self.state_store.get(idx).level;
+        }
+        const threads = try self.arena.alloc(std.Thread, self.worker_count);
+        var spawned: u16 = 0;
+        errdefer for (threads[0..spawned]) |thread| thread.join();
+        for (workers, 0..) |*worker, i| {
+            threads[i] = try std.Thread.spawn(.{}, parallel_worker, .{
+                &parallel,
+                worker,
+            });
+            spawned += 1;
+        }
+        assert(spawned == self.worker_count);
+        for (threads) |thread| thread.join();
+        // The spawn-failure errdefer owns only live, unjoined handles. Clear
+        // its range before propagating a model-checking error.
+        spawned = 0;
+        if (parallel.failure) |err| return err;
+    }
+
+    fn init_worker(self: *Checker, worker: *WorkerContext) !void {
+        worker.eval_arena = try Arena.init(16 * 1024 * 1024);
+        errdefer worker.eval_arena.deinit();
+        worker.evaluator = try self.evaluator.fork(&worker.eval_arena);
+        worker.eval_pool = try ValuePool.init(
+            &worker.eval_arena,
+            262_144,
+            65_536,
+        );
+        worker.eval_pool_base = worker.eval_pool.snapshot();
+
+        worker.candidate_arena = try Arena.init(16 * 1024 * 1024);
+        errdefer worker.candidate_arena.deinit();
+        worker.candidate_store = try StateStore.init(
+            &worker.candidate_arena,
+            self.state_store.variable_names,
+            self.max_states,
+            262_144,
+            65_536,
+        );
+        worker.candidate_evaluator = try worker.evaluator.fork(
+            &worker.candidate_arena,
+        );
+        worker.candidate_evaluator.set_constants(try clone_constants(
+            self.arena,
+            self.evaluator.constants,
+            &self.state_store.values_pool,
+            &worker.candidate_store.values_pool,
+        ));
+        worker.candidate_pool_base = worker.candidate_store.values_pool.snapshot();
+        worker.out_states = try StateBuffer.init(
+            &worker.candidate_arena,
+            self.max_states,
+        );
+        worker.compose_states = try StateBuffer.init(
+            &worker.candidate_arena,
+            self.max_states,
+        );
+        worker.composition_generated = 0;
+        worker.source_snapshot = self.state_store;
+    }
+
+    fn process_generated(
+        self: *Checker,
+        parent_idx: ?u32,
+        out_states: *StateBuffer,
+        candidate_store: *StateStore,
+        candidate_evaluator: *Evaluator,
+    ) !void {
         // First pass: check constraints/invariants, canonicalize duplicates,
         // and enqueue newly discovered states. After this loop, out_states
         // contains canonical indices for graph edges.
         var kept_count: u32 = 0;
+        var action_parent = if (parent_idx) |pidx|
+            try self.clone_parent_for_action_constraints(
+                pidx,
+                candidate_store,
+            )
+        else
+            null;
         for (out_states.items) |*idx| {
-            assert(idx.* < self.candidate_store.count);
+            assert(idx.* < candidate_store.count);
             self.generated += 1;
-            const candidate = self.candidate_store.get(idx.*);
+            const candidate = candidate_store.get(idx.*);
+            if (parent_idx) |pidx| {
+                candidate.pred = pidx;
+                candidate.level = self.state_store.get(pidx).level + 1;
+            }
             const snap = self.eval_pool.snapshot();
-            const constraints_hold = try self.check_candidate_constraints(candidate);
+            const constraints_hold = try self.check_candidate_constraints(
+                candidate,
+                candidate_store,
+                candidate_evaluator,
+            );
             if (!constraints_hold) {
                 self.eval_pool.restore(snap);
                 idx.* = std.math.maxInt(u32);
                 continue;
             }
+            const action_constraints_hold =
+                if (action_parent) |*parent|
+                    try self.check_candidate_action_constraints(
+                        parent,
+                        candidate,
+                        candidate_store,
+                        candidate_evaluator,
+                    )
+                else
+                    true;
+            if (!action_constraints_hold) {
+                self.eval_pool.restore(snap);
+                idx.* = std.math.maxInt(u32);
+                continue;
+            }
             const fp = fingerprint.hash_state(
-                &self.candidate_store.values_pool,
+                &candidate_store.values_pool,
                 candidate.values,
             );
             const canonical = self.fp_set.find(fp);
             const is_new = canonical == null;
             const state_idx = if (canonical) |existing| existing else blk: {
-                const permanent_idx = try self.clone_candidate_state(candidate);
+                const permanent_idx = try self.clone_candidate_state(
+                    candidate,
+                    candidate_store,
+                );
                 assert(self.fp_set.put_with_index(fp, permanent_idx) == null);
                 break :blk permanent_idx;
             };
@@ -405,7 +731,7 @@ pub const Checker = struct {
             out_states.items[kept_count] = state_idx;
             kept_count += 1;
         }
-        out_states.shrinkRetainingCapacity(kept_count);
+        out_states.shrink(kept_count);
 
         if (parent_idx) |pidx| {
             const count: u32 = @intCast(out_states.items.len);
@@ -433,6 +759,7 @@ pub const Checker = struct {
     fn clone_candidate_state(
         self: *Checker,
         candidate: *StateStore.State,
+        candidate_store: *StateStore,
     ) !u32 {
         const state_idx = try self.state_store.alloc_state();
         const state = self.state_store.get(state_idx);
@@ -440,7 +767,7 @@ pub const Checker = struct {
         state.pred = candidate.pred;
         for (candidate.values, state.values) |source, *target| {
             target.* = try source.clone(
-                &self.candidate_store.values_pool,
+                &candidate_store.values_pool,
                 &self.state_store.values_pool,
             );
         }
@@ -450,14 +777,62 @@ pub const Checker = struct {
     fn check_candidate_constraints(
         self: *Checker,
         candidate: *StateStore.State,
+        candidate_store: *StateStore,
+        candidate_evaluator: *Evaluator,
     ) !bool {
         for (self.constraints) |constraint| {
-            const value = try self.candidate_evaluator.eval_expr(
+            const value = try candidate_evaluator.eval_expr(
                 constraint,
                 Context.empty(),
                 candidate,
                 &self.eval_pool,
-                &self.candidate_store.values_pool,
+                &candidate_store.values_pool,
+            );
+            if (!value.is_truthy()) return false;
+        }
+        return true;
+    }
+
+    fn clone_parent_for_action_constraints(
+        self: *Checker,
+        parent_idx: u32,
+        candidate_store: *StateStore,
+    ) !?StateStore.State {
+        if (self.action_constraints.len == 0) return null;
+        const source = self.state_store.get(parent_idx);
+        const values = try candidate_store.values_pool.alloc_values(
+            @intCast(source.values.len),
+        );
+        for (source.values, values) |value, *target| {
+            target.* = try value.clone(
+                &self.state_store.values_pool,
+                &candidate_store.values_pool,
+            );
+        }
+        return StateStore.State{
+            .level = source.level,
+            .pred = source.pred,
+            .values = values,
+        };
+    }
+
+    fn check_candidate_action_constraints(
+        self: *Checker,
+        parent: *StateStore.State,
+        candidate: *StateStore.State,
+        candidate_store: *StateStore,
+        candidate_evaluator: *Evaluator,
+    ) !bool {
+        assert(self.action_constraints.len > 0);
+        candidate_evaluator.set_next_state(candidate);
+        defer candidate_evaluator.set_next_state(null);
+        for (self.action_constraints) |constraint| {
+            const value = try candidate_evaluator.eval_expr(
+                constraint,
+                Context.empty(),
+                parent,
+                &self.eval_pool,
+                &candidate_store.values_pool,
             );
             if (!value.is_truthy()) return false;
         }
@@ -596,6 +971,8 @@ pub const Checker = struct {
         scc_succ_edges: []u32,
         scc_states_offsets: []u32,
         scc_states_edges: []u32,
+        pred_offsets: []u32,
+        pred_edges: []u32,
         fair_sccs: []bool,
         fair_region: []bool,
         allocator: std.mem.Allocator,
@@ -606,6 +983,8 @@ pub const Checker = struct {
             self.allocator.free(self.scc_succ_edges);
             self.allocator.free(self.scc_states_offsets);
             self.allocator.free(self.scc_states_edges);
+            self.allocator.free(self.pred_offsets);
+            self.allocator.free(self.pred_edges);
             self.allocator.free(self.fair_sccs);
             self.allocator.free(self.fair_region);
         }
@@ -697,6 +1076,7 @@ pub const Checker = struct {
 
         const fair_sccs = try self.compute_fair_sccs(scc_ids, scc_count, scc_states_offsets, scc_states_edges, allocator);
         const fair_region = try self.compute_fair_region(scc_ids, scc_count, scc_succ_offsets, scc_succ_edges, fair_sccs, n, allocator);
+        const reverse = try self.build_reverse_graph(allocator, n);
 
         return SccData{
             .scc_ids = scc_ids,
@@ -705,10 +1085,60 @@ pub const Checker = struct {
             .scc_succ_edges = scc_succ_edges,
             .scc_states_offsets = scc_states_offsets,
             .scc_states_edges = scc_states_edges,
+            .pred_offsets = reverse.offsets,
+            .pred_edges = reverse.edges,
             .fair_sccs = fair_sccs,
             .fair_region = fair_region,
             .allocator = allocator,
         };
+    }
+
+    const ReverseGraph = struct {
+        offsets: []u32,
+        edges: []u32,
+    };
+
+    fn build_reverse_graph(
+        self: *Checker,
+        allocator: std.mem.Allocator,
+        state_count: u32,
+    ) Error!ReverseGraph {
+        const counts = try allocator.alloc(u32, state_count);
+        defer allocator.free(counts);
+        @memset(counts, 0);
+        var edge_count: u32 = 0;
+        for (0..state_count) |state_index_usize| {
+            const state_index: u32 = @intCast(state_index_usize);
+            for (self.successors(state_index)) |successor| {
+                assert(successor < state_count);
+                counts[successor] += 1;
+                edge_count += 1;
+            }
+        }
+
+        const offsets = try allocator.alloc(u32, state_count + 1);
+        errdefer allocator.free(offsets);
+        var offset: u32 = 0;
+        for (counts, 0..) |count, i| {
+            offsets[i] = offset;
+            offset += count;
+        }
+        assert(offset == edge_count);
+        offsets[state_count] = edge_count;
+
+        const edges = try allocator.alloc(u32, edge_count);
+        errdefer allocator.free(edges);
+        const fill = try allocator.alloc(u32, state_count);
+        defer allocator.free(fill);
+        @memcpy(fill, offsets[0..state_count]);
+        for (0..state_count) |state_index_usize| {
+            const state_index: u32 = @intCast(state_index_usize);
+            for (self.successors(state_index)) |successor| {
+                edges[fill[successor]] = state_index;
+                fill[successor] += 1;
+            }
+        }
+        return .{ .offsets = offsets, .edges = edges };
     }
 
     fn compute_fair_region(
@@ -1009,39 +1439,29 @@ pub const Checker = struct {
         assert(n == scc_data.fair_region.len);
         const results = try std.heap.page_allocator.alloc(bool, n);
         errdefer std.heap.page_allocator.free(results);
-        var visited = try std.heap.page_allocator.alloc(bool, n);
-        defer std.heap.page_allocator.free(visited);
-        var stack = try std.heap.page_allocator.alloc(u32, n);
-        defer std.heap.page_allocator.free(stack);
-        for (0..n) |start| {
-            const start_idx: u32 = @intCast(start);
-            if (!scc_data.fair_region[start_idx]) {
-                results[start] = true;
-                continue;
+        @memset(results, true);
+        const work = try std.heap.page_allocator.alloc(u32, n);
+        defer std.heap.page_allocator.free(work);
+        var work_len: u32 = 0;
+        for (operand, 0..) |holds, state_index_usize| {
+            const state_index: u32 = @intCast(state_index_usize);
+            if (!scc_data.fair_region[state_index] or holds) continue;
+            results[state_index] = false;
+            work[work_len] = state_index;
+            work_len += 1;
+        }
+        while (work_len > 0) {
+            work_len -= 1;
+            const state_index = work[work_len];
+            const begin = scc_data.pred_offsets[state_index];
+            const end = scc_data.pred_offsets[state_index + 1];
+            for (scc_data.pred_edges[begin..end]) |predecessor| {
+                if (!scc_data.fair_region[predecessor]) continue;
+                if (!results[predecessor]) continue;
+                results[predecessor] = false;
+                work[work_len] = predecessor;
+                work_len += 1;
             }
-            @memset(visited, false);
-            var stack_len: u32 = 0;
-            stack[stack_len] = start_idx;
-            stack_len += 1;
-            visited[start_idx] = true;
-            var holds = true;
-            while (stack_len > 0) {
-                stack_len -= 1;
-                const cur = stack[stack_len];
-                if (!operand[cur]) {
-                    holds = false;
-                    break;
-                }
-                for (self.successors(cur)) |succ| {
-                    if (!self.is_fair_game_edge(scc_data, succ)) continue;
-                    if (!visited[succ]) {
-                        visited[succ] = true;
-                        stack[stack_len] = succ;
-                        stack_len += 1;
-                    }
-                }
-            }
-            results[start] = holds;
         }
         return results;
     }
@@ -1090,17 +1510,10 @@ pub const Checker = struct {
         while (work_len > 0) {
             work_len -= 1;
             const cur = work[work_len];
-            for (0..n) |s| {
-                const pred: u32 = @intCast(s);
+            const begin = scc_data.pred_offsets[cur];
+            const end = scc_data.pred_offsets[cur + 1];
+            for (scc_data.pred_edges[begin..end]) |pred| {
                 if (bad[pred] or operand[pred]) continue;
-                var has_edge = false;
-                for (self.successors(pred)) |succ| {
-                    if (succ == cur) {
-                        has_edge = true;
-                        break;
-                    }
-                }
-                if (!has_edge) continue;
                 bad[pred] = true;
                 work[work_len] = pred;
                 work_len += 1;

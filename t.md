@@ -1,0 +1,4 @@
+- [x] parallel
+- [ ] tlzig can have modes or can automatically choose a mode that will make certain kinds of workloads more perfomant
+- [ ] running as a lib (no restart required)
+- [ ] fast

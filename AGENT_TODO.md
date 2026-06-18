@@ -1,8 +1,9 @@
 # AGENT_TODO — tlzig Implementation Tracker
 
 ## Mission
-Build a Zig TLA+ model checker that is faster than Java TLC on all specs in
-`vendor/tlaplus-examples/specifications`, from simplest to most complex.
+Build a Zig TLA+ model checker that is faster than Java TLC on TLC-valid specs
+in `vendor/tlaplus-examples/specifications`, from simplest to most complex.
+TLAPS proof-only modules are intentionally outside the product scope.
 
 ## Progress Legend
 - [ ] Not started
@@ -31,28 +32,55 @@ Build a Zig TLA+ model checker that is faster than Java TLC on all specs in
 
 ## Phase 2 — Examples (simplest to complex)
 
-Target: **≥50% of all `.tla` files in `vendor/tlaplus-examples/specifications` must pass.**
+Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
+
+### Current validation snapshot (2026-06-18)
+- Unit/integration suite: `67/67` passing in Debug.
+- Probe suffix after EWD998: `18 PASS / 14 FAIL / 2 SKIP`.
+- `sums_even/MC_sums_even` is excluded: Java TLC rejects it during parsing
+  because its base module imports `TLAPS`; tlzig must not invent proof-system
+  semantics to make it pass.
+- Exact advanced examples:
+  - EWD998 Async: `53271/4097`.
+  - YoYo NoPruning: `110/60`.
+  - YoYo Pruning: `157/102`.
+  - MCCRDT: `1350001/25000`.
+  - MCReplicatedLog: `11617/1363`.
+  - MCInnerSerial: `11136/972`.
+- Parser/evaluator support added for expression-only specs, assumptions,
+  symbolic `Nat`/`Int`/ranges, tuple destructuring, local namespace
+  instances, primed function applications, record `DOMAIN`, nested function
+  sets, action composition, and lexical `LET` shadowing.
 
 ### Latest benchmark run (ReleaseFast)
 ```
-                           SPEC     TLC(s)   Tlzig(s)   TLC states Tlzig states  Speedup
----------------------------------------------------------------------------------------------
-                           HourClock.tla      0.352      0.001           12           12   352.0x
-                     AsynchInterface.tla      0.368      0.000           12           12     0.0x
-                             Channel.tla      0.370      0.000           12           12     0.0x
-                             DieHard.tla      0.396      0.002           14           14   198.0x
-            MissionariesAndCannibals.tla      0.425      0.005           61           61    85.0x
-                    CigaretteSmokers.tla      0.374      0.001            6            6   374.0x
-                  APCigaretteSmokers.tla      0.375      0.001            6            6   375.0x
-                           CoffeeCan.tla      0.775      0.092         5150         5150     8.4x
-                              Simple.tla      0.437      0.027          723          723    16.2x
-                             Barrier.tla      0.387      0.004           64           64    96.8x
-                                Lock.tla      0.407      0.001           12           12   407.0x
-                          MCMajority.tla      0.506      0.042         2733         2733    12.0x
-                       MCFindHighest.tla      0.492      0.013          742          742    37.8x
-                            TwoPhase.tla      0.410      0.022          288          288    18.6x
-                       LiveHourClock.tla      0.372      0.000           12           12     0.0x
+                            SPEC      TLC-1   TLC-auto    tlzig-1 tlzig-auto       states
+----------------------------------------------------------------------------------------
+                   HourClock.tla      0.671      0.369      0.001      0.002           12
+             AsynchInterface.tla      0.397      0.384      0.000      0.001           12
+                     Channel.tla      0.377      0.443      0.000      0.001           12
+                     DieHard.tla      0.406      0.408      0.002      0.003           14
+    MissionariesAndCannibals.tla      0.437      0.424      0.009      0.007           61
+            CigaretteSmokers.tla      0.406      0.457      0.001      0.001            6
+          APCigaretteSmokers.tla      0.433      0.413      0.001      0.002            6
+                   CoffeeCan.tla      0.793      0.855      0.565      0.581         5150
+                      Simple.tla      0.463      0.447      0.029      0.031          723
+                     Barrier.tla      0.407      0.408      0.006      0.008           64
+                        Lock.tla      0.422      0.418      0.001      0.002           12
+                  MCMajority.tla      0.519      0.527      0.088      0.112         2733
+               MCFindHighest.tla      0.524      0.508      0.006      0.011          742
+                    TwoPhase.tla      0.424      0.420      0.006      0.007          288
+               LiveHourClock.tla      0.375      0.381      0.001      0.001           12
+                     TCommit.tla      0.397      0.391      0.002      0.003           34
+                   APTCommit.tla      0.431      0.401      0.002      0.004           34
+              MCChangRoberts.tla      0.467      0.437      0.005      0.008          137
+                    SpanTree.tla      0.707      0.630      1.021      0.972         1236
+    SyncTerminationDetection.tla      0.467      0.428      0.022      0.017          129
+   AsyncTerminationDetection.tla      0.632      0.582      0.352      0.297         4097
 ```
+Intentional invariant/property-violation models compare deterministic
+single-thread counts; parallel runs may stop after a different worker finds
+the same counterexample.
 
 ### Coverage probe (all 226 specifiable configs, max_states=200000, --unlimited-memory)
 - PASS: 111 / 226 (49%) -- up from 50->53->73->74->81->82->89->91->98->100->103->104->108->109->111
@@ -146,7 +174,7 @@ Target: **≥50% of all `.tla` files in `vendor/tlaplus-examples/specifications`
 
 ## Phase 3 — Performance
 - [~] Profile on medium specs
-- [ ] Multi-threaded worker pool
+- [~] Multi-threaded worker pool
 - [ ] Lock-free / sharded FPSet
 - [ ] Compressed state queue
 - [ ] Disk FPSet spill
@@ -157,12 +185,17 @@ Target: **≥50% of all `.tla` files in `vendor/tlaplus-examples/specifications`
 - [x] Benchmark `ewd840/EWD840` and `ewd998/AsyncTerminationDetection`
   against Java TLC with exact state-count validation.
   - EWD840: tlzig `1817/302`; TLC `2001/302`.
-  - AsyncTerminationDetection: tlzig `53267/4097`; TLC `53271/4097`.
+  - AsyncTerminationDetection: tlzig and TLC both `53271/4097`.
 - [x] Measure ReleaseFast single-thread baseline for EWD998:
-  - tlzig: 3.15s, approximately 2.48GB peak RSS.
-  - TLC `-workers 1`/default baseline still needs an explicit workers matrix.
-  - TLC observed run: 0.67s, approximately 318MB peak RSS.
-- [ ] Benchmark matrix for every performance claim:
+  - Historical tlzig baseline: 3.15s, approximately 2.48GB peak RSS.
+  - Current tlzig: 0.38s, approximately 17MB peak RSS.
+  - Current TLC `-workers 1`: 0.68s, approximately 370MB peak RSS.
+- [x] EWD998 four-mode benchmark matrix with exact counts:
+  - TLC `-workers 1`: 0.68s, approximately 370MB.
+  - TLC `-workers auto` (16 workers): 0.55s, approximately 356MB.
+  - tlzig `--workers 1`: 0.38s, approximately 17MB.
+  - tlzig `--workers 4`: 0.30s, approximately 19MB.
+- [~] Benchmark matrix for every performance claim:
   - TLC `-workers 1`.
   - TLC `-workers auto`.
   - tlzig `--workers 1`.
@@ -177,17 +210,40 @@ Target: **≥50% of all `.tla` files in `vendor/tlaplus-examples/specifications`
   - Clone only newly canonical states into `StateStore.values_pool`.
   - Reset the candidate pool after each expanded parent state.
 - [x] Re-benchmark EWD998 after candidate-state canonicalization:
-  - Exact count preserved: `53267/4097`.
+  - Exact count preserved: `53271/4097`.
   - ReleaseFast runtime: 3.15s -> 1.03s.
   - Peak RSS: approximately 2.48GB -> approximately 17MB.
   - TLC `-workers 1`: 0.70s, approximately 318MB.
   - TLC `-workers auto` (16 workers): 0.62s, approximately 324MB.
+- [x] Restore the single-thread evaluator to a stable post-initialization
+  snapshot before and after every expanded state.
+  - The old code restored a snapshot taken immediately before each restore,
+    which was a no-op and leaked temporary values across the entire search.
+  - Live MCDistributedReplicatedLog RSS dropped from over 4GB in the stale
+    probe process to hundreds of MB after rebuilding with the fix.
+- [x] Replace parallel worker busy-waiting with condition-variable blocking.
+  - EWD998 `--workers auto`: 1.01s wall, 0.37s system CPU.
+  - The previous spin/yield loop used 8.37s system CPU for the same result.
 - [ ] Replace `max_states * 256` eager value-pool sizing with measured,
   bounded initial capacities and geometric growth telemetry.
 - [ ] Replace the fixed `max_states * 32` successor edge allocation with
   chunked graph storage sized from observed outdegree.
-- [ ] Remove runtime `std.ArrayList(page_allocator)` from evaluator/action hot
+- [~] Remove runtime `std.ArrayList(page_allocator)` from evaluator/action hot
   paths; use bounded stack buffers or arena-owned reusable buffers.
+  - [x] Replace the successor-state `ArrayList` with an arena-owned
+    fixed-capacity `StateBuffer`.
+  - [x] Remove page-allocator lists from quantifier and set-map evaluation.
+  - [ ] Audit and remove the remaining evaluator/action hot-path lists.
+- [ ] Replace the relocatable canonical `ValuePool` with segmented,
+  non-relocating storage. Parallel readers currently require growth to be
+  disabled; the TLC test-model EWD998 configuration reaches the fixed
+  8-million-value cap at `340025/68965`.
+- [x] Make parallel error cleanup single-owner:
+  - Never join a thread handle twice while propagating a worker failure.
+  - Never deinitialize worker arenas through both partial-init and normal
+    cleanup paths.
+  - The large EWD998 test model now returns `error.OutOfMemory` normally
+    instead of crashing in ReleaseFast.
 - [ ] Add `--stats` output for permanent values, candidate values, strings,
   graph edges, generated states, duplicate states, and arena high-water marks.
 - [ ] Add assertions that candidate-pool values never escape into canonical
@@ -195,16 +251,91 @@ Target: **≥50% of all `.tla` files in `vendor/tlaplus-examples/specifications`
 
 ### Multi-threading prerequisites
 
-- [ ] Add CLI `--workers 1|auto|N`; keep `1` as the correctness baseline.
-- [ ] Give each worker a private evaluator, candidate arena, candidate
+- [x] Add CLI `--workers 1|auto|N`; keep `1` as the correctness baseline.
+- [x] Give each worker a private evaluator, candidate arena, candidate
   `ValuePool`, action executor, and successor buffer.
-- [ ] Share immutable AST/compiled actions and canonical states.
-- [ ] Synchronize canonical-state insertion, queue publication, trace
+- [x] Share immutable AST/compiled actions and canonical states.
+- [x] Synchronize canonical-state insertion, queue publication, trace
   predecessor assignment, counters, and transition graph updates.
 - [ ] Shard the fingerprint set before scaling worker count; do not serialize
   all workers behind one global FPSet lock.
-- [ ] Preserve temporal-property graph completeness and exact state counts
+- [x] Preserve temporal-property graph completeness and exact state counts
   under parallel exploration.
+  - EWD998 Async, 4 workers: `53271/4097`, identical to TLC and worker 1.
+  - YoYoPruning, 4 workers: `157/102`, identical to TLC and tlzig worker 1.
+  - MCBinarySearch, worker 1 and auto: `34383/27953`, identical to TLC.
+
+### MCBinarySearch performance gate
+
+- [x] Run MCBinarySearch individually before the next full probe.
+  - TLC worker 1: 1.78s, approximately 774MB RSS.
+  - tlzig worker 1: 10.27s, approximately 814MB RSS.
+  - tlzig auto: 10.47s, approximately 819MB RSS.
+- [x] Profile the tlzig run with macOS `sample`.
+  - The dominant cost was repeated construction of `SortedSeqs` while
+    checking invariants.
+  - Removed quadratic `make_set` deduplication from the sorted-sequence
+    generator because its lexicographic generation is already unique.
+- [x] Add allocation-free hash prefiltering to generic set canonicalization
+  for sets up to 4,096 elements; structural equality is only checked when
+  fingerprints match.
+  - MCBinarySearch worker 1 improved from 10.27s to 8.07s with exact counts.
+- [ ] Cache state-independent zero-argument definitions in canonical storage,
+  or represent filtered sequence sets symbolically, so `SortedSeqs` is not
+  regenerated for every invariant and state.
+- [ ] Avoid allocating worker contexts when BFS levels expose no useful
+  parallelism; MCBinarySearch has maximum outdegree 1 and gains nothing from
+  `--workers auto`.
+
+### Temporal-property performance
+
+- [x] Build predecessor CSR (`pred_offsets`/`pred_edges`) with the SCC graph.
+- [x] Evaluate universal box properties with one reverse reachability pass
+  instead of a graph traversal from every state.
+- [x] Evaluate universal diamond properties over predecessor edges.
+- [x] Preserve exact EWD998 liveness results after the algorithm change.
+
+### MCCRDT performance gate
+
+- [x] Match Java TLC exactly: `1350001/25000`.
+- [x] Remove page-allocator traffic from quantifier and set-map hot paths.
+- [x] Improve tlzig auto from 52.12s to 11.63s.
+- [ ] Beat TLC's approximately 9s runtime.
+- [ ] Shard canonical-state insertion; the global canonicalization mutex is
+  now the primary parallel bottleneck.
+
+### TigerBeetle-style engineering gates
+
+- [x] Prioritize safety, then performance, then developer experience.
+- [x] Add explicit bounds and assertions around state indices, pool counts,
+  queue publication, graph edges, worker ownership, and candidate lifetimes.
+- [x] Keep exploration hot paths allocation-free where converted; allocate
+  worker scratch storage before exploration.
+- [~] Eliminate all runtime dynamic allocation after initialization.
+- [~] Maintain performance sketches and exact TLC/tlzig benchmark matrices.
+- [x] Keep `zig fmt --check` and `git diff --check` clean.
+
+### EWD687a correctness/performance gate
+
+- [x] Keep `ACTION_CONSTRAINT(S)` separate from state `CONSTRAINT(S)`.
+  - Action constraints filter transitions and never filter initial states.
+- [x] Evaluate primed parameterized operators against a partial next state
+  assembled from the parent state and primed assignments accumulated so far.
+- [x] Validate MCEWD687a in both engines.
+  - TLC worker 1: `177171/18028`, 17.97s, approximately 796MB RSS.
+  - tlzig worker 1: `175873/18028`, 24.53s, approximately 100MB RSS.
+  - tlzig auto: `175873/18028`, 21.99s, approximately 103MB RSS.
+  - Distinct state count is exact; generated-state accounting still differs.
+
+### Probe-driven semantic fixes
+
+- [x] Implement `DOMAIN` for records as the set of record field-name strings.
+  - `SpecifyingSystems/AdvancedExamples/MCInnerSerial` now completes:
+    `11136/972`.
+- [x] Verify bounded no-witness `CHOOSE` against Java TLC.
+  - TLC raises an evaluation error; tlzig intentionally retains
+    `error.EmptyChoose` for compatibility.
+- [x] Add resumable full-probe support with `START_AFTER` and `RESULT_FILE`.
 
 ## Phase 4 — Advanced TLA+
 - [x] Liveness checking (`[]`/`<>/`leads-to with weak/strong fairness and stuttering)

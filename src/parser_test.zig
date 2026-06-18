@@ -442,8 +442,7 @@ test "action if false branch commits done state" {
         .candidate_store = &store,
         .eval_pool = &eval_pool,
     };
-    var out = std.ArrayList(u32).empty;
-    defer out.deinit(std.heap.page_allocator);
+    var out = try action.StateBuffer.init(&arena, 32);
     try executor.execute_next(compiled, s0_idx, &out);
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
     const next = store.get(out.items[0]);
@@ -491,8 +490,7 @@ test "multi-variable existential action expands every binding" {
         .candidate_store = &store,
         .eval_pool = &eval_pool,
     };
-    var out = std.ArrayList(u32).empty;
-    defer out.deinit(std.heap.page_allocator);
+    var out = try action.StateBuffer.init(&arena, 32);
     try executor.execute_next(compiled, s0_idx, &out);
     try std.testing.expectEqual(@as(usize, 4), out.items.len);
 
@@ -538,8 +536,7 @@ test "parameterized LET operator remains in action scope" {
         .candidate_store = &store,
         .eval_pool = &eval_pool,
     };
-    var out = std.ArrayList(u32).empty;
-    defer out.deinit(std.heap.page_allocator);
+    var out = try action.StateBuffer.init(&arena, 32);
     try executor.execute_next(compiled, s0_idx, &out);
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
     try std.testing.expectEqual(@as(i64, 2), store.get(out.items[0]).values[0].int_v);
@@ -576,8 +573,7 @@ test "CASE action executes first matching branch" {
         .candidate_store = &store,
         .eval_pool = &eval_pool,
     };
-    var out = std.ArrayList(u32).empty;
-    defer out.deinit(std.heap.page_allocator);
+    var out = try action.StateBuffer.init(&arena, 32);
     try executor.execute_next(compiled, s0_idx, &out);
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
     try std.testing.expectEqual(@as(i64, 1), store.get(out.items[0]).values[0].int_v);
@@ -607,6 +603,7 @@ test "spec-shaped temporal property is checked from initial states" {
         .properties = &.{"Refinement"},
         .constants = &.{},
         .constraints = &.{},
+        .action_constraints = &.{},
     };
     var model_checker = try checker.Checker.init(
         &arena,
@@ -619,10 +616,104 @@ test "spec-shaped temporal property is checked from initial states" {
         1024,
         4 * 1024 * 1024,
         overrides.OverrideContext.default(),
+        1,
     );
     defer model_checker.deinit();
     const result = try model_checker.check();
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "parallel exploration preserves branching temporal state space" {
+    const source =
+        \\---------------------- MODULE TestParallel ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLES x, y
+        \\Init == x = 0 /\ y = 0
+        \\Next == \/ /\ x < 2
+        \\           /\ x' = x + 1
+        \\           /\ UNCHANGED y
+        \\        \/ /\ y < 2
+        \\           /\ y' = y + 1
+        \\           /\ UNCHANGED x
+        \\Spec == Init /\ [][Next]_<<x, y>>
+        \\TypeOK == x \in 0..2 /\ y \in 0..2
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(32 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{"TypeOK"},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        64,
+        16_384,
+        4096,
+        16_384,
+        4096,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        4,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 9), result.distinct);
+}
+
+test "action constraints filter transitions but not initial states" {
+    const source =
+        \\---------------------- MODULE TestActionConstraint ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Next == x' \in 0..2
+        \\OnlyIncrement == x' = x + 1
+        \\Spec == Init /\ [][Next]_x
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(32 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{"OnlyIncrement"},
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        64,
+        16_384,
+        4096,
+        16_384,
+        4096,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        4,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 3), result.distinct);
 }
 
 test "compound temporal property checks boxed action transitions" {
@@ -650,6 +741,7 @@ test "compound temporal property checks boxed action transitions" {
         .properties = &.{"BadRefinement"},
         .constants = &.{},
         .constraints = &.{},
+        .action_constraints = &.{},
     };
     var model_checker = try checker.Checker.init(
         &arena,
@@ -662,6 +754,7 @@ test "compound temporal property checks boxed action transitions" {
         1024,
         4 * 1024 * 1024,
         overrides.OverrideContext.default(),
+        1,
     );
     defer model_checker.deinit();
     try std.testing.expectError(error.PropertyViolated, model_checker.check());
@@ -885,6 +978,36 @@ test "parameterized definitions inherit caller context" {
     try std.testing.expect(result.is_truthy());
 }
 
+test "local LET operator shadows a global definition" {
+    const source =
+        \\---------------------- MODULE TestLocalShadow ----------------------
+        \\Max(S) == CHOOSE x \in S : TRUE
+        \\Result ==
+        \\    LET Max(a, b) == IF a > b THEN a ELSE b
+        \\    IN Max(2, 3)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 4096, 1024);
+    const result = try evaluator.eval_expr(
+        evaluator.find_definition("Result").?.body,
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expectEqual(@as(i64, 3), result.int_v);
+}
+
 test "parse transitive closure definition with local operator" {
     const source =
         \\---------------- MODULE TestTransitiveClosure ----------------
@@ -966,6 +1089,50 @@ test "multi-variable function literal belongs to cartesian function set" {
     var state_pool = try value.ValuePool.init(&arena, 256, 64);
     const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
     const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "nested function set membership remains symbolic" {
+    const source =
+        \\---------------------- MODULE TestNestedFunctionSet ----------------------
+        \\EXTENDS Naturals
+        \\CONSTANT Node
+        \\Value == [n \in Node |-> [o \in Node |-> 0]]
+        \\TypeOK == Value \in [Node -> [Node -> Nat]]
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(8 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    var evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    evaluator.set_treat_unknown_as_model(true);
+    var pool = try value.ValuePool.init(&arena, 16_384, 4096);
+    const constants = try arena.alloc(eval.Constant, 1);
+    const nodes = try pool.alloc_values(2);
+    nodes[0] = .{ .model_v = try evaluator.models.intern("a") };
+    nodes[1] = .{ .model_v = try evaluator.models.intern("b") };
+    constants[0] = .{
+        .name = "Node",
+        .value = .{ .set_v = .{
+            .offset = 0,
+            .len = 2,
+        } },
+    };
+    evaluator.set_constants(constants);
+    evaluator.set_treat_unknown_as_model(false);
+    const result = try evaluator.eval_expr(
+        evaluator.find_definition("TypeOK").?.body,
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
     try std.testing.expect(result.is_truthy());
 }
 
@@ -1164,6 +1331,42 @@ test "sets are canonical and infinite Nat stays symbolic" {
     }
 }
 
+test "DOMAIN of a record returns its field names" {
+    const source =
+        \\---------------------- MODULE TestRecordDomain ----------------------
+        \\R == [alpha |-> 1, beta |-> 2]
+        \\Result == DOMAIN R
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    var evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 4096, 4096);
+    const result = try evaluator.eval_expr(
+        evaluator.find_definition("Result").?.body,
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expect(result == .set_v);
+    try std.testing.expect(result.member(
+        &pool,
+        value.Value{ .string_v = try pool.push_string("alpha") },
+    ));
+    try std.testing.expect(result.member(
+        &pool,
+        value.Value{ .string_v = try pool.push_string("beta") },
+    ));
+}
+
 test "FoldFunctionOnSet folds without recursive set allocation" {
     const source =
         \\---------------------- MODULE TestFoldFunction ----------------------
@@ -1196,6 +1399,115 @@ test "parser retains assumptions" {
     var p = parser.Parser.init(&arena, source);
     const module = try p.parse_module();
     try std.testing.expectEqual(@as(usize, 1), module.assumptions.len);
+}
+
+test "module terminator tolerates one consumed equals pair" {
+    const source =
+        \\---------------------- MODULE TestTerminator ----------------------
+        \\EXTENDS Naturals
+        \\CONSTANT MaxNat
+        \\ASSUME MaxNat \in Nat
+        \\NatOverride == 0..MaxNat
+        \\ASSUME TRUE
+        \\=================================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    try std.testing.expectEqual(@as(usize, 2), module.assumptions.len);
+}
+
+test "identifier assumption does not consume next-line terminator" {
+    const source =
+        \\---------------------- MODULE TestAssumeTerminator ----------------------
+        \\T1 == TRUE
+        \\ASSUME T1
+        \\=======================================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    try std.testing.expectEqual(@as(usize, 1), module.assumptions.len);
+}
+
+test "parameterized definition keeps its name column as expression boundary" {
+    const source =
+        \\---------------------- MODULE TestActionCompositionParse ----------------------
+        \\Increment(n) == n' = n + 1
+        \\Reduction == TRUE
+        \\IncrementAndReduction(n) ==
+        \\    Increment(n) \cdot Reduction
+        \\GossipAndReduction(n, o) ==
+        \\    Increment(n) \cdot Reduction
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    try std.testing.expect(evaluator.find_definition(
+        "IncrementAndReduction",
+    ) != null);
+    try std.testing.expect(evaluator.find_definition(
+        "GossipAndReduction",
+    ) != null);
+}
+
+test "action composition publishes only the second action result" {
+    const source =
+        \\---------------------- MODULE TestActionComposition ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\First == /\ x = 0
+        \\         /\ x' = 1
+        \\Second == x' = x + 1
+        \\Next == First \cdot Second
+        \\Spec == Init /\ [][Next]_x
+        \\TypeOK == x \in 0..2
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(32 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{"TypeOK"},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
 }
 
 test "local namespace instance is hoisted for module expansion" {

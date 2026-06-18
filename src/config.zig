@@ -16,6 +16,7 @@ pub const Config = struct {
     properties: []const []const u8,
     constants: []const ConstantAssignment,
     constraints: []const []const u8,
+    action_constraints: []const []const u8,
 
     pub fn empty() Config {
         return Config{
@@ -26,6 +27,7 @@ pub const Config = struct {
             .properties = &[_][]const u8{},
             .constants = &[_]ConstantAssignment{},
             .constraints = &[_][]const u8{},
+            .action_constraints = &[_][]const u8{},
         };
     }
 
@@ -41,6 +43,7 @@ pub const Config = struct {
             .properties = &[_][]const u8{},
             .constants = &[_]ConstantAssignment{},
             .constraints = &[_][]const u8{},
+            .action_constraints = &[_][]const u8{},
         };
     }
 
@@ -66,6 +69,7 @@ pub const Config = struct {
             .properties = &[_][]const u8{},
             .constants = &[_]ConstantAssignment{},
             .constraints = &[_][]const u8{},
+            .action_constraints = &[_][]const u8{},
         };
     }
 };
@@ -87,6 +91,8 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
     defer constants.deinit(std.heap.page_allocator);
     var constraints = std.ArrayList([]const u8).empty;
     defer constraints.deinit(std.heap.page_allocator);
+    var action_constraints = std.ArrayList([]const u8).empty;
+    defer action_constraints.deinit(std.heap.page_allocator);
 
     // Pre-process: strip all (* ... *) block comments from the config source.
     const cleaned = strip_block_comments(arena, source) catch return error.OutOfMemory;
@@ -246,8 +252,12 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
                 }
             }
         } else if (eql(first_word, "CONSTRAINT") or eql(first_word, "ACTION_CONSTRAINT")) {
+            const destination = if (eql(first_word, "ACTION_CONSTRAINT"))
+                &action_constraints
+            else
+                &constraints;
             if (rest.len > 0) {
-                try parse_name_list(arena, rest, &constraints);
+                try parse_name_list(arena, rest, destination);
             } else {
                 i += 1;
                 while (i < lines.len) : (i += 1) {
@@ -258,12 +268,16 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
                         i -= 1;
                         break;
                     }
-                    try constraints.append(std.heap.page_allocator, try arena_dup(arena, t));
+                    try destination.append(std.heap.page_allocator, try arena_dup(arena, t));
                 }
             }
         } else if (eql(first_word, "CONSTRAINTS") or eql(first_word, "ACTION_CONSTRAINTS")) {
+            const destination = if (eql(first_word, "ACTION_CONSTRAINTS"))
+                &action_constraints
+            else
+                &constraints;
             if (rest.len > 0) {
-                try parse_name_list(arena, rest, &constraints);
+                try parse_name_list(arena, rest, destination);
             } else {
                 i += 1;
                 while (i < lines.len) : (i += 1) {
@@ -274,7 +288,7 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
                         i -= 1;
                         break;
                     }
-                    try parse_name_list(arena, t, &constraints);
+                    try parse_name_list(arena, t, destination);
                 }
             }
         } else if (eql(first_word, "ALIAS") or
@@ -313,6 +327,11 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
         .properties = try dup_slice(arena, []const u8, properties.items),
         .constants = try dup_slice(arena, ConstantAssignment, constants.items),
         .constraints = try dup_slice(arena, []const u8, constraints.items),
+        .action_constraints = try dup_slice(
+            arena,
+            []const u8,
+            action_constraints.items,
+        ),
     };
 }
 
@@ -575,4 +594,28 @@ test "parse multiple constant assignments on one line" {
     try std.testing.expect(cfg.constants[4].is_substitution);
     try std.testing.expectEqualStrings("Spec", cfg.spec_name.?);
     try std.testing.expectEqualStrings("Inv", cfg.invariants[0]);
+}
+
+test "state and action constraints remain distinct" {
+    const source =
+        \\CONSTRAINT StateLimit
+        \\ACTION_CONSTRAINT NoStutter
+        \\ACTION_CONSTRAINTS
+        \\  Monotonic
+    ;
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+
+    const cfg = try parse(&arena, source);
+    try std.testing.expectEqual(@as(usize, 1), cfg.constraints.len);
+    try std.testing.expectEqualStrings("StateLimit", cfg.constraints[0]);
+    try std.testing.expectEqual(@as(usize, 2), cfg.action_constraints.len);
+    try std.testing.expectEqualStrings(
+        "NoStutter",
+        cfg.action_constraints[0],
+    );
+    try std.testing.expectEqualStrings(
+        "Monotonic",
+        cfg.action_constraints[1],
+    );
 }

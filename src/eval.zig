@@ -7,6 +7,7 @@ const Value = value.Value;
 const ValuePool = value.ValuePool;
 const Function = value.Function;
 const Set = value.Set;
+const fingerprint = @import("fingerprint.zig");
 const state = @import("state.zig");
 const StateStore = state.StateStore;
 const Error = @import("err.zig").Error;
@@ -94,6 +95,16 @@ pub const Evaluator = struct {
 
     pub fn set_treat_unknown_as_model(self: *Evaluator, enable: bool) void {
         self.treat_unknown_as_model = enable;
+    }
+
+    pub fn fork(self: Evaluator, arena: *Arena) !Evaluator {
+        const err_ctx = try arena.alloc_object(ErrorContext);
+        err_ctx.* = .{};
+        var copy = self;
+        copy.next_state = null;
+        copy.enabled_result = null;
+        copy.err_ctx = err_ctx;
+        return copy;
     }
 
     pub fn set_next_state(self: *Evaluator, st: ?*state.StateStore.State) void {
@@ -549,6 +560,18 @@ pub const Evaluator = struct {
             },
             .domain => {
                 if (operand == .function_v) return Value{ .set_v = operand.function_v.domain };
+                if (operand == .record_v) {
+                    const fields = operand.record_v.fields(eval_pool);
+                    const names = try eval_pool.alloc_values(
+                        operand.record_v.len,
+                    );
+                    var i: u32 = 0;
+                    while (i < operand.record_v.len) : (i += 1) {
+                        assert(fields[i * 2] == .string_v);
+                        names[i] = fields[i * 2];
+                    }
+                    return Value{ .set_v = make_set(eval_pool, names) };
+                }
                 // Tuples (sequences) have domain 1..Len.
                 if (operand == .tuple_v) {
                     const n = operand.tuple_v.len;
@@ -686,7 +709,13 @@ pub const Evaluator = struct {
 
         const dest = try eval_pool.alloc_values(@intCast(generated.items.len));
         @memcpy(dest, generated.items);
-        return Value{ .set_v = make_set(eval_pool, dest) };
+        // Generation is lexicographic over nondecreasing value indices, so
+        // each sequence is produced exactly once. Running make_set here would
+        // perform a quadratic equality scan over an already-canonical set.
+        return Value{ .set_v = .{
+            .offset = value_offset(eval_pool, dest.ptr),
+            .len = @intCast(dest.len),
+        } };
     }
 
     fn eval_set_map(
@@ -697,19 +726,36 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!Value {
-        var domains = std.ArrayList(Value).empty;
-        defer domains.deinit(std.heap.page_allocator);
+        var domains: [32]Value = undefined;
+        if (sm.vars.len > domains.len) {
+            return self.fail(
+                Error.NotImplemented,
+                "set map",
+                "more than 32 bound variables",
+            );
+        }
         var total: u64 = 1;
-        for (sm.vars) |bv| {
+        for (sm.vars, 0..) |bv, i| {
             const mat = try self.eval_set_materialized(bv.domain, ctx, s0, eval_pool, state_pool);
-            try domains.append(std.heap.page_allocator, mat);
+            assert(mat == .set_v);
+            domains[i] = mat;
             total *= mat.set_v.len;
             if (total > eval_pool.value_cap) return Error.OutOfMemory;
         }
         if (total > 4096) return self.fail(Error.NotImplemented, "set map", "more than 4096 results");
         var scratch: [4096]Value = undefined;
         const results = scratch[0..@intCast(total)];
-        _ = try self.eval_set_map_vars(sm, 0, domains.items, ctx, s0, eval_pool, state_pool, results, 0);
+        _ = try self.eval_set_map_vars(
+            sm,
+            0,
+            domains[0..sm.vars.len],
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+            results,
+            0,
+        );
         const dest = try eval_pool.alloc_values(@intCast(total));
         @memcpy(dest, results);
         return Value{ .set_v = make_set(eval_pool, dest) };
@@ -1298,14 +1344,78 @@ pub const Evaluator = struct {
                 if (def.params.len != ap.args.len) {
                     return self.fail(Error.TypeError, "primed apply arity", name);
                 }
-                const next = self.next_state orelse
-                    return self.fail(Error.TypeError, "primed apply without next state", name);
                 var new_ctx = ctx;
                 for (def.params, ap.args) |param, arg| {
                     const arg_value = try self.eval_expr(arg, ctx, s0, eval_pool, state_pool);
                     new_ctx = new_ctx.extend(param, arg_value);
                 }
-                return try self.eval_expr(def.body, new_ctx, next, eval_pool, state_pool);
+                if (self.next_state) |next| {
+                    return try self.eval_expr(
+                        def.body,
+                        new_ctx,
+                        next,
+                        eval_pool,
+                        state_pool,
+                    );
+                }
+
+                // Action execution evaluates assignments incrementally. A
+                // primed parameterized operator must observe the partial next
+                // state represented by ctx, with unassigned variables copied
+                // from the current state.
+                const current = s0 orelse
+                    return self.fail(
+                        Error.TypeError,
+                        "primed apply without current state",
+                        name,
+                    );
+                const next_values = try eval_pool.alloc_values(
+                    @intCast(self.module.variables.len),
+                );
+                for (self.module.variables, next_values, current.values) |
+                    variable_name,
+                    *next_value,
+                    current_value,
+                | {
+                    next_value.* = if (ctx.lookup(variable_name)) |assigned|
+                        assigned
+                    else
+                        try current_value.clone(state_pool, eval_pool);
+                }
+                var partial_next = StateStore.State{
+                    .level = current.level + 1,
+                    .pred = current.pred,
+                    .values = next_values,
+                };
+
+                var constant_scratch: [256]Constant = undefined;
+                if (self.constants.len > constant_scratch.len) {
+                    return self.fail(
+                        Error.NotImplemented,
+                        "primed apply constants",
+                        "more than 256 constants",
+                    );
+                }
+                for (self.constants, 0..) |constant, i| {
+                    constant_scratch[i] = .{
+                        .name = constant.name,
+                        .value = try constant.value.clone(
+                            state_pool,
+                            eval_pool,
+                        ),
+                    };
+                }
+                var primed_evaluator = self;
+                primed_evaluator.constants =
+                    constant_scratch[0..self.constants.len];
+                primed_evaluator.next_state = &partial_next;
+                return try primed_evaluator.eval_expr(
+                    def.body,
+                    new_ctx,
+                    &partial_next,
+                    eval_pool,
+                    eval_pool,
+                );
             }
         }
         if (ap.func.* == .ident) {
@@ -1331,6 +1441,27 @@ pub const Evaluator = struct {
             }
             if (std.mem.eql(u8, name, "FoldFunctionOnSet") and ap.args.len == 4) {
                 return try self.eval_fold_function_on_set(ap, ctx, s0, eval_pool, state_pool);
+            }
+            if (ctx.lookup(name)) |local_function| {
+                const values = try eval_pool.alloc_values(
+                    @intCast(ap.args.len),
+                );
+                for (ap.args, 0..) |arg, i| {
+                    values[i] = try self.eval_expr(
+                        arg,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    );
+                }
+                return try self.apply_values(
+                    local_function,
+                    values,
+                    eval_pool,
+                    state_pool,
+                    s0,
+                );
             }
             if (self.override_registry.find(name)) |func| {
                 const values = try eval_pool.alloc_values(@intCast(ap.args.len));
@@ -1368,7 +1499,13 @@ pub const Evaluator = struct {
                     const func = try self.eval_expr(def.body, ctx, s0, eval_pool, state_pool);
                     return try self.apply_values(func, values, eval_pool, state_pool, s0);
                 }
-                if (def.params.len != ap.args.len) return Error.TypeError;
+                if (def.params.len != ap.args.len) {
+                    return self.fail(
+                        Error.TypeError,
+                        "definition apply arity",
+                        name,
+                    );
+                }
                 var new_ctx = ctx;
                 for (def.params, 0..) |p, i| {
                     new_ctx = new_ctx.extend(p, values[i]);
@@ -1535,7 +1672,11 @@ pub const Evaluator = struct {
                 }
                 return try self.eval_expr(body, new_ctx, s0, eval_pool, state_pool);
             },
-            else => return Error.TypeError,
+            else => return self.fail(
+                Error.TypeError,
+                "apply value",
+                @tagName(func),
+            ),
         }
     }
 
@@ -1577,11 +1718,15 @@ pub const Evaluator = struct {
         }
         const bv = q.vars[idx];
         const domain = try self.eval_set_materialized(bv.domain, ctx, s0, eval_pool, state_pool);
-        var items = std.ArrayList(Value).empty;
-        defer items.deinit(std.heap.page_allocator);
-        try items.appendSlice(std.heap.page_allocator, domain.set_v.items(eval_pool));
+        assert(domain == .set_v);
+        const item_offset = domain.set_v.offset;
+        const item_count = domain.set_v.len;
+        assert(item_offset + item_count <= eval_pool.value_count);
         const expected = q.kind == .forall;
-        for (items.items) |it| {
+        var item_index: u32 = 0;
+        while (item_index < item_count) : (item_index += 1) {
+            assert(item_offset + item_index < eval_pool.value_count);
+            const it = eval_pool.values[item_offset + item_index];
             const new_ctx = ctx.extend(bv.name, it);
             const result = try self.eval_quantifier_vars(q, idx + 1, new_ctx, s0, eval_pool, state_pool);
             if (result.is_truthy() != expected) {
@@ -1675,7 +1820,11 @@ pub const Evaluator = struct {
                     }
                 }
             }
-            return chosen orelse self.fail(Error.EmptyChoose, "CHOOSE", c.var_name);
+            return chosen orelse self.fail(
+                Error.EmptyChoose,
+                "CHOOSE",
+                c.var_name,
+            );
         }
         // Domain-free CHOOSE: try fresh model values until the predicate holds.
         var attempt: u32 = 0;
@@ -2079,10 +2228,21 @@ fn eval_subset(eval_pool: *ValuePool, operand: Value) Error!Value {
 }
 
 fn make_set(eval_pool: *ValuePool, values: []Value) value.Set {
+    var hashes: [4096]fingerprint.Fingerprint = undefined;
+    const use_hashes = values.len <= hashes.len;
     var unique_len: u32 = 0;
     for (values) |candidate| {
+        const candidate_hash = if (use_hashes)
+            fingerprint.hash_value(
+                eval_pool,
+                candidate,
+                fingerprint.hash_init(),
+            )
+        else
+            0;
         var duplicate = false;
-        for (values[0..unique_len]) |existing| {
+        for (values[0..unique_len], 0..) |existing, i| {
+            if (use_hashes and hashes[i] != candidate_hash) continue;
             if (existing.eql(candidate, eval_pool)) {
                 duplicate = true;
                 break;
@@ -2090,6 +2250,7 @@ fn make_set(eval_pool: *ValuePool, values: []Value) value.Set {
         }
         if (!duplicate) {
             values[unique_len] = candidate;
+            if (use_hashes) hashes[unique_len] = candidate_hash;
             unique_len += 1;
         }
     }
@@ -2142,15 +2303,54 @@ fn eval_symbolic_set(
             return if (set.is_set_like()) set else null;
         },
         .set_of_functions => |sf| {
-            const domain = try self.eval_expr(sf.domain, ctx, s0, eval_pool, state_pool);
-            const codomain = try self.eval_expr(sf.codomain, ctx, s0, eval_pool, state_pool);
+            const domain = (try eval_symbolic_set(
+                self,
+                sf.domain,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            )) orelse try self.eval_expr(
+                sf.domain,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            );
+            const codomain = (try eval_symbolic_set(
+                self,
+                sf.codomain,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            )) orelse try self.eval_expr(
+                sf.codomain,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            );
             if (!domain.is_set_like() or !codomain.is_set_like()) return null;
             return try make_function_set_value(eval_pool, domain, codomain);
         },
         .record_set => |rs| {
             const dest = try eval_pool.alloc_values(@intCast(rs.fields.len * 2));
             for (rs.fields, 0..) |f, i| {
-                const domain = try self.eval_expr(f.domain, ctx, s0, eval_pool, state_pool);
+                const domain = (try eval_symbolic_set(
+                    self,
+                    f.domain,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                )) orelse try self.eval_expr(
+                    f.domain,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
                 if (!domain.is_set_like()) return null;
                 const name = try eval_pool.push_string(f.name);
                 dest[i * 2] = Value{ .string_v = name };
@@ -2164,8 +2364,34 @@ fn eval_symbolic_set(
         .set_binary => |sb| {
             switch (sb.op) {
                 .cartesian_op => {
-                    const left = try self.eval_expr(sb.left, ctx, s0, eval_pool, state_pool);
-                    const right = try self.eval_expr(sb.right, ctx, s0, eval_pool, state_pool);
+                    const left = (try eval_symbolic_set(
+                        self,
+                        sb.left,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    )) orelse try self.eval_expr(
+                        sb.left,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    );
+                    const right = (try eval_symbolic_set(
+                        self,
+                        sb.right,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    )) orelse try self.eval_expr(
+                        sb.right,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    );
                     if (!left.is_set_like() or !right.is_set_like()) return null;
                     // Flatten: if left is a tuple_set_v, extend it with right.
                     if (left == .tuple_set_v) {
@@ -2212,7 +2438,20 @@ fn eval_symbolic_set(
         },
         .unary => |u| {
             if (u.op == .subset) {
-                const base = try self.eval_expr(u.operand, ctx, s0, eval_pool, state_pool);
+                const base = (try eval_symbolic_set(
+                    self,
+                    u.operand,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                )) orelse try self.eval_expr(
+                    u.operand,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
                 if (!base.is_set_like()) return null;
                 return Value{ .power_set_v = .{
                     .set_offset = try eval_pool.push_value(base),

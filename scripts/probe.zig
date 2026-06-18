@@ -122,6 +122,7 @@ fn run_tlzig(allocator: std.mem.Allocator, io: std.Io, tla: []const u8, cfg: []c
         500_000,
         256 * 1024 * 1024,
         override_ctx,
+        1,
     );
     defer ch.deinit();
 

@@ -20,6 +20,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var max_int: i64 = 10;
     var arena_bytes: u64 = 512 * 1024 * 1024;
     var eval_arena_bytes: u64 = 256 * 1024 * 1024;
+    var worker_count: u16 = 1;
     var unlimited_memory = false;
 
     while (it.next()) |arg| {
@@ -56,6 +57,18 @@ pub fn main(init: std.process.Init.Minimal) void {
         } else if (std.mem.eql(u8, arg, "--eval-arena-bytes")) {
             if (it.next()) |v| {
                 eval_arena_bytes = std.fmt.parseInt(u64, v, 10) catch 256 * 1024 * 1024;
+            }
+        } else if (std.mem.eql(u8, arg, "--workers")) {
+            if (it.next()) |v| {
+                if (std.mem.eql(u8, v, "auto")) {
+                    worker_count = @intCast(@min(
+                        std.Thread.getCpuCount() catch 1,
+                        std.math.maxInt(u16),
+                    ));
+                } else {
+                    worker_count = std.fmt.parseInt(u16, v, 10) catch 1;
+                }
+                if (worker_count == 0) worker_count = 1;
             }
         } else if (std.mem.eql(u8, arg, "--unlimited-memory")) {
             unlimited_memory = true;
@@ -129,6 +142,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         state_string_cap,
         eval_arena_bytes,
         override_ctx,
+        worker_count,
     ) catch |err| {
         std.debug.print("failed to initialize checker: {any}\n", .{err});
         std.process.exit(1);

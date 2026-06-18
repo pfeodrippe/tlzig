@@ -324,6 +324,7 @@ pub const ActionStep = union(enum(u8)) {
     if_branch: IfBranch,
     case_branch: CaseBranch,
     call: Call,
+    compose: Composition,
     let_bind: LetBind,
     unchanged: []const u8,
 };
@@ -357,6 +358,11 @@ pub const LetBind = struct {
     expr: *ast.Expr,
 };
 
+pub const Composition = struct {
+    left_steps: []const ActionStep,
+    right_steps: []const ActionStep,
+};
+
 pub const Branch = struct {
     options: []const []const ActionStep,
 };
@@ -383,6 +389,32 @@ pub const CompiledInit = struct {
 
 pub const CompiledNext = struct {
     steps: []const ActionStep,
+};
+
+pub const StateBuffer = struct {
+    storage: []u32,
+    items: []u32,
+
+    pub fn init(arena: *Arena, capacity: u32) !StateBuffer {
+        assert(capacity > 0);
+        const storage = try arena.alloc(u32, capacity);
+        return .{ .storage = storage, .items = storage[0..0] };
+    }
+
+    pub fn append(self: *StateBuffer, state_index: u32) Error!void {
+        if (self.items.len >= self.storage.len) return Error.StateSpaceExhausted;
+        self.storage[self.items.len] = state_index;
+        self.items = self.storage[0 .. self.items.len + 1];
+    }
+
+    pub fn clear(self: *StateBuffer) void {
+        self.items = self.storage[0..0];
+    }
+
+    pub fn shrink(self: *StateBuffer, len: u32) void {
+        assert(len <= self.items.len);
+        self.items = self.storage[0..len];
+    }
 };
 
 pub const ActionCompiler = struct {
@@ -451,6 +483,11 @@ pub const ActionCompiler = struct {
             },
             .apply => |ap| {
                 if (ap.func.* == .ident) {
+                    if (std.mem.eql(u8, ap.func.*.ident, "\\cdot")) {
+                        return ap.args.len == 2 and
+                            self.is_action_expr(ap.args[0]) and
+                            self.is_action_expr(ap.args[1]);
+                    }
                     if (self.evaluator.find_definition(ap.func.*.ident)) |def| return self.is_action_expr_inner(def.body);
                 }
                 return false;
@@ -602,6 +639,28 @@ pub const ActionCompiler = struct {
             .apply => |ap| {
                 if (ap.func.* == .ident) {
                     const func_name = self.evaluator.resolve_alias(ap.func.*.ident);
+                    if (std.mem.eql(u8, func_name, "\\cdot")) {
+                        if (is_init or ap.args.len != 2) return Error.TypeError;
+                        var left_steps = std.ArrayList(ActionStep).empty;
+                        defer left_steps.deinit(std.heap.page_allocator);
+                        try self.collect_steps(ap.args[0], &left_steps, false);
+                        var right_steps = std.ArrayList(ActionStep).empty;
+                        defer right_steps.deinit(std.heap.page_allocator);
+                        try self.collect_steps(ap.args[1], &right_steps, false);
+                        try steps.append(std.heap.page_allocator, .{
+                            .compose = .{
+                                .left_steps = try self.dup_slice(
+                                    ActionStep,
+                                    left_steps.items,
+                                ),
+                                .right_steps = try self.dup_slice(
+                                    ActionStep,
+                                    right_steps.items,
+                                ),
+                            },
+                        });
+                        return;
+                    }
                     if (self.evaluator.find_definition(func_name)) |def| {
                         if (def.params.len == ap.args.len) {
                             const inlined = try inline_expr(self.arena, def.body, def.params, ap.args);
@@ -685,6 +744,8 @@ pub const ActionExecutor = struct {
     source_state_store: *StateStore,
     candidate_store: *StateStore,
     eval_pool: *ValuePool,
+    compose_states: ?*StateBuffer = null,
+    composition_generated: ?*u64 = null,
 
     const Continuation = struct {
         steps: []const ActionStep,
@@ -694,7 +755,7 @@ pub const ActionExecutor = struct {
     pub fn execute_init(
         self: ActionExecutor,
         compiled: CompiledInit,
-        out_states: *std.ArrayList(u32),
+        out_states: *StateBuffer,
     ) !void {
         assert(compiled.steps.len >= 0);
         assert(out_states.items.len == 0);
@@ -705,7 +766,7 @@ pub const ActionExecutor = struct {
         self: ActionExecutor,
         compiled: CompiledNext,
         s0_idx: u32,
-        out_states: *std.ArrayList(u32),
+        out_states: *StateBuffer,
     ) !void {
         const s0 = self.source_state_store.get(s0_idx);
         try self.execute_steps(compiled.steps, null, Context.empty(), s0, out_states, false);
@@ -717,7 +778,7 @@ pub const ActionExecutor = struct {
         continuation: ?*const Continuation,
         ctx: Context,
         s0: ?*StateStore.State,
-        out_states: *std.ArrayList(u32),
+        out_states: *StateBuffer,
         is_init: bool,
     ) !void {
         assert(self.eval_pool.value_count <= self.eval_pool.value_cap);
@@ -740,7 +801,7 @@ pub const ActionExecutor = struct {
             .assign_var => |a| {
                 const val = try self.evaluator.eval_expr(a.expr, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                 if (a.is_membership and val.is_set_like()) {
-                        const mat = try self.evaluator.materialize_set(val, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
+                    const mat = try self.evaluator.materialize_set(val, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                     if (mat != .set_v) return Error.TypeError;
                     const items = mat.set_v.items(self.eval_pool);
                     const snap = self.eval_pool.snapshot();
@@ -810,6 +871,49 @@ pub const ActionExecutor = struct {
                 try self.execute_steps(c.body_steps, &next, call_ctx, s0, out_states, is_init);
                 self.eval_pool.restore(snap);
             },
+            .compose => |composition| {
+                const intermediates = self.compose_states orelse
+                    return Error.NotImplemented;
+                assert(intermediates.items.len == 0);
+                try self.execute_steps(
+                    composition.left_steps,
+                    null,
+                    ctx,
+                    s0,
+                    intermediates,
+                    false,
+                );
+                const next = Continuation{
+                    .steps = rest,
+                    .next = continuation,
+                };
+                const snapshot = self.eval_pool.snapshot();
+                const intermediate_items = intermediates.items;
+                if (self.composition_generated) |generated| {
+                    generated.* += intermediate_items.len;
+                }
+                for (intermediate_items) |intermediate_idx| {
+                    assert(intermediate_idx < self.candidate_store.count);
+                    var second = ActionExecutor{
+                        .evaluator = self.evaluator,
+                        .source_state_store = self.candidate_store,
+                        .candidate_store = self.candidate_store,
+                        .eval_pool = self.eval_pool,
+                        .compose_states = null,
+                        .composition_generated = self.composition_generated,
+                    };
+                    try second.execute_steps(
+                        composition.right_steps,
+                        &next,
+                        ctx,
+                        self.candidate_store.get(intermediate_idx),
+                        out_states,
+                        false,
+                    );
+                    self.eval_pool.restore(snapshot);
+                }
+                intermediates.clear();
+            },
             .branch => |b| {
                 const next = Continuation{ .steps = rest, .next = continuation };
                 const snap = self.eval_pool.snapshot();
@@ -861,7 +965,7 @@ pub const ActionExecutor = struct {
         self: ActionExecutor,
         ctx: Context,
         s0: ?*StateStore.State,
-        out_states: *std.ArrayList(u32),
+        out_states: *StateBuffer,
         is_init: bool,
     ) !void {
         _ = is_init;
@@ -898,6 +1002,6 @@ pub const ActionExecutor = struct {
                 &self.candidate_store.values_pool,
             );
         }
-        try out_states.append(std.heap.page_allocator, new_idx);
+        try out_states.append(new_idx);
     }
 };

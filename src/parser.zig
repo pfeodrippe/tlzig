@@ -631,8 +631,10 @@ pub const Parser = struct {
         while (true) {
             self.skip_dashes();
 
-            // Module terminator: a line containing ==== (two defeq tokens).
-            if (self.current.kind == .defeq and self.next.kind == .defeq) {
+            // At module scope, a definition must start with an identifier.
+            // Thus any remaining `==` token belongs to the equals-line
+            // terminator, even if expression lookahead consumed its first pair.
+            if (self.current.kind == .defeq) {
                 break;
             }
 
@@ -687,7 +689,10 @@ pub const Parser = struct {
             }
             if (self.current.kind == .keyword_assume) {
                 self.advance();
-                if (self.current.kind == .ident and self.next.kind == .defeq) {
+                if (self.current.kind == .ident and
+                    self.next.kind == .defeq and
+                    self.current.line == self.next.line)
+                {
                     const assumption = try self.parse_definition();
                     try assumptions.append(std.heap.page_allocator, assumption.body);
                 } else {
@@ -832,9 +837,10 @@ pub const Parser = struct {
     }
 
     fn parse_definition(self: *Parser) !ast.Definition {
+        const definition_col = self.current.col;
         const left_param = try self.parse_param_name();
         const saved_def_col = self.def_col;
-        self.def_col = self.current.col;
+        self.def_col = definition_col;
         defer self.def_col = saved_def_col;
 
         // Recursive function definition: F[x \in S] == body.
@@ -1716,7 +1722,9 @@ pub const Parser = struct {
         // Tuple destructuring set filter: {<<a, b>> \in S : P}
         if (self.current.kind == .langle) {
             const saved = self.*;
+            self.suppress_errors = true;
             if (self.parse_tuple_set_filter()) |result| {
+                self.suppress_errors = saved.suppress_errors;
                 return result;
             } else |err| {
                 if (err == error.OutOfMemory) return err;

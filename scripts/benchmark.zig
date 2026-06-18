@@ -13,14 +13,15 @@ const Spec = struct {
     max_nat: i64 = 1000,
     min_int: i64 = -1000,
     max_int: i64 = 1000,
+    expected_violation: bool = false,
 };
 
 const specs = [_]Spec{
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/HourClock/HourClock.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/HourClock/HourClock.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/Channel.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/Channel.cfg" },
-    .{ .tla = "vendor/tlaplus-examples/specifications/DieHard/DieHard.tla", .cfg = "vendor/tlaplus-examples/specifications/DieHard/DieHard.cfg" },
-    .{ .tla = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla", .cfg = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.cfg" },
+    .{ .tla = "vendor/tlaplus-examples/specifications/DieHard/DieHard.tla", .cfg = "vendor/tlaplus-examples/specifications/DieHard/DieHard.cfg", .expected_violation = true },
+    .{ .tla = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla", .cfg = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.cfg", .expected_violation = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.cfg", .max_states = 5000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.cfg", .max_states = 5000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan100Beans.cfg", .max_states = 100_000, .max_nat = 1000, .min_int = -1000, .max_int = 1000 },
@@ -35,9 +36,10 @@ const specs = [_]Spec{
     // .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan3000Beans.cfg", .max_states = 50_000_000, .max_nat = 10000, .min_int = -10000, .max_int = 10000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/TCommit.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/TCommit.cfg", .max_states = 500_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/APTCommit.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/APTCommit.cfg", .max_states = 500_000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.tla", .cfg = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.cfg", .max_states = 500_000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.tla", .cfg = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.cfg", .max_states = 500_000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.tla", .cfg = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.cfg", .max_states = 500_000, .expected_violation = true },
+    .{ .tla = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.tla", .cfg = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.cfg", .max_states = 500_000, .expected_violation = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.cfg", .max_states = 500_000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.cfg", .max_states = 200_000 },
 };
 
 pub fn main(init: std.process.Init.Minimal) void {
@@ -54,8 +56,10 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     const java_classpath = "/tmp/tla2tools.jar";
 
-    std.debug.print("{s:40} {s:>10} {s:>10} {s:>12} {s:>12} {s:>8}\n", .{ "SPEC", "TLC(s)", "Tlzig(s)", "TLC states", "Tlzig states", "Speedup" });
-    std.debug.print("---------------------------------------------------------------------------------------------\n", .{});
+    std.debug.print("{s:32} {s:>10} {s:>10} {s:>10} {s:>10} {s:>12}\n", .{
+        "SPEC", "TLC-1", "TLC-auto", "tlzig-1", "tlzig-auto", "states",
+    });
+    std.debug.print("----------------------------------------------------------------------------------------\n", .{});
 
     for (specs) |spec| {
         run_comparison(allocator, io, java_classpath, spec) catch |err| {
@@ -65,29 +69,40 @@ pub fn main(init: std.process.Init.Minimal) void {
 }
 
 fn run_comparison(allocator: std.mem.Allocator, io: std.Io, java_cp: []const u8, spec: Spec) !void {
-    const tlzig_result = try run_tlzig_internal(allocator, io, spec);
-    defer tlzig_result.deinit(allocator);
-
-    const tlc_result = try run_tlc(allocator, io, java_cp, spec);
-    defer tlc_result.deinit(allocator);
-
-    const speedup = if (tlc_result.elapsed_ms > 0 and tlzig_result.elapsed_ms > 0)
-        @as(f64, @floatFromInt(tlc_result.elapsed_ms)) / @as(f64, @floatFromInt(tlzig_result.elapsed_ms))
-    else
-        0.0;
+    const cpu_count: u16 = @intCast(@min(
+        std.Thread.getCpuCount() catch 1,
+        std.math.maxInt(u16),
+    ));
+    const tlzig_one = try run_tlzig_internal(allocator, io, spec, 1);
+    defer tlzig_one.deinit(allocator);
+    const tlzig_auto = try run_tlzig_internal(allocator, io, spec, cpu_count);
+    defer tlzig_auto.deinit(allocator);
+    const tlc_one = try run_tlc(allocator, io, java_cp, spec, "1");
+    defer tlc_one.deinit(allocator);
+    const tlc_auto = try run_tlc(allocator, io, java_cp, spec, "auto");
+    defer tlc_auto.deinit(allocator);
 
     const basename = std.fs.path.basename(spec.tla);
-    std.debug.print("{s:40} {d:>10.3} {d:>10.3} {d:>12} {d:>12} {d:>7.1}x\n", .{
+    std.debug.print("{s:32} {d:>10.3} {d:>10.3} {d:>10.3} {d:>10.3} {d:>12}\n", .{
         basename,
-        @as(f64, @floatFromInt(tlc_result.elapsed_ms)) / 1000.0,
-        @as(f64, @floatFromInt(tlzig_result.elapsed_ms)) / 1000.0,
-        tlc_result.states,
-        tlzig_result.states,
-        speedup,
+        seconds(tlc_one.elapsed_ms),
+        seconds(tlc_auto.elapsed_ms),
+        seconds(tlzig_one.elapsed_ms),
+        seconds(tlzig_auto.elapsed_ms),
+        tlc_one.states,
     });
 
-    if (tlc_result.states != tlzig_result.states) {
-        std.debug.print("  WARNING: state counts differ!\n", .{});
+    const mismatch = if (spec.expected_violation)
+        tlc_one.states != tlzig_one.states
+    else
+        tlc_one.states != tlc_auto.states or
+            tlc_one.states != tlzig_one.states or
+            tlc_one.states != tlzig_auto.states;
+    if (mismatch) {
+        std.debug.print(
+            "  STATE MISMATCH: TLC-1={d} TLC-auto={d} tlzig-1={d} tlzig-auto={d}\n",
+            .{ tlc_one.states, tlc_auto.states, tlzig_one.states, tlzig_auto.states },
+        );
     }
 }
 
@@ -106,7 +121,16 @@ fn elapsed_ms(io: std.Io, start: std.Io.Clock.Timestamp) u64 {
     return @intCast(@divTrunc(duration.raw.nanoseconds, 1_000_000));
 }
 
-fn run_tlzig_internal(allocator: std.mem.Allocator, io: std.Io, spec: Spec) !RunResult {
+fn seconds(ms: u64) f64 {
+    return @as(f64, @floatFromInt(ms)) / 1000.0;
+}
+
+fn run_tlzig_internal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    spec: Spec,
+    worker_count: u16,
+) !RunResult {
     const start = std.Io.Clock.Timestamp.now(io, .real);
 
     var arena = Arena.init(512 * 1024 * 1024) catch |err| {
@@ -160,6 +184,7 @@ fn run_tlzig_internal(allocator: std.mem.Allocator, io: std.Io, spec: Spec) !Run
         state_string_cap,
         256 * 1024 * 1024,
         override_ctx,
+        worker_count,
     ) catch |err| {
         std.debug.print("failed to initialize checker for {s}: {any}\n", .{ spec.tla, err });
         return error.CheckFailed;
@@ -191,12 +216,15 @@ fn run_tlzig_internal(allocator: std.mem.Allocator, io: std.Io, spec: Spec) !Run
     };
 }
 
-fn run_tlc(allocator: std.mem.Allocator, io: std.Io, java_cp: []const u8, spec: Spec) !RunResult {
+fn run_tlc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    java_cp: []const u8,
+    spec: Spec,
+    workers: []const u8,
+) !RunResult {
     const classpath = try std.mem.concat(allocator, u8, &.{ java_cp, ":specs/modules" });
     defer allocator.free(classpath);
-    const workers = std.Thread.getCpuCount() catch 1;
-    const workers_str = try std.fmt.allocPrint(allocator, "{d}", .{workers});
-    defer allocator.free(workers_str);
     const argv = [_][]const u8{
         "java",
         "-cp",
@@ -205,7 +233,7 @@ fn run_tlc(allocator: std.mem.Allocator, io: std.Io, java_cp: []const u8, spec: 
         "-metadir",
         "benchmark_results/tlc_meta",
         "-workers",
-        workers_str,
+        workers,
         "-cleanup",
         "-config",
         spec.cfg,

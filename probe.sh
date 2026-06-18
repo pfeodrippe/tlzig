@@ -4,6 +4,8 @@ cd /Users/pfeodrippe/dev/tlzig
 
 MAX_STATES=${MAX_STATES:-200000}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-180}
+START_AFTER=${START_AFTER:-}
+RESULT_FILE=${RESULT_FILE:-/tmp/tlzig-probe-results.log}
 PASS=0
 FAIL=0
 SKIP=0
@@ -11,6 +13,10 @@ TOTAL=0
 FAIL_FILE=$(mktemp)
 
 echo "Probing configs with max_states=$MAX_STATES timeout=${TIMEOUT_SECONDS}s"
+if [ -n "$START_AFTER" ]; then
+    echo "Resuming after $START_AFTER"
+fi
+: > "$RESULT_FILE"
 
 run_with_timeout() {
     LC_ALL=C LANG=C /usr/bin/perl -e '
@@ -27,31 +33,34 @@ run_with_timeout() {
 }
 
 while IFS= read -r cfg; do
+    if [ -n "$START_AFTER" ] && [[ "$cfg" < "$START_AFTER" || "$cfg" == "$START_AFTER" ]]; then
+        continue
+    fi
     TOTAL=$((TOTAL+1))
     dir=$(dirname "$cfg")
     base=$(basename "$cfg" .cfg)
     tla="$dir/$base.tla"
     if [ ! -f "$tla" ]; then
         SKIP=$((SKIP+1))
-        echo "SKIP $cfg (no $tla)"
+        echo "SKIP $cfg (no $tla)" | tee -a "$RESULT_FILE"
         continue
     fi
     if run_with_timeout ./zig-out/bin/tlzig --spec "$tla" --cfg "$cfg" --max-states "$MAX_STATES" --unlimited-memory --arena-bytes 1073741824 --eval-arena-bytes 1073741824 > /tmp/probe.out 2>&1; then
         PASS=$((PASS+1))
-        echo "PASS $cfg $(tail -1 /tmp/probe.out)"
+        echo "PASS $cfg $(tail -1 /tmp/probe.out)" | tee -a "$RESULT_FILE"
     elif grep -q "InvariantViolated" /tmp/probe.out && grep -q "distinct=" /tmp/probe.out; then
         # Invariant violations are expected behavior for specs designed to find them.
         # TLC also exits non-zero for these. Count as pass if we got distinct states.
         PASS=$((PASS+1))
-        echo "PASS $cfg (inv-violated) $(grep -o 'distinct=[0-9]*' /tmp/probe.out)"
+        echo "PASS $cfg (inv-violated) $(grep -o 'distinct=[0-9]*' /tmp/probe.out)" | tee -a "$RESULT_FILE"
     elif grep -q "PropertyViolated" /tmp/probe.out && grep -q "distinct=" /tmp/probe.out; then
         # Property violations are also expected behavior for some specs.
         PASS=$((PASS+1))
-        echo "PASS $cfg (prop-violated) $(grep -o 'distinct=[0-9]*' /tmp/probe.out)"
+        echo "PASS $cfg (prop-violated) $(grep -o 'distinct=[0-9]*' /tmp/probe.out)" | tee -a "$RESULT_FILE"
     else
         FAIL=$((FAIL+1))
         err=$(tail -5 /tmp/probe.out | tr '\n' ' ')
-        echo "FAIL $cfg: $err"
+        echo "FAIL $cfg: $err" | tee -a "$RESULT_FILE"
         echo "$cfg: $err" >> "$FAIL_FILE"
     fi
 done < <(find vendor/tlaplus-examples/specifications -name "*.cfg" | sort)

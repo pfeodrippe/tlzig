@@ -587,7 +587,17 @@ fn java_time(_: OverrideContext, _: *ValuePool, _: []const Value) Error!Value {
     return Value{ .int_v = 0 };
 }
 
-fn tlc_get(_: OverrideContext, _: *ValuePool, _: []const Value) Error!Value {
+fn tlc_get(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
+    if (args.len == 1 and args[0] == .string_v) {
+        const key = args[0].string_v.slice(pool);
+        if (std.mem.eql(
+            u8,
+            key,
+            "-Dtlc2.tool.impl.Tool.cdot",
+        )) {
+            return Value{ .string_v = try pool.push_string("true") };
+        }
+    }
     return Value{ .int_v = 0 };
 }
 

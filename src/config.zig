@@ -17,6 +17,8 @@ pub const Config = struct {
     constants: []const ConstantAssignment,
     constraints: []const []const u8,
     action_constraints: []const []const u8,
+    symmetry_name: ?[]const u8 = null,
+    check_deadlock: bool,
 
     pub fn empty() Config {
         return Config{
@@ -28,6 +30,8 @@ pub const Config = struct {
             .constants = &[_]ConstantAssignment{},
             .constraints = &[_][]const u8{},
             .action_constraints = &[_][]const u8{},
+            .symmetry_name = null,
+            .check_deadlock = true,
         };
     }
 
@@ -44,6 +48,8 @@ pub const Config = struct {
             .constants = &[_]ConstantAssignment{},
             .constraints = &[_][]const u8{},
             .action_constraints = &[_][]const u8{},
+            .symmetry_name = null,
+            .check_deadlock = true,
         };
     }
 
@@ -70,6 +76,8 @@ pub const Config = struct {
             .constants = &[_]ConstantAssignment{},
             .constraints = &[_][]const u8{},
             .action_constraints = &[_][]const u8{},
+            .symmetry_name = null,
+            .check_deadlock = true,
         };
     }
 };
@@ -291,16 +299,21 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
                     try parse_name_list(arena, t, destination);
                 }
             }
+        } else if (eql(first_word, "CHECK_DEADLOCK")) {
+            if (rest.len > 0) {
+                cfg.check_deadlock = !eql(first_token(rest), "FALSE");
+            }
+        } else if (eql(first_word, "SYMMETRY")) {
+            if (rest.len > 0) {
+                cfg.symmetry_name = try arena_dup(arena, first_token(rest));
+            }
         } else if (eql(first_word, "ALIAS") or
             eql(first_word, "VIEW") or
-            eql(first_word, "SYMMETRY") or
-            eql(first_word, "POSTCONDITION") or
-            eql(first_word, "CHECK_DEADLOCK"))
+            eql(first_word, "POSTCONDITION"))
         {
             // Not implemented yet; parse and ignore for now.
             if (eql(first_word, "ALIAS") or eql(first_word, "VIEW") or
-                eql(first_word, "SYMMETRY") or eql(first_word, "POSTCONDITION") or
-                eql(first_word, "CHECK_DEADLOCK"))
+                eql(first_word, "POSTCONDITION"))
             {
                 // Single-line or block values are ignored.
                 if (rest.len == 0) {
@@ -332,6 +345,8 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
             []const u8,
             action_constraints.items,
         ),
+        .symmetry_name = cfg.symmetry_name,
+        .check_deadlock = cfg.check_deadlock,
     };
 }
 
@@ -596,6 +611,27 @@ test "parse multiple constant assignments on one line" {
     try std.testing.expectEqualStrings("Inv", cfg.invariants[0]);
 }
 
+test "parse boolean operator substitutions" {
+    const source =
+        \\CONSTANT
+        \\  Enabled <- TRUE
+        \\  Disabled <- FALSE
+        \\INIT Init
+        \\NEXT Next
+    ;
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+
+    const cfg = try parse(&arena, source);
+    try std.testing.expectEqual(@as(usize, 2), cfg.constants.len);
+    try std.testing.expectEqualStrings("Enabled", cfg.constants[0].name);
+    try std.testing.expectEqualStrings("TRUE", cfg.constants[0].expr);
+    try std.testing.expect(cfg.constants[0].is_substitution);
+    try std.testing.expectEqualStrings("Disabled", cfg.constants[1].name);
+    try std.testing.expectEqualStrings("FALSE", cfg.constants[1].expr);
+    try std.testing.expect(cfg.constants[1].is_substitution);
+}
+
 test "state and action constraints remain distinct" {
     const source =
         \\CONSTRAINT StateLimit
@@ -617,5 +653,21 @@ test "state and action constraints remain distinct" {
     try std.testing.expectEqualStrings(
         "Monotonic",
         cfg.action_constraints[1],
+    );
+}
+
+test "parse symmetry operator" {
+    const source =
+        \\INIT Init
+        \\NEXT Next
+        \\SYMMETRY ModelSymmetry
+    ;
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+
+    const cfg = try parse(&arena, source);
+    try std.testing.expectEqualStrings(
+        "ModelSymmetry",
+        cfg.symmetry_name.?,
     );
 }

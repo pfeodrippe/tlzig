@@ -474,11 +474,12 @@ pub const ActionCompiler = struct {
         switch (expr.*) {
             .primed, .primed_expr, .unchanged, .unchanged_expr => return true,
             .ident => |name| {
+                if (self.evaluator.find_constant(name) != null) return false;
                 if (self.evaluator.find_definition(name)) |def| return self.is_action_expr_inner(def.body);
                 return false;
             },
             .binary => |b| {
-                if (b.op == .or_op) return self.is_action_expr(b.left) and self.is_action_expr(b.right);
+                if (b.op == .or_op) return self.is_action_expr(b.left) or self.is_action_expr(b.right);
                 if (b.op == .and_op) return self.is_action_expr(b.left) or self.is_action_expr(b.right);
                 return self.is_action_expr(b.left) or self.is_action_expr(b.right) or self.is_init_action(expr);
             },
@@ -497,6 +498,9 @@ pub const ActionCompiler = struct {
                         return ap.args.len == 2 and
                             self.is_action_expr(ap.args[0]) and
                             self.is_action_expr(ap.args[1]);
+                    }
+                    if (self.evaluator.find_constant(ap.func.*.ident) != null) {
+                        return false;
                     }
                     if (self.evaluator.find_definition(ap.func.*.ident)) |def| return self.is_action_expr_inner(def.body);
                 }
@@ -521,7 +525,7 @@ pub const ActionCompiler = struct {
                     return;
                 }
                 if (b.op == .or_op) {
-                    if (self.is_action_expr(b.left) and self.is_action_expr(b.right)) {
+                    if (self.is_action_expr(b.left) or self.is_action_expr(b.right)) {
                         var options = std.ArrayList([]const ActionStep).empty;
                         defer options.deinit(std.heap.page_allocator);
                         var left_steps = std.ArrayList(ActionStep).empty;
@@ -559,7 +563,12 @@ pub const ActionCompiler = struct {
                 try steps.append(std.heap.page_allocator, ActionStep{ .condition = expr });
             },
             .ident => |name| {
-                if (self.evaluator.find_definition(name)) |def| {
+                if (self.evaluator.find_constant(name) != null) {
+                    try steps.append(
+                        std.heap.page_allocator,
+                        ActionStep{ .condition = expr },
+                    );
+                } else if (self.evaluator.find_definition(name)) |def| {
                     try self.collect_steps(def.body, steps, is_init);
                 } else {
                     try steps.append(std.heap.page_allocator, ActionStep{ .condition = expr });
@@ -671,6 +680,13 @@ pub const ActionCompiler = struct {
                         });
                         return;
                     }
+                    if (self.evaluator.find_constant(func_name) != null) {
+                        try steps.append(
+                            std.heap.page_allocator,
+                            ActionStep{ .condition = expr },
+                        );
+                        return;
+                    }
                     if (self.evaluator.find_definition(func_name)) |def| {
                         if (def.params.len == ap.args.len) {
                             const inlined = try inline_expr(self.arena, def.body, def.params, ap.args);
@@ -753,12 +769,21 @@ pub const ActionCompiler = struct {
 };
 
 pub const ActionExecutor = struct {
+    pub const CommitCallback = *const fn (
+        context: *anyopaque,
+        candidate_idx: u32,
+        pool_snapshot: ValuePool.Snapshot,
+        out_states: *StateBuffer,
+    ) Error!void;
+
     evaluator: Evaluator,
     source_state_store: *StateStore,
     candidate_store: *StateStore,
     eval_pool: *ValuePool,
     compose_states: ?*StateBuffer = null,
     composition_generated: ?*u64 = null,
+    commit_callback: ?CommitCallback = null,
+    commit_context: ?*anyopaque = null,
 
     const Continuation = struct {
         steps: []const ActionStep,
@@ -772,6 +797,7 @@ pub const ActionExecutor = struct {
     ) !void {
         assert(compiled.steps.len >= 0);
         assert(out_states.items.len == 0);
+        self.evaluator.reset_context_pool();
         try self.execute_steps(compiled.steps, null, Context.empty(), null, out_states, true);
     }
 
@@ -782,6 +808,7 @@ pub const ActionExecutor = struct {
         out_states: *StateBuffer,
     ) !void {
         const s0 = self.source_state_store.get(s0_idx);
+        self.evaluator.reset_context_pool();
         try self.execute_steps(compiled.steps, null, Context.empty(), s0, out_states, false);
     }
 
@@ -818,13 +845,25 @@ pub const ActionExecutor = struct {
                     if (mat != .set_v) return Error.TypeError;
                     const items = mat.set_v.items(self.eval_pool);
                     const snap = self.eval_pool.snapshot();
+                    const context_snap = self.evaluator.context_snapshot();
                     for (items) |it| {
-                        const new_ctx = ctx.extend(a.var_name, it);
+                        const new_ctx = try self.evaluator.extend_state_context(
+                            ctx,
+                            a.var_name,
+                            it,
+                            .changed,
+                        );
                         try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
                         self.eval_pool.restore(snap);
+                        self.evaluator.restore_context_pool(context_snap);
                     }
                 } else {
-                    const new_ctx = ctx.extend(a.var_name, val);
+                    const new_ctx = try self.evaluator.extend_state_context(
+                        ctx,
+                        a.var_name,
+                        val,
+                        .changed,
+                    );
                     try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
                 }
             },
@@ -835,13 +874,25 @@ pub const ActionExecutor = struct {
                     if (mat != .set_v) return Error.TypeError;
                     const items = mat.set_v.items(self.eval_pool);
                     const snap = self.eval_pool.snapshot();
+                    const context_snap = self.evaluator.context_snapshot();
                     for (items) |it| {
-                        const new_ctx = ctx.extend(a.var_name, it);
+                        const new_ctx = try self.evaluator.extend_state_context(
+                            ctx,
+                            a.var_name,
+                            it,
+                            .changed,
+                        );
                         try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
                         self.eval_pool.restore(snap);
+                        self.evaluator.restore_context_pool(context_snap);
                     }
                 } else {
-                    const new_ctx = ctx.extend(a.var_name, val);
+                    const new_ctx = try self.evaluator.extend_state_context(
+                        ctx,
+                        a.var_name,
+                        val,
+                        .changed,
+                    );
                     try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
                 }
             },
@@ -858,37 +909,45 @@ pub const ActionExecutor = struct {
                 const items = mat.set_v.items(self.eval_pool);
                 const next = Continuation{ .steps = rest, .next = continuation };
                 const snap = self.eval_pool.snapshot();
+                const context_snap = self.evaluator.context_snapshot();
                 for (items) |it| {
-                    const new_ctx = ctx.extend(c.var_name, it);
+                    const new_ctx = try self.evaluator.extend_context(ctx, c.var_name, it);
                     try self.execute_steps(c.body_steps, &next, new_ctx, s0, out_states, is_init);
                     self.eval_pool.restore(snap);
+                    self.evaluator.restore_context_pool(context_snap);
                 }
             },
             .let_bind => |l| {
                 const v = try self.evaluator.eval_expr(l.expr, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
-                const new_ctx = ctx.extend(l.name, v);
+                const new_ctx = try self.evaluator.extend_context(ctx, l.name, v);
                 try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
             },
             .call => |c| {
                 if (c.def.params.len != c.args.len) return Error.TypeError;
+                const context_snap = self.evaluator.context_snapshot();
                 const values = try self.eval_pool.alloc_values(@intCast(c.args.len));
                 for (c.args, 0..) |arg, i| {
                     values[i] = try self.evaluator.eval_expr(arg, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                 }
                 var call_ctx = ctx;
                 for (c.def.params, 0..) |p, i| {
-                    call_ctx = call_ctx.extend(p, values[i]);
+                    call_ctx = try self.evaluator.extend_context(call_ctx, p, values[i]);
                 }
                 const next = Continuation{ .steps = rest, .next = continuation };
                 const snap = self.eval_pool.snapshot();
                 try self.execute_steps(c.body_steps, &next, call_ctx, s0, out_states, is_init);
                 self.eval_pool.restore(snap);
+                self.evaluator.restore_context_pool(context_snap);
             },
             .compose => |composition| {
                 const intermediates = self.compose_states orelse
                     return Error.NotImplemented;
                 assert(intermediates.items.len == 0);
-                try self.execute_steps(
+                const left_context_snapshot = self.evaluator.context_snapshot();
+                var first = self;
+                first.commit_callback = null;
+                first.commit_context = null;
+                try first.execute_steps(
                     composition.left_steps,
                     null,
                     ctx,
@@ -896,11 +955,13 @@ pub const ActionExecutor = struct {
                     intermediates,
                     false,
                 );
+                self.evaluator.restore_context_pool(left_context_snapshot);
                 const next = Continuation{
                     .steps = rest,
                     .next = continuation,
                 };
                 const snapshot = self.eval_pool.snapshot();
+                const context_snapshot = self.evaluator.context_snapshot();
                 const intermediate_items = intermediates.items;
                 if (self.composition_generated) |generated| {
                     generated.* += intermediate_items.len;
@@ -914,6 +975,8 @@ pub const ActionExecutor = struct {
                         .eval_pool = self.eval_pool,
                         .compose_states = null,
                         .composition_generated = self.composition_generated,
+                        .commit_callback = self.commit_callback,
+                        .commit_context = self.commit_context,
                     };
                     try second.execute_steps(
                         composition.right_steps,
@@ -924,15 +987,18 @@ pub const ActionExecutor = struct {
                         false,
                     );
                     self.eval_pool.restore(snapshot);
+                    self.evaluator.restore_context_pool(context_snapshot);
                 }
                 intermediates.clear();
             },
             .branch => |b| {
                 const next = Continuation{ .steps = rest, .next = continuation };
                 const snap = self.eval_pool.snapshot();
+                const context_snap = self.evaluator.context_snapshot();
                 for (b.options) |opt| {
                     try self.execute_steps(opt, &next, ctx, s0, out_states, is_init);
                     self.eval_pool.restore(snap);
+                    self.evaluator.restore_context_pool(context_snap);
                 }
             },
             .if_branch => |ib| {
@@ -940,25 +1006,31 @@ pub const ActionExecutor = struct {
                 const taken = if (cond_val.is_truthy()) ib.then_steps else ib.else_steps;
                 const next = Continuation{ .steps = rest, .next = continuation };
                 const snap = self.eval_pool.snapshot();
+                const context_snap = self.evaluator.context_snapshot();
                 try self.execute_steps(taken, &next, ctx, s0, out_states, is_init);
                 self.eval_pool.restore(snap);
+                self.evaluator.restore_context_pool(context_snap);
             },
             .case_branch => |case| {
                 const next = Continuation{ .steps = rest, .next = continuation };
                 const snap = self.eval_pool.snapshot();
+                const context_snap = self.evaluator.context_snapshot();
                 for (case.arms) |arm| {
                     const cond = try self.evaluator.eval_expr(arm.cond, ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                     if (!cond.is_truthy()) {
                         self.eval_pool.restore(snap);
+                        self.evaluator.restore_context_pool(context_snap);
                         continue;
                     }
                     try self.execute_steps(arm.steps, &next, ctx, s0, out_states, is_init);
                     self.eval_pool.restore(snap);
+                    self.evaluator.restore_context_pool(context_snap);
                     return;
                 }
                 if (case.otherwise_steps) |otherwise| {
                     try self.execute_steps(otherwise, &next, ctx, s0, out_states, is_init);
                     self.eval_pool.restore(snap);
+                    self.evaluator.restore_context_pool(context_snap);
                 }
             },
             .unchanged => |name| {
@@ -968,7 +1040,12 @@ pub const ActionExecutor = struct {
                     return Error.UndefinedSymbol;
                 };
                 const v = try s0.?.values[idx].clone(&self.source_state_store.values_pool, self.eval_pool);
-                const new_ctx = ctx.extend(name, v);
+                const new_ctx = try self.evaluator.extend_state_context(
+                    ctx,
+                    name,
+                    v,
+                    .unchanged,
+                );
                 try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
             },
         }
@@ -982,6 +1059,7 @@ pub const ActionExecutor = struct {
         is_init: bool,
     ) !void {
         _ = is_init;
+        const pool_snapshot = self.candidate_store.values_pool.snapshot();
         const new_idx = try self.candidate_store.alloc_state();
         const new_state = self.candidate_store.get(new_idx);
         if (s0) |parent| {
@@ -995,26 +1073,83 @@ pub const ActionExecutor = struct {
             new_state.level = 0;
             new_state.pred = 0;
         }
-        if (s0) |parent| {
-            for (new_state.values, 0..) |*v, vi| {
-                v.* = try parent.values[vi].clone(
-                    &self.source_state_store.values_pool,
-                    &self.candidate_store.values_pool,
-                );
+        new_state.changed_mask = 0;
+        for (
+            self.source_state_store.variable_names,
+            new_state.values,
+            0..,
+        ) |name, *destination, variable_index| {
+            if (ctx.lookup(name)) |assigned| {
+                const assignment = self.evaluator.context_assignment(ctx, name);
+                if (assignment == .changed) {
+                    new_state.changed_mask |= @as(u64, 1) << @intCast(variable_index);
+                }
+                destination.* = if (assignment == .unchanged and
+                    self.candidate_store == self.source_state_store)
+                    s0.?.values[variable_index]
+                else
+                    try assigned.clone(
+                        self.eval_pool,
+                        &self.candidate_store.values_pool,
+                    );
+            } else if (s0) |parent| {
+                destination.* = if (self.candidate_store ==
+                    self.source_state_store)
+                    parent.values[variable_index]
+                else
+                    try parent.values[variable_index].clone(
+                        &self.source_state_store.values_pool,
+                        &self.candidate_store.values_pool,
+                    );
+            } else {
+                destination.* = Value{ .bool_v = false };
             }
-        } else {
-            for (new_state.values) |*v| v.* = Value{ .bool_v = false };
         }
-        var i: u32 = 0;
-        while (i < ctx.len) : (i += 1) {
-            const name = ctx.names[i];
-            const v = ctx.values[i];
-            const var_idx = self.evaluator.find_variable(name) orelse continue;
-            new_state.values[var_idx] = try v.clone(
-                self.eval_pool,
-                &self.candidate_store.values_pool,
+        if (self.commit_callback) |callback| {
+            try callback(
+                self.commit_context.?,
+                new_idx,
+                pool_snapshot,
+                out_states,
             );
+        } else {
+            try out_states.append(new_idx);
         }
-        try out_states.append(new_idx);
     }
 };
+
+pub fn steps_have_composition(steps: []const ActionStep) bool {
+    for (steps) |step| {
+        switch (step) {
+            .compose => return true,
+            .choose => |choose| {
+                if (steps_have_composition(choose.body_steps)) return true;
+            },
+            .call => |call| {
+                if (steps_have_composition(call.body_steps)) return true;
+            },
+            .branch => |branch| {
+                for (branch.options) |option| {
+                    if (steps_have_composition(option)) return true;
+                }
+            },
+            .if_branch => |if_branch| {
+                if (steps_have_composition(if_branch.then_steps) or
+                    steps_have_composition(if_branch.else_steps))
+                {
+                    return true;
+                }
+            },
+            .case_branch => |case_branch| {
+                for (case_branch.arms) |arm| {
+                    if (steps_have_composition(arm.steps)) return true;
+                }
+                if (case_branch.otherwise_steps) |otherwise| {
+                    if (steps_have_composition(otherwise)) return true;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}

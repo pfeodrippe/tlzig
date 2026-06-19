@@ -1,4 +1,6 @@
 - [x] parallel
+- [ ] generate performant zig code for model checking  !
+  - [ ] Also, are we able to add a way in, tlzig, to generate zig code that completely emulates the TLA+ spec so it's faster enough ? Or it's not possible at all ?
 - [ ] tlzig can have modes or can automatically choose a mode that will make certain kinds of workloads more perfomant
 - [ ] running as a lib (no restart required)
 - [ ] fast

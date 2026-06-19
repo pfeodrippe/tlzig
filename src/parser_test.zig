@@ -379,6 +379,31 @@ test "instance substitutions rewrite primed variables in both copies" {
     try std.testing.expect(!steps_assign_primed(d2_next.steps, "contents"));
 }
 
+test "load EWD998Chan retains root message actions" {
+    var arena = try Arena.init(128 * 1024 * 1024);
+    defer arena.deinit();
+    const search_paths = [_][]const u8{
+        "vendor/tlaplus-examples/specifications/ewd998",
+        "specs/modules",
+        "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+        "vendor/tlaplus-community-modules/modules",
+        "vendor/tlaplus-examples/specifications",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = try loader.load(
+        "vendor/tlaplus-examples/specifications/ewd998/EWD998Chan.tla",
+    );
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    try std.testing.expect(evaluator.find_definition("SendMsg") != null);
+    try std.testing.expect(evaluator.find_definition("RecvMsg") != null);
+    try std.testing.expect(evaluator.find_definition("Environment") != null);
+    try std.testing.expect(evaluator.find_definition("EWD998!RecvMsg") != null);
+}
+
 test "compile real btree init as assignments" {
     var arena = try Arena.init(64 * 1024 * 1024);
     defer arena.deinit();
@@ -604,6 +629,7 @@ test "spec-shaped temporal property is checked from initial states" {
         .constants = &.{},
         .constraints = &.{},
         .action_constraints = &.{},
+        .check_deadlock = false,
     };
     var model_checker = try checker.Checker.init(
         &arena,
@@ -653,6 +679,7 @@ test "parallel exploration preserves branching temporal state space" {
         .constants = &.{},
         .constraints = &.{},
         .action_constraints = &.{},
+        .check_deadlock = false,
     };
     var model_checker = try checker.Checker.init(
         &arena,
@@ -697,6 +724,7 @@ test "action constraints filter transitions but not initial states" {
         .constants = &.{},
         .constraints = &.{},
         .action_constraints = &.{"OnlyIncrement"},
+        .check_deadlock = false,
     };
     var model_checker = try checker.Checker.init(
         &arena,
@@ -742,6 +770,7 @@ test "compound temporal property checks boxed action transitions" {
         .constants = &.{},
         .constraints = &.{},
         .action_constraints = &.{},
+        .check_deadlock = false,
     };
     var model_checker = try checker.Checker.init(
         &arena,
@@ -797,6 +826,7 @@ test "UNCHANGED expression checks parent and next state" {
         .constants = &.{},
         .constraints = &.{},
         .action_constraints = &.{},
+        .check_deadlock = false,
     };
     var model_checker = try checker.Checker.init(
         &arena,
@@ -1028,9 +1058,63 @@ test "parameterized definitions inherit caller context" {
     const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
     var pool = try value.ValuePool.init(&arena, 64, 64);
     var state_pool = try value.ValuePool.init(&arena, 64, 64);
-    const ctx = eval.Context.empty().extend("x", .{ .int_v = 1 });
+    const ctx = try evaluator.extend_context(
+        eval.Context.empty(),
+        "x",
+        .{ .int_v = 1 },
+    );
     const result = try evaluator.eval_expr(expr, ctx, null, &pool, &state_pool);
     try std.testing.expect(result.is_truthy());
+}
+
+test "Permutations returns functions over model values" {
+    const source =
+        \\---------------------- MODULE TestPermutations ----------------------
+        \\EXTENDS TLC
+        \\=============================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const expr = try parser.Parser.parse_expr_string(
+        &arena,
+        "Permutations({a, b})",
+    );
+    var evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    evaluator.set_treat_unknown_as_model(true);
+    var pool = try value.ValuePool.init(&arena, 128, 64);
+    const result = try evaluator.eval_expr(
+        expr,
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expect(result == .set_v);
+    try std.testing.expectEqual(@as(u32, 2), result.set_v.len);
+
+    var found_swap = false;
+    for (result.set_v.items(&pool)) |permutation| {
+        try std.testing.expect(permutation == .function_v);
+        try std.testing.expectEqual(
+            @as(u32, 2),
+            permutation.function_v.domain.len,
+        );
+        const keys = permutation.function_v.domain.items(&pool);
+        const entries = permutation.function_v.entries(&pool);
+        if (keys[0].model_v == entries[1].model_v and
+            keys[1].model_v == entries[0].model_v)
+        {
+            found_swap = true;
+        }
+    }
+    try std.testing.expect(found_swap);
 }
 
 test "local LET operator shadows a global definition" {
@@ -1456,6 +1540,37 @@ test "parser retains assumptions" {
     try std.testing.expectEqual(@as(usize, 1), module.assumptions.len);
 }
 
+test "TLCGet config exposes bfs mode record" {
+    const source =
+        \\---------------------- MODULE TestTLCGetConfig ----------------------
+        \\EXTENDS TLC
+        \\ModeOK == TLCGet("config").mode = "bfs"
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 128, 128);
+    var state_pool = try value.ValuePool.init(&arena, 128, 128);
+    const mode_ok = evaluator.find_definition("ModeOK") orelse
+        return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(
+        mode_ok.body,
+        eval.Context.empty(),
+        null,
+        &pool,
+        &state_pool,
+    );
+    try std.testing.expect(result.is_truthy());
+}
+
 test "module terminator tolerates one consumed equals pair" {
     const source =
         \\---------------------- MODULE TestTerminator ----------------------
@@ -1518,6 +1633,22 @@ test "parameterized definition keeps its name column as expression boundary" {
     ) != null);
 }
 
+test "parameterized namespace call flattens instance and operator arguments" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    const expression = try parser.Parser.parse_expr_string(
+        &arena,
+        "Storage(s)!StartTransaction(s, tid, ts, rc, ignore)",
+    );
+    try std.testing.expect(expression.* == .apply);
+    try std.testing.expect(expression.apply.func.* == .ident);
+    try std.testing.expectEqualStrings(
+        "Storage!StartTransaction",
+        expression.apply.func.ident,
+    );
+    try std.testing.expectEqual(@as(usize, 6), expression.apply.args.len);
+}
+
 test "action composition publishes only the second action result" {
     const source =
         \\---------------------- MODULE TestActionComposition ----------------------
@@ -1546,6 +1677,7 @@ test "action composition publishes only the second action result" {
         .constants = &.{},
         .constraints = &.{},
         .action_constraints = &.{},
+        .check_deadlock = false,
     };
     var model_checker = try checker.Checker.init(
         &arena,
@@ -1563,6 +1695,204 @@ test "action composition publishes only the second action result" {
     defer model_checker.deinit();
     const result = try model_checker.check();
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "FALSE operator substitution does not suppress other Next branches" {
+    const source =
+        \\---------------------- MODULE TestDisabledAction ----------------------
+        \\EXTENDS Naturals
+        \\CONSTANT Disabled
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Step == /\ x = 0
+        \\        /\ x' = 1
+        \\Next == Disabled \/ Step
+        \\TypeOK == x \in 0..1
+        \\==============================================================
+        \\
+    ;
+    const cfg_source =
+        \\INIT Init
+        \\NEXT Next
+        \\INVARIANT TypeOK
+        \\CONSTANT Disabled <- FALSE
+        \\CHECK_DEADLOCK FALSE
+    ;
+    var arena = try Arena.init(32 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = try config.parse(&arena, cfg_source);
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.generated);
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "EXCEPT indexes nested records by string key" {
+    const source =
+        \\---------------------- MODULE TestRecordExcept ----------------------
+        \\Value == [outer |-> [inner |-> 1]]
+        \\Updated == [Value EXCEPT !["outer"]["inner"] = 2]
+        \\Ok == Updated.outer.inner = 2
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 1024, 1024);
+    const ok = evaluator.find_definition("Ok") orelse
+        return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(
+        ok.body,
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expect(result.is_truthy());
+}
+
+test "record override replaces matching fields" {
+    const source =
+        \\---------------------- MODULE TestRecordOverride ----------------------
+        \\Value == [a |-> 1, b |-> 2] @@ [b |-> 3, c |-> 4]
+        \\Ok == /\ Value.a = 1
+        \\      /\ Value.b = 3
+        \\      /\ Value.c = 4
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 1024, 1024);
+    const ok = evaluator.find_definition("Ok") orelse
+        return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(
+        ok.body,
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expect(result.is_truthy());
+}
+
+test "action LET observes pre-state when constructing a record" {
+    const source =
+        \\---------------------- MODULE TestActionLetRecord ----------------------
+        \\EXTENDS Sequences
+        \\VARIABLES participants, requests, count
+        \\Range(f) == {f[x] : x \in DOMAIN f}
+        \\CreateEntry(start) == [start |-> start]
+        \\Init ==
+        \\    /\ participants = ("r1" :> ("t1" :> <<>>))
+        \\    /\ requests = ("s1" :> ("t1" :> <<>>))
+        \\    /\ count = ("r1" :> ("t1" :> 0))
+        \\Op(r, s, t) ==
+        \\    /\ participants' = [participants EXCEPT
+        \\         ![r][t] = Append(participants[r][t], <<s, {"read"}>>)]
+        \\    /\ LET first == ~\E el \in Range(participants[r][t]) :
+        \\                          el[1] = s
+        \\       IN requests' = [requests EXCEPT
+        \\            ![s][t] = Append(requests[s][t], CreateEntry(first))]
+        \\    /\ count' = [count EXCEPT ![r][t] = count[r][t] + 1]
+        \\Next == \E r \in {"r1"}, s \in {"s1"}, t \in {"t1"} : Op(r, s, t)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = null,
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        4,
+        16_384,
+        4096,
+        16_384,
+        4096,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    _ = model_checker.check() catch |err| {
+        if (err != error.StateSpaceExhausted) return err;
+    };
+
+    const requests_index =
+        model_checker.evaluator.find_variable("requests").?;
+    var found = false;
+    var state_index: u32 = 0;
+    while (state_index < model_checker.state_store.count) : (state_index += 1) {
+        const state = model_checker.state_store.get(state_index);
+        if (state.level != 1) continue;
+        const root = state.values[requests_index].function_v.apply(
+            &model_checker.state_store.values_pool,
+            .{ .string_v = try model_checker.state_store.values_pool.push_string(
+                "s1",
+            ) },
+        ) orelse return error.UndefinedSymbol;
+        const sequence = root.function_v.apply(
+            &model_checker.state_store.values_pool,
+            .{ .string_v = try model_checker.state_store.values_pool.push_string(
+                "t1",
+            ) },
+        ) orelse return error.UndefinedSymbol;
+        const requests = sequence.tuple_v.items(
+            &model_checker.state_store.values_pool,
+        );
+        try std.testing.expectEqual(@as(usize, 1), requests.len);
+        const start = requests[0].record_v.lookup(
+            &model_checker.state_store.values_pool,
+            "start",
+        ) orelse return error.UndefinedSymbol;
+        try std.testing.expect(start.is_truthy());
+        found = true;
+        break;
+    }
+    try std.testing.expect(found);
 }
 
 test "local namespace instance is hoisted for module expansion" {
@@ -1586,6 +1916,64 @@ test "local namespace instance is hoisted for module expansion" {
     try std.testing.expectEqualStrings("After", module.definitions[1].name);
 }
 
+test "MDBTLA ClientCentric namespace calls remain qualified" {
+    var arena = try Arena.init(256 * 1024 * 1024);
+    defer arena.deinit();
+    const search_paths = [_][]const u8{
+        "vendor/MDBTLA/MultiShardTxn",
+        "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+        "vendor/tlaplus-community-modules/modules",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = try loader.load(
+        "vendor/MDBTLA/MultiShardTxn/ClientCentricTests.tla",
+    );
+    try std.testing.expect(find_definition(module, "CC!SnapshotIsolation"));
+    try std.testing.expect(!expr_contains_ident(
+        module.assumptions[0],
+        "SnapshotIsolation",
+    ));
+    try std.testing.expect(expr_contains_ident(
+        module.assumptions[0],
+        "CC!SnapshotIsolation",
+    ));
+}
+
+test "MDBTLA MultiShardTxn resolves Range over an empty sequence" {
+    var arena = try Arena.init(256 * 1024 * 1024);
+    defer arena.deinit();
+    const search_paths = [_][]const u8{
+        "vendor/MDBTLA/MultiShardTxn",
+        "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+        "vendor/tlaplus-community-modules/modules",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = try loader.load(
+        "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+    );
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    const range = evaluator.find_definition("Range") orelse
+        return error.UndefinedSymbol;
+    try std.testing.expectEqual(@as(usize, 1), range.params.len);
+    const expression = try parser.Parser.parse_expr_string(
+        &arena,
+        "~\\E el \\in Range(<<>>) : el[1] = \"s1\"",
+    );
+    var pool = try value.ValuePool.init(&arena, 4096, 4096);
+    const result = try evaluator.eval_expr(
+        expression,
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expect(result.is_truthy());
+}
+
 fn read_test_file(arena: *Arena, path: []const u8) ![]u8 {
     const path_z = try arena.alloc(u8, path.len + 1);
     @memcpy(path_z[0..path.len], path);
@@ -1605,6 +1993,146 @@ fn read_test_file(arena: *Arena, path: []const u8) ![]u8 {
     const result = try arena.alloc(u8, temp.items.len);
     @memcpy(result, temp.items);
     return result;
+}
+
+fn find_definition(module: @import("ast.zig").Module, name: []const u8) bool {
+    for (module.definitions) |definition| {
+        if (std.mem.eql(u8, definition.name, name)) return true;
+    }
+    return false;
+}
+
+fn expr_contains_ident(expr: *const @import("ast.zig").Expr, name: []const u8) bool {
+    return switch (expr.*) {
+        .ident => |ident| std.mem.eql(u8, ident, name),
+        .primed => |ident| std.mem.eql(u8, ident, name),
+        .primed_expr => |operand| expr_contains_ident(operand, name),
+        .unchanged => |idents| blk: {
+            for (idents) |ident| {
+                if (std.mem.eql(u8, ident, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .unchanged_expr => |operand| expr_contains_ident(operand, name),
+        .binary => |binary| expr_contains_ident(binary.left, name) or
+            expr_contains_ident(binary.right, name),
+        .unary => |unary| expr_contains_ident(unary.operand, name),
+        .if_then_else => |ite| expr_contains_ident(ite.cond, name) or
+            expr_contains_ident(ite.then_branch, name) or
+            expr_contains_ident(ite.else_branch, name),
+        .apply => |application| blk: {
+            if (expr_contains_ident(application.func, name)) break :blk true;
+            for (application.args) |argument| {
+                if (expr_contains_ident(argument, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .field => |field| expr_contains_ident(field.expr, name),
+        .tuple, .set_enum => |items| blk: {
+            for (items) |item| {
+                if (expr_contains_ident(item, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .record => |fields| blk: {
+            for (fields) |field| {
+                if (expr_contains_ident(field.value, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .set_filter => |set_filter| expr_contains_bound_vars(
+            set_filter.vars,
+            set_filter.pred,
+            name,
+        ),
+        .set_map => |set_map| expr_contains_bound_vars(
+            set_map.vars,
+            set_map.value,
+            name,
+        ),
+        .set_binary => |set_binary| expr_contains_ident(set_binary.left, name) or
+            expr_contains_ident(set_binary.right, name),
+        .set_of_functions => |set_functions| expr_contains_ident(
+            set_functions.domain,
+            name,
+        ) or expr_contains_ident(set_functions.codomain, name),
+        .function_literal => |function| expr_contains_bound_vars(
+            function.vars,
+            function.body,
+            name,
+        ),
+        .record_set => |record_set| blk: {
+            for (record_set.fields) |field| {
+                if (expr_contains_ident(field.domain, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .except => |except| blk: {
+            if (expr_contains_ident(except.func, name) or
+                expr_contains_ident(except.value, name))
+            {
+                break :blk true;
+            }
+            for (except.steps) |step| {
+                switch (step) {
+                    .index => |index| {
+                        if (expr_contains_ident(index, name)) break :blk true;
+                    },
+                    .field => {},
+                }
+            }
+            break :blk false;
+        },
+        .let_in => |let| blk: {
+            for (let.defs) |definition| {
+                if (expr_contains_ident(definition.body, name)) break :blk true;
+            }
+            break :blk expr_contains_ident(let.body, name);
+        },
+        .case_expr => |case| blk: {
+            for (case.arms) |arm| {
+                if (expr_contains_ident(arm.cond, name) or
+                    expr_contains_ident(arm.value, name))
+                {
+                    break :blk true;
+                }
+            }
+            break :blk if (case.otherwise) |otherwise|
+                expr_contains_ident(otherwise, name)
+            else
+                false;
+        },
+        .box_action => |box_action| expr_contains_ident(
+            box_action.action,
+            name,
+        ) or expr_contains_ident(box_action.vars, name),
+        .lambda => |lambda| expr_contains_ident(lambda.body, name),
+        .quantifier => |quantifier| expr_contains_bound_vars(
+            quantifier.vars,
+            quantifier.body,
+            name,
+        ),
+        .choose => |choose| (if (choose.domain) |domain|
+            expr_contains_ident(domain, name)
+        else
+            false) or expr_contains_ident(choose.body, name),
+        .bool_literal,
+        .int_literal,
+        .string_literal,
+        .at,
+        => false,
+    };
+}
+
+fn expr_contains_bound_vars(
+    vars: []const @import("ast.zig").BoundVar,
+    body: *const @import("ast.zig").Expr,
+    name: []const u8,
+) bool {
+    for (vars) |variable| {
+        if (expr_contains_ident(variable.domain, name)) return true;
+    }
+    return expr_contains_ident(body, name);
 }
 
 fn steps_assign_primed(steps: []const action.ActionStep, name: []const u8) bool {

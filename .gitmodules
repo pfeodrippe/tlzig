@@ -7,3 +7,6 @@
 [submodule "vendor/tlaplus-community-modules"]
 	path = vendor/tlaplus-community-modules
 	url = https://github.com/tlaplus/CommunityModules.git
+[submodule "vendor/MDBTLA"]
+	path = vendor/MDBTLA
+	url = https://github.com/muratdem/MDBTLA.git

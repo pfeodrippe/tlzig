@@ -134,6 +134,17 @@ fn parallel_worker(
         parallel_lock(parallel);
         if (generation_error) |err| {
             parallel.failure = err;
+        } else if (checker.check_deadlock and
+            worker.out_states.items.len == 0)
+        {
+            if (checker.diagnostics) {
+                std.debug.print(
+                    "Deadlock generated={d} distinct={d}\n",
+                    .{ checker.generated, checker.distinct },
+                );
+                checker.print_trace(state_idx);
+            }
+            parallel.failure = Error.Deadlock;
         } else if (parallel.failure == null) {
             checker.generated += worker.composition_generated;
             checker.succ_offsets[state_idx] = checker.succ_count;
@@ -176,6 +187,50 @@ fn starts_with(haystack: []const u8, needle: []const u8) bool {
     return haystack.len >= needle.len and std.mem.eql(u8, haystack[0..needle.len], needle);
 }
 
+fn symmetry_fingerprint(
+    pool: *const ValuePool,
+    values: []const Value,
+    permutations: []const []const u32,
+) fingerprint.Fingerprint {
+    if (permutations.len == 0) return fingerprint.hash_state(pool, values);
+    assert(values.len <= 64);
+
+    var best_permutation: ?[]const u32 = null;
+    var best_hashes: [64]fingerprint.Fingerprint = undefined;
+    var best_hash_valid: [64]bool = @splat(false);
+
+    for (permutations) |candidate_permutation| {
+        for (values, 0..) |value_v, variable_index| {
+            if (!best_hash_valid[variable_index]) {
+                best_hashes[variable_index] = fingerprint.hash_value_permuted(
+                    pool,
+                    value_v,
+                    best_permutation,
+                );
+                best_hash_valid[variable_index] = true;
+            }
+            const candidate_hash = fingerprint.hash_value_permuted(
+                pool,
+                value_v,
+                candidate_permutation,
+            );
+            if (candidate_hash > best_hashes[variable_index]) break;
+            if (candidate_hash < best_hashes[variable_index]) {
+                best_permutation = candidate_permutation;
+                @memset(&best_hash_valid, false);
+                best_hashes[variable_index] = candidate_hash;
+                best_hash_valid[variable_index] = true;
+                break;
+            }
+        }
+    }
+
+    return if (best_permutation) |permutation|
+        fingerprint.hash_state_permuted(pool, values, permutation)
+    else
+        fingerprint.hash_state(pool, values);
+}
+
 pub const Checker = struct {
     arena: *Arena,
     state_store: StateStore,
@@ -186,6 +241,7 @@ pub const Checker = struct {
     queue: StateQueue,
     fp_set: FpSet,
     evaluator: Evaluator,
+    direct_evaluator: Evaluator,
     init_spec: ?action.CompiledInit,
     next_spec: ?action.CompiledNext,
     invariants: []const *ast.Expr,
@@ -197,6 +253,8 @@ pub const Checker = struct {
     eval_arena: *Arena,
     eval_pool: ValuePool,
     eval_pool_base: ValuePool.Snapshot,
+    check_deadlock: bool,
+    diagnostics: bool,
     worker_count: u16,
     max_states: u32,
     generated: u64,
@@ -216,6 +274,7 @@ pub const Checker = struct {
     max_states_limit: u32,
     // Fairness conditions extracted from the specification formula.
     fairness: []const FairnessCondition,
+    symmetry_permutations: []const []const u32,
 
     pub fn init(
         arena: *Arena,
@@ -252,8 +311,11 @@ pub const Checker = struct {
         const eval_arena = try arena.alloc_object(Arena);
         eval_arena.* = try Arena.init(eval_arena_bytes);
         var eval_pool = try ValuePool.init(eval_arena, eval_value_cap, eval_string_cap);
+        var direct_evaluator = try evaluator.fork(eval_arena);
+        direct_evaluator.set_constants(constants);
+        const assumption_pool_base = eval_pool.snapshot();
+        evaluator.set_definition_memo_pool(&eval_pool);
         for (module.assumptions, 0..) |assumption, assumption_index| {
-            const snapshot = eval_pool.snapshot();
             const result = evaluator.eval_expr(
                 assumption,
                 Context.empty(),
@@ -278,8 +340,17 @@ pub const Checker = struct {
                 std.debug.print("ASSUME[{d}] evaluated to FALSE\n", .{assumption_index});
                 return Error.AssumptionViolated;
             }
-            eval_pool.restore(snapshot);
         }
+        evaluator.set_definition_memo_pool(null);
+        eval_pool.restore(assumption_pool_base);
+        const symmetry_permutations = try evaluate_symmetry(
+            arena,
+            cfg,
+            &evaluator,
+            &eval_pool,
+            &state_store.values_pool,
+        );
+        eval_pool.restore(assumption_pool_base);
         const eval_pool_base = eval_pool.snapshot();
 
         const candidate_arena = try arena.alloc_object(Arena);
@@ -291,7 +362,7 @@ pub const Checker = struct {
             @min(state_value_cap, 262_144),
             @min(state_string_cap, 65_536),
         );
-        var candidate_evaluator = evaluator;
+        var candidate_evaluator = try evaluator.fork(candidate_arena);
         candidate_evaluator.set_constants(try clone_constants(
             arena,
             constants,
@@ -448,6 +519,7 @@ pub const Checker = struct {
             .queue = queue,
             .fp_set = fp_set,
             .evaluator = evaluator,
+            .direct_evaluator = direct_evaluator,
             .init_spec = compiled_init,
             .next_spec = compiled_next,
             .invariants = invariants,
@@ -459,6 +531,8 @@ pub const Checker = struct {
             .eval_arena = eval_arena,
             .eval_pool = eval_pool,
             .eval_pool_base = eval_pool_base,
+            .check_deadlock = cfg.check_deadlock,
+            .diagnostics = true,
             .worker_count = worker_count,
             .max_states = max_states,
             .generated = 0,
@@ -472,12 +546,17 @@ pub const Checker = struct {
             .initial_states = initial_states,
             .max_states_limit = max_states,
             .fairness = fairness,
+            .symmetry_permutations = symmetry_permutations,
         };
     }
 
     pub fn deinit(self: *Checker) void {
         self.eval_arena.deinit();
         self.candidate_arena.deinit();
+    }
+
+    pub fn set_diagnostics(self: *Checker, enabled: bool) void {
+        self.diagnostics = enabled;
     }
 
     pub fn check(self: *Checker) !Result {
@@ -526,6 +605,16 @@ pub const Checker = struct {
                 composition_generated = 0;
                 try executor.execute_next(self.next_spec.?, idx, &out_states);
                 self.generated += composition_generated;
+                if (self.check_deadlock and out_states.items.len == 0) {
+                    if (self.diagnostics) {
+                        std.debug.print(
+                            "Deadlock generated={d} distinct={d}\n",
+                            .{ self.generated, self.distinct },
+                        );
+                        self.print_trace(idx);
+                    }
+                    return Error.Deadlock;
+                }
                 try self.check_enabled_invariants(idx, out_states.items.len > 0);
                 try self.process_generated(
                     idx,
@@ -692,9 +781,10 @@ pub const Checker = struct {
                 idx.* = std.math.maxInt(u32);
                 continue;
             }
-            const fp = fingerprint.hash_state(
+            const fp = symmetry_fingerprint(
                 &candidate_store.values_pool,
                 candidate.values,
+                self.symmetry_permutations,
             );
             const canonical = self.fp_set.find(fp);
             const is_new = canonical == null;
@@ -702,6 +792,7 @@ pub const Checker = struct {
                 const permanent_idx = try self.clone_candidate_state(
                     candidate,
                     candidate_store,
+                    parent_idx,
                 );
                 assert(self.fp_set.put_with_index(fp, permanent_idx) == null);
                 break :blk permanent_idx;
@@ -760,16 +851,25 @@ pub const Checker = struct {
         self: *Checker,
         candidate: *StateStore.State,
         candidate_store: *StateStore,
+        parent_idx: ?u32,
     ) !u32 {
         const state_idx = try self.state_store.alloc_state();
         const state = self.state_store.get(state_idx);
         state.level = candidate.level;
         state.pred = candidate.pred;
-        for (candidate.values, state.values) |source, *target| {
-            target.* = try source.clone(
-                &candidate_store.values_pool,
-                &self.state_store.values_pool,
-            );
+        state.changed_mask = candidate.changed_mask;
+        for (candidate.values, state.values, 0..) |source, *target, variable_index| {
+            const changed = parent_idx == null or
+                (candidate.changed_mask &
+                    (@as(u64, 1) << @intCast(variable_index))) != 0;
+            if (changed) {
+                target.* = try source.clone(
+                    &candidate_store.values_pool,
+                    &self.state_store.values_pool,
+                );
+            } else {
+                target.* = self.state_store.get(parent_idx.?).values[variable_index];
+            }
         }
         return state_idx;
     }
@@ -812,6 +912,7 @@ pub const Checker = struct {
         return StateStore.State{
             .level = source.level,
             .pred = source.pred,
+            .changed_mask = 0,
             .values = values,
         };
     }
@@ -2019,6 +2120,153 @@ fn find_spec_name(module: ast.Module) ?[]const u8 {
     return null;
 }
 
+fn evaluate_symmetry(
+    arena: *Arena,
+    cfg: Config,
+    evaluator: *Evaluator,
+    eval_pool: *ValuePool,
+    state_pool: *ValuePool,
+) ![]const []const u32 {
+    const symmetry_name = cfg.symmetry_name orelse return &.{};
+    const definition = evaluator.find_definition(symmetry_name) orelse
+        return evaluator.fail(
+            Error.UndefinedSymbol,
+            "symmetry",
+            symmetry_name,
+        );
+    const raw = try evaluator.eval_expr(
+        definition.body,
+        Context.empty(),
+        null,
+        eval_pool,
+        state_pool,
+    );
+    const materialized = try evaluator.materialize_set(
+        raw,
+        Context.empty(),
+        null,
+        eval_pool,
+        state_pool,
+    );
+    if (materialized != .set_v) {
+        return evaluator.fail(
+            Error.TypeError,
+            "symmetry",
+            @tagName(materialized),
+        );
+    }
+
+    const model_count: usize = evaluator.models.count;
+    if (model_count == 0) return &.{};
+    var mappings = std.ArrayList([]u32).empty;
+    defer {
+        for (mappings.items) |mapping| {
+            std.heap.page_allocator.free(mapping);
+        }
+        mappings.deinit(std.heap.page_allocator);
+    }
+
+    for (materialized.set_v.items(eval_pool)) |permutation_value| {
+        if (permutation_value != .function_v) {
+            return evaluator.fail(
+                Error.TypeError,
+                "symmetry permutation",
+                @tagName(permutation_value),
+            );
+        }
+        const mapping = try identity_mapping(model_count);
+        errdefer std.heap.page_allocator.free(mapping);
+        const function = permutation_value.function_v;
+        for (
+            function.domain.items(eval_pool),
+            function.entries(eval_pool),
+        ) |from, to| {
+            if (from != .model_v or to != .model_v) {
+                return evaluator.fail(
+                    Error.TypeError,
+                    "symmetry permutation",
+                    "domain and range must contain model values",
+                );
+            }
+            assert(from.model_v < mapping.len);
+            assert(to.model_v < mapping.len);
+            mapping[from.model_v] = to.model_v;
+        }
+        if (!mapping_is_identity(mapping) and
+            !mapping_exists(mappings.items, mapping))
+        {
+            try mappings.append(std.heap.page_allocator, mapping);
+        } else {
+            std.heap.page_allocator.free(mapping);
+        }
+    }
+
+    try mappings.ensureTotalCapacity(std.heap.page_allocator, 4096);
+    const generator_count = mappings.items.len;
+    var cursor: usize = 0;
+    while (cursor < mappings.items.len) : (cursor += 1) {
+        for (mappings.items[0..generator_count]) |generator| {
+            if (mappings.items.len >= 4096) {
+                return evaluator.fail(
+                    Error.OutOfMemory,
+                    "symmetry subgroup",
+                    "more than 4096 permutations",
+                );
+            }
+            const composed = try compose_mapping(
+                generator,
+                mappings.items[cursor],
+            );
+            errdefer std.heap.page_allocator.free(composed);
+            if (!mapping_is_identity(composed) and
+                !mapping_exists(mappings.items, composed))
+            {
+                try mappings.append(std.heap.page_allocator, composed);
+            } else {
+                std.heap.page_allocator.free(composed);
+            }
+        }
+    }
+
+    const result = try arena.alloc([]const u32, mappings.items.len);
+    for (mappings.items, result) |mapping, *copy| {
+        const destination = try arena.alloc(u32, mapping.len);
+        @memcpy(destination, mapping);
+        copy.* = destination;
+    }
+    return result;
+}
+
+fn identity_mapping(model_count: usize) ![]u32 {
+    const mapping = try std.heap.page_allocator.alloc(u32, model_count);
+    for (mapping, 0..) |*entry, i| entry.* = @intCast(i);
+    return mapping;
+}
+
+fn compose_mapping(left: []const u32, right: []const u32) ![]u32 {
+    assert(left.len == right.len);
+    const result = try std.heap.page_allocator.alloc(u32, left.len);
+    for (result, 0..) |*entry, i| {
+        assert(right[i] < left.len);
+        entry.* = left[right[i]];
+    }
+    return result;
+}
+
+fn mapping_is_identity(mapping: []const u32) bool {
+    for (mapping, 0..) |entry, i| {
+        if (entry != i) return false;
+    }
+    return true;
+}
+
+fn mapping_exists(mappings: []const []u32, candidate: []const u32) bool {
+    for (mappings) |mapping| {
+        if (std.mem.eql(u32, mapping, candidate)) return true;
+    }
+    return false;
+}
+
 fn evaluate_constants(arena: *Arena, cfg: Config, evaluator: *Evaluator, state_pool: *ValuePool) ![]const Constant {
     var values = std.ArrayList(Constant).empty;
     defer values.deinit(std.heap.page_allocator);
@@ -2076,6 +2324,11 @@ fn evaluate_aliases(arena: *Arena, cfg: Config) ![]const eval.Alias {
 fn is_operator_alias(expr: []const u8) bool {
     const trimmed = std.mem.trim(u8, expr, " \t");
     if (trimmed.len == 0) return false;
+    if (std.mem.eql(u8, trimmed, "TRUE") or
+        std.mem.eql(u8, trimmed, "FALSE"))
+    {
+        return false;
+    }
     if (!std.ascii.isAlphabetic(trimmed[0])) return false;
     for (trimmed[1..]) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '_') return false;

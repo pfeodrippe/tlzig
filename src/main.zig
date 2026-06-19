@@ -18,8 +18,8 @@ pub fn main(init: std.process.Init.Minimal) void {
     var max_nat: i64 = 10;
     var min_int: i64 = -10;
     var max_int: i64 = 10;
-    var arena_bytes: u64 = 512 * 1024 * 1024;
-    var eval_arena_bytes: u64 = 256 * 1024 * 1024;
+    var arena_bytes: u64 = 16 * 1024 * 1024;
+    var eval_arena_bytes: u64 = 16 * 1024 * 1024;
     var worker_count: u16 = 1;
     var unlimited_memory = false;
 
@@ -52,11 +52,11 @@ pub fn main(init: std.process.Init.Minimal) void {
             }
         } else if (std.mem.eql(u8, arg, "--arena-bytes")) {
             if (it.next()) |v| {
-                arena_bytes = std.fmt.parseInt(u64, v, 10) catch 512 * 1024 * 1024;
+                arena_bytes = std.fmt.parseInt(u64, v, 10) catch 16 * 1024 * 1024;
             }
         } else if (std.mem.eql(u8, arg, "--eval-arena-bytes")) {
             if (it.next()) |v| {
-                eval_arena_bytes = std.fmt.parseInt(u64, v, 10) catch 256 * 1024 * 1024;
+                eval_arena_bytes = std.fmt.parseInt(u64, v, 10) catch 16 * 1024 * 1024;
             }
         } else if (std.mem.eql(u8, arg, "--workers")) {
             if (it.next()) |v| {
@@ -126,10 +126,19 @@ pub fn main(init: std.process.Init.Minimal) void {
         };
     };
 
-    const eval_value_cap = cap_u32(@min(@max(@as(u64, max_states) * 256, 500_000), 8_000_000));
-    const eval_string_cap = cap_u32(@min(@max(@as(u64, max_states) * 64, 500_000), 4_000_000));
-    const state_value_cap = cap_u32(@min(@max(@as(u64, max_states) * 256, 500_000), 8_000_000));
-    const state_string_cap = cap_u32(@min(@max(@as(u64, max_states) * 32, 200_000), 2_000_000));
+    const eval_value_cap: u32 = 262_144;
+    const eval_string_cap: u32 = 65_536;
+    const variables_len: u64 = @intCast(module.variables.len);
+    const state_values_per_state = @max(variables_len * 12, 64);
+    const state_strings_per_state = @max(variables_len * 16, 64);
+    const state_value_cap = cap_u32(@min(
+        @max(@as(u64, max_states) * state_values_per_state, 1_000_000),
+        64_000_000,
+    ));
+    const state_string_cap = cap_u32(@min(
+        @max(@as(u64, max_states) * state_strings_per_state, 500_000),
+        64_000_000,
+    ));
 
     var ch = checker.Checker.init(
         &arena,
@@ -153,6 +162,17 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.debug.print("checking failed: {any}", .{err});
         if (ch.evaluator.err_ctx.context) |ctx| {
             std.debug.print(" -- context: {s} {s}", .{ ctx, ch.evaluator.err_ctx.detail orelse "" });
+        }
+        if (err == error.OutOfMemory) {
+            std.debug.print(
+                " -- state-pool values={d}/{d} strings={d}/{d}",
+                .{
+                    ch.state_store.values_pool.value_count,
+                    ch.state_store.values_pool.value_cap,
+                    ch.state_store.values_pool.string_count,
+                    ch.state_store.values_pool.string_cap,
+                },
+            );
         }
         std.debug.print(" -- generated={d} distinct={d}\n", .{ ch.generated, ch.distinct });
         std.process.exit(1);

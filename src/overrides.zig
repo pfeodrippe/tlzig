@@ -324,6 +324,42 @@ fn int_pow(base: u64, exp: u32) u64 {
 
 pub fn ooverride(_: OverrideContext, pool: *ValuePool, a: Value, b: Value) Error!Value {
     // Combine two records/functions; right-hand side overrides left for matching keys.
+    if (a == .record_v and b == .record_v) {
+        const left = a.record_v;
+        const right = b.record_v;
+        const left_fields = left.fields(pool);
+        const right_fields = right.fields(pool);
+        const max_fields: u32 = left.len + right.len;
+        const dest = try pool.alloc_values(max_fields * 2);
+        var count: u32 = 0;
+        var left_index: u32 = 0;
+        while (left_index < left.len) : (left_index += 1) {
+            const left_name = left_fields[left_index * 2].string_v;
+            var overridden = false;
+            var right_index: u32 = 0;
+            while (right_index < right.len) : (right_index += 1) {
+                const right_name = right_fields[right_index * 2].string_v;
+                if (left_name.eql(right_name, pool)) {
+                    overridden = true;
+                    break;
+                }
+            }
+            if (!overridden) {
+                dest[count * 2] = left_fields[left_index * 2];
+                dest[count * 2 + 1] = left_fields[left_index * 2 + 1];
+                count += 1;
+            }
+        }
+        @memcpy(
+            dest[count * 2 ..][0 .. right.len * 2],
+            right_fields,
+        );
+        count += right.len;
+        return Value{ .record_v = .{
+            .offset = value_offset(pool, dest.ptr),
+            .len = count,
+        } };
+    }
     const fa = if (a == .function_v) a.function_v else return Error.TypeError;
     const fb = if (b == .function_v) b.function_v else return Error.TypeError;
     const dest_len: u32 = @intCast(fa.len + fb.len);
@@ -445,9 +481,15 @@ fn make_tuple(pool: *ValuePool, values: []Value) value.Tuple {
     };
 }
 
-fn value_offset(pool: *ValuePool, ptr: [*]Value) u32 {
-    const bytes = @intFromPtr(ptr) - @intFromPtr(pool.values.ptr);
-    return @intCast(bytes / @sizeOf(Value));
+fn value_offset(pool: *const ValuePool, ptr: [*]Value) u32 {
+    const base = @intFromPtr(pool.values.ptr);
+    const address = @intFromPtr(ptr);
+    assert(address >= base);
+    const bytes = address - base;
+    assert(bytes % @sizeOf(Value) == 0);
+    const offset = bytes / @sizeOf(Value);
+    assert(offset <= std.math.maxInt(u32));
+    return @intCast(offset);
 }
 
 fn make_range_set(pool: *ValuePool, lo: i64, hi: i64) value.Set {
@@ -533,13 +575,19 @@ fn permutations(_: OverrideContext, pool: *ValuePool, args: []const Value) Error
     defer std.heap.page_allocator.free(order);
     for (0..items.len) |i| order[i] = i;
     while (true) {
-        const seq_values = try pool.alloc_values(@intCast(items.len));
-        for (order, 0..) |idx, i| seq_values[i] = items[idx];
-        const seq = if (items.len == 0)
-            Value{ .function_v = .{ .domain = value.Set{ .offset = pool.value_count, .len = 0 }, .offset = pool.value_count, .len = 0 } }
-        else
-            make_sequence(pool, seq_values, @intCast(items.len));
-        try result.append(std.heap.page_allocator, seq);
+        const function_values = try pool.alloc_values(@intCast(items.len * 2));
+        const domain = function_values[0..items.len];
+        const entries = function_values[items.len..];
+        @memcpy(domain, items);
+        for (order, 0..) |idx, i| entries[i] = items[idx];
+        try result.append(std.heap.page_allocator, Value{ .function_v = .{
+            .domain = .{
+                .offset = value_offset(pool, domain.ptr),
+                .len = @intCast(domain.len),
+            },
+            .offset = value_offset(pool, entries.ptr),
+            .len = @intCast(entries.len),
+        } });
         if (!next_permutation(order)) break;
     }
     const dest = try pool.alloc_values(@intCast(result.items.len));
@@ -590,6 +638,19 @@ fn java_time(_: OverrideContext, _: *ValuePool, _: []const Value) Error!Value {
 fn tlc_get(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len == 1 and args[0] == .string_v) {
         const key = args[0].string_v.slice(pool);
+        if (std.mem.eql(u8, key, "config")) {
+            const fields = try pool.alloc_values(2);
+            const fields_offset = value_offset(pool, fields.ptr);
+            fields[0] = Value{
+                .string_v = try pool.push_string("mode"),
+            };
+            fields[1] = Value{
+                .string_v = try pool.push_string("bfs"),
+            };
+            return Value{
+                .record_v = .{ .offset = fields_offset, .len = 1 },
+            };
+        }
         if (std.mem.eql(
             u8,
             key,

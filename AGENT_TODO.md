@@ -35,7 +35,7 @@ TLAPS proof-only modules are intentionally outside the product scope.
 Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
 
 ### Current validation snapshot (2026-06-18)
-- Unit/integration suite: `67/67` passing in Debug.
+- Unit/integration suite: `75/75` passing in Debug.
 - Probe suffix after EWD998: `18 PASS / 14 FAIL / 2 SKIP`.
 - `sums_even/MC_sums_even` is excluded: Java TLC rejects it during parsing
   because its base module imports `TLAPS`; tlzig must not invent proof-system
@@ -51,6 +51,85 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   symbolic `Nat`/`Int`/ranges, tuple destructuring, local namespace
   instances, primed function applications, record `DOMAIN`, nested function
   sets, action composition, and lexical `LET` shadowing.
+
+### MDBTLA / MultiShardTxn integration (2026-06-18)
+- [x] Add `muratdem/MDBTLA` as `vendor/MDBTLA` submodule at
+  `39ba8ba327c57366e82f7aee970f2c1e366e94b7`.
+- [x] Parse parameterized namespace instances such as
+  `Storage(s) == INSTANCE Storage WITH ...`.
+- [x] Preserve namespace-qualified calls in `ASSUME`; `CC!Op(...)` is no
+  longer misparsed as an assumption label.
+- [x] Support config operator replacements such as
+  `AbortTransaction <- FALSE` without suppressing sibling `Next` branches.
+- [x] Support string-keyed nested record `EXCEPT` and record `@@` override.
+- [x] Validate `ClientCentricTests` against bundled TLC:
+  - TLC `-workers 1`: `1602/801`, 2.286s in benchmark.
+  - TLC `-workers auto`: `1602/801`, 2.375s.
+  - tlzig `--workers 1`: `2044/801`, 8.427s.
+  - tlzig `--workers auto`: `2044/801`, 8.438s.
+  - Distinct states match exactly; generated-state accounting still differs.
+- [x] Reduce `ClientCentricTests` tlzig runtime from 159.5s to 8.4s:
+  bounded fingerprint set deduplication, assumption-scoped definition
+  memoization, and pre-sized non-growing evaluation/state pools.
+- [x] Add `ClientCentricTests` to the ReleaseFast benchmark with MDBTLA's
+  bundled TLC/CommunityModules classpath.
+- [x] Fix RC semantic under-exploration and deadlock handling:
+  - unprimed state applications now read the pre-state inside actions;
+  - parameterized namespace calls flatten instance and operator arguments;
+  - TLC-compatible deadlocks are reported instead of false completion;
+  - all four RC model configs now match TLC's full-run outcome and depth.
+- [x] Implement fixed-capacity, allocation-free evaluator contexts with
+  branch snapshots; remove the 32-entry context copy from every recursive
+  expression evaluation.
+- [x] Implement TLC-compatible symmetry support:
+  - parse `SYMMETRY`;
+  - return model-value functions from `Permutations`;
+  - compute the generated permutation subgroup;
+  - fingerprint a deterministic orbit representative.
+- [x] Remove page-allocator calls from the hot one-variable set-filter path
+  and use fixed-stack open addressing for large set deduplication.
+- [x] Run full, unbounded single/auto comparisons for every upstream-valid
+  MDBTLA MultiShardTxn configuration and add each case to the benchmark:
+  `ClientCentricTests.cfg`, `Storage.cfg`, `MCMultiShardTxn.cfg`,
+  `MCMultiShardTxn_rc_local.cfg`, and all four configs under `models/`.
+- [x] Make all-core tlzig faster than TLC on every full MultiShardTxn run.
+  Representative ReleaseFast results:
+  - RC snapshot: tlzig `1.03s` vs TLC `2.44s`;
+  - Storage: tlzig `0.45s` vs TLC `1.50s`;
+  - RC no-prepare-block: tlzig `0.15s` vs TLC `1.59s`;
+  - symmetry rc-local: tlzig `0.15s` vs TLC `1.44s`.
+- [ ] Eliminate the remaining single-core gaps:
+  - RC snapshot: tlzig `7.12s` vs true one-core TLC `5.40s`;
+  - Storage: tlzig `3.40s` vs true one-core TLC `2.80s`;
+  - ClientCentric: tlzig `4.50s` vs true one-core TLC `2.30s`;
+  - snapshot-invariant symmetry: tlzig `2.26s` vs TLC `2.09s`.
+- [ ] Add a single-worker direct-canonical successor path: construct one
+  candidate at a time in the canonical value pool, fingerprint immediately,
+  retain new states without a second deep clone, and roll back duplicate or
+  constrained candidates to a pool snapshot. Keep the existing isolated
+  candidate pools for parallel workers.
+- [ ] Match TLC's generated count for `ClientCentricTests` (`1602/801`;
+  tlzig currently reaches the same `801` distinct states with different
+  generated-state accounting).
+- [x] Classify upstream configs that TLC itself rejects:
+  `MultiShardTxn.cfg` and `models/MultiShardTxn_RC.cfg` omit required
+  constants such as `Timestamps`; do not invent tlzig-only defaults.
+
+### Long-running public benchmark candidates
+- [ ] `detector_chan96/EnvironmentController.tla` (official Examples;
+  documented runtime over two hours):
+  https://github.com/tlaplus/Examples/blob/master/specifications/detector_chan96/EnvironmentController.tla
+- [ ] Payment-channel model (reported about two hours / 1,131,490 states):
+  https://conf.tlapl.us/2021/MatthiasGrundmann-talk.pdf
+- [ ] Snapshot-isolation database model (reported 44 minutes with three keys):
+  https://muratbuffalo.blogspot.com/2023/09/a-snapshot-isolated-database-modeling.html
+- [ ] Fine-grained DCAS model (historical report around 40 hours):
+  https://lamport.azurewebsites.net/tla/dcas.pdf
+- [ ] Existing vendor long models: `MCKVSSafetyLarge` (~7h16),
+  `SlushLarge` (~50m), `bcastFolklore` (~30m), MultiCarElevator liveness
+  (~11m), `aba-asyn-byz` (~10m), and high-level EWD998 (~50m).
+- [ ] Add only reproducible, TLC-valid configurations to benchmark tiers;
+  keep >10-minute cases opt-in so the default benchmark remains usable.
 
 ### Representative benchmark run (ReleaseFast)
 ```

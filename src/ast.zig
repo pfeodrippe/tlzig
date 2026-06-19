@@ -21,6 +21,7 @@ pub const Instance = struct {
 
 pub const NamespaceInstance = struct {
     alias: []const u8,
+    params: []const []const u8,
     module_name: []const u8,
     substitutions: []const Substitution,
 };

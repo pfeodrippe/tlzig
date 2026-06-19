@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Arena = @import("arena.zig").Arena;
 const ast = @import("ast.zig");
@@ -20,30 +21,88 @@ pub const Constant = struct {
 };
 
 pub const Context = struct {
-    names: [32][]const u8,
-    values: [32]Value,
-    len: u32,
+    head: ?*const ContextBinding,
+    len: u8,
 
     pub fn empty() Context {
-        return Context{ .names = undefined, .values = undefined, .len = 0 };
+        return .{ .head = null, .len = 0 };
     }
 
     pub fn lookup(self: Context, name: []const u8) ?Value {
-        var i: u32 = self.len;
-        while (i > 0) {
-            i -= 1;
-            if (std.mem.eql(u8, self.names[i], name)) return self.values[i];
+        const binding = self.lookup_binding(name) orelse return null;
+        return binding.value;
+    }
+
+    fn lookup_binding(self: Context, name: []const u8) ?*const ContextBinding {
+        var binding = self.head;
+        while (binding) |current| {
+            if (name_eql(current.name, name)) return current;
+            binding = current.parent;
         }
         return null;
     }
+};
 
-    pub fn extend(self: Context, name: []const u8, val: Value) Context {
-        var copy = self;
-        std.debug.assert(copy.len < 32);
-        copy.names[copy.len] = name;
-        copy.values[copy.len] = val;
-        copy.len += 1;
-        return copy;
+const ContextBinding = struct {
+    parent: ?*const ContextBinding,
+    name: []const u8,
+    value: Value,
+    assignment: AssignmentKind,
+};
+
+pub const AssignmentKind = enum {
+    local,
+    changed,
+    unchanged,
+};
+
+const ContextPool = struct {
+    bindings: []ContextBinding,
+    count: u32,
+
+    fn init(arena: *Arena) !ContextPool {
+        return .{
+            .bindings = try arena.alloc(ContextBinding, 131_072),
+            .count = 0,
+        };
+    }
+
+    fn reset(self: *ContextPool) void {
+        assert(self.count <= self.bindings.len);
+        self.count = 0;
+    }
+
+    fn snapshot(self: *const ContextPool) u32 {
+        assert(self.count <= self.bindings.len);
+        return self.count;
+    }
+
+    fn restore(self: *ContextPool, saved_count: u32) void {
+        assert(saved_count <= self.count);
+        self.count = saved_count;
+    }
+
+    fn extend(
+        self: *ContextPool,
+        context: Context,
+        name: []const u8,
+        value_v: Value,
+        assignment: AssignmentKind,
+    ) Error!Context {
+        assert(context.len < 32);
+        if (self.count >= self.bindings.len) return Error.OutOfMemory;
+        const binding = &self.bindings[self.count];
+        self.count += 1;
+        binding.* = .{
+            .parent = context.head,
+            .name = name,
+            .value = value_v,
+            .assignment = assignment,
+        };
+        return .{
+            .head = binding,
+            .len = context.len + 1,
+        };
     }
 };
 
@@ -58,9 +117,55 @@ pub const EvalLambda = struct {
     ctx: Context,
 };
 
+const ApplicationGroup = struct {
+    args: []const *ast.Expr,
+};
+
 pub const ErrorContext = struct {
     context: ?[]const u8 = null,
     detail: ?[]const u8 = null,
+    active: bool = false,
+};
+
+const MemoEntry = struct {
+    name: []const u8,
+    value: Value,
+};
+
+const DefinitionMemo = struct {
+    pool: ?*ValuePool = null,
+    count: u16 = 0,
+    entries: [1024]MemoEntry = undefined,
+
+    fn reset(self: *DefinitionMemo, pool: ?*ValuePool) void {
+        self.pool = pool;
+        self.count = 0;
+    }
+
+    fn get(
+        self: *const DefinitionMemo,
+        pool: *ValuePool,
+        name: []const u8,
+    ) ?Value {
+        if (self.pool != pool) return null;
+        for (self.entries[0..self.count]) |entry| {
+            if (name_eql(entry.name, name)) return entry.value;
+        }
+        return null;
+    }
+
+    fn put(
+        self: *DefinitionMemo,
+        pool: *ValuePool,
+        name: []const u8,
+        value_v: Value,
+    ) Error!void {
+        if (self.pool != pool) return;
+        if (self.count >= self.entries.len) return Error.OutOfMemory;
+        self.entries[self.count] = .{ .name = name, .value = value_v };
+        self.count += 1;
+        assert(self.count <= self.entries.len);
+    }
 };
 
 pub const Evaluator = struct {
@@ -72,6 +177,8 @@ pub const Evaluator = struct {
     treat_unknown_as_model: bool,
     next_state: ?*state.StateStore.State,
     enabled_result: ?bool,
+    definition_memo: *DefinitionMemo,
+    context_pool: *ContextPool,
     /// Error context stored via pointer so all by-value copies share state.
     err_ctx: *ErrorContext,
 
@@ -80,6 +187,10 @@ pub const Evaluator = struct {
         models.* = try ModelTable.init(arena, 1024);
         const err_ctx = try arena.alloc_object(ErrorContext);
         err_ctx.* = .{};
+        const definition_memo = try arena.alloc_object(DefinitionMemo);
+        definition_memo.* = .{};
+        const context_pool = try arena.alloc_object(ContextPool);
+        context_pool.* = try ContextPool.init(arena);
         return Evaluator{
             .module = module,
             .constants = &[_]Constant{},
@@ -89,6 +200,8 @@ pub const Evaluator = struct {
             .treat_unknown_as_model = false,
             .next_state = null,
             .enabled_result = null,
+            .definition_memo = definition_memo,
+            .context_pool = context_pool,
             .err_ctx = err_ctx,
         };
     }
@@ -100,11 +213,66 @@ pub const Evaluator = struct {
     pub fn fork(self: Evaluator, arena: *Arena) !Evaluator {
         const err_ctx = try arena.alloc_object(ErrorContext);
         err_ctx.* = .{};
+        const definition_memo = try arena.alloc_object(DefinitionMemo);
+        definition_memo.* = .{};
+        const context_pool = try arena.alloc_object(ContextPool);
+        context_pool.* = try ContextPool.init(arena);
         var copy = self;
         copy.next_state = null;
         copy.enabled_result = null;
+        copy.definition_memo = definition_memo;
+        copy.context_pool = context_pool;
         copy.err_ctx = err_ctx;
         return copy;
+    }
+
+    pub fn reset_context_pool(self: Evaluator) void {
+        self.context_pool.reset();
+    }
+
+    pub fn context_snapshot(self: Evaluator) u32 {
+        return self.context_pool.snapshot();
+    }
+
+    pub fn restore_context_pool(self: Evaluator, saved_count: u32) void {
+        self.context_pool.restore(saved_count);
+    }
+
+    pub fn extend_context(
+        self: Evaluator,
+        context: Context,
+        name: []const u8,
+        value_v: Value,
+    ) Error!Context {
+        return self.context_pool.extend(context, name, value_v, .local);
+    }
+
+    pub fn extend_state_context(
+        self: Evaluator,
+        context: Context,
+        name: []const u8,
+        value_v: Value,
+        assignment: AssignmentKind,
+    ) Error!Context {
+        assert(assignment != .local);
+        return self.context_pool.extend(
+            context,
+            name,
+            value_v,
+            assignment,
+        );
+    }
+
+    pub fn context_assignment(
+        self: Evaluator,
+        context: Context,
+        name: []const u8,
+    ) AssignmentKind {
+        _ = self;
+        return if (context.lookup_binding(name)) |binding|
+            binding.assignment
+        else
+            .local;
     }
 
     pub fn set_next_state(self: *Evaluator, st: ?*state.StateStore.State) void {
@@ -113,6 +281,13 @@ pub const Evaluator = struct {
 
     pub fn set_enabled_result(self: *Evaluator, enabled: ?bool) void {
         self.enabled_result = enabled;
+    }
+
+    pub fn set_definition_memo_pool(
+        self: *Evaluator,
+        pool: ?*ValuePool,
+    ) void {
+        self.definition_memo.reset(pool);
     }
 
     pub fn set_constants(self: *Evaluator, constants: []const Constant) void {
@@ -133,14 +308,14 @@ pub const Evaluator = struct {
 
     pub fn resolve_alias(self: Evaluator, name: []const u8) []const u8 {
         for (self.aliases) |a| {
-            if (std.mem.eql(u8, name, a.from)) return a.to;
+            if (name_eql(name, a.from)) return a.to;
         }
         return name;
     }
 
     pub fn find_constant(self: Evaluator, name: []const u8) ?Value {
         for (self.constants) |c| {
-            if (std.mem.eql(u8, c.name, name)) return c.value;
+            if (name_eql(c.name, name)) return c.value;
         }
         return null;
     }
@@ -156,6 +331,17 @@ pub const Evaluator = struct {
         assert(@intFromPtr(expr) != 0);
         assert(eval_pool.value_count <= eval_pool.value_cap);
         assert(state_pool.value_count <= state_pool.value_cap);
+        const root_call = !self.err_ctx.active;
+        if (root_call) {
+            if (ctx.len == 0) self.context_pool.reset();
+            self.err_ctx.context = null;
+            self.err_ctx.detail = null;
+            self.err_ctx.active = true;
+        }
+        defer if (root_call) {
+            assert(self.err_ctx.active);
+            self.err_ctx.active = false;
+        };
         const result = self.eval_expr_inner(expr, ctx, s0, eval_pool, state_pool);
         return result catch |err| {
             if (err == Error.TypeError and self.err_ctx.context == null) {
@@ -219,12 +405,36 @@ pub const Evaluator = struct {
                 }
                 if (self.find_definition(aliased)) |def| {
                     if (def.is_function) {
-                        return try make_recursive_function(def, ctx, eval_pool);
+                        return try self.make_recursive_function(def, ctx, eval_pool);
                     }
                     if (def.params.len != 0) {
                         return try self.make_lambda(def, ctx, eval_pool);
                     }
-                    return try self.eval_expr(def.body, ctx, s0, eval_pool, state_pool);
+                    if (s0 == null and ctx.len == 0) {
+                        if (self.definition_memo.get(eval_pool, aliased)) |v| {
+                            return v;
+                        }
+                        const v = try self.eval_expr(
+                            def.body,
+                            ctx,
+                            s0,
+                            eval_pool,
+                            state_pool,
+                        );
+                        try self.definition_memo.put(
+                            eval_pool,
+                            aliased,
+                            v,
+                        );
+                        return v;
+                    }
+                    return try self.eval_expr(
+                        def.body,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    );
                 }
                 if (self.find_subexpression(aliased)) |body| {
                     return try self.eval_expr(body, ctx, s0, eval_pool, state_pool);
@@ -271,7 +481,23 @@ pub const Evaluator = struct {
                     state_pool,
                 );
             },
-            .binary => |b| return try self.eval_binary(b, ctx, s0, eval_pool, state_pool),
+            .binary => |b| {
+                return self.eval_binary(
+                    b,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                ) catch |err| {
+                    if (err == Error.TypeError and
+                        self.err_ctx.context == null)
+                    {
+                        self.err_ctx.context = "binary";
+                        self.err_ctx.detail = @tagName(b.op);
+                    }
+                    return err;
+                };
+            },
             .unary => |u| {
                 if (try eval_symbolic_set(self, expr, ctx, s0, eval_pool, state_pool)) |sv| return sv;
                 return try self.eval_unary(u, ctx, s0, eval_pool, state_pool);
@@ -421,25 +647,33 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!Value {
-        const left = try self.eval_expr(b.left, ctx, s0, eval_pool, state_pool);
+        const left = try self.eval_binary_operand(
+            b,
+            b.left,
+            "left",
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
         switch (b.op) {
             .and_op => {
                 if (!left.is_truthy()) return Value{ .bool_v = false };
-                const right = try self.eval_expr(b.right, ctx, s0, eval_pool, state_pool);
+                const right = try self.eval_binary_operand(b, b.right, "right", ctx, s0, eval_pool, state_pool);
                 return Value{ .bool_v = right.is_truthy() };
             },
             .or_op => {
                 if (left.is_truthy()) return Value{ .bool_v = true };
-                const right = try self.eval_expr(b.right, ctx, s0, eval_pool, state_pool);
+                const right = try self.eval_binary_operand(b, b.right, "right", ctx, s0, eval_pool, state_pool);
                 return Value{ .bool_v = right.is_truthy() };
             },
             .implies => {
                 if (!left.is_truthy()) return Value{ .bool_v = true };
-                const right = try self.eval_expr(b.right, ctx, s0, eval_pool, state_pool);
+                const right = try self.eval_binary_operand(b, b.right, "right", ctx, s0, eval_pool, state_pool);
                 return Value{ .bool_v = right.is_truthy() };
             },
             .equiv => {
-                const right = try self.eval_expr(b.right, ctx, s0, eval_pool, state_pool);
+                const right = try self.eval_binary_operand(b, b.right, "right", ctx, s0, eval_pool, state_pool);
                 return Value{ .bool_v = left.is_truthy() == right.is_truthy() };
             },
             .in => {
@@ -475,7 +709,13 @@ pub const Evaluator = struct {
                     return Value{ .bool_v = right.member(eval_pool, left) };
                 }
                 const right = try self.eval_expr(b.right, ctx, s0, eval_pool, state_pool);
-                if (!right.is_set_like()) return Error.TypeError;
+                if (!right.is_set_like()) {
+                    return self.fail(
+                        Error.TypeError,
+                        "\\in: rhs not a set",
+                        @tagName(right),
+                    );
+                }
                 return Value{ .bool_v = right.member(eval_pool, left) };
             },
             .notin => {
@@ -499,7 +739,15 @@ pub const Evaluator = struct {
             },
             else => {},
         }
-        const right = try self.eval_expr(b.right, ctx, s0, eval_pool, state_pool);
+        const right = try self.eval_binary_operand(
+            b,
+            b.right,
+            "right",
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
         return switch (b.op) {
             .eq => Value{ .bool_v = left.eql(right, eval_pool) },
             .ne => Value{ .bool_v = !left.eql(right, eval_pool) },
@@ -559,6 +807,34 @@ pub const Evaluator = struct {
             else => {
                 return self.fail(Error.NotImplemented, "binary", @tagName(b.op));
             },
+        };
+    }
+
+    fn eval_binary_operand(
+        self: Evaluator,
+        binary: *ast.Binary,
+        operand: *ast.Expr,
+        side: []const u8,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!Value {
+        return self.eval_expr(
+            operand,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        ) catch |err| {
+            if (err == Error.TypeError and
+                self.err_ctx.context != null and
+                std.mem.eql(u8, self.err_ctx.context.?, "expr"))
+            {
+                self.err_ctx.context = side;
+                self.err_ctx.detail = @tagName(binary.op);
+            }
+            return err;
         };
     }
 
@@ -680,21 +956,26 @@ pub const Evaluator = struct {
                 return sorted;
             }
             const domain = try self.eval_set_materialized(bv.domain, ctx, s0, eval_pool, state_pool);
-            var items = std.ArrayList(Value).empty;
-            defer items.deinit(std.heap.page_allocator);
-            try items.appendSlice(std.heap.page_allocator, domain.set_v.items(eval_pool));
-            var accepted = std.ArrayList(Value).empty;
-            defer accepted.deinit(std.heap.page_allocator);
-            for (items.items) |it| {
-                const new_ctx = ctx.extend(bv.name, it);
+            const items = domain.set_v.items(eval_pool);
+            const accepted = try eval_pool.alloc_values(domain.set_v.len);
+            const scratch_snapshot = eval_pool.snapshot();
+            const context_snap = self.context_snapshot();
+            var accepted_count: u32 = 0;
+            for (items) |it| {
+                const new_ctx = try self.extend_context(ctx, bv.name, it);
                 const pred = try self.eval_expr(sf.pred, new_ctx, s0, eval_pool, state_pool);
                 if (pred.is_truthy()) {
-                    try accepted.append(std.heap.page_allocator, it);
+                    assert(accepted_count < accepted.len);
+                    accepted[accepted_count] = it;
+                    accepted_count += 1;
                 }
+                eval_pool.restore(scratch_snapshot);
+                self.restore_context_pool(context_snap);
             }
-            const dest = try eval_pool.alloc_values(@intCast(accepted.items.len));
-            @memcpy(dest, accepted.items);
-            return Value{ .set_v = make_set(eval_pool, dest) };
+            return Value{ .set_v = make_set(
+                eval_pool,
+                accepted[0..accepted_count],
+            ) };
         }
         return try self.eval_set_filter_tuples(sf, 0, ctx, s0, eval_pool, state_pool);
     }
@@ -720,7 +1001,7 @@ pub const Evaluator = struct {
         var tuples = std.ArrayList(Value).empty;
         defer tuples.deinit(std.heap.page_allocator);
         for (items.items) |it| {
-            const new_ctx = ctx.extend(bv.name, it);
+            const new_ctx = try self.extend_context(ctx, bv.name, it);
             const nested = try self.eval_set_filter_tuples(sf, var_idx + 1, new_ctx, s0, eval_pool, state_pool);
             if (var_idx + 1 < sf.vars.len) {
                 if (nested != .set_v) return Error.TypeError;
@@ -856,7 +1137,7 @@ pub const Evaluator = struct {
         while (j < domains.len) : (j += 1) stride *= domains[j].set_v.len;
         for (0..item_count) |i| {
             const it = domains[var_idx].set_v.items(eval_pool)[i];
-            const new_ctx = ctx.extend(bv.name, it);
+            const new_ctx = try self.extend_context(ctx, bv.name, it);
             try self.eval_set_map_vars(sm, var_idx + 1, domains, new_ctx, s0, eval_pool, state_pool, dest, start + i * stride);
         }
     }
@@ -1315,7 +1596,7 @@ pub const Evaluator = struct {
             var scratch: [4096]Value = undefined;
             for (0..item_count) |i| {
                 const it = domain.set_v.items(eval_pool)[i];
-                const new_ctx = ctx.extend(fl.vars[0].name, it);
+                const new_ctx = try self.extend_context(ctx, fl.vars[0].name, it);
                 scratch[i] = try self.eval_expr(fl.body, new_ctx, s0, eval_pool, state_pool);
             }
             const dest = try eval_pool.alloc_values(item_count);
@@ -1341,7 +1622,7 @@ pub const Evaluator = struct {
             var new_ctx = ctx;
             const items = tuple.tuple_v.items(eval_pool);
             for (fl.vars, 0..) |v, j| {
-                new_ctx = new_ctx.extend(v.name, items[j]);
+                new_ctx = try self.extend_context(new_ctx, v.name, items[j]);
             }
             scratch[i] = try self.eval_expr(fl.body, new_ctx, s0, eval_pool, state_pool);
         }
@@ -1419,7 +1700,7 @@ pub const Evaluator = struct {
                 var new_ctx = ctx;
                 for (def.params, ap.args) |param, arg| {
                     const arg_value = try self.eval_expr(arg, ctx, s0, eval_pool, state_pool);
-                    new_ctx = new_ctx.extend(param, arg_value);
+                    new_ctx = try self.extend_context(new_ctx, param, arg_value);
                 }
                 if (self.next_state) |next| {
                     return try self.eval_expr(
@@ -1457,6 +1738,7 @@ pub const Evaluator = struct {
                 var partial_next = StateStore.State{
                     .level = current.level + 1,
                     .pred = current.pred,
+                    .changed_mask = 0,
                     .values = next_values,
                 };
 
@@ -1488,6 +1770,64 @@ pub const Evaluator = struct {
                     eval_pool,
                     eval_pool,
                 );
+            }
+        }
+        if (s0) |state_v| {
+            var root_name: []const u8 = "";
+            var groups: [8]ApplicationGroup = undefined;
+            var group_count: u8 = 0;
+            if (collect_application_groups(
+                ap,
+                &root_name,
+                &groups,
+                &group_count,
+            )) {
+                if (self.find_variable(root_name)) |variable_index| {
+                    assert(variable_index < state_v.values.len);
+                    var current = state_v.values[variable_index];
+                    for (groups[0..group_count]) |group| {
+                        if (group.args.len > 8) {
+                            return self.fail(
+                                Error.NotImplemented,
+                                "state application",
+                                "more than 8 grouped arguments",
+                            );
+                        }
+                        var arguments: [8]Value = undefined;
+                        for (group.args, 0..) |arg, i| {
+                            arguments[i] = try self.eval_expr(
+                                arg,
+                                ctx,
+                                s0,
+                                eval_pool,
+                                state_pool,
+                            );
+                        }
+                        const key = if (group.args.len == 1)
+                            arguments[0]
+                        else blk: {
+                            const tuple_values = try eval_pool.alloc_values(
+                                @intCast(group.args.len),
+                            );
+                            @memcpy(
+                                tuple_values,
+                                arguments[0..group.args.len],
+                            );
+                            break :blk Value{ .tuple_v = make_tuple(
+                                eval_pool,
+                                tuple_values,
+                            ) };
+                        };
+                        current = try apply_cross_pool(
+                            self,
+                            current,
+                            state_pool,
+                            key,
+                            eval_pool,
+                        );
+                    }
+                    return try current.clone(state_pool, eval_pool);
+                }
             }
         }
         if (ap.func.* == .ident) {
@@ -1558,13 +1898,44 @@ pub const Evaluator = struct {
                     return err;
                 };
             }
+            if (self.find_constant(name)) |constant| {
+                switch (constant) {
+                    .function_v, .lambda_v => {
+                        const values = try eval_pool.alloc_values(
+                            @intCast(ap.args.len),
+                        );
+                        for (ap.args, 0..) |arg, i| {
+                            values[i] = try self.eval_expr(
+                                arg,
+                                ctx,
+                                s0,
+                                eval_pool,
+                                state_pool,
+                            );
+                        }
+                        return try self.apply_values(
+                            constant,
+                            values,
+                            eval_pool,
+                            state_pool,
+                            s0,
+                        );
+                    },
+                    else => {
+                        // A config replacement such as `Op <- FALSE` replaces
+                        // the complete operator body. Its formal arguments are
+                        // therefore intentionally not evaluated.
+                        return try constant.clone(state_pool, eval_pool);
+                    },
+                }
+            }
             if (self.find_definition(name)) |def| {
                 const values = try eval_pool.alloc_values(@intCast(ap.args.len));
                 for (ap.args, 0..) |arg, i| {
                     values[i] = try self.eval_expr(arg, ctx, s0, eval_pool, state_pool);
                 }
                 if (def.is_function) {
-                    const func = try make_recursive_function(def, ctx, eval_pool);
+                    const func = try self.make_recursive_function(def, ctx, eval_pool);
                     return try self.apply_values(func, values, eval_pool, state_pool, s0);
                 }
                 if (def.params.len == 0) {
@@ -1572,6 +1943,10 @@ pub const Evaluator = struct {
                     return try self.apply_values(func, values, eval_pool, state_pool, s0);
                 }
                 if (def.params.len != ap.args.len) {
+                    std.debug.print(
+                        "definition apply arity: {s} expected={d} actual={d}\n",
+                        .{ name, def.params.len, ap.args.len },
+                    );
                     return self.fail(
                         Error.TypeError,
                         "definition apply arity",
@@ -1580,7 +1955,7 @@ pub const Evaluator = struct {
                 }
                 var new_ctx = ctx;
                 for (def.params, 0..) |p, i| {
-                    new_ctx = new_ctx.extend(p, values[i]);
+                    new_ctx = try self.extend_context(new_ctx, p, values[i]);
                 }
                 return try self.eval_expr(def.body, new_ctx, s0, eval_pool, state_pool);
             }
@@ -1679,7 +2054,7 @@ pub const Evaluator = struct {
             const lambda_ctx: *Context = @ptrCast(@alignCast(lambda.ctx));
             var new_ctx = lambda_ctx.*;
             for (lambda.params, args) |param, arg| {
-                new_ctx = new_ctx.extend(param, arg);
+                new_ctx = try self.extend_context(new_ctx, param, arg);
             }
             return try self.eval_expr(body, new_ctx, s0, eval_pool, state_pool);
         }
@@ -1690,6 +2065,7 @@ pub const Evaluator = struct {
     }
 
     fn make_recursive_function(
+        self: Evaluator,
         def: ast.Definition,
         ctx: Context,
         eval_pool: *ValuePool,
@@ -1708,7 +2084,7 @@ pub const Evaluator = struct {
         const lam = try eval_pool.arena.alloc_object(value.Lambda);
         const ctx_ptr = try eval_pool.arena.alloc_object(Context);
         const func_val = Value{ .lambda_v = lam };
-        ctx_ptr.* = ctx.extend(def.name, func_val);
+        ctx_ptr.* = try self.extend_context(ctx, def.name, func_val);
         lam.* = value.Lambda{
             .params = params_copy,
             .body = @ptrCast(body),
@@ -1734,12 +2110,12 @@ pub const Evaluator = struct {
                 const lambda_ctx: *Context = @ptrCast(@alignCast(l.ctx));
                 var new_ctx = lambda_ctx.*;
                 if (l.params.len == 1) {
-                    new_ctx = new_ctx.extend(l.params[0], arg);
+                    new_ctx = try self.extend_context(new_ctx, l.params[0], arg);
                 } else {
                     if (arg != .tuple_v or arg.tuple_v.len != l.params.len) return Error.TypeError;
                     const items = arg.tuple_v.items(eval_pool);
                     for (l.params, 0..) |p, i| {
-                        new_ctx = new_ctx.extend(p, items[i]);
+                        new_ctx = try self.extend_context(new_ctx, p, items[i]);
                     }
                 }
                 return try self.eval_expr(body, new_ctx, s0, eval_pool, state_pool);
@@ -1785,6 +2161,8 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!Value {
+        const saved_context_count = self.context_pool.snapshot();
+        defer self.context_pool.restore(saved_context_count);
         if (idx >= q.vars.len) {
             return try self.eval_expr(q.body, ctx, s0, eval_pool, state_pool);
         }
@@ -1799,7 +2177,7 @@ pub const Evaluator = struct {
         while (item_index < item_count) : (item_index += 1) {
             assert(item_offset + item_index < eval_pool.value_count);
             const it = eval_pool.values[item_offset + item_index];
-            const new_ctx = ctx.extend(bv.name, it);
+            const new_ctx = try self.extend_context(ctx, bv.name, it);
             const result = try self.eval_quantifier_vars(q, idx + 1, new_ctx, s0, eval_pool, state_pool);
             if (result.is_truthy() != expected) {
                 return Value{ .bool_v = !expected };
@@ -1819,12 +2197,12 @@ pub const Evaluator = struct {
         var new_ctx = ctx;
         for (l.defs) |def| {
             const v = if (def.is_function)
-                try make_recursive_function(def, new_ctx, eval_pool)
+                try self.make_recursive_function(def, new_ctx, eval_pool)
             else if (def.params.len > 0)
                 try self.make_lambda(def, new_ctx, eval_pool)
             else
                 try self.eval_expr(def.body, new_ctx, s0, eval_pool, state_pool);
-            new_ctx = new_ctx.extend(def.name, v);
+            new_ctx = try self.extend_context(new_ctx, def.name, v);
         }
         return try self.eval_expr(l.body, new_ctx, s0, eval_pool, state_pool);
     }
@@ -1882,7 +2260,7 @@ pub const Evaluator = struct {
             const items = domain.set_v.items(eval_pool);
             var chosen: ?Value = null;
             for (items) |it| {
-                const new_ctx = ctx.extend(c.var_name, it);
+                const new_ctx = try self.extend_context(ctx, c.var_name, it);
                 const pred = try self.eval_expr(c.body, new_ctx, s0, eval_pool, state_pool);
                 if (pred.is_truthy()) {
                     if (chosen == null) {
@@ -1905,7 +2283,7 @@ pub const Evaluator = struct {
             defer std.heap.page_allocator.free(name);
             const id = try self.models.intern(name);
             const candidate = Value{ .model_v = id };
-            const new_ctx = ctx.extend(c.var_name, candidate);
+            const new_ctx = try self.extend_context(ctx, c.var_name, candidate);
             const pred = try self.eval_expr(c.body, new_ctx, s0, eval_pool, state_pool);
             if (pred.is_truthy()) return candidate;
         }
@@ -1943,13 +2321,13 @@ pub const Evaluator = struct {
             .index => |idx_expr| {
                 const key = try self.eval_expr(idx_expr, ctx, s0, eval_pool, state_pool);
                 const old_value = try self.except_lookup_index(original, key, eval_pool);
-                const new_ctx = ctx.extend("@", old_value);
+                const new_ctx = try self.extend_context(ctx, "@", old_value);
                 const new_value = try self.except_steps(old_value, steps, idx + 1, value_expr, new_ctx, s0, eval_pool, state_pool);
                 return try self.except_update_index(original, key, new_value, eval_pool);
             },
             .field => |field| {
                 const old_value = try self.except_lookup_field(original, field, eval_pool);
-                const new_ctx = ctx.extend("@", old_value);
+                const new_ctx = try self.extend_context(ctx, "@", old_value);
                 const new_value = try self.except_steps(old_value, steps, idx + 1, value_expr, new_ctx, s0, eval_pool, state_pool);
                 return try self.except_update_field(original, field, new_value, eval_pool);
             },
@@ -1960,11 +2338,36 @@ pub const Evaluator = struct {
         switch (original) {
             .function_v => |f| return f.apply(eval_pool, key) orelse self.fail(Error.IndexOutOfBounds, "except lookup function", @tagName(key)),
             .tuple_v => |t| {
-                const i = (key.as_int() orelse return Error.TypeError) - 1;
+                const i = (key.as_int() orelse
+                    return self.fail(
+                        Error.TypeError,
+                        "except tuple index",
+                        @tagName(key),
+                    )) - 1;
                 if (i < 0 or i >= t.len) return self.fail(Error.IndexOutOfBounds, "except lookup tuple", @tagName(key));
                 return t.items(eval_pool)[@intCast(i)];
             },
-            else => return Error.TypeError,
+            .record_v => |record| {
+                if (key != .string_v) {
+                    return self.fail(
+                        Error.TypeError,
+                        "except record index",
+                        @tagName(key),
+                    );
+                }
+                const field = key.string_v.slice(eval_pool);
+                return record.lookup(eval_pool, field) orelse
+                    self.fail(
+                        Error.UndefinedSymbol,
+                        "except record index",
+                        field,
+                    );
+            },
+            else => return self.fail(
+                Error.TypeError,
+                "except index lookup",
+                @tagName(original),
+            ),
         }
     }
 
@@ -1984,7 +2387,12 @@ pub const Evaluator = struct {
                 } };
             },
             .tuple_v => |t| {
-                const i = (key.as_int() orelse return Error.TypeError) - 1;
+                const i = (key.as_int() orelse
+                    return self.fail(
+                        Error.TypeError,
+                        "except tuple index",
+                        @tagName(key),
+                    )) - 1;
                 if (i < 0 or i >= t.len) return self.fail(Error.IndexOutOfBounds, "except update tuple", @tagName(key));
                 const items = t.items(eval_pool);
                 const dest = try eval_pool.alloc_values(@intCast(items.len));
@@ -1992,19 +2400,48 @@ pub const Evaluator = struct {
                 dest[@intCast(i)] = new_value;
                 return Value{ .tuple_v = make_tuple(eval_pool, dest) };
             },
-            else => return Error.TypeError,
+            .record_v => {
+                if (key != .string_v) {
+                    return self.fail(
+                        Error.TypeError,
+                        "except record index",
+                        @tagName(key),
+                    );
+                }
+                return try self.except_update_field(
+                    original,
+                    key.string_v.slice(eval_pool),
+                    new_value,
+                    eval_pool,
+                );
+            },
+            else => return self.fail(
+                Error.TypeError,
+                "except index update",
+                @tagName(original),
+            ),
         }
     }
 
     fn except_lookup_field(self: Evaluator, original: Value, field: []const u8, eval_pool: *ValuePool) Error!Value {
-        _ = self;
-        if (original != .record_v) return Error.TypeError;
+        if (original != .record_v) {
+            return self.fail(
+                Error.TypeError,
+                "except field lookup",
+                @tagName(original),
+            );
+        }
         return original.record_v.lookup(eval_pool, field) orelse Error.UndefinedSymbol;
     }
 
     fn except_update_field(self: Evaluator, original: Value, field: []const u8, new_value: Value, eval_pool: *ValuePool) Error!Value {
-        _ = self;
-        if (original != .record_v) return Error.TypeError;
+        if (original != .record_v) {
+            return self.fail(
+                Error.TypeError,
+                "except field update",
+                @tagName(original),
+            );
+        }
         const fs = original.record_v.fields(eval_pool);
         const dest = try eval_pool.alloc_values(@intCast(fs.len));
         @memcpy(dest, fs);
@@ -2021,14 +2458,14 @@ pub const Evaluator = struct {
 
     pub fn find_variable(self: Evaluator, name: []const u8) ?u32 {
         for (self.module.variables, 0..) |v, i| {
-            if (std.mem.eql(u8, v, name)) return @intCast(i);
+            if (name_eql(v, name)) return @intCast(i);
         }
         return null;
     }
 
     pub fn find_definition(self: Evaluator, name: []const u8) ?ast.Definition {
         for (self.module.definitions) |d| {
-            if (std.mem.eql(u8, d.name, name)) return d;
+            if (name_eql(d.name, name)) return d;
         }
         return null;
     }
@@ -2047,6 +2484,12 @@ pub const Evaluator = struct {
         return select_subexpression(base, selector);
     }
 };
+
+inline fn name_eql(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    if (left.ptr == right.ptr) return true;
+    return std.mem.eql(u8, left, right);
+}
 
 fn select_subexpression(expr: *ast.Expr, selector: usize) ?*ast.Expr {
     if (expr.* != .binary) return if (selector == 1) expr else null;
@@ -2300,8 +2743,14 @@ fn eval_subset(eval_pool: *ValuePool, operand: Value) Error!Value {
 }
 
 fn make_set(eval_pool: *ValuePool, values: []Value) value.Set {
-    var hashes: [4096]fingerprint.Fingerprint = undefined;
+    var hashes: [65_536]fingerprint.Fingerprint = undefined;
     const use_hashes = values.len <= hashes.len;
+    var table: [131_072]u32 = undefined;
+    var table_len: usize = 1;
+    while (table_len < values.len * 2) table_len *= 2;
+    const use_table = use_hashes and values.len >= 32;
+    if (use_table) @memset(table[0..table_len], 0);
+
     var unique_len: u32 = 0;
     for (values) |candidate| {
         const candidate_hash = if (use_hashes)
@@ -2313,16 +2762,42 @@ fn make_set(eval_pool: *ValuePool, values: []Value) value.Set {
         else
             0;
         var duplicate = false;
-        for (values[0..unique_len], 0..) |existing, i| {
-            if (use_hashes and hashes[i] != candidate_hash) continue;
-            if (existing.eql(candidate, eval_pool)) {
-                duplicate = true;
-                break;
+        var insert_slot: usize = 0;
+        if (use_table) {
+            insert_slot = @as(usize, @truncate(candidate_hash)) &
+                (table_len - 1);
+            while (table[insert_slot] != 0) {
+                const existing_index = table[insert_slot] - 1;
+                if (hashes[existing_index] == candidate_hash) {
+                    if (builtin.mode == .ReleaseFast or
+                        values[existing_index].eql(candidate, eval_pool))
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                insert_slot = (insert_slot + 1) & (table_len - 1);
+            }
+        } else {
+            for (values[0..unique_len], 0..) |existing, i| {
+                if (use_hashes and hashes[i] != candidate_hash) continue;
+                if (use_hashes and builtin.mode == .ReleaseFast) {
+                    // TLC also uses 64-bit fingerprints as its identity boundary.
+                    // Debug and safe builds retain structural verification so a
+                    // collision is observable during development.
+                    duplicate = true;
+                    break;
+                }
+                if (existing.eql(candidate, eval_pool)) {
+                    duplicate = true;
+                    break;
+                }
             }
         }
         if (!duplicate) {
             values[unique_len] = candidate;
             if (use_hashes) hashes[unique_len] = candidate_hash;
+            if (use_table) table[insert_slot] = unique_len + 1;
             unique_len += 1;
         }
     }
@@ -2356,6 +2831,131 @@ fn value_offset(eval_pool: *const ValuePool, ptr: [*]Value) u32 {
     const offset: u32 = @intCast(bytes / @sizeOf(Value));
     assert(offset <= eval_pool.value_count);
     return offset;
+}
+
+fn collect_application_groups(
+    application: *ast.Apply,
+    root_name: *[]const u8,
+    groups: []ApplicationGroup,
+    group_count: *u8,
+) bool {
+    switch (application.func.*) {
+        .ident => |name| root_name.* = name,
+        .apply => |parent| {
+            if (!collect_application_groups(
+                parent,
+                root_name,
+                groups,
+                group_count,
+            )) return false;
+        },
+        else => return false,
+    }
+    if (group_count.* >= groups.len) return false;
+    groups[group_count.*] = .{ .args = application.args };
+    group_count.* += 1;
+    return true;
+}
+
+fn apply_cross_pool(
+    evaluator: Evaluator,
+    function: Value,
+    function_pool: *const ValuePool,
+    key: Value,
+    key_pool: *const ValuePool,
+) Error!Value {
+    return switch (function) {
+        .function_v => |function_v| blk: {
+            const keys = function_v.domain.items(function_pool);
+            const entries = function_v.entries(function_pool);
+            for (keys, entries) |candidate, entry| {
+                if (cross_pool_eql(
+                    candidate,
+                    function_pool,
+                    key,
+                    key_pool,
+                )) break :blk entry;
+            }
+            return evaluator.fail(
+                Error.IndexOutOfBounds,
+                "state function application",
+                @tagName(key),
+            );
+        },
+        .tuple_v => |tuple| blk: {
+            const index = (key.as_int() orelse
+                return evaluator.fail(
+                    Error.TypeError,
+                    "state tuple application",
+                    @tagName(key),
+                )) - 1;
+            if (index < 0 or index >= tuple.len) {
+                return evaluator.fail(
+                    Error.IndexOutOfBounds,
+                    "state tuple application",
+                    @tagName(key),
+                );
+            }
+            break :blk tuple.items(function_pool)[@intCast(index)];
+        },
+        .record_v => |record| blk: {
+            if (key != .string_v) {
+                return evaluator.fail(
+                    Error.TypeError,
+                    "state record application",
+                    @tagName(key),
+                );
+            }
+            const name = key.string_v.slice(key_pool);
+            break :blk record.lookup(function_pool, name) orelse
+                return evaluator.fail(
+                    Error.UndefinedSymbol,
+                    "state record application",
+                    name,
+                );
+        },
+        else => evaluator.fail(
+            Error.TypeError,
+            "state application",
+            @tagName(function),
+        ),
+    };
+}
+
+fn cross_pool_eql(
+    left: Value,
+    left_pool: *const ValuePool,
+    right: Value,
+    right_pool: *const ValuePool,
+) bool {
+    if (left.tag() != right.tag()) return false;
+    return switch (left) {
+        .bool_v => |value_v| value_v == right.bool_v,
+        .int_v => |value_v| value_v == right.int_v,
+        .model_v => |value_v| value_v == right.model_v,
+        .string_v => |value_v| std.mem.eql(
+            u8,
+            value_v.slice(left_pool),
+            right.string_v.slice(right_pool),
+        ),
+        .tuple_v => |tuple| blk: {
+            const right_tuple = right.tuple_v;
+            if (tuple.len != right_tuple.len) break :blk false;
+            for (
+                tuple.items(left_pool),
+                right_tuple.items(right_pool),
+            ) |left_item, right_item| {
+                if (!cross_pool_eql(
+                    left_item,
+                    left_pool,
+                    right_item,
+                    right_pool,
+                )) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
 }
 
 /// Try to evaluate an expression to a symbolic set value without materializing
@@ -2557,9 +3157,9 @@ fn eval_symbolic_set(
                 for (ap.args, 0..) |arg, i| {
                     values[i] = try self.eval_expr(arg, ctx, s0, eval_pool, state_pool);
                 }
-                var new_ctx = Context{ .names = undefined, .values = undefined, .len = 0 };
+                var new_ctx = Context.empty();
                 for (def.params, 0..) |p, i| {
-                    new_ctx = new_ctx.extend(p, values[i]);
+                    new_ctx = try self.extend_context(new_ctx, p, values[i]);
                 }
                 return try eval_symbolic_set(self, def.body, new_ctx, s0, eval_pool, state_pool);
             }

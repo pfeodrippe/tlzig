@@ -17,11 +17,13 @@ pub const StateStore = struct {
     pub const State = struct {
         level: u32,
         pred: u32,
+        changed_mask: u64,
         values: []Value,
     };
 
     pub fn init(arena: *Arena, variable_names: []const []const u8, max_states: u32, value_cap: u32, string_cap: u32) !StateStore {
         const states = try arena.alloc(State, max_states);
+        assert(variable_names.len <= 64);
         const values_count = std.math.mul(
             u64,
             max_states,
@@ -53,6 +55,7 @@ pub const StateStore = struct {
         self.states[idx] = .{
             .level = 0,
             .pred = 0,
+            .changed_mask = 0,
             .values = self.state_values[values_start..][0..variable_count],
         };
         self.count += 1;

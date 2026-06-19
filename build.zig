@@ -48,6 +48,13 @@ pub fn build(b: *std.Build) void {
 
     const run_bench = b.addRunArtifact(bench);
     run_bench.step.dependOn(b.getInstallStep());
+    if (b.option(
+        []const u8,
+        "benchmark-filter",
+        "Run only benchmark specs whose path contains this substring",
+    )) |filter| {
+        run_bench.addArg(filter);
+    }
     b.step("benchmark", "Benchmark tlzig vs Java TLC").dependOn(&run_bench.step);
 
     const harness = b.addExecutable(.{

@@ -249,6 +249,18 @@ pub const ModuleLoader = struct {
         return ptr;
     }
 
+    fn expr_apply(
+        self: ModuleLoader,
+        func: *ast.Expr,
+        args: []const *ast.Expr,
+    ) !*ast.Expr {
+        const application = try self.arena.alloc_object(ast.Apply);
+        application.* = .{ .func = func, .args = args };
+        const ptr = try self.arena.alloc_object(ast.Expr);
+        ptr.* = .{ .apply = application };
+        return ptr;
+    }
+
     fn load_instances(self: ModuleLoader, module: *ast.Module, dir: []const u8, loaded: *std.ArrayList([]const u8)) !void {
         for (module.instances) |inst| {
             if (self.already_loaded(loaded.items, inst.module_name)) continue;
@@ -298,14 +310,24 @@ pub const ModuleLoader = struct {
         var def_count: usize = module.definitions.len;
         for (module.namespace_instances, 0..) |ns, i| {
             const child = child_modules[i];
-            const internal_subs = try self.build_internal_namespace_subs(ns.alias, child.definitions);
+            const internal_subs = try self.build_internal_namespace_subs(
+                ns.alias,
+                ns.params,
+                child.definitions,
+            );
             for (child.definitions) |def| {
                 const qualified = try self.arena_concat(ns.alias, "!", def.name);
                 const effective_subs = try self.concat_subs(ns.substitutions, internal_subs);
                 const new_body = try copy_expr(self.arena, def.body, effective_subs);
+                const params = try self.arena.alloc(
+                    []const u8,
+                    ns.params.len + def.params.len,
+                );
+                @memcpy(params[0..ns.params.len], ns.params);
+                @memcpy(params[ns.params.len..], def.params);
                 merged[def_count] = ast.Definition{
                     .name = qualified,
-                    .params = def.params,
+                    .params = params,
                     .body = new_body,
                     .is_function = def.is_function,
                     .function_var = def.function_var,
@@ -319,12 +341,24 @@ pub const ModuleLoader = struct {
         module.definitions = merged[0..def_count];
     }
 
-    fn build_internal_namespace_subs(self: ModuleLoader, alias: []const u8, defs: []const ast.Definition) ![]const ast.Substitution {
+    fn build_internal_namespace_subs(
+        self: ModuleLoader,
+        alias: []const u8,
+        namespace_params: []const []const u8,
+        defs: []const ast.Definition,
+    ) ![]const ast.Substitution {
         if (defs.len == 0) return &[_]ast.Substitution{};
         const result = try self.arena.alloc(ast.Substitution, defs.len);
         for (defs, 0..) |def, i| {
             const qualified = try self.arena_concat(alias, "!", def.name);
-            const expr = try self.expr_ident(qualified);
+            var expr = try self.expr_ident(qualified);
+            if (namespace_params.len > 0) {
+                const args = try self.arena.alloc(*ast.Expr, namespace_params.len);
+                for (namespace_params, 0..) |param, arg_index| {
+                    args[arg_index] = try self.expr_ident(param);
+                }
+                expr = try self.expr_apply(expr, args);
+            }
             result[i] = ast.Substitution{ .local_name = def.name, .expr = expr };
         }
         return result;
@@ -536,6 +570,11 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
             return ptr;
         },
         .unchanged => |names| {
+            if (names.len == 0) {
+                const ptr = try arena.alloc_object(ast.Expr);
+                ptr.* = .{ .bool_literal = true };
+                return ptr;
+            }
             var result: ?*ast.Expr = null;
             for (names) |name| {
                 const item = try arena.alloc_object(ast.Expr);
@@ -567,7 +606,8 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
                     result = item;
                 }
             }
-            return result orelse error.SyntaxError;
+            assert(result != null);
+            return result.?;
         },
         .unchanged_expr => |operand| {
             const ptr = try arena.alloc_object(ast.Expr);
@@ -612,6 +652,34 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
             return ptr;
         },
         .apply => |ap| {
+            if (ap.func.* == .ident) {
+                if (find_substitution(subs, ap.func.ident)) |sub_expr| {
+                    const copied_func = try copy_expr(
+                        arena,
+                        sub_expr,
+                        &[_]ast.Substitution{},
+                    );
+                    if (copied_func.* == .apply) {
+                        const prefix = copied_func.apply;
+                        const combined_args = try arena.alloc(
+                            *ast.Expr,
+                            prefix.args.len + ap.args.len,
+                        );
+                        @memcpy(combined_args[0..prefix.args.len], prefix.args);
+                        for (ap.args, prefix.args.len..) |arg, i| {
+                            combined_args[i] = try copy_expr(arena, arg, subs);
+                        }
+                        const combined = try arena.alloc_object(ast.Apply);
+                        combined.* = .{
+                            .func = prefix.func,
+                            .args = combined_args,
+                        };
+                        const ptr = try arena.alloc_object(ast.Expr);
+                        ptr.* = .{ .apply = combined };
+                        return ptr;
+                    }
+                }
+            }
             const app = try arena.alloc_object(ast.Apply);
             const args: []const *ast.Expr = if (ap.args.len == 0) &[_]*ast.Expr{} else blk: {
                 const c = try arena.alloc(*ast.Expr, ap.args.len);

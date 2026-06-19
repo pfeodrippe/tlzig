@@ -95,7 +95,10 @@ pub const RecordSet = extern struct {
         var i: u32 = 0;
         while (i < self.len) : (i += 1) {
             const name = try self.field_name(source, i).clone(source, target);
-            const dom = try self.field_domain(source, i).clone(source, target);
+            const dom = try self.field_domain(source, i).clone_assume_capacity(
+                source,
+                target,
+            );
             dest[i * 2] = Value{ .string_v = name };
             dest[i * 2 + 1] = dom;
         }
@@ -155,7 +158,7 @@ pub const TupleSet = extern struct {
         const src = self.sets(source);
         const dest = try target.alloc_values(self.len);
         for (src, 0..) |v, i| {
-            dest[i] = try v.clone(source, target);
+            dest[i] = try v.clone_assume_capacity(source, target);
         }
         const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
         return TupleSet{ .offset = offset, .len = self.len };
@@ -341,7 +344,19 @@ pub const Value = union(ValueTag) {
         assert(source.value_count <= source.value_cap);
         assert(source.string_count <= source.string_cap);
         assert(target.string_count <= target.string_cap);
-        try target.ensure_value_capacity(self.clone_value_count(source));
+        if (source == target) {
+            try target.ensure_value_capacity(self.clone_value_count(source));
+        }
+        return self.clone_assume_capacity(source, target);
+    }
+
+    fn clone_assume_capacity(
+        self: Value,
+        source: *const ValuePool,
+        target: *ValuePool,
+    ) error{ OutOfMemory, NotImplemented }!Value {
+        assert(source.value_count <= source.value_cap);
+        assert(target.value_count <= target.value_cap);
         return switch (self) {
             .bool_v => |b| Value{ .bool_v = b },
             .int_v => |i| Value{ .int_v = i },
@@ -354,39 +369,39 @@ pub const Value = union(ValueTag) {
             .lambda_v => |l| Value{ .lambda_v = l },
             .function_set_v => |fs| Value{
                 .function_set_v = .{
-                    .domain_offset = try target.push_value(try fs.domain(source).clone(source, target)),
-                    .codomain_offset = try target.push_value(try fs.codomain(source).clone(source, target)),
+                    .domain_offset = try target.push_value(try fs.domain(source).clone_assume_capacity(source, target)),
+                    .codomain_offset = try target.push_value(try fs.codomain(source).clone_assume_capacity(source, target)),
                 },
             },
             .record_set_v => |rs| Value{ .record_set_v = try rs.clone(source, target) },
             .tuple_set_v => |ts| Value{ .tuple_set_v = try ts.clone(source, target) },
-            .union_v => |u| Value{ .union_v = .{ .set_offset = try target.push_value(try u.set(source).clone(source, target)) } },
+            .union_v => |u| Value{ .union_v = .{ .set_offset = try target.push_value(try u.set(source).clone_assume_capacity(source, target)) } },
             .cup_v => |bs| Value{
                 .cup_v = .{
-                    .left_offset = try target.push_value(try bs.left(source).clone(source, target)),
-                    .right_offset = try target.push_value(try bs.right(source).clone(source, target)),
+                    .left_offset = try target.push_value(try bs.left(source).clone_assume_capacity(source, target)),
+                    .right_offset = try target.push_value(try bs.right(source).clone_assume_capacity(source, target)),
                 },
             },
             .cap_v => |bs| Value{
                 .cap_v = .{
-                    .left_offset = try target.push_value(try bs.left(source).clone(source, target)),
-                    .right_offset = try target.push_value(try bs.right(source).clone(source, target)),
+                    .left_offset = try target.push_value(try bs.left(source).clone_assume_capacity(source, target)),
+                    .right_offset = try target.push_value(try bs.right(source).clone_assume_capacity(source, target)),
                 },
             },
             .diff_v => |bs| Value{
                 .diff_v = .{
-                    .left_offset = try target.push_value(try bs.left(source).clone(source, target)),
-                    .right_offset = try target.push_value(try bs.right(source).clone(source, target)),
+                    .left_offset = try target.push_value(try bs.left(source).clone_assume_capacity(source, target)),
+                    .right_offset = try target.push_value(try bs.right(source).clone_assume_capacity(source, target)),
                 },
             },
             .range_v => |r| Value{ .range_v = r },
             .seq_set_v => |ss| Value{ .seq_set_v = .{
                 .element_set_offset = try target.push_value(
-                    try ss.element_set(source).clone(source, target),
+                    try ss.element_set(source).clone_assume_capacity(source, target),
                 ),
             } },
             .power_set_v => |ps| Value{ .power_set_v = .{
-                .set_offset = try target.push_value(try ps.set(source).clone(source, target)),
+                .set_offset = try target.push_value(try ps.set(source).clone_assume_capacity(source, target)),
             } },
         };
     }
@@ -636,7 +651,7 @@ pub const Set = extern struct {
         const dest = try target.alloc_values(@intCast(src_items.len));
         assert(dest.len == src_items.len);
         for (src_items, 0..) |it, i| {
-            dest[i] = try it.clone(source, target);
+            dest[i] = try it.clone_assume_capacity(source, target);
         }
         const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
         assert(offset + dest.len <= target.value_cap);
@@ -685,7 +700,7 @@ pub const Function = extern struct {
         const dest = try target.alloc_values(@intCast(vals.len));
         assert(dest.len == vals.len);
         for (vals, 0..) |v, i| {
-            dest[i] = try v.clone(source, target);
+            dest[i] = try v.clone_assume_capacity(source, target);
         }
         const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
         assert(offset + dest.len <= target.value_cap);
@@ -722,7 +737,7 @@ pub const Tuple = extern struct {
         const dest = try target.alloc_values(@intCast(src_items.len));
         assert(dest.len == src_items.len);
         for (src_items, 0..) |it, i| {
-            dest[i] = try it.clone(source, target);
+            dest[i] = try it.clone_assume_capacity(source, target);
         }
         const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
         assert(offset + dest.len <= target.value_cap);
@@ -772,7 +787,7 @@ pub const Record = extern struct {
         const dest = try target.alloc_values(@intCast(fs.len));
         assert(dest.len == fs.len);
         for (fs, 0..) |v, i| {
-            dest[i] = try v.clone(source, target);
+            dest[i] = try v.clone_assume_capacity(source, target);
         }
         const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
         assert(offset + dest.len <= target.value_cap);

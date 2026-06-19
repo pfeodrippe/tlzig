@@ -697,11 +697,17 @@ pub const Parser = struct {
                     try assumptions.append(std.heap.page_allocator, assumption.body);
                 } else {
                     // ASSUME can have labels (e.g. ASSUME Theorem!: body).
-                    // Skip label if present.
+                    // A namespace call has the same `Ident!` prefix, so only
+                    // consume the prefix when it is followed by a colon.
                     if (self.current.kind == .ident and self.next.kind == .bang) {
+                        const before_label = self.*;
                         self.advance(); // ident
                         self.advance(); // !
-                        if (self.current.kind == .colon) self.advance(); // :
+                        if (self.current.kind == .colon) {
+                            self.advance(); // :
+                        } else {
+                            self.* = before_label;
+                        }
                     }
                     const assumption = self.parse_expr() catch {
                         self.skip_to_next_definition();
@@ -759,22 +765,14 @@ pub const Parser = struct {
                 try definitions.append(std.heap.page_allocator, def);
                 continue;
             }
-            if (self.current.kind == .ident and self.next.kind == .defeq) {
-                const alias = self.current.text;
-                self.advance(); // alias
-                self.advance(); // ==
-                if (self.current.kind == .keyword_instance) {
-                    const inst = try self.parse_instance();
-                    try namespace_instances.append(std.heap.page_allocator, ast.NamespaceInstance{
-                        .alias = try self.dup(alias),
-                        .module_name = inst.module_name,
-                        .substitutions = inst.substitutions,
-                    });
-                    continue;
-                }
-                // Not an instance alias; rewind and parse as normal definition.
-                self.* = saved;
+            if (try self.try_parse_namespace_instance()) |namespace_instance| {
+                try namespace_instances.append(
+                    std.heap.page_allocator,
+                    namespace_instance,
+                );
+                continue;
             }
+            self.* = saved;
             const def = self.parse_definition() catch {
                 self.* = saved;
                 self.skip_to_next_definition();
@@ -810,6 +808,49 @@ pub const Parser = struct {
             .init_name = init_name,
             .next_name = next_name,
             .invariants = try self.dup_slice([]const u8, invariants.items),
+        };
+    }
+
+    fn try_parse_namespace_instance(
+        self: *Parser,
+    ) !?ast.NamespaceInstance {
+        const saved = self.*;
+        errdefer self.* = saved;
+        const alias = self.expect_ident_text() catch {
+            self.* = saved;
+            return null;
+        };
+        var params = std.ArrayList([]const u8).empty;
+        defer params.deinit(std.heap.page_allocator);
+        if (self.match(.lparen)) {
+            if (self.current.kind != .rparen) {
+                while (true) {
+                    const param = self.expect_ident_text() catch {
+                        self.* = saved;
+                        return null;
+                    };
+                    try params.append(
+                        std.heap.page_allocator,
+                        try self.dup(param),
+                    );
+                    if (!self.match(.comma)) break;
+                }
+            }
+            if (!self.match(.rparen)) {
+                self.* = saved;
+                return null;
+            }
+        }
+        if (!self.match(.defeq) or self.current.kind != .keyword_instance) {
+            self.* = saved;
+            return null;
+        }
+        const instance = try self.parse_instance();
+        return ast.NamespaceInstance{
+            .alias = try self.dup(alias),
+            .params = try self.dup_slice([]const u8, params.items),
+            .module_name = instance.module_name,
+            .substitutions = instance.substitutions,
         };
     }
 
@@ -1573,7 +1614,25 @@ pub const Parser = struct {
         while (true) {
             if (self.match(.lparen)) {
                 const args = try self.parse_expr_list(.rparen);
-                result = try self.expr_apply(result, args);
+                if (result.* == .apply and
+                    result.apply.func.* == .ident and
+                    std.mem.indexOfScalar(
+                        u8,
+                        result.apply.func.ident,
+                        '!',
+                    ) != null)
+                {
+                    const prefix = result.apply;
+                    const combined = try self.arena.alloc(
+                        *ast.Expr,
+                        prefix.args.len + args.len,
+                    );
+                    @memcpy(combined[0..prefix.args.len], prefix.args);
+                    @memcpy(combined[prefix.args.len..], args);
+                    result = try self.expr_apply(prefix.func, combined);
+                } else {
+                    result = try self.expr_apply(result, args);
+                }
                 continue;
             }
             // Only treat `[...]` as a function/sequence application if it is
@@ -1587,6 +1646,20 @@ pub const Parser = struct {
             if (self.match(.dot)) {
                 const field = try self.expect_ident_text();
                 result = try self.expr_field(result, field);
+                continue;
+            }
+            if (self.match(.bang)) {
+                const selector = try self.expect_ident_text();
+                if (result.* != .apply or result.apply.func.* != .ident) {
+                    return error.SyntaxError;
+                }
+                const qualified = try self.arena_concat_three(
+                    result.apply.func.ident,
+                    "!",
+                    selector,
+                );
+                const func = try self.expr_ident(qualified);
+                result = try self.expr_apply(func, result.apply.args);
                 continue;
             }
             // Primed suffix: f[x]' means (f[x])' which equals f'[x].
@@ -2047,6 +2120,7 @@ pub const Parser = struct {
                     std.debug.assert(self.hoisted_namespace_count < self.hoisted_namespace_instances.len);
                     self.hoisted_namespace_instances[self.hoisted_namespace_count] = .{
                         .alias = try self.dup(alias),
+                        .params = &.{},
                         .module_name = instance.module_name,
                         .substitutions = instance.substitutions,
                     };
@@ -2124,6 +2198,9 @@ pub const Parser = struct {
             return try self.expr_unchanged_expr(try self.parse_primary());
         }
         if (self.match(.langle)) {
+            if (self.match(.rangle)) {
+                return try self.expr_unchanged(&[_][]const u8{});
+            }
             var vars = std.ArrayList([]const u8).empty;
             defer vars.deinit(std.heap.page_allocator);
             while (true) {

@@ -5,6 +5,7 @@ const checker = tlzig.checker;
 const config = tlzig.config;
 const ModuleLoader = tlzig.ModuleLoader;
 const overrides = tlzig.overrides;
+const generated_model = @import("generated_model");
 
 const Spec = struct {
     label: ?[]const u8 = null,
@@ -153,10 +154,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         "/tmp/tla2tools.jar:" ++
         "vendor/tlaplus/tlatools/org.lamport.tlatools/lib/CommunityModules.jar";
 
-    std.debug.print("{s:32} {s:>10} {s:>10} {s:>10} {s:>10} {s:>18}\n", .{
-        "SPEC", "TLC-1", "TLC-auto", "tlzig-1", "tlzig-auto", "generated/distinct",
+    std.debug.print("{s:32} {s:>10} {s:>10} {s:>10} {s:>10} {s:>18} {s:>18}\n", .{
+        "SPEC", "TLC-1", "TLC-auto", "tlzig-1", "tlzig-auto", "TLC states", "tlzig states",
     });
-    std.debug.print("----------------------------------------------------------------------------------------\n", .{});
+    std.debug.print("-----------------------------------------------------------------------------------------------------------\n", .{});
 
     var failures: u32 = 0;
     for (specs) |spec| {
@@ -196,7 +197,7 @@ fn run_comparison(allocator: std.mem.Allocator, io: std.Io, java_cp: []const u8,
     defer tlc_auto.deinit(allocator);
 
     const basename = spec.label orelse std.fs.path.basename(spec.tla);
-    std.debug.print("{s:32} {d:>10.3} {d:>10.3} {d:>10.3} {d:>10.3} {d:>9}/{d:<8}\n", .{
+    std.debug.print("{s:32} {d:>10.3} {d:>10.3} {d:>10.3} {d:>10.3} {d:>9}/{d:<8} {d:>9}/{d:<8}\n", .{
         basename,
         seconds(tlc_one.elapsed_ms),
         seconds(tlc_auto.elapsed_ms),
@@ -204,6 +205,8 @@ fn run_comparison(allocator: std.mem.Allocator, io: std.Io, java_cp: []const u8,
         seconds(tlzig_auto.elapsed_ms),
         tlc_one.generated,
         tlc_one.distinct,
+        tlzig_one.generated,
+        tlzig_one.distinct,
     });
 
     const mismatch = tlc_one.outcome != tlzig_one.outcome or
@@ -323,7 +326,11 @@ fn run_tlzig_internal(
         64_000_000,
     ));
 
-    var ch = checker.Checker.init(
+    const generated = if (generated_matches(module.name, cfg))
+        &generated_model.operators
+    else
+        &.{};
+    var ch = checker.Checker.init_generated(
         &arena,
         module,
         cfg,
@@ -335,6 +342,7 @@ fn run_tlzig_internal(
         16 * 1024 * 1024,
         override_ctx,
         worker_count,
+        generated,
     ) catch |err| {
         std.debug.print("failed to initialize checker for {s}: {any}\n", .{ spec.tla, err });
         return error.CheckFailed;
@@ -375,6 +383,39 @@ fn run_tlzig_internal(
         .outcome = .completed,
         .output = output,
     };
+}
+
+fn generated_matches(module_name: []const u8, cfg: config.Config) bool {
+    if (generated_model.generated_count == 0 or
+        !std.mem.eql(u8, generated_model.module_name, module_name))
+    {
+        return false;
+    }
+    if (!generated_root_covered(cfg.spec_name)) return false;
+    if (!generated_root_covered(cfg.init_name)) return false;
+    if (!generated_root_covered(cfg.next_name)) return false;
+    if (!generated_root_covered(cfg.symmetry_name)) return false;
+    for (cfg.invariants) |name| {
+        if (!generated_root_covered(name)) return false;
+    }
+    for (cfg.properties) |name| {
+        if (!generated_root_covered(name)) return false;
+    }
+    for (cfg.constraints) |name| {
+        if (!generated_root_covered(name)) return false;
+    }
+    for (cfg.action_constraints) |name| {
+        if (!generated_root_covered(name)) return false;
+    }
+    return true;
+}
+
+fn generated_root_covered(optional_name: ?[]const u8) bool {
+    const name = optional_name orelse return true;
+    for (generated_model.root_names) |root| {
+        if (std.mem.eql(u8, root, name)) return true;
+    }
+    return false;
 }
 
 fn run_tlc(

@@ -14,11 +14,9 @@ const StateStore = state.StateStore;
 const Error = @import("err.zig").Error;
 const ModelTable = value.ModelTable;
 const overrides = @import("overrides.zig");
+const generated_runtime = @import("generated_runtime.zig");
 
-pub const Constant = struct {
-    name: []const u8,
-    value: Value,
-};
+pub const Constant = generated_runtime.NamedValue;
 
 pub const Context = struct {
     head: ?*const ContextBinding,
@@ -178,6 +176,7 @@ const DefinitionMemo = struct {
 pub const Evaluator = struct {
     module: ast.Module,
     constants: []const Constant,
+    constant_slots: []?Value,
     aliases: []const Alias,
     models: *ModelTable,
     override_registry: overrides.Registry,
@@ -190,6 +189,15 @@ pub const Evaluator = struct {
     err_ctx: *ErrorContext,
 
     pub fn init(module: ast.Module, arena: *Arena, override_ctx: overrides.OverrideContext) !Evaluator {
+        return init_generated(module, arena, override_ctx, &.{});
+    }
+
+    pub fn init_generated(
+        module: ast.Module,
+        arena: *Arena,
+        override_ctx: overrides.OverrideContext,
+        generated: []const generated_runtime.Operator,
+    ) !Evaluator {
         const models = try arena.alloc_object(ModelTable);
         models.* = try ModelTable.init(arena, 1024);
         const err_ctx = try arena.alloc_object(ErrorContext);
@@ -198,12 +206,17 @@ pub const Evaluator = struct {
         definition_memo.* = .{};
         const context_pool = try arena.alloc_object(ContextPool);
         context_pool.* = try ContextPool.init(arena);
+        const constant_slots = try arena.alloc(?Value, module.constants.len);
+        @memset(constant_slots, null);
+        var override_registry = overrides.default_registry(override_ctx);
+        override_registry.generated = generated;
         return Evaluator{
             .module = module,
             .constants = &[_]Constant{},
+            .constant_slots = constant_slots,
             .aliases = &[_]Alias{},
             .models = models,
-            .override_registry = overrides.default_registry(override_ctx),
+            .override_registry = override_registry,
             .treat_unknown_as_model = false,
             .next_state = null,
             .enabled_result = null,
@@ -224,11 +237,17 @@ pub const Evaluator = struct {
         definition_memo.* = .{};
         const context_pool = try arena.alloc_object(ContextPool);
         context_pool.* = try ContextPool.init(arena);
+        const constant_slots = try arena.alloc(
+            ?Value,
+            self.module.constants.len,
+        );
+        @memset(constant_slots, null);
         var copy = self;
         copy.next_state = null;
         copy.enabled_result = null;
         copy.definition_memo = definition_memo;
         copy.context_pool = context_pool;
+        copy.constant_slots = constant_slots;
         copy.err_ctx = err_ctx;
         return copy;
     }
@@ -303,6 +322,15 @@ pub const Evaluator = struct {
 
     pub fn set_constants(self: *Evaluator, constants: []const Constant) void {
         self.constants = constants;
+        @memset(self.constant_slots, null);
+        for (self.module.constants, 0..) |name, index| {
+            for (constants) |constant| {
+                if (name_eql(name, constant.name)) {
+                    self.constant_slots[index] = constant.value;
+                    break;
+                }
+            }
+        }
     }
 
     pub fn set_aliases(self: *Evaluator, aliases: []const Alias) void {
@@ -416,6 +444,19 @@ pub const Evaluator = struct {
                     // STRING (set of all strings) — represented as a model value
                     // that can be checked for membership.
                     return Value{ .string_v = try eval_pool.push_string("__STRING_SET__") };
+                }
+                if (self.override_registry.find_generated(
+                    aliased,
+                    0,
+                )) |func| {
+                    return try self.call_generated(
+                        func,
+                        &.{},
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    );
                 }
                 if (self.find_definition(aliased)) |def| {
                     if (def.is_function) {
@@ -2382,6 +2423,40 @@ pub const Evaluator = struct {
                     return err;
                 };
             }
+            if (self.override_registry.find_generated(
+                name,
+                ap.args.len,
+            )) |func| {
+                const values = try eval_pool.alloc_values(
+                    @intCast(ap.args.len),
+                );
+                for (ap.args, 0..) |arg, i| {
+                    values[i] = try self.eval_expr(
+                        arg,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    );
+                }
+                return self.call_generated(
+                    func,
+                    values,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                ) catch |err| {
+                    if (err == Error.TypeError) {
+                        return self.fail(
+                            Error.TypeError,
+                            "apply generated override",
+                            name,
+                        );
+                    }
+                    return err;
+                };
+            }
             if (self.find_constant(name)) |constant| {
                 switch (constant) {
                     .function_v, .lambda_v => {
@@ -2456,6 +2531,40 @@ pub const Evaluator = struct {
             values[i] = try self.eval_expr(a, ctx, s0, eval_pool, state_pool);
         }
         return try self.apply_values(func, values, eval_pool, state_pool, s0);
+    }
+
+    fn call_generated(
+        self: Evaluator,
+        function: generated_runtime.OperatorFn,
+        args: []const Value,
+        evaluator_context: Context,
+        current_state: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!Value {
+        var partial_values: [64]?Value = @splat(null);
+        assert(self.module.variables.len <= partial_values.len);
+        var binding = evaluator_context.head;
+        while (binding) |current| : (binding = current.parent) {
+            const index = self.find_variable(current.name) orelse continue;
+            if (partial_values[index] == null) {
+                partial_values[index] = current.value;
+            }
+        }
+        var context = generated_runtime.CallContext{
+            .eval_pool = eval_pool,
+            .state_pool = state_pool,
+            .state = current_state,
+            .next_state = self.next_state,
+            .partial_values = partial_values[0..self.module.variables.len],
+            .read_primed = false,
+            .constants = self.constants,
+            .constant_slots = self.constant_slots,
+            .native_context = &self.override_registry,
+            .native_call = generated_native_call,
+            .max_seq_len = self.override_registry.ctx.max_seq_len,
+        };
+        return function(&context, args);
     }
 
     fn eval_sequence_fold(
@@ -3498,15 +3607,15 @@ pub const Evaluator = struct {
     }
 
     pub fn find_variable(self: Evaluator, name: []const u8) ?u32 {
-        for (self.module.variables, 0..) |v, i| {
-            if (name_eql(v, name)) return @intCast(i);
+        for (self.module.variables, 0..) |variable, index| {
+            if (name_eql(variable, name)) return @intCast(index);
         }
         return null;
     }
 
     pub fn find_definition(self: Evaluator, name: []const u8) ?ast.Definition {
-        for (self.module.definitions) |d| {
-            if (name_eql(d.name, name)) return d;
+        for (self.module.definitions) |definition| {
+            if (name_eql(definition.name, name)) return definition;
         }
         return null;
     }
@@ -3530,6 +3639,20 @@ inline fn name_eql(left: []const u8, right: []const u8) bool {
     if (left.len != right.len) return false;
     if (left.ptr == right.ptr) return true;
     return std.mem.eql(u8, left, right);
+}
+
+fn generated_native_call(
+    context: *const anyopaque,
+    pool: *ValuePool,
+    name: []const u8,
+    args: []const Value,
+) Error!Value {
+    const registry: *const overrides.Registry = @ptrCast(
+        @alignCast(context),
+    );
+    const function = registry.find(name) orelse
+        return Error.UndefinedSymbol;
+    return function(registry.ctx, pool, args);
 }
 
 fn expr_mentions_bound_names(

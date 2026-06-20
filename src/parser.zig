@@ -878,6 +878,12 @@ pub const Parser = struct {
     }
 
     fn parse_definition(self: *Parser) !ast.Definition {
+        const definition_line = self.current.line;
+        const definition_excerpt = try self.dup(std.mem.trim(
+            u8,
+            source_line(self.lexer.source, definition_line),
+            " \t\r",
+        ));
         const definition_col = self.current.col;
         const left_param = try self.parse_param_name();
         const saved_def_col = self.def_col;
@@ -929,6 +935,8 @@ pub const Parser = struct {
                 .name = left_param,
                 .params = &.{},
                 .body = body,
+                .source_line = definition_line,
+                .source_excerpt = definition_excerpt,
                 .is_function = true,
                 .function_var = function_vars.items[0],
                 .function_vars = try self.dup_slice([]const u8, function_vars.items),
@@ -952,6 +960,8 @@ pub const Parser = struct {
                 .name = op_name,
                 .params = try self.dup_slice([]const u8, params.items),
                 .body = body,
+                .source_line = definition_line,
+                .source_excerpt = definition_excerpt,
             };
         }
 
@@ -989,7 +999,32 @@ pub const Parser = struct {
             .name = params.items[0],
             .params = try self.dup_slice([]const u8, params.items[1..]),
             .body = body,
+            .source_line = definition_line,
+            .source_excerpt = definition_excerpt,
         };
+    }
+
+    fn source_line(source: []const u8, line: u32) []const u8 {
+        std.debug.assert(line > 0);
+        var current_line: u32 = 1;
+        var start: usize = 0;
+        while (current_line < line) {
+            const newline = std.mem.indexOfScalarPos(
+                u8,
+                source,
+                start,
+                '\n',
+            ) orelse return "";
+            start = newline + 1;
+            current_line += 1;
+        }
+        const end = std.mem.indexOfScalarPos(
+            u8,
+            source,
+            start,
+            '\n',
+        ) orelse source.len;
+        return source[start..end];
     }
 
     fn parse_param_name(self: *Parser) ![]const u8 {

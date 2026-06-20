@@ -1,9 +1,21 @@
 const std = @import("std");
-const Arena = @import("arena.zig").Arena;
-const config = @import("config.zig");
-const checker = @import("checker.zig");
-const ModuleLoader = @import("module_loader.zig").ModuleLoader;
-const overrides = @import("overrides.zig");
+const tlzig = @import("tlzig");
+const Arena = tlzig.Arena;
+const config = tlzig.config;
+const checker = tlzig.checker;
+const codegen = tlzig.codegen;
+const generated_model = @import("generated_model");
+const ModuleLoader = tlzig.ModuleLoader;
+const overrides = tlzig.overrides;
+
+comptime {
+    if (generated_model.fallback_count != 0) {
+        @compileError(
+            "generated model contains interpreter fallbacks; " ++
+                "strict tlzig executables require fallback_count == 0",
+        );
+    }
+}
 
 pub fn main(init: std.process.Init.Minimal) void {
     var it = std.process.Args.Iterator.init(init.args);
@@ -22,6 +34,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var eval_arena_bytes: u64 = 16 * 1024 * 1024;
     var worker_count: u16 = 1;
     var unlimited_memory = false;
+    var emit_zig_path: ?[]const u8 = null;
 
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--spec")) {
@@ -72,14 +85,16 @@ pub fn main(init: std.process.Init.Minimal) void {
             }
         } else if (std.mem.eql(u8, arg, "--unlimited-memory")) {
             unlimited_memory = true;
+        } else if (std.mem.eql(u8, arg, "--emit-zig")) {
+            emit_zig_path = it.next();
         }
     }
 
     const spec_path_v = spec_path orelse {
-        std.debug.print("usage: tlzig --spec FILE.tla --cfg FILE.cfg [--max-states N] [--arena-bytes B] [--eval-arena-bytes B]\n", .{});
+        std.debug.print("usage: tlzig --spec FILE.tla [--emit-zig FILE.zig | --cfg FILE.cfg] [--max-states N]\n", .{});
         std.process.exit(1);
     };
-    if (cfg_path == null and !default_cfg) {
+    if (cfg_path == null and !default_cfg and emit_zig_path == null) {
         std.debug.print("usage: tlzig --spec FILE.tla (--cfg FILE.cfg | --default-cfg) [--max-states N] ...\n", .{});
         std.process.exit(1);
     }
@@ -114,6 +129,87 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.debug.print("failed to load spec: {any}\n", .{err});
         std.process.exit(1);
     };
+    if (generated_model.generated_count > 0 and
+        !std.mem.eql(u8, generated_model.module_name, module.name))
+    {
+        std.debug.print(
+            "generated model is for module {s}, not {s}\n",
+            .{ generated_model.module_name, module.name },
+        );
+        std.process.exit(1);
+    }
+    if (emit_zig_path) |output_path| {
+        var roots = std.ArrayList([]const u8).empty;
+        defer roots.deinit(std.heap.page_allocator);
+        if (default_cfg) {
+            const cfg = config.Config.from_module(&arena, module);
+            append_config_roots(&roots, cfg) catch {
+                std.debug.print("failed to allocate config roots\n", .{});
+                std.process.exit(1);
+            };
+        } else if (cfg_path) |cfg_path_v| {
+            const cfg_source = read_file(&arena, cfg_path_v) catch {
+                std.debug.print("failed to read cfg: {s}\n", .{cfg_path_v});
+                std.process.exit(1);
+            };
+            const cfg = config.parse(&arena, cfg_source) catch {
+                std.debug.print("failed to parse config\n", .{});
+                std.process.exit(1);
+            };
+            append_config_roots(&roots, cfg) catch {
+                std.debug.print("failed to allocate config roots\n", .{});
+                std.process.exit(1);
+            };
+        }
+        const generated = codegen.emit_module_with_roots(
+            std.heap.page_allocator,
+            module,
+            roots.items,
+        ) catch |err| {
+            std.debug.print("failed to generate Zig: {any}\n", .{err});
+            std.process.exit(1);
+        };
+        defer generated.deinit(std.heap.page_allocator);
+        if (generated.fallback_count > 0) {
+            std.debug.print(
+                "strict Zig generation rejected {d} unsupported definitions:\n",
+                .{generated.fallback_count},
+            );
+            for (generated.unsupported) |name| {
+                std.debug.print("  {s}\n", .{name});
+            }
+            std.process.exit(1);
+        }
+        const formatted = format_zig(
+            std.heap.page_allocator,
+            generated.source,
+        ) catch |err| {
+            std.debug.print(
+                "generated Zig failed formatting: {any}\n",
+                .{err},
+            );
+            std.process.exit(1);
+        };
+        defer std.heap.page_allocator.free(formatted);
+        write_file(output_path, formatted) catch {
+            std.debug.print(
+                "failed to write generated Zig: {s}\n",
+                .{output_path},
+            );
+            std.process.exit(1);
+        };
+        std.debug.print(
+            "generated Zig operators={d} native={d} fallbacks={d} path={s}\n",
+            .{
+                generated.generated_count,
+                generated.native_count,
+                generated.fallback_count,
+                output_path,
+            },
+        );
+        return;
+    }
+
     const cfg: config.Config = if (default_cfg) config.Config.from_module(&arena, module) else blk: {
         const cfg_path_v = cfg_path.?;
         const cfg_source = read_file(&arena, cfg_path_v) catch {
@@ -125,6 +221,15 @@ pub fn main(init: std.process.Init.Minimal) void {
             std.process.exit(1);
         };
     };
+    if (generated_model.generated_count > 0 and
+        !generated_config_covers(cfg))
+    {
+        std.debug.print(
+            "generated model does not cover every configured root\n",
+            .{},
+        );
+        std.process.exit(1);
+    }
 
     const eval_value_cap: u32 = 262_144;
     const eval_string_cap: u32 = 65_536;
@@ -140,7 +245,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         64_000_000,
     ));
 
-    var ch = checker.Checker.init(
+    var ch = checker.Checker.init_generated(
         &arena,
         module,
         cfg,
@@ -152,6 +257,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         eval_arena_bytes,
         override_ctx,
         worker_count,
+        &generated_model.operators,
     ) catch |err| {
         std.debug.print("failed to initialize checker: {any}\n", .{err});
         std.process.exit(1);
@@ -181,9 +287,72 @@ pub fn main(init: std.process.Init.Minimal) void {
     _ = std.c.printf("generated=%llu distinct=%llu\n", result.generated, result.distinct);
 }
 
+fn format_zig(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) ![]u8 {
+    const source_z = try allocator.allocSentinel(u8, source.len, 0);
+    defer allocator.free(source_z);
+    @memcpy(source_z, source);
+    var tree = try std.zig.Ast.parse(allocator, source_z, .zig);
+    defer tree.deinit(allocator);
+    if (tree.errors.len != 0) return error.InvalidGeneratedZig;
+    return tree.renderAlloc(allocator);
+}
+
 fn cap_u32(v: u64) u32 {
     const max = std.math.maxInt(u32);
     return if (v > max) max else @intCast(v);
+}
+
+fn append_config_roots(
+    roots: *std.ArrayList([]const u8),
+    cfg: config.Config,
+) !void {
+    if (cfg.spec_name) |name| {
+        try roots.append(std.heap.page_allocator, name);
+    }
+    if (cfg.init_name) |name| {
+        try roots.append(std.heap.page_allocator, name);
+    }
+    if (cfg.next_name) |name| {
+        try roots.append(std.heap.page_allocator, name);
+    }
+    if (cfg.symmetry_name) |name| {
+        try roots.append(std.heap.page_allocator, name);
+    }
+    try roots.appendSlice(std.heap.page_allocator, cfg.invariants);
+    try roots.appendSlice(std.heap.page_allocator, cfg.properties);
+    try roots.appendSlice(std.heap.page_allocator, cfg.constraints);
+    try roots.appendSlice(std.heap.page_allocator, cfg.action_constraints);
+}
+
+fn generated_config_covers(cfg: config.Config) bool {
+    if (!generated_root_covered(cfg.spec_name)) return false;
+    if (!generated_root_covered(cfg.init_name)) return false;
+    if (!generated_root_covered(cfg.next_name)) return false;
+    if (!generated_root_covered(cfg.symmetry_name)) return false;
+    for (cfg.invariants) |name| {
+        if (!generated_root_covered(name)) return false;
+    }
+    for (cfg.properties) |name| {
+        if (!generated_root_covered(name)) return false;
+    }
+    for (cfg.constraints) |name| {
+        if (!generated_root_covered(name)) return false;
+    }
+    for (cfg.action_constraints) |name| {
+        if (!generated_root_covered(name)) return false;
+    }
+    return true;
+}
+
+fn generated_root_covered(optional_name: ?[]const u8) bool {
+    const name = optional_name orelse return true;
+    for (generated_model.root_names) |root| {
+        if (std.mem.eql(u8, root, name)) return true;
+    }
+    return false;
 }
 
 fn read_file(arena: *Arena, path: []const u8) ![]u8 {
@@ -205,4 +374,17 @@ fn read_file(arena: *Arena, path: []const u8) ![]u8 {
     const result = try arena.alloc(u8, temp.items.len);
     @memcpy(result, temp.items);
     return result;
+}
+
+fn write_file(path: []const u8, bytes: []const u8) !void {
+    const path_z = try std.heap.page_allocator.alloc(u8, path.len + 1);
+    defer std.heap.page_allocator.free(path_z);
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+
+    const file = std.c.fopen(@ptrCast(path_z.ptr), "wb") orelse
+        return error.IoError;
+    defer _ = std.c.fclose(file);
+    const written = std.c.fwrite(bytes.ptr, 1, bytes.len, file);
+    if (written != bytes.len) return error.IoError;
 }

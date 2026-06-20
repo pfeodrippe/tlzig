@@ -106,6 +106,40 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
     tlzig `1.92s/1.95s` vs TLC `2.25s/2.36s`.
   - Snapshot-invariant symmetry is now faster in both modes:
     tlzig `1.96s/1.40s` vs TLC `2.21s/1.80s`.
+- [x] Add strict configuration-aware Zig generation:
+  every configured `INIT`, `NEXT`, invariant, temporal property, state/action
+  constraint, symmetry operator, and operator substitution is a native
+  reachability root. Strict builds reject any reachable fallback.
+- [x] Remove the `--allow-fallbacks` generation escape hatch. Emission is now
+  all-native for the selected configuration or fails with the exact
+  unsupported definition list.
+- [x] Attach module/config identity metadata to generated models and activate
+  generated registries only when the loaded module and all configured roots
+  match. This prevents common names such as `Init` and `Next` from leaking
+  across benchmark specs.
+- [x] Compile every upstream-valid MultiShardTxn configuration with zero
+  reachable fallbacks. Current strict counts range from 41 generated
+  operators for `Storage.cfg` to 83 for the snapshot-invariant config.
+- [x] Add generated-runtime cross-pool state access so emitted Zig traverses
+  nested state functions/tuples/records in canonical storage and clones only
+  the selected leaf. RC snapshot single-thread improved from `7.13s` to
+  `6.39s`; Storage improved to `1.78s`.
+- [x] Make the benchmark link an optional strict generated model and activate
+  it only for matching configs. Print both TLC and tlzig state counts so
+  deadlock traversal-order differences are visible.
+- [ ] Generate native execution for the compiled `ActionStep` tree. Generated
+  expression operators are faster, but `Next` still dispatches recursively
+  through the generic action executor and AST evaluator. This is the primary
+  remaining RC snapshot single-core gap.
+- [ ] Re-run exhaustive `CHECK_DEADLOCK FALSE` differential models before
+  treating deadlock-stop generated/distinct counts as coverage totals.
+  Default MultiShardTxn configs stop at the first valid deadlock, and worker
+  scheduling/enumeration order changes those partial counts.
+- [ ] Current strict AOT full-run performance snapshot:
+  - ClientCentric: TLC `2.231s/2.364s`, tlzig `1.550s/1.578s`;
+  - Storage: TLC `2.828s/1.516s`, tlzig `1.777s/0.440s`;
+  - RC snapshot: TLC `5.216s/2.173s`, tlzig `6.392s/0.898s`.
+  RC snapshot single-thread remains the explicit performance blocker.
 - [x] Stream one-variable filters over finite function sets through resettable
   scratch storage and materialize only accepted functions. This removes
   rejected composite values from `TxnSetsAll` while preserving exact results.
@@ -508,6 +542,68 @@ the same counterexample.
 6. Resolve LET-IN and lambdas.
 7. Resolve temporal operators and box actions.
 8. Remove AST eval path entirely.
+
+## Phase 6 — AOT Zig model generation
+
+**Goal**: `tlzig --emit-zig model.zig` lowers the parsed TLA+ module into
+allocation-free Zig operator overrides, and
+`zig build -Dgenerated-model=model.zig` links them into the checker.
+
+- [x] Add the `--emit-zig` CLI entry point using tlzig's existing parser and
+  loaded module graph.
+- [x] Make AOT emission strict: unsupported reachable definitions prevent
+  output and are listed by name. There is no fallback-generation escape hatch.
+- [x] Add a generated-operator ABI sharing tlzig's `Value`, `ValuePool`, and
+  current/next state representations.
+- [x] Compile generated modules independently and link them through
+  `-Dgenerated-model`.
+- [x] Preserve native TLC override precedence; generated definitions may not
+  replace `Print`, `TLCSet`, standard-module overrides, or other special
+  semantics.
+- [x] Treat `TLCEval` as an intrinsic rather than compiling its apparent
+  identity body; it controls evaluation/memoization and is not semantically
+  interchangeable with an ordinary eager function.
+- [x] Use stable definition indices for Zig symbols and escape arbitrary TLA+
+  operator names in metadata.
+- [x] Lower literals, configured-constant reads, current/primed variables,
+  scalar arithmetic and logic, structural equality/order, conditionals,
+  record-field reads, function/sequence lookup, and generated calls.
+- [x] Omit unsupported operators from generated registries and reject the
+  generated model before writing or linking it.
+- [x] Differentially validate the initial ClientCentric generated build:
+  interpreted and generated both report `2044/801`.
+- [x] Differentially validate RC/snapshot after excluding primed partial-state
+  operators and TLC intrinsics: interpreted and generated both report
+  `245844/84692` in the current checkout.
+- [x] Extend the generated action ABI with partial next-state assignments and
+  lower primed parameterized operators.
+- [x] Lower finite sets, ranges, membership, tuples, records, and set
+  operations without hot-path heap allocation.
+  - Set/tuple/record literals, ranges, membership, subset checks, equivalence,
+    and integer power now use only `ValuePool` bump allocation.
+  - Union/intersection/difference materialize into resettable scratch storage;
+    power/function/record sets retain compact symbolic representations.
+  - `UNION`, bounded function sets, filters/maps, and record sets are
+    materialized without general-purpose runtime allocation.
+- [x] Allow generated operators to call existing native Zig overrides through
+  the generated call context without returning to AST evaluation.
+- [x] Enforce `fallback_count == 0` at generated-model link time.
+- [x] ClientCentric strict coverage: `67 generated / 0 native /
+  0 unsupported` for the selected config.
+- [x] Lower bounded quantifiers, filters, maps, CHOOSE, function literals,
+  `EXCEPT`, `@`, `SelectSeq`, `ReduceSeq`, and action predicates using fixed
+  worker scratch storage.
+- [ ] Generate direct entry points for INIT, NEXT actions, constraints,
+  invariants, and temporal-state/action predicates instead of routing their
+  zero-argument definitions through generic AST evaluation.
+- [ ] Resolve constants and definitions to generated indices so generated hot
+  paths contain no runtime name scans.
+- [ ] Add differential tests comparing every generated operator against the
+  interpreter over representative values and states.
+- [x] Link optional generated models into the ReleaseFast benchmark with
+  module/config identity checks; print TLC and tlzig counts separately.
+- [ ] Beat the interpreter and TLC Java on representative single-core and
+  all-core MultiShardTxn full runs before enabling AOT generation by default.
 
 ## Notes
 - Update this file after every spec/example milestone.

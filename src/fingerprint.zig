@@ -122,6 +122,9 @@ fn hash_value_inner(
             }
         },
         .lambda_v => @panic("lambda values cannot be fingerprinted"),
+        .generated_operator_v => @panic(
+            "generated operator values cannot be fingerprinted",
+        ),
         .function_set_v => |fs| {
             h = hash_byte(h, 0x10);
             h = hash_combine(h, hash_value_inner(pool, fs.domain(pool), permutation));

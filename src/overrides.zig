@@ -4,6 +4,7 @@ const value = @import("value.zig");
 const Value = value.Value;
 const ValuePool = value.ValuePool;
 const Error = @import("err.zig").Error;
+const generated_runtime = @import("generated_runtime.zig");
 
 pub const OverrideContext = struct {
     max_seq_len: u32,
@@ -46,6 +47,7 @@ pub const Registry = struct {
     ctx: OverrideContext,
     entries: []const OverrideEntry,
     values: []const ValueOverrideEntry,
+    generated: []const generated_runtime.Operator,
 
     pub fn find(self: Registry, name: []const u8) ?OverrideFn {
         for (self.entries) |e| {
@@ -60,13 +62,36 @@ pub const Registry = struct {
         }
         return null;
     }
+
+    pub fn find_generated(
+        self: Registry,
+        name: []const u8,
+        arity: usize,
+    ) ?generated_runtime.OperatorFn {
+        for (self.generated) |operator| {
+            if (operator.arity == arity and
+                std.mem.eql(u8, operator.name, name))
+            {
+                return operator.function;
+            }
+        }
+        return null;
+    }
 };
 
 pub fn default_registry(ctx: OverrideContext) Registry {
-    return Registry{ .ctx = ctx, .entries = &default_overrides, .values = &default_value_overrides };
+    return Registry{
+        .ctx = ctx,
+        .entries = &default_overrides,
+        .values = &default_value_overrides,
+        .generated = &.{},
+    };
 }
 
 const default_overrides = [_]OverrideEntry{
+    .{ .name = "\\o", .func = sequence_concat_entry },
+    .{ .name = "@@", .func = ooverride_entry },
+    .{ .name = ":>", .func = recordto_entry },
     .{ .name = "Cardinality", .func = cardinality },
     .{ .name = "IsFiniteSet", .func = is_finite_set },
     .{ .name = "Len", .func = sequence_len },
@@ -102,6 +127,33 @@ const default_overrides = [_]OverrideEntry{
     .{ .name = "WF_vars", .func = wf_vars },
     .{ .name = "SF_vars", .func = sf_vars },
 };
+
+fn sequence_concat_entry(
+    ctx: OverrideContext,
+    pool: *ValuePool,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    return sequence_concat(ctx, pool, args[0], args[1]);
+}
+
+fn ooverride_entry(
+    ctx: OverrideContext,
+    pool: *ValuePool,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    return ooverride(ctx, pool, args[0], args[1]);
+}
+
+fn recordto_entry(
+    ctx: OverrideContext,
+    pool: *ValuePool,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    return recordto(ctx, pool, args[0], args[1]);
+}
 
 const default_value_overrides = [_]ValueOverrideEntry{
     .{ .name = "BOOLEAN", .func = boolean_set },

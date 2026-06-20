@@ -9,7 +9,9 @@ const fp_set = @import("fp_set.zig");
 const StateQueue = @import("queue.zig").StateQueue;
 
 comptime {
+    _ = @import("codegen.zig");
     _ = @import("config.zig");
+    _ = @import("generated_runtime.zig");
     _ = @import("parser_test.zig");
 }
 

@@ -5,6 +5,14 @@ const ast = @import("ast.zig");
 const parser = @import("parser.zig");
 const pluscal = @import("pluscal.zig");
 
+fn count_newlines(bytes: []const u8) u32 {
+    var count: u32 = 0;
+    for (bytes) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    return count;
+}
+
 pub const ModuleLoader = struct {
     arena: *Arena,
     search_paths: []const []const u8,
@@ -28,6 +36,7 @@ pub const ModuleLoader = struct {
             std.debug.print("Parse error in {s}: {any} at line {d} col {d}\n", .{ path, err, p.current.line, p.current.col });
             return err;
         };
+        try scoped.stamp_definitions(&module, path, 0);
         const dir = std.fs.path.dirname(path) orelse ".";
         var loaded = std.ArrayList([]const u8).empty;
         defer loaded.deinit(std.heap.page_allocator);
@@ -65,6 +74,7 @@ pub const ModuleLoader = struct {
                 std.debug.print("Parse error in EXTENDS {s} ({s}): {any}\n", .{ name, path, err });
                 return err;
             };
+            try self.stamp_definitions(&child, path, 0);
             var scoped = self;
             scoped.embedded_source = source;
             try scoped.load_extends(&child, std.fs.path.dirname(path) orelse ".", loaded);
@@ -189,6 +199,9 @@ pub const ModuleLoader = struct {
                 .name = def.name,
                 .params = def.params,
                 .body = new_body,
+                .source_path = def.source_path,
+                .source_line = def.source_line,
+                .source_excerpt = def.source_excerpt,
                 .is_function = def.is_function,
                 .function_var = def.function_var,
                 .function_vars = def.function_vars,
@@ -287,6 +300,7 @@ pub const ModuleLoader = struct {
                 std.debug.print("Parse error in INSTANCE {s} ({s}): {any}\n", .{ inst.module_name, path, err });
                 return err;
             };
+            try self.stamp_definitions(&child, path, 0);
             var scoped = self;
             scoped.embedded_source = source;
             try scoped.load_extends(&child, std.fs.path.dirname(path) orelse ".", loaded);
@@ -329,6 +343,9 @@ pub const ModuleLoader = struct {
                     .name = qualified,
                     .params = params,
                     .body = new_body,
+                    .source_path = def.source_path,
+                    .source_line = def.source_line,
+                    .source_excerpt = def.source_excerpt,
                     .is_function = def.is_function,
                     .function_var = def.function_var,
                     .function_vars = def.function_vars,
@@ -412,6 +429,7 @@ pub const ModuleLoader = struct {
             std.debug.print("Parse error in namespace INSTANCE {s} ({s}): {any}\n", .{ name, path, err });
             return err;
         };
+        try self.stamp_definitions(&child, path, 0);
         var scoped = self;
         scoped.embedded_source = source;
         const child_dir = std.fs.path.dirname(path) orelse "./";
@@ -443,13 +461,18 @@ pub const ModuleLoader = struct {
                     source[end] == '-')
                 {
                     var p = parser.Parser.init(self.arena, source[module_pos..]);
-                    const child = p.parse_module() catch |err| {
+                    var child = p.parse_module() catch |err| {
                         std.debug.print(
                             "Parse error in embedded module {s}: {any} at line {d} col {d}\n",
                             .{ name, err, p.current.line, p.current.col },
                         );
                         return err;
                     };
+                    try self.stamp_definitions(
+                        &child,
+                        "<embedded>",
+                        count_newlines(source[0..module_pos]),
+                    );
                     assert(std.mem.eql(u8, child.name, name));
                     return child;
                 }
@@ -466,6 +489,21 @@ pub const ModuleLoader = struct {
         @memcpy(result[a.len .. a.len + sep.len], sep);
         @memcpy(result[a.len + sep.len ..], b);
         return result;
+    }
+
+    fn stamp_definitions(
+        self: ModuleLoader,
+        module: *ast.Module,
+        source_path: []const u8,
+        line_offset: u32,
+    ) !void {
+        const path = try self.dup(source_path);
+        for (@constCast(module.definitions)) |*definition| {
+            if (definition.source_path.len == 0) {
+                definition.source_path = path;
+                definition.source_line += line_offset;
+            }
+        }
     }
 
     fn translate_source(self: ModuleLoader, path: []const u8, raw: []const u8) ![]const u8 {

@@ -12,6 +12,7 @@ pub const ValueTag = enum(u8) {
     string_v,
     model_v,
     lambda_v,
+    generated_operator_v,
     // Lazy symbolic set constructors (never enumerate unless forced).
     function_set_v,
     record_set_v,
@@ -29,6 +30,13 @@ pub const Lambda = struct {
     params: []const []const u8,
     body: *anyopaque,
     ctx: *anyopaque,
+};
+
+pub const GeneratedOperator = extern struct {
+    function_address: usize,
+    arity: u16,
+    captured_offset: u32,
+    captured_len: u16,
 };
 
 pub const FunctionSet = extern struct {
@@ -222,6 +230,7 @@ pub const Value = union(ValueTag) {
     string_v: String,
     model_v: u32,
     lambda_v: *Lambda,
+    generated_operator_v: GeneratedOperator,
     function_set_v: FunctionSet,
     record_set_v: RecordSet,
     tuple_set_v: TupleSet,
@@ -312,6 +321,8 @@ pub const Value = union(ValueTag) {
             .record_v => |ra| tags_equal and ra.eql(b.record_v, pool),
             .string_v => |sa| tags_equal and sa.eql(b.string_v, pool),
             .lambda_v => false,
+            .generated_operator_v => |operator| tags_equal and
+                std.meta.eql(operator, b.generated_operator_v),
             .function_set_v => tags_equal and a.function_set_v.domain(pool).eql(b.function_set_v.domain(pool), pool) and
                 a.function_set_v.codomain(pool).eql(b.function_set_v.codomain(pool), pool),
             .record_set_v => tags_equal and a.record_set_v.eql(b.record_set_v, pool),
@@ -338,7 +349,7 @@ pub const Value = union(ValueTag) {
                 return if (ia < ib) -1 else if (ia > ib) 1 else 0;
             },
             .string_v => |sa| sa.compare(b.string_v, pool),
-            .lambda_v => null,
+            .lambda_v, .generated_operator_v => null,
             else => null,
         };
     }
@@ -370,6 +381,9 @@ pub const Value = union(ValueTag) {
             .tuple_v => |t| Value{ .tuple_v = try t.clone(source, target) },
             .record_v => |r| Value{ .record_v = try r.clone(source, target) },
             .lambda_v => |l| Value{ .lambda_v = l },
+            .generated_operator_v => |operator| Value{
+                .generated_operator_v = operator,
+            },
             .function_set_v => |fs| Value{
                 .function_set_v = .{
                     .domain_offset = try target.push_value(try fs.domain(source).clone_assume_capacity(source, target)),
@@ -411,7 +425,14 @@ pub const Value = union(ValueTag) {
 
     fn clone_value_count(self: Value, source: *const ValuePool) u64 {
         return switch (self) {
-            .bool_v, .int_v, .model_v, .string_v, .lambda_v, .range_v => 0,
+            .bool_v,
+            .int_v,
+            .model_v,
+            .string_v,
+            .lambda_v,
+            .generated_operator_v,
+            .range_v,
+            => 0,
             .set_v => |s| clone_slice_value_count(s.items(source), source),
             .tuple_v => |t| clone_slice_value_count(t.items(source), source),
             .record_v => |r| clone_slice_value_count(r.fields(source), source),

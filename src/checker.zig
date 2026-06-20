@@ -21,6 +21,7 @@ const ConstantAssignment = @import("config.zig").ConstantAssignment;
 const Constant = eval.Constant;
 const parser = @import("parser.zig");
 const overrides = @import("overrides.zig");
+const generated_runtime = @import("generated_runtime.zig");
 
 const WorkerContext = struct {
     eval_arena: Arena,
@@ -260,6 +261,11 @@ fn value_identity(value_v: Value) u64 {
         .record_v => |record| tag ^
             (@as(u64, record.offset) << 32) ^ record.len,
         .lambda_v => |lambda| tag ^ @intFromPtr(lambda),
+        .generated_operator_v => |operator| tag ^
+            operator.function_address ^
+            (@as(u64, operator.arity) << 48) ^
+            (@as(u64, operator.captured_offset) << 16) ^
+            operator.captured_len,
         .function_set_v => |set| tag ^
             (@as(u64, set.domain_offset) << 32) ^
             set.codomain_offset,
@@ -442,6 +448,66 @@ pub const Checker = struct {
         override_ctx: overrides.OverrideContext,
         worker_count: u16,
     ) !Checker {
+        return init_internal(
+            arena,
+            module,
+            cfg,
+            max_states,
+            eval_value_cap,
+            eval_string_cap,
+            state_value_cap,
+            state_string_cap,
+            eval_arena_bytes,
+            override_ctx,
+            worker_count,
+            &.{},
+        );
+    }
+
+    pub fn init_generated(
+        arena: *Arena,
+        module: ast.Module,
+        cfg: Config,
+        max_states: u32,
+        eval_value_cap: u32,
+        eval_string_cap: u32,
+        state_value_cap: u32,
+        state_string_cap: u32,
+        eval_arena_bytes: u64,
+        override_ctx: overrides.OverrideContext,
+        worker_count: u16,
+        generated: []const generated_runtime.Operator,
+    ) !Checker {
+        return init_internal(
+            arena,
+            module,
+            cfg,
+            max_states,
+            eval_value_cap,
+            eval_string_cap,
+            state_value_cap,
+            state_string_cap,
+            eval_arena_bytes,
+            override_ctx,
+            worker_count,
+            generated,
+        );
+    }
+
+    fn init_internal(
+        arena: *Arena,
+        module: ast.Module,
+        cfg: Config,
+        max_states: u32,
+        eval_value_cap: u32,
+        eval_string_cap: u32,
+        state_value_cap: u32,
+        state_string_cap: u32,
+        eval_arena_bytes: u64,
+        override_ctx: overrides.OverrideContext,
+        worker_count: u16,
+        generated: []const generated_runtime.Operator,
+    ) !Checker {
         assert(worker_count > 0);
         var state_store = try StateStore.init(
             arena,
@@ -456,7 +522,12 @@ pub const Checker = struct {
             arena,
             worker_count == 1,
         );
-        var evaluator = try Evaluator.init(module, arena, override_ctx);
+        var evaluator = try Evaluator.init_generated(
+            module,
+            arena,
+            override_ctx,
+            generated,
+        );
         evaluator.set_treat_unknown_as_model(true);
         const aliases = try evaluate_aliases(arena, cfg);
         evaluator.set_aliases(aliases);
@@ -843,6 +914,7 @@ pub const Checker = struct {
         worker.eval_arena = try Arena.init(16 * 1024 * 1024);
         errdefer worker.eval_arena.deinit();
         worker.evaluator = try self.evaluator.fork(&worker.eval_arena);
+        worker.evaluator.set_constants(self.evaluator.constants);
         worker.eval_pool = try ValuePool.init(
             &worker.eval_arena,
             262_144,

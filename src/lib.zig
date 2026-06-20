@@ -1,6 +1,10 @@
 pub const Arena = @import("arena.zig").Arena;
+pub const Error = @import("err.zig").Error;
 pub const checker = @import("checker.zig");
+pub const codegen = @import("codegen.zig");
 pub const config = @import("config.zig");
+pub const generated_runtime = @import("generated_runtime.zig");
 pub const ir = @import("ir.zig");
 pub const ModuleLoader = @import("module_loader.zig").ModuleLoader;
 pub const overrides = @import("overrides.zig");
+pub const value = @import("value.zig");

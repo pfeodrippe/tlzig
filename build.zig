@@ -9,6 +9,20 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const generated_model_path = b.option(
+        []const u8,
+        "generated-model",
+        "Generated Zig model emitted by tlzig --emit-zig",
+    );
+    const generated_model_module = b.createModule(.{
+        .root_source_file = if (generated_model_path) |path|
+            .{ .cwd_relative = path }
+        else
+            b.path("src/generated_model_stub.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    generated_model_module.addImport("tlzig", tlzig_module);
 
     const exe = b.addExecutable(.{
         .name = "tlzig",
@@ -19,11 +33,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("tlzig", tlzig_module);
+    exe.root_module.addImport("generated_model", generated_model_module);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     b.step("run", "Run tlzig").dependOn(&run_cmd.step);
+
+    const generate_cmd = b.addRunArtifact(exe);
+    generate_cmd.step.dependOn(b.getInstallStep());
+    generate_cmd.addPassthruArgs();
+    b.step(
+        "generate-model",
+        "Generate a strict native Zig model; pass tlzig arguments after --",
+    ).dependOn(&generate_cmd.step);
 
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -44,6 +67,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     bench.root_module.addImport("tlzig", tlzig_module);
+    bench.root_module.addImport("generated_model", generated_model_module);
     b.installArtifact(bench);
 
     const run_bench = b.addRunArtifact(bench);

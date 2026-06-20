@@ -1,0 +1,2176 @@
+const std = @import("std");
+const Value = @import("value.zig").Value;
+const ValuePool = @import("value.zig").ValuePool;
+const Set = @import("value.zig").Set;
+const BinarySet = @import("value.zig").BinarySet;
+const State = @import("state.zig").StateStore.State;
+const Error = @import("err.zig").Error;
+
+pub const NamedValue = struct {
+    name: []const u8,
+    value: Value,
+};
+
+pub const CallContext = struct {
+    pub const NativeCall = *const fn (
+        *const anyopaque,
+        *ValuePool,
+        []const u8,
+        []const Value,
+    ) Error!Value;
+
+    eval_pool: *ValuePool,
+    state_pool: *ValuePool,
+    state: ?*State,
+    next_state: ?*State,
+    partial_values: []const ?Value,
+    read_primed: bool,
+    constants: []const NamedValue,
+    constant_slots: []const ?Value,
+    native_context: *const anyopaque,
+    native_call: NativeCall,
+    max_seq_len: u32,
+};
+
+pub const OperatorFn = *const fn (*CallContext, []const Value) Error!Value;
+
+pub const QuantifierKind = enum {
+    exists,
+    forall,
+};
+
+pub const LetDefinition = struct {
+    function: OperatorFn,
+    arity: u16,
+};
+
+pub const Operator = struct {
+    name: []const u8,
+    arity: u16,
+    function: ?OperatorFn,
+};
+
+pub fn variable(context: *CallContext, index: u32) Error!Value {
+    if (context.read_primed) return primed_variable(context, index);
+    return current_variable(context, index);
+}
+
+fn current_variable(context: *CallContext, index: u32) Error!Value {
+    const current = context.state orelse {
+        if (index < context.partial_values.len) {
+            if (context.partial_values[index]) |value| return value;
+        }
+        return Error.TypeError;
+    };
+    if (index >= current.values.len) return Error.TypeError;
+    return current.values[index].clone(
+        current.value_pool(index, context.state_pool),
+        context.eval_pool,
+    );
+}
+
+pub fn primed_variable(context: *CallContext, index: u32) Error!Value {
+    if (index < context.partial_values.len) {
+        if (context.partial_values[index]) |value| return value;
+    }
+    if (context.next_state) |next| {
+        if (index >= next.values.len) return Error.TypeError;
+        return next.values[index].clone(
+            next.value_pool(index, context.state_pool),
+            context.eval_pool,
+        );
+    }
+    return current_variable(context, index);
+}
+
+pub fn primed_expression(
+    context: *CallContext,
+    args: []const Value,
+    expression: OperatorFn,
+) Error!Value {
+    const previous = context.read_primed;
+    context.read_primed = true;
+    defer context.read_primed = previous;
+    return expression(context, args);
+}
+
+pub fn unchanged_expression(
+    context: *CallContext,
+    args: []const Value,
+    expression: OperatorFn,
+) Error!bool {
+    const current = try expression(context, args);
+    const next = try primed_expression(context, args, expression);
+    return current.eql(next, context.eval_pool);
+}
+
+pub fn unchanged_variable(
+    context: *CallContext,
+    index: u32,
+) Error!bool {
+    const current = context.state orelse return Error.TypeError;
+    const next = context.next_state orelse return Error.TypeError;
+    if (index >= current.values.len or index >= next.values.len) {
+        return Error.TypeError;
+    }
+    const current_value = try current.values[index].clone(
+        current.value_pool(index, context.state_pool),
+        context.eval_pool,
+    );
+    const next_value = try next.values[index].clone(
+        next.value_pool(index, context.state_pool),
+        context.eval_pool,
+    );
+    return current_value.eql(next_value, context.eval_pool);
+}
+
+pub fn constant(context: *CallContext, name: []const u8) Error!Value {
+    for (context.constants) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) {
+            return entry.value.clone(
+                context.state_pool,
+                context.eval_pool,
+            );
+        }
+    }
+    return Error.UndefinedSymbol;
+}
+
+pub fn constant_at(
+    context: *CallContext,
+    index: u32,
+) Error!Value {
+    if (index >= context.constant_slots.len) {
+        return Error.UndefinedSymbol;
+    }
+    const value = context.constant_slots[index] orelse
+        return Error.UndefinedSymbol;
+    return value.clone(context.state_pool, context.eval_pool);
+}
+
+pub fn native(
+    context: *CallContext,
+    name: []const u8,
+    args: []const Value,
+) Error!Value {
+    return context.native_call(
+        context.native_context,
+        context.eval_pool,
+        name,
+        args,
+    );
+}
+
+pub fn native_binary(
+    context: *CallContext,
+    name: []const u8,
+    left: Value,
+    right: Value,
+) Error!Value {
+    const args = [_]Value{ left, right };
+    return native(context, name, &args);
+}
+
+pub fn operator(
+    context: *CallContext,
+    function: OperatorFn,
+    arity: u16,
+    captures: []const Value,
+) Error!Value {
+    const source_offset = pool_slice_offset(context.eval_pool, captures);
+    const captured = try context.eval_pool.alloc_values(
+        @intCast(captures.len),
+    );
+    const source = if (source_offset) |offset|
+        context.eval_pool.values[offset..][0..captures.len]
+    else
+        captures;
+    @memcpy(captured, source);
+    return .{ .generated_operator_v = .{
+        .function_address = @intFromPtr(function),
+        .arity = arity,
+        .captured_offset = value_offset(
+            context.eval_pool,
+            captured.ptr,
+        ),
+        .captured_len = @intCast(captured.len),
+    } };
+}
+
+pub fn call(
+    context: *CallContext,
+    function: Value,
+    args: []const Value,
+) Error!Value {
+    if (function == .generated_operator_v) {
+        const operator_value = function.generated_operator_v;
+        if (args.len != operator_value.arity) return Error.TypeError;
+        if (operator_value.captured_len + args.len > 64) {
+            return Error.NotImplemented;
+        }
+        const operator_function: OperatorFn = @ptrFromInt(
+            operator_value.function_address,
+        );
+        var combined: [64]Value = undefined;
+        const captured = context.eval_pool.values[operator_value.captured_offset..][0..operator_value.captured_len];
+        @memcpy(combined[0..captured.len], captured);
+        @memcpy(
+            combined[captured.len..][0..args.len],
+            args,
+        );
+        return operator_function(
+            context,
+            combined[0 .. captured.len + args.len],
+        );
+    }
+    if (args.len != 1) return Error.TypeError;
+    return apply(context, function, args[0]);
+}
+
+pub fn string(context: *CallContext, bytes: []const u8) Error!Value {
+    return .{ .string_v = try context.eval_pool.push_string(bytes) };
+}
+
+pub fn field(
+    context: *CallContext,
+    record_value: Value,
+    name: []const u8,
+) Error!Value {
+    if (record_value != .record_v) return Error.TypeError;
+    const fields = record_value.record_v.fields(context.eval_pool);
+    var index: u32 = 0;
+    while (index < record_value.record_v.len) : (index += 1) {
+        if (std.mem.eql(
+            u8,
+            fields[index * 2].string_v.slice(context.eval_pool),
+            name,
+        )) return fields[index * 2 + 1];
+    }
+    return Error.UndefinedSymbol;
+}
+
+pub fn apply(
+    context: *CallContext,
+    function: Value,
+    key: Value,
+) Error!Value {
+    return switch (function) {
+        .function_v => |value| value.apply(
+            context.eval_pool,
+            key,
+        ) orelse Error.IndexOutOfBounds,
+        .tuple_v => |value| blk: {
+            const index = key.as_int() orelse return Error.TypeError;
+            if (index < 1 or index > value.len) {
+                return Error.IndexOutOfBounds;
+            }
+            break :blk value.items(context.eval_pool)[@intCast(index - 1)];
+        },
+        .record_v => |value| blk: {
+            if (key != .string_v) return Error.TypeError;
+            break :blk try field(
+                context,
+                .{ .record_v = value },
+                key.string_v.slice(context.eval_pool),
+            );
+        },
+        else => Error.TypeError,
+    };
+}
+
+pub fn variable_path(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+) Error!Value {
+    if (context.state == null) {
+        var value = try current_variable(context, index);
+        for (keys) |key| value = try apply(context, value, key);
+        return value;
+    }
+
+    const current = context.state.?;
+    if (index >= current.values.len) return Error.TypeError;
+    const source_pool = current.value_pool(index, context.state_pool);
+    var value = current.values[index];
+    for (keys) |key| {
+        value = try apply_cross_pool(
+            value,
+            source_pool,
+            key,
+            context.eval_pool,
+        );
+    }
+    return value.clone(source_pool, context.eval_pool);
+}
+
+fn apply_cross_pool(
+    function: Value,
+    function_pool: *const ValuePool,
+    key: Value,
+    key_pool: *const ValuePool,
+) Error!Value {
+    return switch (function) {
+        .function_v => |function_value| blk: {
+            const domain_values =
+                function_value.domain.items(function_pool);
+            const entries = function_value.entries(function_pool);
+            for (domain_values, entries) |candidate, entry| {
+                if (cross_pool_equal(
+                    candidate,
+                    function_pool,
+                    key,
+                    key_pool,
+                )) break :blk entry;
+            }
+            return Error.IndexOutOfBounds;
+        },
+        .tuple_v => |tuple_value| blk: {
+            const tuple_index = key.as_int() orelse return Error.TypeError;
+            if (tuple_index < 1 or tuple_index > tuple_value.len) {
+                return Error.IndexOutOfBounds;
+            }
+            break :blk tuple_value.items(
+                function_pool,
+            )[@intCast(tuple_index - 1)];
+        },
+        .record_v => |record_value| blk: {
+            if (key != .string_v) return Error.TypeError;
+            const name = key.string_v.slice(key_pool);
+            break :blk record_value.lookup(function_pool, name) orelse
+                return Error.UndefinedSymbol;
+        },
+        else => Error.TypeError,
+    };
+}
+
+fn cross_pool_equal(
+    left: Value,
+    left_pool: *const ValuePool,
+    right: Value,
+    right_pool: *const ValuePool,
+) bool {
+    if (left.tag() != right.tag()) return false;
+    return switch (left) {
+        .bool_v => |value| value == right.bool_v,
+        .int_v => |value| value == right.int_v,
+        .model_v => |value| value == right.model_v,
+        .string_v => |value| std.mem.eql(
+            u8,
+            value.slice(left_pool),
+            right.string_v.slice(right_pool),
+        ),
+        else => false,
+    };
+}
+
+pub fn tuple(context: *CallContext, items: []const Value) Error!Value {
+    const source_offset = pool_slice_offset(context.eval_pool, items);
+    const values = try context.eval_pool.alloc_values(
+        @intCast(items.len),
+    );
+    const source = if (source_offset) |offset|
+        context.eval_pool.values[offset..][0..items.len]
+    else
+        items;
+    @memcpy(values, source);
+    return .{ .tuple_v = .{
+        .offset = value_offset(context.eval_pool, values.ptr),
+        .len = @intCast(values.len),
+    } };
+}
+
+pub fn record(context: *CallContext, fields: []const Value) Error!Value {
+    if (fields.len % 2 != 0) return Error.TypeError;
+    const source_offset = pool_slice_offset(context.eval_pool, fields);
+    const values = try context.eval_pool.alloc_values(
+        @intCast(fields.len),
+    );
+    const source = if (source_offset) |offset|
+        context.eval_pool.values[offset..][0..fields.len]
+    else
+        fields;
+    @memcpy(values, source);
+    return .{ .record_v = .{
+        .offset = value_offset(context.eval_pool, values.ptr),
+        .len = @intCast(values.len / 2),
+    } };
+}
+
+pub fn set(context: *CallContext, items: []const Value) Error!Value {
+    const source_offset = pool_slice_offset(context.eval_pool, items);
+    const values = try context.eval_pool.alloc_values(
+        @intCast(items.len),
+    );
+    const source = if (source_offset) |offset|
+        context.eval_pool.values[offset..][0..items.len]
+    else
+        items;
+    var count: u32 = 0;
+    for (source) |candidate| {
+        var duplicate = false;
+        for (values[0..count]) |existing| {
+            if (existing.eql(candidate, context.eval_pool)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            values[count] = candidate;
+            count += 1;
+        }
+    }
+    return .{ .set_v = .{
+        .offset = value_offset(context.eval_pool, values.ptr),
+        .len = count,
+    } };
+}
+
+pub fn set_union(
+    context: *CallContext,
+    left: Value,
+    right: Value,
+) Error!Value {
+    return materialize_binary_set(context, left, right, .cup);
+}
+
+pub fn set_intersection(
+    context: *CallContext,
+    left: Value,
+    right: Value,
+) Error!Value {
+    return materialize_binary_set(context, left, right, .cap);
+}
+
+pub fn set_difference(
+    context: *CallContext,
+    left: Value,
+    right: Value,
+) Error!Value {
+    return materialize_binary_set(context, left, right, .diff);
+}
+
+pub fn cardinality(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    const iterable = try materialize_iterable(context, args[0]);
+    return .{ .int_v = @intCast(try iterable_count(iterable)) };
+}
+
+pub fn sequence_len(
+    _: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    return switch (args[0]) {
+        .function_v => |function| .{ .int_v = @intCast(function.len) },
+        .tuple_v => |tuple_value| .{ .int_v = @intCast(tuple_value.len) },
+        .string_v => |string_value| .{ .int_v = @intCast(string_value.len) },
+        else => Error.TypeError,
+    };
+}
+
+pub fn sequence_head(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    return switch (args[0]) {
+        .function_v => |function| function.apply(
+            context.eval_pool,
+            .{ .int_v = 1 },
+        ) orelse Error.IndexOutOfBounds,
+        .tuple_v => |tuple_value| if (tuple_value.len == 0)
+            Error.IndexOutOfBounds
+        else
+            tuple_value.items(context.eval_pool)[0],
+        .string_v => |string_value| if (string_value.len == 0)
+            Error.IndexOutOfBounds
+        else
+            .{ .int_v = string_value.slice(context.eval_pool)[0] },
+        else => Error.TypeError,
+    };
+}
+
+pub fn sequence_tail(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    const source = switch (args[0]) {
+        .function_v => |function| function.entries(context.eval_pool),
+        .tuple_v => |tuple_value| tuple_value.items(context.eval_pool),
+        else => return Error.TypeError,
+    };
+    if (source.len == 0) return Error.IndexOutOfBounds;
+    return tuple(context, source[1..]);
+}
+
+pub fn sequence_append(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    const source = switch (args[0]) {
+        .function_v => |function| function.entries(context.eval_pool),
+        .tuple_v => |tuple_value| tuple_value.items(context.eval_pool),
+        else => return Error.TypeError,
+    };
+    const source_offset = pool_slice_offset(context.eval_pool, source);
+    const result = try context.eval_pool.alloc_values(
+        @intCast(source.len + 1),
+    );
+    const source_after_growth = if (source_offset) |offset|
+        context.eval_pool.values[offset..][0..source.len]
+    else
+        source;
+    @memcpy(result[0..source.len], source_after_growth);
+    result[source.len] = args[1];
+    return .{ .tuple_v = .{
+        .offset = value_offset(context.eval_pool, result.ptr),
+        .len = @intCast(result.len),
+    } };
+}
+
+pub fn function_range(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    const source = switch (args[0]) {
+        .function_v => |function| function.entries(context.eval_pool),
+        .tuple_v => |tuple_value| tuple_value.items(context.eval_pool),
+        else => return Error.TypeError,
+    };
+    return set(context, source);
+}
+
+pub fn sequence_to_set(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    const source = switch (args[0]) {
+        .function_v => |function| function.entries(context.eval_pool),
+        .tuple_v => |tuple_value| tuple_value.items(context.eval_pool),
+        else => return Error.TypeError,
+    };
+    return set(context, source);
+}
+
+pub fn sequence_index(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    const source = switch (args[0]) {
+        .function_v => |function| function.entries(context.eval_pool),
+        .tuple_v => |tuple_value| tuple_value.items(context.eval_pool),
+        else => return Error.TypeError,
+    };
+    for (source, 0..) |item, index| {
+        if (item.eql(args[1], context.eval_pool)) {
+            return .{ .int_v = @as(i64, @intCast(index)) + 1 };
+        }
+    }
+    return Error.EmptyChoose;
+}
+
+pub fn permutation_sequences(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 1 or args[0] != .set_v) return Error.TypeError;
+    const items = args[0].set_v.items(context.eval_pool);
+    if (items.len > 10) return Error.NotImplemented;
+    const count = try permutation_count(items.len);
+    try context.eval_pool.ensure_value_capacity(
+        count + count * items.len,
+    );
+    const result = try context.eval_pool.alloc_values(count);
+    const result_offset = value_offset(context.eval_pool, result.ptr);
+    var scratch: [10]Value = undefined;
+    var used: [10]bool = @splat(false);
+    var output_index: u32 = 0;
+    try generate_permutation_sequences(
+        context,
+        items,
+        scratch[0..items.len],
+        used[0..items.len],
+        0,
+        result_offset,
+        &output_index,
+    );
+    std.debug.assert(output_index == count);
+    return .{ .set_v = .{
+        .offset = result_offset,
+        .len = count,
+    } };
+}
+
+fn generate_permutation_sequences(
+    context: *CallContext,
+    items: []const Value,
+    scratch: []Value,
+    used: []bool,
+    depth: usize,
+    result_offset: u32,
+    output_index: *u32,
+) Error!void {
+    if (depth == items.len) {
+        const tuple_value = try tuple(context, scratch);
+        context.eval_pool.values[result_offset + output_index.*] =
+            tuple_value;
+        output_index.* += 1;
+        return;
+    }
+    for (items, 0..) |item, item_index| {
+        if (used[item_index]) continue;
+        used[item_index] = true;
+        scratch[depth] = item;
+        try generate_permutation_sequences(
+            context,
+            items,
+            scratch,
+            used,
+            depth + 1,
+            result_offset,
+            output_index,
+        );
+        used[item_index] = false;
+    }
+}
+
+pub fn permutations(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 1 or args[0] != .set_v) return Error.TypeError;
+    const function_domain = args[0].set_v;
+    const items = function_domain.items(context.eval_pool);
+    if (items.len > 10) return Error.NotImplemented;
+    const count = try permutation_count(items.len);
+    try context.eval_pool.ensure_value_capacity(
+        count + count * items.len,
+    );
+    const result = try context.eval_pool.alloc_values(count);
+    const result_offset = value_offset(context.eval_pool, result.ptr);
+    var order: [10]u8 = undefined;
+    for (order[0..items.len], 0..) |*entry, index| {
+        entry.* = @intCast(index);
+    }
+    var output_index: u32 = 0;
+    while (true) {
+        const entries = try context.eval_pool.alloc_values(
+            @intCast(items.len),
+        );
+        const entries_offset = value_offset(
+            context.eval_pool,
+            entries.ptr,
+        );
+        for (order[0..items.len], 0..) |source_index, index| {
+            context.eval_pool.values[entries_offset + index] =
+                items[source_index];
+        }
+        context.eval_pool.values[result_offset + output_index] =
+            .{ .function_v = .{
+                .domain = function_domain,
+                .offset = entries_offset,
+                .len = @intCast(items.len),
+            } };
+        output_index += 1;
+        if (!next_permutation(order[0..items.len])) break;
+    }
+    std.debug.assert(output_index == count);
+    return .{ .set_v = .{
+        .offset = result_offset,
+        .len = count,
+    } };
+}
+
+fn permutation_count(item_count: usize) Error!u32 {
+    var count: u64 = 1;
+    for (2..item_count + 1) |factor| {
+        count = std.math.mul(u64, count, factor) catch
+            return Error.OutOfMemory;
+    }
+    if (count > std.math.maxInt(u32)) return Error.OutOfMemory;
+    return @intCast(count);
+}
+
+fn next_permutation(order: []u8) bool {
+    if (order.len < 2) return false;
+    var pivot = order.len - 1;
+    while (pivot > 0 and order[pivot - 1] >= order[pivot]) {
+        pivot -= 1;
+    }
+    if (pivot == 0) return false;
+    var successor = order.len - 1;
+    while (order[successor] <= order[pivot - 1]) successor -= 1;
+    std.mem.swap(u8, &order[pivot - 1], &order[successor]);
+    std.mem.reverse(u8, order[pivot..]);
+    return true;
+}
+
+pub fn intersection_all(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    const outer = try materialize_iterable(context, args[0]);
+    if (outer != .set_v) return Error.TypeError;
+    const outer_set = outer.set_v;
+    if (outer_set.len == 0) return set(context, &.{});
+    var smallest = try materialize_iterable(
+        context,
+        context.eval_pool.values[outer_set.offset],
+    );
+    if (smallest != .set_v) return Error.TypeError;
+    var set_index: u32 = 1;
+    while (set_index < outer_set.len) : (set_index += 1) {
+        const set_value =
+            context.eval_pool.values[outer_set.offset + set_index];
+        const candidate = try materialize_iterable(context, set_value);
+        if (candidate != .set_v) return Error.TypeError;
+        if (candidate.set_v.len < smallest.set_v.len) {
+            smallest = candidate;
+        }
+    }
+    const smallest_set = smallest.set_v;
+    const accepted = try context.eval_pool.alloc_values(
+        smallest_set.len,
+    );
+    const accepted_offset = value_offset(context.eval_pool, accepted.ptr);
+    var accepted_count: u32 = 0;
+    const candidates = smallest_set.items(context.eval_pool);
+    for (candidates) |candidate| {
+        var present = true;
+        set_index = 0;
+        while (set_index < outer_set.len) : (set_index += 1) {
+            const set_value =
+                context.eval_pool.values[outer_set.offset + set_index];
+            if (!set_value.member(context.eval_pool, candidate)) {
+                present = false;
+                break;
+            }
+        }
+        if (present) {
+            context.eval_pool.values[accepted_offset + accepted_count] =
+                candidate;
+            accepted_count += 1;
+        }
+    }
+    return .{ .set_v = .{
+        .offset = accepted_offset,
+        .len = accepted_count,
+    } };
+}
+
+pub fn power_set(context: *CallContext, operand: Value) Error!Value {
+    if (!operand.is_set_like()) return Error.TypeError;
+    return .{ .power_set_v = .{
+        .set_offset = try context.eval_pool.push_value(operand),
+    } };
+}
+
+pub fn union_all(context: *CallContext, operand: Value) Error!Value {
+    if (!operand.is_set_like()) return Error.TypeError;
+    return .{ .union_v = .{
+        .set_offset = try context.eval_pool.push_value(operand),
+    } };
+}
+
+pub fn function_set(
+    context: *CallContext,
+    domain_value: Value,
+    codomain_value: Value,
+) Error!Value {
+    if (!domain_value.is_set_like() or !codomain_value.is_set_like()) {
+        return Error.TypeError;
+    }
+    return .{ .function_set_v = .{
+        .domain_offset = try context.eval_pool.push_value(domain_value),
+        .codomain_offset = try context.eval_pool.push_value(codomain_value),
+    } };
+}
+
+pub fn record_set(
+    context: *CallContext,
+    fields: []const Value,
+) Error!Value {
+    if (fields.len % 2 != 0) return Error.TypeError;
+    const values = try context.eval_pool.alloc_values(
+        @intCast(fields.len),
+    );
+    @memcpy(values, fields);
+    var index: usize = 0;
+    while (index < values.len) : (index += 2) {
+        if (values[index] != .string_v or
+            !values[index + 1].is_set_like())
+        {
+            return Error.TypeError;
+        }
+    }
+    return .{ .record_set_v = .{
+        .offset = value_offset(context.eval_pool, values.ptr),
+        .len = @intCast(values.len / 2),
+    } };
+}
+
+pub fn domain(context: *CallContext, operand: Value) Error!Value {
+    return switch (operand) {
+        .function_v => |function| .{ .set_v = function.domain },
+        .tuple_v => |tuple_value| .{ .range_v = .{
+            .lo = 1,
+            .hi = @intCast(tuple_value.len),
+        } },
+        .record_v => |record_value| blk: {
+            const keys = try context.eval_pool.alloc_values(record_value.len);
+            var index: u32 = 0;
+            while (index < record_value.len) : (index += 1) {
+                keys[index] = record_value.fields(
+                    context.eval_pool,
+                )[index * 2];
+            }
+            break :blk try set(context, keys);
+        },
+        else => Error.TypeError,
+    };
+}
+
+pub fn constant_function(
+    context: *CallContext,
+    domain_value: Value,
+    result_value: Value,
+) Error!Value {
+    const function_domain: Set = switch (domain_value) {
+        .set_v => |set_value| set_value,
+        .range_v => |range_value| blk: {
+            if (range_value.hi < range_value.lo) {
+                const empty = try context.eval_pool.alloc_values(0);
+                break :blk .{
+                    .offset = value_offset(
+                        context.eval_pool,
+                        empty.ptr,
+                    ),
+                    .len = 0,
+                };
+            }
+            const length_i128 =
+                @as(i128, range_value.hi) -
+                @as(i128, range_value.lo) + 1;
+            if (length_i128 > std.math.maxInt(u32)) {
+                return Error.OutOfMemory;
+            }
+            const keys = try context.eval_pool.alloc_values(
+                @intCast(length_i128),
+            );
+            for (keys, 0..) |*key, index| {
+                key.* = .{
+                    .int_v = range_value.lo + @as(i64, @intCast(index)),
+                };
+            }
+            break :blk .{
+                .offset = value_offset(context.eval_pool, keys.ptr),
+                .len = @intCast(keys.len),
+            };
+        },
+        else => return Error.TypeError,
+    };
+    const entries = try context.eval_pool.alloc_values(
+        function_domain.len,
+    );
+    @memset(entries, result_value);
+    return .{ .function_v = .{
+        .domain = function_domain,
+        .offset = value_offset(context.eval_pool, entries.ptr),
+        .len = function_domain.len,
+    } };
+}
+
+pub fn quantify(
+    context: *CallContext,
+    operator_args: []const Value,
+    domains: []const Value,
+    kind: QuantifierKind,
+    predicate: OperatorFn,
+) Error!Value {
+    if (domains.len > 16 or operator_args.len + domains.len > 64) {
+        return Error.NotImplemented;
+    }
+    var materialized: [16]Value = undefined;
+    for (domains, 0..) |domain_value, index| {
+        materialized[index] = try materialize_iterable(
+            context,
+            domain_value,
+        );
+    }
+    var bound: [16]Value = undefined;
+    return .{ .bool_v = try quantify_recursive(
+        context,
+        operator_args,
+        materialized[0..domains.len],
+        kind,
+        predicate,
+        bound[0..domains.len],
+        0,
+    ) };
+}
+
+pub fn filter(
+    context: *CallContext,
+    operator_args: []const Value,
+    domain_value: Value,
+    predicate: OperatorFn,
+) Error!Value {
+    if (domain_value == .function_set_v) {
+        return filter_function_set(
+            context,
+            operator_args,
+            domain_value.function_set_v,
+            predicate,
+        );
+    }
+    const iterable = try materialize_iterable(context, domain_value);
+    const count = try iterable_count(iterable);
+    const accepted = try context.eval_pool.alloc_values(count);
+    const accepted_offset = value_offset(
+        context.eval_pool,
+        accepted.ptr,
+    );
+    var accepted_count: u32 = 0;
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const candidate = try iterable_value(context, iterable, index);
+        const result = try call_bound(
+            context,
+            operator_args,
+            &.{candidate},
+            predicate,
+        );
+        if (try boolean(result)) {
+            const accepted_values = context.eval_pool.values[accepted_offset..][0..count];
+            var duplicate = false;
+            for (accepted_values[0..accepted_count]) |existing| {
+                if (existing.eql(candidate, context.eval_pool)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                accepted_values[accepted_count] = candidate;
+                accepted_count += 1;
+            }
+        }
+    }
+    return .{ .set_v = .{
+        .offset = accepted_offset,
+        .len = accepted_count,
+    } };
+}
+
+fn filter_function_set(
+    context: *CallContext,
+    operator_args: []const Value,
+    function_set_value: @import("value.zig").FunctionSet,
+    predicate: OperatorFn,
+) Error!Value {
+    const domain_value = try materialize_iterable(
+        context,
+        function_set_value.domain(context.eval_pool),
+    );
+    const codomain_value = try materialize_iterable(
+        context,
+        function_set_value.codomain(context.eval_pool),
+    );
+    const function_domain = domain_value.set_v;
+    const codomain = codomain_value.set_v;
+    var candidate_count: u64 = 1;
+    var index: u32 = 0;
+    while (index < function_domain.len) : (index += 1) {
+        candidate_count = std.math.mul(
+            u64,
+            candidate_count,
+            codomain.len,
+        ) catch return Error.OutOfMemory;
+        if (candidate_count > 262_144) return Error.NotImplemented;
+    }
+    var accepted_bits: [4096]u64 = undefined;
+    const word_count: usize = @intCast((candidate_count + 63) / 64);
+    @memset(accepted_bits[0..word_count], 0);
+    const scratch = context.eval_pool.snapshot();
+    var accepted_count: u32 = 0;
+    var combination: u64 = 0;
+    while (combination < candidate_count) : (combination += 1) {
+        const entries = try context.eval_pool.alloc_values(
+            function_domain.len,
+        );
+        const entries_offset = value_offset(
+            context.eval_pool,
+            entries.ptr,
+        );
+        var cursor = combination;
+        index = 0;
+        while (index < function_domain.len) : (index += 1) {
+            const selected: u32 = @intCast(cursor % codomain.len);
+            cursor /= codomain.len;
+            context.eval_pool.values[entries_offset + index] =
+                codomain.items(context.eval_pool)[selected];
+        }
+        const candidate = Value{ .function_v = .{
+            .domain = function_domain,
+            .offset = entries_offset,
+            .len = function_domain.len,
+        } };
+        if (try boolean(try call_bound(
+            context,
+            operator_args,
+            &.{candidate},
+            predicate,
+        ))) {
+            const word: usize = @intCast(combination / 64);
+            const bit: u6 = @intCast(combination % 64);
+            accepted_bits[word] |= @as(u64, 1) << bit;
+            accepted_count += 1;
+        }
+        context.eval_pool.restore(scratch);
+    }
+
+    try context.eval_pool.ensure_value_capacity(
+        accepted_count +
+            @as(u64, accepted_count) * function_domain.len,
+    );
+    const accepted = try context.eval_pool.alloc_values(accepted_count);
+    const accepted_offset = value_offset(
+        context.eval_pool,
+        accepted.ptr,
+    );
+    var accepted_index: u32 = 0;
+    combination = 0;
+    while (combination < candidate_count) : (combination += 1) {
+        const word: usize = @intCast(combination / 64);
+        const bit: u6 = @intCast(combination % 64);
+        if (accepted_bits[word] & (@as(u64, 1) << bit) == 0) continue;
+        const entries = try context.eval_pool.alloc_values(
+            function_domain.len,
+        );
+        const entries_offset = value_offset(
+            context.eval_pool,
+            entries.ptr,
+        );
+        var cursor = combination;
+        index = 0;
+        while (index < function_domain.len) : (index += 1) {
+            const selected: u32 = @intCast(cursor % codomain.len);
+            cursor /= codomain.len;
+            context.eval_pool.values[entries_offset + index] =
+                codomain.items(context.eval_pool)[selected];
+        }
+        context.eval_pool.values[accepted_offset + accepted_index] =
+            .{ .function_v = .{
+                .domain = function_domain,
+                .offset = entries_offset,
+                .len = function_domain.len,
+            } };
+        accepted_index += 1;
+    }
+    std.debug.assert(accepted_index == accepted_count);
+    return .{ .set_v = .{
+        .offset = accepted_offset,
+        .len = accepted_count,
+    } };
+}
+
+pub fn map_set(
+    context: *CallContext,
+    operator_args: []const Value,
+    domain_value: Value,
+    mapper: OperatorFn,
+) Error!Value {
+    const iterable = try materialize_iterable(context, domain_value);
+    const count = try iterable_count(iterable);
+    const mapped = try context.eval_pool.alloc_values(count);
+    const mapped_offset = value_offset(context.eval_pool, mapped.ptr);
+    var mapped_count: u32 = 0;
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const candidate = try iterable_value(context, iterable, index);
+        const result = try call_bound(
+            context,
+            operator_args,
+            &.{candidate},
+            mapper,
+        );
+        const mapped_values = context.eval_pool.values[mapped_offset..][0..count];
+        var duplicate = false;
+        for (mapped_values[0..mapped_count]) |existing| {
+            if (existing.eql(result, context.eval_pool)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            mapped_values[mapped_count] = result;
+            mapped_count += 1;
+        }
+    }
+    return .{ .set_v = .{
+        .offset = mapped_offset,
+        .len = mapped_count,
+    } };
+}
+
+pub fn function_map(
+    context: *CallContext,
+    operator_args: []const Value,
+    domain_value: Value,
+    mapper: OperatorFn,
+) Error!Value {
+    const iterable = try materialize_iterable(context, domain_value);
+    const count = try iterable_count(iterable);
+    const keys = try context.eval_pool.alloc_values(count);
+    const keys_offset = value_offset(context.eval_pool, keys.ptr);
+    const entries = try context.eval_pool.alloc_values(count);
+    const entries_offset = value_offset(context.eval_pool, entries.ptr);
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const key = try iterable_value(context, iterable, index);
+        context.eval_pool.values[keys_offset + index] = key;
+        const entry = try call_bound(
+            context,
+            operator_args,
+            &.{key},
+            mapper,
+        );
+        context.eval_pool.values[entries_offset + index] = entry;
+    }
+    return .{ .function_v = .{
+        .domain = .{
+            .offset = keys_offset,
+            .len = count,
+        },
+        .offset = entries_offset,
+        .len = count,
+    } };
+}
+
+pub fn let_expression(
+    context: *CallContext,
+    operator_args: []const Value,
+    definitions: []const LetDefinition,
+    body: OperatorFn,
+) Error!Value {
+    if (operator_args.len + definitions.len > 64) {
+        return Error.NotImplemented;
+    }
+    var values: [64]Value = undefined;
+    @memcpy(values[0..operator_args.len], operator_args);
+    for (definitions, 0..) |definition, index| {
+        const captures = values[0 .. operator_args.len + index];
+        values[operator_args.len + index] =
+            if (definition.arity == 0)
+                try definition.function(context, captures)
+            else
+                try operator(
+                    context,
+                    definition.function,
+                    definition.arity,
+                    captures,
+                );
+    }
+    return body(
+        context,
+        values[0 .. operator_args.len + definitions.len],
+    );
+}
+
+pub fn choose(
+    context: *CallContext,
+    operator_args: []const Value,
+    domain_value: Value,
+    predicate: OperatorFn,
+) Error!Value {
+    const iterable = try materialize_iterable(context, domain_value);
+    const count = try iterable_count(iterable);
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const candidate = try iterable_value(context, iterable, index);
+        if (try boolean(try call_bound(
+            context,
+            operator_args,
+            &.{candidate},
+            predicate,
+        ))) return candidate;
+    }
+    return Error.EmptyChoose;
+}
+
+pub fn reduce_sequence(
+    context: *CallContext,
+    operator_args: []const Value,
+    sequence: Value,
+    initial: Value,
+    reducer: OperatorFn,
+) Error!Value {
+    const length: u32 = switch (sequence) {
+        .tuple_v => |tuple_value| tuple_value.len,
+        .function_v => |function_value| function_value.len,
+        else => return Error.TypeError,
+    };
+    var accumulator = initial;
+    var index: u32 = 0;
+    while (index < length) : (index += 1) {
+        const element = try apply(
+            context,
+            sequence,
+            .{ .int_v = @as(i64, @intCast(index)) + 1 },
+        );
+        accumulator = try call_bound(
+            context,
+            operator_args,
+            &.{ element, accumulator },
+            reducer,
+        );
+    }
+    return accumulator;
+}
+
+pub fn select_sequence(
+    context: *CallContext,
+    operator_args: []const Value,
+    sequence: Value,
+    predicate: OperatorFn,
+) Error!Value {
+    const length: u32 = switch (sequence) {
+        .tuple_v => |tuple_value| tuple_value.len,
+        .function_v => |function_value| function_value.len,
+        else => return Error.TypeError,
+    };
+    const result = try context.eval_pool.alloc_values(length);
+    const result_offset = value_offset(context.eval_pool, result.ptr);
+    var selected: u32 = 0;
+    var index: u32 = 0;
+    while (index < length) : (index += 1) {
+        const element = try apply(
+            context,
+            sequence,
+            .{ .int_v = @as(i64, @intCast(index)) + 1 },
+        );
+        if (try boolean(try call_bound(
+            context,
+            operator_args,
+            &.{element},
+            predicate,
+        ))) {
+            context.eval_pool.values[result_offset + selected] = element;
+            selected += 1;
+        }
+    }
+    return .{ .tuple_v = .{
+        .offset = result_offset,
+        .len = selected,
+    } };
+}
+
+pub fn except(
+    context: *CallContext,
+    original: Value,
+    path: []const Value,
+    replacement: Value,
+) Error!Value {
+    if (path.len == 0) return replacement;
+    return except_recursive(
+        context,
+        original,
+        path,
+        0,
+        .{ .value = replacement },
+    );
+}
+
+pub fn except_update(
+    context: *CallContext,
+    operator_args: []const Value,
+    original: Value,
+    path: []const Value,
+    updater: OperatorFn,
+) Error!Value {
+    if (path.len == 0) {
+        return call_bound(
+            context,
+            operator_args,
+            &.{original},
+            updater,
+        );
+    }
+    return except_recursive(
+        context,
+        original,
+        path,
+        0,
+        .{ .function = .{
+            .operator_args = operator_args,
+            .updater = updater,
+        } },
+    );
+}
+
+pub fn range(left: Value, right: Value) Error!Value {
+    return .{ .range_v = .{
+        .lo = try integer(left),
+        .hi = try integer(right),
+    } };
+}
+
+pub fn member(
+    context: *CallContext,
+    element: Value,
+    set_value: Value,
+) Error!Value {
+    if (!set_value.is_set_like()) return Error.TypeError;
+    return .{ .bool_v = set_value.member(context.eval_pool, element) };
+}
+
+pub fn member_bool(
+    context: *CallContext,
+    element: Value,
+    set_value: Value,
+) Error!bool {
+    if (!set_value.is_set_like()) return Error.TypeError;
+    return set_value.member(context.eval_pool, element);
+}
+
+pub fn not_member(
+    context: *CallContext,
+    element: Value,
+    set_value: Value,
+) Error!Value {
+    const result = try member(context, element, set_value);
+    return .{ .bool_v = !result.bool_v };
+}
+
+pub fn not_member_bool(
+    context: *CallContext,
+    element: Value,
+    set_value: Value,
+) Error!bool {
+    return !try member_bool(context, element, set_value);
+}
+
+pub fn subset_equal(
+    context: *CallContext,
+    left: Value,
+    right: Value,
+) Error!Value {
+    if (!left.is_set_like() or !right.is_set_like()) {
+        return Error.TypeError;
+    }
+    switch (left) {
+        .set_v => |left_set| {
+            for (left_set.items(context.eval_pool)) |item| {
+                if (!right.member(context.eval_pool, item)) {
+                    return .{ .bool_v = false };
+                }
+            }
+            return .{ .bool_v = true };
+        },
+        .range_v => |left_range| {
+            if (left_range.hi < left_range.lo) {
+                return .{ .bool_v = true };
+            }
+            var item = left_range.lo;
+            while (item <= left_range.hi) : (item += 1) {
+                if (!right.member(
+                    context.eval_pool,
+                    .{ .int_v = item },
+                )) return .{ .bool_v = false };
+                if (item == std.math.maxInt(i64)) break;
+            }
+            return .{ .bool_v = true };
+        },
+        else => return Error.NotImplemented,
+    }
+}
+
+pub fn subset_equal_bool(
+    context: *CallContext,
+    left: Value,
+    right: Value,
+) Error!bool {
+    return boolean(try subset_equal(context, left, right));
+}
+
+pub fn equivalent(left: Value, right: Value) Error!Value {
+    return .{ .bool_v = (try boolean(left)) == (try boolean(right)) };
+}
+
+pub fn power(left: Value, right: Value) Error!Value {
+    const base = try integer(left);
+    const exponent = try integer(right);
+    if (exponent < 0) return Error.DivisionByZero;
+    var result: i64 = 1;
+    var index: i64 = 0;
+    while (index < exponent) : (index += 1) result *= base;
+    return .{ .int_v = result };
+}
+
+fn value_offset(pool: *const ValuePool, pointer: [*]Value) u32 {
+    const base = @intFromPtr(pool.values.ptr);
+    const address = @intFromPtr(pointer);
+    std.debug.assert(address >= base);
+    const bytes = address - base;
+    std.debug.assert(bytes % @sizeOf(Value) == 0);
+    const offset: u32 = @intCast(bytes / @sizeOf(Value));
+    std.debug.assert(offset <= pool.value_count);
+    return offset;
+}
+
+fn pool_slice_offset(
+    pool: *const ValuePool,
+    values: []const Value,
+) ?u32 {
+    if (values.len == 0) return null;
+    const base = @intFromPtr(pool.values.ptr);
+    const end = base + pool.value_count * @sizeOf(Value);
+    const address = @intFromPtr(values.ptr);
+    if (address < base or address >= end) return null;
+    const bytes = address - base;
+    std.debug.assert(bytes % @sizeOf(Value) == 0);
+    const offset: u32 = @intCast(bytes / @sizeOf(Value));
+    std.debug.assert(offset + values.len <= pool.value_count);
+    return offset;
+}
+
+const BinarySetKind = enum {
+    cup,
+    cap,
+    diff,
+};
+
+fn binary_set(
+    context: *CallContext,
+    left: Value,
+    right: Value,
+    kind: BinarySetKind,
+) Error!Value {
+    if (!left.is_set_like() or !right.is_set_like()) {
+        return Error.TypeError;
+    }
+    const left_offset = try context.eval_pool.push_value(left);
+    const right_offset = try context.eval_pool.push_value(right);
+    const value = BinarySet{
+        .left_offset = left_offset,
+        .right_offset = right_offset,
+    };
+    return switch (kind) {
+        .cup => .{ .cup_v = value },
+        .cap => .{ .cap_v = value },
+        .diff => .{ .diff_v = value },
+    };
+}
+
+fn quantify_recursive(
+    context: *CallContext,
+    operator_args: []const Value,
+    domains: []const Value,
+    kind: QuantifierKind,
+    predicate: OperatorFn,
+    bound: []Value,
+    depth: usize,
+) Error!bool {
+    if (depth == domains.len) {
+        return boolean(try call_bound(
+            context,
+            operator_args,
+            bound,
+            predicate,
+        ));
+    }
+    const count = try iterable_count(domains[depth]);
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        bound[depth] = try iterable_value(
+            context,
+            domains[depth],
+            index,
+        );
+        const result = try quantify_recursive(
+            context,
+            operator_args,
+            domains,
+            kind,
+            predicate,
+            bound,
+            depth + 1,
+        );
+        if (kind == .exists and result) return true;
+        if (kind == .forall and !result) return false;
+    }
+    return kind == .forall;
+}
+
+fn call_bound(
+    context: *CallContext,
+    operator_args: []const Value,
+    bound: []const Value,
+    function: OperatorFn,
+) Error!Value {
+    if (operator_args.len + bound.len > 64) {
+        return Error.NotImplemented;
+    }
+    var combined: [64]Value = undefined;
+    @memcpy(combined[0..operator_args.len], operator_args);
+    @memcpy(
+        combined[operator_args.len..][0..bound.len],
+        bound,
+    );
+    return function(
+        context,
+        combined[0 .. operator_args.len + bound.len],
+    );
+}
+
+pub fn materialize_iterable(
+    context: *CallContext,
+    value: Value,
+) Error!Value {
+    return switch (value) {
+        .set_v => value,
+        .range_v => try materialize_range(context, value.range_v),
+        .record_set_v => |record_set_value| try materialize_record_set(
+            context,
+            record_set_value,
+        ),
+        .function_set_v => |function_set_value| try materialize_function_set(
+            context,
+            function_set_value,
+        ),
+        .union_v => |union_value| try materialize_union(
+            context,
+            union_value.set(context.eval_pool),
+        ),
+        .cup_v => |binary| try materialize_binary_set(
+            context,
+            binary.left(context.eval_pool),
+            binary.right(context.eval_pool),
+            .cup,
+        ),
+        .cap_v => |binary| try materialize_binary_set(
+            context,
+            binary.left(context.eval_pool),
+            binary.right(context.eval_pool),
+            .cap,
+        ),
+        .diff_v => |binary| try materialize_binary_set(
+            context,
+            binary.left(context.eval_pool),
+            binary.right(context.eval_pool),
+            .diff,
+        ),
+        .power_set_v => |power_set_value| try materialize_power_set(
+            context,
+            power_set_value.set(context.eval_pool),
+        ),
+        else => Error.NotImplemented,
+    };
+}
+
+fn materialize_range(
+    context: *CallContext,
+    range_value: @import("value.zig").Range,
+) Error!Value {
+    if (range_value.hi < range_value.lo) {
+        const empty = try context.eval_pool.alloc_values(0);
+        return .{ .set_v = .{
+            .offset = value_offset(context.eval_pool, empty.ptr),
+            .len = 0,
+        } };
+    }
+    const count_i128 =
+        @as(i128, range_value.hi) -
+        @as(i128, range_value.lo) + 1;
+    if (count_i128 > std.math.maxInt(u32)) return Error.OutOfMemory;
+    const count: u32 = @intCast(count_i128);
+    const items = try context.eval_pool.alloc_values(count);
+    for (items, 0..) |*item, index| {
+        item.* = .{
+            .int_v = range_value.lo + @as(i64, @intCast(index)),
+        };
+    }
+    return .{ .set_v = .{
+        .offset = value_offset(context.eval_pool, items.ptr),
+        .len = count,
+    } };
+}
+
+fn materialize_record_set(
+    context: *CallContext,
+    record_set_value: @import("value.zig").RecordSet,
+) Error!Value {
+    if (record_set_value.len > 64) return Error.NotImplemented;
+    var domains: [64]Value = undefined;
+    var count: u64 = 1;
+    var field_index: u32 = 0;
+    while (field_index < record_set_value.len) : (field_index += 1) {
+        domains[field_index] = try materialize_iterable(
+            context,
+            record_set_value.field_domain(
+                context.eval_pool,
+                field_index,
+            ),
+        );
+        count = std.math.mul(
+            u64,
+            count,
+            domains[field_index].set_v.len,
+        ) catch return Error.OutOfMemory;
+        if (count > std.math.maxInt(u32)) return Error.OutOfMemory;
+    }
+    const records = try context.eval_pool.alloc_values(@intCast(count));
+    const records_offset = value_offset(context.eval_pool, records.ptr);
+    var combination: u64 = 0;
+    while (combination < count) : (combination += 1) {
+        const fields = try context.eval_pool.alloc_values(
+            record_set_value.len * 2,
+        );
+        var cursor = combination;
+        field_index = 0;
+        while (field_index < record_set_value.len) : (field_index += 1) {
+            const items = domains[field_index].set_v.items(
+                context.eval_pool,
+            );
+            const selected: usize = @intCast(cursor % items.len);
+            cursor /= items.len;
+            fields[field_index * 2] = .{
+                .string_v = record_set_value.field_name(
+                    context.eval_pool,
+                    field_index,
+                ),
+            };
+            fields[field_index * 2 + 1] = items[selected];
+        }
+        const fields_offset = value_offset(context.eval_pool, fields.ptr);
+        context.eval_pool.values[records_offset + combination] = .{ .record_v = .{
+            .offset = fields_offset,
+            .len = record_set_value.len,
+        } };
+    }
+    return .{ .set_v = .{
+        .offset = records_offset,
+        .len = @intCast(count),
+    } };
+}
+
+fn materialize_function_set(
+    context: *CallContext,
+    function_set_value: @import("value.zig").FunctionSet,
+) Error!Value {
+    const domain_value = try materialize_iterable(
+        context,
+        function_set_value.domain(context.eval_pool),
+    );
+    const codomain_value = try materialize_iterable(
+        context,
+        function_set_value.codomain(context.eval_pool),
+    );
+    const function_domain = domain_value.set_v;
+    const codomain_items = codomain_value.set_v.items(context.eval_pool);
+    var count: u64 = 1;
+    var index: u32 = 0;
+    while (index < function_domain.len) : (index += 1) {
+        count = std.math.mul(
+            u64,
+            count,
+            codomain_items.len,
+        ) catch return Error.OutOfMemory;
+        if (count > std.math.maxInt(u32)) return Error.OutOfMemory;
+    }
+    const functions = try context.eval_pool.alloc_values(@intCast(count));
+    const functions_offset = value_offset(
+        context.eval_pool,
+        functions.ptr,
+    );
+    var combination: u64 = 0;
+    while (combination < count) : (combination += 1) {
+        const entries = try context.eval_pool.alloc_values(
+            function_domain.len,
+        );
+        var cursor = combination;
+        index = 0;
+        while (index < function_domain.len) : (index += 1) {
+            if (codomain_items.len == 0) return Error.TypeError;
+            const selected: usize = @intCast(cursor % codomain_items.len);
+            cursor /= codomain_items.len;
+            entries[index] = codomain_items[selected];
+        }
+        const entries_offset = value_offset(context.eval_pool, entries.ptr);
+        context.eval_pool.values[functions_offset + combination] = .{ .function_v = .{
+            .domain = function_domain,
+            .offset = entries_offset,
+            .len = function_domain.len,
+        } };
+    }
+    return .{ .set_v = .{
+        .offset = functions_offset,
+        .len = @intCast(count),
+    } };
+}
+
+fn materialize_union(
+    context: *CallContext,
+    outer_value: Value,
+) Error!Value {
+    const outer = try materialize_iterable(context, outer_value);
+    if (outer.set_v.len > 256) return Error.NotImplemented;
+    var inner_sets: [256]Value = undefined;
+    var capacity: u64 = 0;
+    for (outer.set_v.items(context.eval_pool), 0..) |inner, index| {
+        inner_sets[index] = try materialize_iterable(context, inner);
+        capacity += inner_sets[index].set_v.len;
+        if (capacity > std.math.maxInt(u32)) return Error.OutOfMemory;
+    }
+    const result = try context.eval_pool.alloc_values(@intCast(capacity));
+    var count: u32 = 0;
+    for (inner_sets[0..outer.set_v.len]) |inner| {
+        for (inner.set_v.items(context.eval_pool)) |candidate| {
+            if (!contains_value(
+                context.eval_pool,
+                result[0..count],
+                candidate,
+            )) {
+                result[count] = candidate;
+                count += 1;
+            }
+        }
+    }
+    return .{ .set_v = .{
+        .offset = value_offset(context.eval_pool, result.ptr),
+        .len = count,
+    } };
+}
+
+fn materialize_binary_set(
+    context: *CallContext,
+    left_value: Value,
+    right_value: Value,
+    kind: BinarySetKind,
+) Error!Value {
+    const left = try materialize_iterable(context, left_value);
+    const right = try materialize_iterable(context, right_value);
+    const capacity = switch (kind) {
+        .cup => left.set_v.len + right.set_v.len,
+        .cap => @min(left.set_v.len, right.set_v.len),
+        .diff => left.set_v.len,
+    };
+    const result = try context.eval_pool.alloc_values(capacity);
+    var count: u32 = 0;
+    for (left.set_v.items(context.eval_pool)) |candidate| {
+        const in_right = right.set_v.contains(
+            context.eval_pool,
+            candidate,
+        );
+        if (kind == .cap and !in_right) continue;
+        if (kind == .diff and in_right) continue;
+        result[count] = candidate;
+        count += 1;
+    }
+    if (kind == .cup) {
+        for (right.set_v.items(context.eval_pool)) |candidate| {
+            if (!contains_value(
+                context.eval_pool,
+                result[0..count],
+                candidate,
+            )) {
+                result[count] = candidate;
+                count += 1;
+            }
+        }
+    }
+    return .{ .set_v = .{
+        .offset = value_offset(context.eval_pool, result.ptr),
+        .len = count,
+    } };
+}
+
+fn materialize_power_set(
+    context: *CallContext,
+    base_value: Value,
+) Error!Value {
+    const base = try materialize_iterable(context, base_value);
+    if (base.set_v.len > 30) return Error.OutOfMemory;
+    const count: u32 = @as(u32, 1) << @intCast(base.set_v.len);
+    const subsets = try context.eval_pool.alloc_values(count);
+    const subsets_offset = value_offset(context.eval_pool, subsets.ptr);
+    const base_items = base.set_v.items(context.eval_pool);
+    var mask: u32 = 0;
+    while (mask < count) : (mask += 1) {
+        const items = try context.eval_pool.alloc_values(@popCount(mask));
+        var item_count: u32 = 0;
+        for (base_items, 0..) |item, bit| {
+            if (mask & (@as(u32, 1) << @intCast(bit)) != 0) {
+                items[item_count] = item;
+                item_count += 1;
+            }
+        }
+        const items_offset = value_offset(context.eval_pool, items.ptr);
+        context.eval_pool.values[subsets_offset + mask] = .{ .set_v = .{
+            .offset = items_offset,
+            .len = item_count,
+        } };
+    }
+    return .{ .set_v = .{
+        .offset = subsets_offset,
+        .len = count,
+    } };
+}
+
+fn contains_value(
+    pool: *const ValuePool,
+    values: []const Value,
+    candidate: Value,
+) bool {
+    for (values) |existing| {
+        if (existing.eql(candidate, pool)) return true;
+    }
+    return false;
+}
+
+fn except_recursive(
+    context: *CallContext,
+    original: Value,
+    path: []const Value,
+    depth: usize,
+    update: ExceptUpdate,
+) Error!Value {
+    if (depth == path.len) {
+        return switch (update) {
+            .value => |replacement| replacement,
+            .function => |function| call_bound(
+                context,
+                function.operator_args,
+                &.{original},
+                function.updater,
+            ),
+        };
+    }
+    const key = path[depth];
+    return switch (original) {
+        .function_v => |function_value| blk: {
+            const selected = function_value.apply(
+                context.eval_pool,
+                key,
+            ) orelse return Error.IndexOutOfBounds;
+            const updated = try except_recursive(
+                context,
+                selected,
+                path,
+                depth + 1,
+                update,
+            );
+            const entries = try context.eval_pool.alloc_values(
+                function_value.len,
+            );
+            @memcpy(
+                entries,
+                function_value.entries(context.eval_pool),
+            );
+            const keys = function_value.domain.items(context.eval_pool);
+            var index: u32 = 0;
+            while (index < function_value.len) : (index += 1) {
+                if (keys[index].eql(key, context.eval_pool)) {
+                    entries[index] = updated;
+                    break;
+                }
+            }
+            break :blk .{ .function_v = .{
+                .domain = function_value.domain,
+                .offset = value_offset(context.eval_pool, entries.ptr),
+                .len = function_value.len,
+            } };
+        },
+        .tuple_v => |tuple_value| blk: {
+            const item_index = key.as_int() orelse return Error.TypeError;
+            if (item_index < 1 or item_index > tuple_value.len) {
+                return Error.IndexOutOfBounds;
+            }
+            const selected_index: usize = @intCast(item_index - 1);
+            const updated = try except_recursive(
+                context,
+                tuple_value.items(context.eval_pool)[selected_index],
+                path,
+                depth + 1,
+                update,
+            );
+            const items = try context.eval_pool.alloc_values(
+                tuple_value.len,
+            );
+            @memcpy(items, tuple_value.items(context.eval_pool));
+            items[selected_index] = updated;
+            break :blk .{ .tuple_v = .{
+                .offset = value_offset(context.eval_pool, items.ptr),
+                .len = tuple_value.len,
+            } };
+        },
+        .record_v => |record_value| blk: {
+            if (key != .string_v) return Error.TypeError;
+            const original_fields = record_value.fields(context.eval_pool);
+            var selected: ?u32 = null;
+            var search_index: u32 = 0;
+            while (search_index < record_value.len) : (search_index += 1) {
+                if (original_fields[search_index * 2].string_v.eql(
+                    key.string_v,
+                    context.eval_pool,
+                )) {
+                    selected = search_index;
+                    break;
+                }
+            }
+            const selected_index = selected orelse
+                return Error.UndefinedSymbol;
+            const updated = try except_recursive(
+                context,
+                record_value.fields(
+                    context.eval_pool,
+                )[selected_index * 2 + 1],
+                path,
+                depth + 1,
+                update,
+            );
+            const fields = try context.eval_pool.alloc_values(
+                record_value.len * 2,
+            );
+            @memcpy(fields, record_value.fields(context.eval_pool));
+            fields[selected_index * 2 + 1] = updated;
+            break :blk .{ .record_v = .{
+                .offset = value_offset(context.eval_pool, fields.ptr),
+                .len = record_value.len,
+            } };
+        },
+        else => Error.TypeError,
+    };
+}
+
+const ExceptUpdate = union(enum) {
+    value: Value,
+    function: struct {
+        operator_args: []const Value,
+        updater: OperatorFn,
+    },
+};
+
+pub fn iterable_count(domain_value: Value) Error!u32 {
+    return switch (domain_value) {
+        .set_v => |set_value| set_value.len,
+        .range_v => |range_value| blk: {
+            if (range_value.hi < range_value.lo) break :blk 0;
+            const count =
+                @as(i128, range_value.hi) -
+                @as(i128, range_value.lo) + 1;
+            if (count > std.math.maxInt(u32)) {
+                return Error.OutOfMemory;
+            }
+            break :blk @intCast(count);
+        },
+        else => Error.NotImplemented,
+    };
+}
+
+pub fn iterable_value(
+    context: *CallContext,
+    domain_value: Value,
+    index: u32,
+) Error!Value {
+    return switch (domain_value) {
+        .set_v => |set_value| blk: {
+            if (index >= set_value.len) return Error.IndexOutOfBounds;
+            break :blk set_value.items(context.eval_pool)[index];
+        },
+        .range_v => |range_value| blk: {
+            const count = try iterable_count(domain_value);
+            if (index >= count) return Error.IndexOutOfBounds;
+            break :blk .{
+                .int_v = range_value.lo + @as(i64, @intCast(index)),
+            };
+        },
+        else => Error.NotImplemented,
+    };
+}
+
+test "generated finite values use only the value pool" {
+    const Arena = @import("arena.zig").Arena;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 256, 256);
+    var context = CallContext{
+        .eval_pool = &pool,
+        .state_pool = &pool,
+        .state = null,
+        .next_state = null,
+        .partial_values = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 5,
+    };
+
+    const finite_set = try set(
+        &context,
+        &.{ .{ .int_v = 1 }, .{ .int_v = 2 }, .{ .int_v = 1 } },
+    );
+    try std.testing.expectEqual(@as(u32, 2), finite_set.set_v.len);
+    try std.testing.expect(
+        (try member(&context, .{ .int_v = 2 }, finite_set)).bool_v,
+    );
+    try std.testing.expect(
+        (try subset_equal(
+            &context,
+            try range(.{ .int_v = 1 }, .{ .int_v = 2 }),
+            finite_set,
+        )).bool_v,
+    );
+
+    const finite_record = try record(
+        &context,
+        &.{
+            try string(&context, "field"),
+            .{ .int_v = 7 },
+        },
+    );
+    try std.testing.expectEqual(
+        @as(i64, 7),
+        (try field(&context, finite_record, "field")).int_v,
+    );
+}
+
+fn test_native_call(
+    _: *const anyopaque,
+    _: *ValuePool,
+    _: []const u8,
+    _: []const Value,
+) Error!Value {
+    return Error.UndefinedSymbol;
+}
+
+pub fn boolean(value: Value) Error!bool {
+    return switch (value) {
+        .bool_v => |boolean_v| boolean_v,
+        else => Error.TypeError,
+    };
+}
+
+pub fn integer(value: Value) Error!i64 {
+    return value.as_int() orelse Error.TypeError;
+}
+
+pub fn negate(value: Value) Error!Value {
+    return .{ .int_v = -(try integer(value)) };
+}
+
+pub fn logical_not(value: Value) Error!Value {
+    return .{ .bool_v = !(try boolean(value)) };
+}
+
+pub fn add(left: Value, right: Value) Error!Value {
+    return .{ .int_v = try integer(left) + try integer(right) };
+}
+
+pub fn subtract(left: Value, right: Value) Error!Value {
+    return .{ .int_v = try integer(left) - try integer(right) };
+}
+
+pub fn multiply(left: Value, right: Value) Error!Value {
+    return .{ .int_v = try integer(left) * try integer(right) };
+}
+
+pub fn divide(left: Value, right: Value) Error!Value {
+    const divisor = try integer(right);
+    if (divisor == 0) return Error.TypeError;
+    return .{ .int_v = @divFloor(try integer(left), divisor) };
+}
+
+pub fn modulo(left: Value, right: Value) Error!Value {
+    const divisor = try integer(right);
+    if (divisor == 0) return Error.TypeError;
+    return .{ .int_v = @mod(try integer(left), divisor) };
+}
+
+pub fn equal(pool: *const ValuePool, left: Value, right: Value) Value {
+    return .{ .bool_v = left.eql(right, pool) };
+}
+
+pub fn equal_bool(
+    pool: *const ValuePool,
+    left: Value,
+    right: Value,
+) Error!bool {
+    return left.eql(right, pool);
+}
+
+pub fn not_equal(pool: *const ValuePool, left: Value, right: Value) Value {
+    const result = equal(pool, left, right);
+    return .{ .bool_v = !result.bool_v };
+}
+
+pub fn not_equal_bool(
+    pool: *const ValuePool,
+    left: Value,
+    right: Value,
+) Error!bool {
+    return !left.eql(right, pool);
+}
+
+pub fn less_than(pool: *const ValuePool, left: Value, right: Value) Error!Value {
+    const order = left.compare(right, pool) orelse return Error.TypeError;
+    return .{ .bool_v = order < 0 };
+}
+
+pub fn less_than_bool(
+    pool: *const ValuePool,
+    left: Value,
+    right: Value,
+) Error!bool {
+    return (left.compare(right, pool) orelse return Error.TypeError) < 0;
+}
+
+pub fn less_equal(pool: *const ValuePool, left: Value, right: Value) Error!Value {
+    const order = left.compare(right, pool) orelse return Error.TypeError;
+    return .{ .bool_v = order <= 0 };
+}
+
+pub fn less_equal_bool(
+    pool: *const ValuePool,
+    left: Value,
+    right: Value,
+) Error!bool {
+    return (left.compare(right, pool) orelse return Error.TypeError) <= 0;
+}
+
+pub fn greater_than(pool: *const ValuePool, left: Value, right: Value) Error!Value {
+    const order = left.compare(right, pool) orelse return Error.TypeError;
+    return .{ .bool_v = order > 0 };
+}
+
+pub fn greater_than_bool(
+    pool: *const ValuePool,
+    left: Value,
+    right: Value,
+) Error!bool {
+    return (left.compare(right, pool) orelse return Error.TypeError) > 0;
+}
+
+pub fn greater_equal(pool: *const ValuePool, left: Value, right: Value) Error!Value {
+    const order = left.compare(right, pool) orelse return Error.TypeError;
+    return .{ .bool_v = order >= 0 };
+}
+
+pub fn greater_equal_bool(
+    pool: *const ValuePool,
+    left: Value,
+    right: Value,
+) Error!bool {
+    return (left.compare(right, pool) orelse return Error.TypeError) >= 0;
+}

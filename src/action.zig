@@ -769,21 +769,12 @@ pub const ActionCompiler = struct {
 };
 
 pub const ActionExecutor = struct {
-    pub const CommitCallback = *const fn (
-        context: *anyopaque,
-        candidate_idx: u32,
-        pool_snapshot: ValuePool.Snapshot,
-        out_states: *StateBuffer,
-    ) Error!void;
-
     evaluator: Evaluator,
     source_state_store: *StateStore,
     candidate_store: *StateStore,
     eval_pool: *ValuePool,
     compose_states: ?*StateBuffer = null,
     composition_generated: ?*u64 = null,
-    commit_callback: ?CommitCallback = null,
-    commit_context: ?*anyopaque = null,
 
     const Continuation = struct {
         steps: []const ActionStep,
@@ -944,10 +935,7 @@ pub const ActionExecutor = struct {
                     return Error.NotImplemented;
                 assert(intermediates.items.len == 0);
                 const left_context_snapshot = self.evaluator.context_snapshot();
-                var first = self;
-                first.commit_callback = null;
-                first.commit_context = null;
-                try first.execute_steps(
+                try self.execute_steps(
                     composition.left_steps,
                     null,
                     ctx,
@@ -975,8 +963,6 @@ pub const ActionExecutor = struct {
                         .eval_pool = self.eval_pool,
                         .compose_states = null,
                         .composition_generated = self.composition_generated,
-                        .commit_callback = self.commit_callback,
-                        .commit_context = self.commit_context,
                     };
                     try second.execute_steps(
                         composition.right_steps,
@@ -1039,7 +1025,14 @@ pub const ActionExecutor = struct {
                     std.debug.print("UndefinedVariable in UNCHANGED: {s}\n", .{name});
                     return Error.UndefinedSymbol;
                 };
-                const v = try s0.?.values[idx].clone(&self.source_state_store.values_pool, self.eval_pool);
+                const source_state = s0.?;
+                const v = try source_state.values[idx].clone(
+                    source_state.value_pool(
+                        idx,
+                        &self.source_state_store.values_pool,
+                    ),
+                    self.eval_pool,
+                );
                 const new_ctx = try self.evaluator.extend_state_context(
                     ctx,
                     name,
@@ -1059,7 +1052,6 @@ pub const ActionExecutor = struct {
         is_init: bool,
     ) !void {
         _ = is_init;
-        const pool_snapshot = self.candidate_store.values_pool.snapshot();
         const new_idx = try self.candidate_store.alloc_state();
         const new_state = self.candidate_store.get(new_idx);
         if (s0) |parent| {
@@ -1074,6 +1066,8 @@ pub const ActionExecutor = struct {
             new_state.pred = 0;
         }
         new_state.changed_mask = 0;
+        new_state.borrowed_mask = 0;
+        new_state.borrowed_pool = null;
         for (
             self.source_state_store.variable_names,
             new_state.values,
@@ -1083,73 +1077,48 @@ pub const ActionExecutor = struct {
                 const assignment = self.evaluator.context_assignment(ctx, name);
                 if (assignment == .changed) {
                     new_state.changed_mask |= @as(u64, 1) << @intCast(variable_index);
-                }
-                destination.* = if (assignment == .unchanged and
-                    self.candidate_store == self.source_state_store)
-                    s0.?.values[variable_index]
-                else
-                    try assigned.clone(
+                    destination.* = try assigned.clone(
                         self.eval_pool,
                         &self.candidate_store.values_pool,
                     );
-            } else if (s0) |parent| {
-                destination.* = if (self.candidate_store ==
-                    self.source_state_store)
-                    parent.values[variable_index]
-                else
-                    try parent.values[variable_index].clone(
+                } else if (s0) |parent| {
+                    destination.* = parent.values[variable_index];
+                    const parent_pool = parent.value_pool(
+                        @intCast(variable_index),
                         &self.source_state_store.values_pool,
+                    );
+                    if (parent_pool !=
+                        &self.candidate_store.values_pool)
+                    {
+                        new_state.borrowed_mask |=
+                            @as(u64, 1) << @intCast(variable_index);
+                        assert(new_state.borrowed_pool == null or
+                            new_state.borrowed_pool == parent_pool);
+                        new_state.borrowed_pool = parent_pool;
+                    }
+                } else {
+                    destination.* = try assigned.clone(
+                        self.eval_pool,
                         &self.candidate_store.values_pool,
                     );
+                }
+            } else if (s0) |parent| {
+                destination.* = parent.values[variable_index];
+                const parent_pool = parent.value_pool(
+                    @intCast(variable_index),
+                    &self.source_state_store.values_pool,
+                );
+                if (parent_pool != &self.candidate_store.values_pool) {
+                    new_state.borrowed_mask |=
+                        @as(u64, 1) << @intCast(variable_index);
+                    assert(new_state.borrowed_pool == null or
+                        new_state.borrowed_pool == parent_pool);
+                    new_state.borrowed_pool = parent_pool;
+                }
             } else {
                 destination.* = Value{ .bool_v = false };
             }
         }
-        if (self.commit_callback) |callback| {
-            try callback(
-                self.commit_context.?,
-                new_idx,
-                pool_snapshot,
-                out_states,
-            );
-        } else {
-            try out_states.append(new_idx);
-        }
+        try out_states.append(new_idx);
     }
 };
-
-pub fn steps_have_composition(steps: []const ActionStep) bool {
-    for (steps) |step| {
-        switch (step) {
-            .compose => return true,
-            .choose => |choose| {
-                if (steps_have_composition(choose.body_steps)) return true;
-            },
-            .call => |call| {
-                if (steps_have_composition(call.body_steps)) return true;
-            },
-            .branch => |branch| {
-                for (branch.options) |option| {
-                    if (steps_have_composition(option)) return true;
-                }
-            },
-            .if_branch => |if_branch| {
-                if (steps_have_composition(if_branch.then_steps) or
-                    steps_have_composition(if_branch.else_steps))
-                {
-                    return true;
-                }
-            },
-            .case_branch => |case_branch| {
-                for (case_branch.arms) |arm| {
-                    if (steps_have_composition(arm.steps)) return true;
-                }
-                if (case_branch.otherwise_steps) |otherwise| {
-                    if (steps_have_composition(otherwise)) return true;
-                }
-            },
-            else => {},
-        }
-    }
-    return false;
-}

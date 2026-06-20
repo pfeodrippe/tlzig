@@ -282,6 +282,9 @@ pub const Value = union(ValueTag) {
         const tag_a = std.meta.activeTag(a);
         const tag_b = std.meta.activeTag(b);
         const tags_equal = tag_a == tag_b;
+        if (tags_equal and a != .lambda_v and std.meta.eql(a, b)) {
+            return true;
+        }
         return switch (a) {
             .set_v => |sa| blk: {
                 if (!tags_equal and b == .range_v) break :blk range_equals_set(b.range_v, sa, pool);
@@ -824,6 +827,7 @@ pub const String = extern struct {
     pub fn clone(self: String, source: *const ValuePool, target: *ValuePool) error{OutOfMemory}!String {
         assert(self.offset + self.len <= source.string_count);
         assert(target.string_count <= target.string_cap);
+        if (source == target) return self;
         return try target.push_string(self.slice(source));
     }
 };

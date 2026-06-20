@@ -18,7 +18,23 @@ pub const StateStore = struct {
         level: u32,
         pred: u32,
         changed_mask: u64,
+        borrowed_mask: u64,
+        borrowed_pool: ?*const ValuePool,
         values: []Value,
+
+        pub fn value_pool(
+            self: *const State,
+            variable_index: u32,
+            default_pool: *const ValuePool,
+        ) *const ValuePool {
+            assert(variable_index < self.values.len);
+            if (self.borrowed_mask &
+                (@as(u64, 1) << @intCast(variable_index)) != 0)
+            {
+                return self.borrowed_pool orelse unreachable;
+            }
+            return default_pool;
+        }
     };
 
     pub fn init(arena: *Arena, variable_names: []const []const u8, max_states: u32, value_cap: u32, string_cap: u32) !StateStore {
@@ -56,6 +72,8 @@ pub const StateStore = struct {
             .level = 0,
             .pred = 0,
             .changed_mask = 0,
+            .borrowed_mask = 0,
+            .borrowed_pool = null,
             .values = self.state_values[values_start..][0..variable_count],
         };
         self.count += 1;

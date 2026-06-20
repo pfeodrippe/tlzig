@@ -21,7 +21,7 @@ pub fn hash_bytes(fp: Fingerprint, bytes: []const u8) Fingerprint {
     return h;
 }
 
-fn hash_combine(a: Fingerprint, b: Fingerprint) Fingerprint {
+pub fn hash_combine(a: Fingerprint, b: Fingerprint) Fingerprint {
     return a ^ (b +% 0x9e3779b97f4a7c15 +% (a << 6) +% (a >> 2));
 }
 

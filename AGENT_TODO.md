@@ -68,7 +68,7 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   - tlzig `--workers 1`: `2044/801`, 8.427s.
   - tlzig `--workers auto`: `2044/801`, 8.438s.
   - Distinct states match exactly; generated-state accounting still differs.
-- [x] Reduce `ClientCentricTests` tlzig runtime from 159.5s to 8.4s:
+- [x] Reduce `ClientCentricTests` tlzig runtime from 159.5s to 4.66s:
   bounded fingerprint set deduplication, assumption-scoped definition
   memoization, and pre-sized non-growing evaluation/state pools.
 - [x] Add `ClientCentricTests` to the ReleaseFast benchmark with MDBTLA's
@@ -97,17 +97,57 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   - RC snapshot: tlzig `1.03s` vs TLC `2.44s`;
   - Storage: tlzig `0.45s` vs TLC `1.50s`;
   - RC no-prepare-block: tlzig `0.15s` vs TLC `1.59s`;
-  - symmetry rc-local: tlzig `0.15s` vs TLC `1.44s`.
+  - symmetry rc-local: tlzig `0.15s` vs TLC `1.44s`;
+  - ClientCentric: tlzig `1.95s` vs TLC `2.36s`.
 - [ ] Eliminate the remaining single-core gaps:
-  - RC snapshot: tlzig `7.12s` vs true one-core TLC `5.40s`;
-  - Storage: tlzig `3.40s` vs true one-core TLC `2.80s`;
-  - ClientCentric: tlzig `4.50s` vs true one-core TLC `2.30s`;
-  - snapshot-invariant symmetry: tlzig `2.26s` vs TLC `2.09s`.
-- [ ] Add a single-worker direct-canonical successor path: construct one
-  candidate at a time in the canonical value pool, fingerprint immediately,
-  retain new states without a second deep clone, and roll back duplicate or
-  constrained candidates to a pool snapshot. Keep the existing isolated
-  candidate pools for parallel workers.
+  - RC snapshot: tlzig `6.76s` vs true one-core TLC `5.30s`;
+  - Storage: tlzig `3.36s` vs true one-core TLC `2.76s`;
+  - ClientCentric is now faster in both modes:
+    tlzig `1.92s/1.95s` vs TLC `2.25s/2.36s`.
+  - Snapshot-invariant symmetry is now faster in both modes:
+    tlzig `1.96s/1.40s` vs TLC `2.21s/1.80s`.
+- [x] Stream one-variable filters over finite function sets through resettable
+  scratch storage and materialize only accepted functions. This removes
+  rejected composite values from `TxnSetsAll` while preserving exact results.
+- [x] Detect pointwise finite-function predicates
+  `{f \in [D -> C] : \A x \in D : P(x, f[x])}` conservatively, validate the
+  quantified domain, and construct only products of per-key accepted values.
+  Non-pointwise predicates retain the general complete-enumeration path.
+- [x] Add native, allocation-bounded implementations for standard finite
+  operators used heavily by MDBTLA: `PermSeqs`, `SeqToSet`, `Index`,
+  function `Range`, `INTERSECTION`, and sequence `ReduceSeq/FoldFunction`.
+  Add a generic sequence-record-field projection for function literals such
+  as `[i \in 1..Len(s) |-> s[i].field]`.
+- [x] Represent generated candidates as overlays: changed roots live in the
+  candidate pool while unchanged roots borrow immutable canonical values.
+  Make constraint evaluation and symmetry hashing pool-aware per variable.
+- [x] Fuse state-rooted `EXCEPT` cloning with path update, and specialize
+  universal scalar constraints over nested state functions.
+- [x] Prototype and reject direct-canonical successors and per-parent
+  unchanged-root caching after full benchmarks. Both lose to the small
+  resettable candidate pool's cache locality (snapshot +6.7%, Storage +3.5%);
+  do not carry either path without a different storage representation.
+- [x] Prototype and reject a 4,096-entry worker-local AST variable-index
+  cache. RC snapshot remained neutral (`7.171s` vs `7.176s`) while increasing
+  per-worker memory; linear lookup is not the dominant remaining cost.
+- [x] Prototype and reject cross-pool string interning, recursive borrowed
+  field access, and generic parameterized-call memoization:
+  - string hashing regressed ClientCentric to `4.36s`;
+  - recursive borrowed field discovery regressed RC snapshot to `7.24s`;
+  - semantic argument hashing regressed ClientCentric to `14.7s`.
+  These costs need compile-time resolution or representation changes, not
+  additional runtime hashing and AST-shape discovery.
+- [ ] Replace deep temporary successor copies with a compact or structurally
+  shared candidate representation that preserves the resettable candidate
+  pool's locality. Benchmark before retaining the design.
+- [ ] Complete and integrate the existing resolved IR evaluator so hot
+  expressions use variable indices, definition references, and local slots
+  directly. Fix `IrModule.defs` construction and keep the AST evaluator as
+  the compatibility fallback until every benchmarked construct is covered.
+  - [x] Export the resolved definition bodies from `Resolver.resolve_all`
+    and compile the resolver through a cross-definition unit test.
+  - [ ] Implement IR evaluation and differential tests against the AST
+    evaluator before enabling it for model checking.
 - [ ] Match TLC's generated count for `ClientCentricTests` (`1602/801`;
   tlzig currently reaches the same `801` distinct states with different
   generated-state accounting).

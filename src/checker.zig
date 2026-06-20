@@ -183,16 +183,128 @@ pub const FairnessCondition = struct {
     vars: *ast.Expr,
 };
 
+const SymmetryHashCache = struct {
+    const Entry = struct {
+        value: Value = .{ .bool_v = false },
+        permutation_ptr: usize = 0,
+        hash: fingerprint.Fingerprint = 0,
+        occupied: bool = false,
+    };
+
+    entries: []Entry,
+    enabled: bool,
+
+    fn init(arena: *Arena, enabled: bool) !SymmetryHashCache {
+        const entries = try arena.alloc(
+            Entry,
+            if (enabled) 32_768 else 1,
+        );
+        @memset(entries, .{});
+        return .{ .entries = entries, .enabled = enabled };
+    }
+
+    fn hash_value(
+        self: *SymmetryHashCache,
+        pool: *const ValuePool,
+        value_v: Value,
+        permutation: ?[]const u32,
+    ) fingerprint.Fingerprint {
+        const permutation_ptr = if (permutation) |mapping|
+            @intFromPtr(mapping.ptr)
+        else
+            0;
+        const identity = value_identity(value_v);
+        const slot: usize = @intCast(
+            (identity ^ (permutation_ptr *% 0x9e3779b97f4a7c15)) &
+                (self.entries.len - 1),
+        );
+        const entry = &self.entries[slot];
+        if (entry.occupied and
+            entry.permutation_ptr == permutation_ptr and
+            std.meta.eql(entry.value, value_v))
+        {
+            return entry.hash;
+        }
+        const hash = fingerprint.hash_value_permuted(
+            pool,
+            value_v,
+            permutation,
+        );
+        entry.* = .{
+            .value = value_v,
+            .permutation_ptr = permutation_ptr,
+            .hash = hash,
+            .occupied = true,
+        };
+        return hash;
+    }
+};
+
+fn value_identity(value_v: Value) u64 {
+    const tag: u64 = @intFromEnum(value_v);
+    return switch (value_v) {
+        .bool_v => |value_b| tag ^ @as(u64, @intFromBool(value_b)),
+        .int_v => |value_i| tag ^ @as(u64, @bitCast(value_i)),
+        .model_v => |model| tag ^ model,
+        .string_v => |string| tag ^
+            (@as(u64, string.offset) << 32) ^ string.len,
+        .set_v => |set| tag ^
+            (@as(u64, set.offset) << 32) ^ set.len,
+        .function_v => |function| tag ^
+            (@as(u64, function.domain.offset) << 32) ^
+            function.domain.len ^
+            (@as(u64, function.offset) *% 0x9e3779b97f4a7c15) ^
+            function.len,
+        .tuple_v => |tuple| tag ^
+            (@as(u64, tuple.offset) << 32) ^ tuple.len,
+        .record_v => |record| tag ^
+            (@as(u64, record.offset) << 32) ^ record.len,
+        .lambda_v => |lambda| tag ^ @intFromPtr(lambda),
+        .function_set_v => |set| tag ^
+            (@as(u64, set.domain_offset) << 32) ^
+            set.codomain_offset,
+        .record_set_v => |set| tag ^
+            (@as(u64, set.offset) << 32) ^ set.len,
+        .tuple_set_v => |set| tag ^
+            (@as(u64, set.offset) << 32) ^ set.len,
+        .union_v, .power_set_v => |set| tag ^ set.set_offset,
+        .cup_v, .cap_v, .diff_v => |set| tag ^
+            (@as(u64, set.left_offset) << 32) ^
+            set.right_offset,
+        .range_v => |range| tag ^
+            @as(u64, @bitCast(range.lo)) ^
+            (@as(u64, @bitCast(range.hi)) *%
+                0x9e3779b97f4a7c15),
+        .seq_set_v => |set| tag ^ set.element_set_offset,
+    };
+}
+
 fn starts_with(haystack: []const u8, needle: []const u8) bool {
     return haystack.len >= needle.len and std.mem.eql(u8, haystack[0..needle.len], needle);
 }
 
 fn symmetry_fingerprint(
-    pool: *const ValuePool,
-    values: []const Value,
+    default_pool: *const ValuePool,
+    canonical_pool: *const ValuePool,
+    symmetry_hash_cache: *SymmetryHashCache,
+    state_v: *const StateStore.State,
     permutations: []const []const u32,
 ) fingerprint.Fingerprint {
-    if (permutations.len == 0) return fingerprint.hash_state(pool, values);
+    const values = state_v.values;
+    if (permutations.len == 0) {
+        var hash = fingerprint.hash_init();
+        for (values, 0..) |value_v, variable_index| {
+            hash = fingerprint.hash_value(
+                state_v.value_pool(
+                    @intCast(variable_index),
+                    default_pool,
+                ),
+                value_v,
+                hash,
+            );
+        }
+        return hash;
+    }
     assert(values.len <= 64);
 
     var best_permutation: ?[]const u32 = null;
@@ -201,19 +313,40 @@ fn symmetry_fingerprint(
 
     for (permutations) |candidate_permutation| {
         for (values, 0..) |value_v, variable_index| {
+            const value_pool = state_v.value_pool(
+                @intCast(variable_index),
+                default_pool,
+            );
             if (!best_hash_valid[variable_index]) {
-                best_hashes[variable_index] = fingerprint.hash_value_permuted(
-                    pool,
-                    value_v,
-                    best_permutation,
-                );
+                best_hashes[variable_index] =
+                    if (value_pool == canonical_pool and
+                    symmetry_hash_cache.enabled)
+                        symmetry_hash_cache.hash_value(
+                            value_pool,
+                            value_v,
+                            best_permutation,
+                        )
+                    else
+                        fingerprint.hash_value_permuted(
+                            value_pool,
+                            value_v,
+                            best_permutation,
+                        );
                 best_hash_valid[variable_index] = true;
             }
-            const candidate_hash = fingerprint.hash_value_permuted(
-                pool,
-                value_v,
-                candidate_permutation,
-            );
+            const candidate_hash = if (value_pool == canonical_pool and
+                symmetry_hash_cache.enabled)
+                symmetry_hash_cache.hash_value(
+                    value_pool,
+                    value_v,
+                    candidate_permutation,
+                )
+            else
+                fingerprint.hash_value_permuted(
+                    value_pool,
+                    value_v,
+                    candidate_permutation,
+                );
             if (candidate_hash > best_hashes[variable_index]) break;
             if (candidate_hash < best_hashes[variable_index]) {
                 best_permutation = candidate_permutation;
@@ -225,10 +358,30 @@ fn symmetry_fingerprint(
         }
     }
 
-    return if (best_permutation) |permutation|
-        fingerprint.hash_state_permuted(pool, values, permutation)
-    else
-        fingerprint.hash_state(pool, values);
+    var hash = fingerprint.hash_init();
+    for (values, 0..) |value_v, variable_index| {
+        const value_pool = state_v.value_pool(
+            @intCast(variable_index),
+            default_pool,
+        );
+        hash = fingerprint.hash_combine(
+            hash,
+            if (value_pool == canonical_pool and
+                symmetry_hash_cache.enabled)
+                symmetry_hash_cache.hash_value(
+                    value_pool,
+                    value_v,
+                    best_permutation,
+                )
+            else
+                fingerprint.hash_value_permuted(
+                    value_pool,
+                    value_v,
+                    best_permutation,
+                ),
+        );
+    }
+    return hash;
 }
 
 pub const Checker = struct {
@@ -240,8 +393,8 @@ pub const Checker = struct {
     candidate_pool_base: ValuePool.Snapshot,
     queue: StateQueue,
     fp_set: FpSet,
+    symmetry_hash_cache: SymmetryHashCache,
     evaluator: Evaluator,
-    direct_evaluator: Evaluator,
     init_spec: ?action.CompiledInit,
     next_spec: ?action.CompiledNext,
     invariants: []const *ast.Expr,
@@ -299,6 +452,10 @@ pub const Checker = struct {
         );
         const queue = try StateQueue.init(arena, max_states);
         const fp_set = try FpSet.init(arena, max_states * 2);
+        const symmetry_hash_cache = try SymmetryHashCache.init(
+            arena,
+            worker_count == 1,
+        );
         var evaluator = try Evaluator.init(module, arena, override_ctx);
         evaluator.set_treat_unknown_as_model(true);
         const aliases = try evaluate_aliases(arena, cfg);
@@ -311,9 +468,6 @@ pub const Checker = struct {
         const eval_arena = try arena.alloc_object(Arena);
         eval_arena.* = try Arena.init(eval_arena_bytes);
         var eval_pool = try ValuePool.init(eval_arena, eval_value_cap, eval_string_cap);
-        var direct_evaluator = try evaluator.fork(eval_arena);
-        direct_evaluator.set_constants(constants);
-        const assumption_pool_base = eval_pool.snapshot();
         evaluator.set_definition_memo_pool(&eval_pool);
         for (module.assumptions, 0..) |assumption, assumption_index| {
             const result = evaluator.eval_expr(
@@ -341,8 +495,7 @@ pub const Checker = struct {
                 return Error.AssumptionViolated;
             }
         }
-        evaluator.set_definition_memo_pool(null);
-        eval_pool.restore(assumption_pool_base);
+        evaluator.freeze_definition_memo();
         const symmetry_permutations = try evaluate_symmetry(
             arena,
             cfg,
@@ -350,7 +503,6 @@ pub const Checker = struct {
             &eval_pool,
             &state_store.values_pool,
         );
-        eval_pool.restore(assumption_pool_base);
         const eval_pool_base = eval_pool.snapshot();
 
         const candidate_arena = try arena.alloc_object(Arena);
@@ -518,8 +670,8 @@ pub const Checker = struct {
             .candidate_pool_base = candidate_pool_base,
             .queue = queue,
             .fp_set = fp_set,
+            .symmetry_hash_cache = symmetry_hash_cache,
             .evaluator = evaluator,
-            .direct_evaluator = direct_evaluator,
             .init_spec = compiled_init,
             .next_spec = compiled_next,
             .invariants = invariants,
@@ -783,7 +935,9 @@ pub const Checker = struct {
             }
             const fp = symmetry_fingerprint(
                 &candidate_store.values_pool,
-                candidate.values,
+                &self.state_store.values_pool,
+                &self.symmetry_hash_cache,
+                candidate,
                 self.symmetry_permutations,
             );
             const canonical = self.fp_set.find(fp);
@@ -823,7 +977,14 @@ pub const Checker = struct {
             kept_count += 1;
         }
         out_states.shrink(kept_count);
+        try self.record_successors(parent_idx, out_states);
+    }
 
+    fn record_successors(
+        self: *Checker,
+        parent_idx: ?u32,
+        out_states: *StateBuffer,
+    ) !void {
         if (parent_idx) |pidx| {
             const count: u32 = @intCast(out_states.items.len);
             if (self.succ_count + count > self.succ_cap) return Error.OutOfMemory;
@@ -858,6 +1019,8 @@ pub const Checker = struct {
         state.level = candidate.level;
         state.pred = candidate.pred;
         state.changed_mask = candidate.changed_mask;
+        state.borrowed_mask = 0;
+        state.borrowed_pool = null;
         for (candidate.values, state.values, 0..) |source, *target, variable_index| {
             const changed = parent_idx == null or
                 (candidate.changed_mask &
@@ -913,6 +1076,8 @@ pub const Checker = struct {
             .level = source.level,
             .pred = source.pred,
             .changed_mask = 0,
+            .borrowed_mask = 0,
+            .borrowed_pool = null,
             .values = values,
         };
     }

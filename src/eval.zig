@@ -134,12 +134,19 @@ const MemoEntry = struct {
 
 const DefinitionMemo = struct {
     pool: ?*ValuePool = null,
+    frozen: bool = false,
     count: u16 = 0,
     entries: [1024]MemoEntry = undefined,
 
     fn reset(self: *DefinitionMemo, pool: ?*ValuePool) void {
         self.pool = pool;
+        self.frozen = false;
         self.count = 0;
+    }
+
+    fn freeze(self: *DefinitionMemo) void {
+        assert(self.pool != null);
+        self.frozen = true;
     }
 
     fn get(
@@ -160,7 +167,7 @@ const DefinitionMemo = struct {
         name: []const u8,
         value_v: Value,
     ) Error!void {
-        if (self.pool != pool) return;
+        if (self.pool != pool or self.frozen) return;
         if (self.count >= self.entries.len) return Error.OutOfMemory;
         self.entries[self.count] = .{ .name = name, .value = value_v };
         self.count += 1;
@@ -290,6 +297,10 @@ pub const Evaluator = struct {
         self.definition_memo.reset(pool);
     }
 
+    pub fn freeze_definition_memo(self: *Evaluator) void {
+        self.definition_memo.freeze();
+    }
+
     pub fn set_constants(self: *Evaluator, constants: []const Constant) void {
         self.constants = constants;
     }
@@ -367,7 +378,10 @@ pub const Evaluator = struct {
             .ident => |name| {
                 if (s0) |st| {
                     if (self.find_variable(name)) |idx| {
-                        return try st.values[idx].clone(state_pool, eval_pool);
+                        return try st.values[idx].clone(
+                            st.value_pool(idx, state_pool),
+                            eval_pool,
+                        );
                     }
                 }
                 if (ctx.lookup(name)) |v| return v;
@@ -450,7 +464,10 @@ pub const Evaluator = struct {
                 const ns = self.next_state;
                 if (ns) |nst| {
                     if (self.find_variable(name)) |idx| {
-                        return try nst.values[idx].clone(state_pool, eval_pool);
+                        return try nst.values[idx].clone(
+                            nst.value_pool(idx, state_pool),
+                            eval_pool,
+                        );
                     }
                     const aliased = self.resolve_alias(name);
                     if (self.find_definition(aliased)) |def| {
@@ -460,7 +477,10 @@ pub const Evaluator = struct {
                 }
                 if (s0) |st| {
                     if (self.find_variable(name)) |idx| {
-                        return try st.values[idx].clone(state_pool, eval_pool);
+                        return try st.values[idx].clone(
+                            st.value_pool(idx, state_pool),
+                            eval_pool,
+                        );
                     }
                 }
                 const aliased = self.resolve_alias(name);
@@ -952,6 +972,16 @@ pub const Evaluator = struct {
     ) Error!Value {
         if (sf.vars.len == 1) {
             const bv = sf.vars[0];
+            if (try self.eval_function_set_filter(
+                sf,
+                bv,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            )) |filtered| {
+                return filtered;
+            }
             if (try self.eval_sorted_sequence_filter(sf, bv, ctx, s0, eval_pool, state_pool)) |sorted| {
                 return sorted;
             }
@@ -978,6 +1008,298 @@ pub const Evaluator = struct {
             ) };
         }
         return try self.eval_set_filter_tuples(sf, 0, ctx, s0, eval_pool, state_pool);
+    }
+
+    fn eval_function_set_filter(
+        self: Evaluator,
+        sf: *ast.SetFilter,
+        bv: ast.BoundVar,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!?Value {
+        const function_set = switch (bv.domain.*) {
+            .set_of_functions => |function_set| function_set,
+            else => return null,
+        };
+        var domain = try self.eval_expr(
+            function_set.domain,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        var codomain = try self.eval_expr(
+            function_set.codomain,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        if (!domain.is_set_like() or !codomain.is_set_like()) {
+            return Error.TypeError;
+        }
+        domain = try self.materialize_set(
+            domain,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        codomain = try self.materialize_set(
+            codomain,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        if (domain != .set_v or codomain != .set_v) return Error.TypeError;
+
+        if (try self.eval_pointwise_function_set_filter(
+            sf,
+            bv,
+            domain,
+            codomain,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        )) |filtered| {
+            return filtered;
+        }
+
+        const domain_count = domain.set_v.len;
+        const codomain_count = codomain.set_v.len;
+        var candidate_count: u64 = 1;
+        for (0..domain_count) |_| {
+            candidate_count *= codomain_count;
+            if (candidate_count > 262_144) return null;
+        }
+        assert(candidate_count <= 262_144);
+
+        var accepted_bits: [4096]u64 = undefined;
+        const word_count: usize = @intCast((candidate_count + 63) / 64);
+        @memset(accepted_bits[0..word_count], 0);
+        const scratch_snapshot = eval_pool.snapshot();
+        const context_snap = self.context_snapshot();
+        const codomain_values = codomain.set_v.items(eval_pool);
+        var accepted_count: u32 = 0;
+        var combo: u64 = 0;
+        while (combo < candidate_count) : (combo += 1) {
+            const entries = try eval_pool.alloc_values(domain_count);
+            var tmp = combo;
+            var i: u32 = 0;
+            while (i < domain_count) : (i += 1) {
+                const value_index: usize = @intCast(tmp % codomain_count);
+                tmp /= codomain_count;
+                entries[i] = codomain_values[value_index];
+            }
+            const candidate = Value{ .function_v = .{
+                .domain = domain.set_v,
+                .offset = value_offset(eval_pool, entries.ptr),
+                .len = domain_count,
+            } };
+            const new_ctx = try self.extend_context(ctx, bv.name, candidate);
+            const pred = try self.eval_expr(
+                sf.pred,
+                new_ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            );
+            if (pred.is_truthy()) {
+                const word: usize = @intCast(combo / 64);
+                const bit: u6 = @intCast(combo % 64);
+                accepted_bits[word] |= @as(u64, 1) << bit;
+                accepted_count += 1;
+            }
+            eval_pool.restore(scratch_snapshot);
+            self.restore_context_pool(context_snap);
+        }
+
+        try eval_pool.ensure_value_capacity(
+            accepted_count +
+                @as(u64, accepted_count) * domain_count,
+        );
+        const accepted = try eval_pool.alloc_values(accepted_count);
+        var accepted_index: u32 = 0;
+        combo = 0;
+        while (combo < candidate_count) : (combo += 1) {
+            const word: usize = @intCast(combo / 64);
+            const bit: u6 = @intCast(combo % 64);
+            if (accepted_bits[word] & (@as(u64, 1) << bit) == 0) continue;
+
+            const entries = try eval_pool.alloc_values(domain_count);
+            var tmp = combo;
+            var i: u32 = 0;
+            while (i < domain_count) : (i += 1) {
+                const value_index: usize = @intCast(tmp % codomain_count);
+                tmp /= codomain_count;
+                entries[i] = codomain_values[value_index];
+            }
+            assert(accepted_index < accepted_count);
+            accepted[accepted_index] = Value{ .function_v = .{
+                .domain = domain.set_v,
+                .offset = value_offset(eval_pool, entries.ptr),
+                .len = domain_count,
+            } };
+            accepted_index += 1;
+        }
+        assert(accepted_index == accepted_count);
+        return Value{ .set_v = .{
+            .offset = value_offset(eval_pool, accepted.ptr),
+            .len = accepted_count,
+        } };
+    }
+
+    fn eval_pointwise_function_set_filter(
+        self: Evaluator,
+        sf: *ast.SetFilter,
+        bv: ast.BoundVar,
+        domain: Value,
+        codomain: Value,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!?Value {
+        assert(domain == .set_v);
+        assert(codomain == .set_v);
+        const quantifier = switch (sf.pred.*) {
+            .quantifier => |quantifier| quantifier,
+            else => return null,
+        };
+        if (quantifier.kind != .forall or quantifier.vars.len != 1) {
+            return null;
+        }
+        const key_var = quantifier.vars[0];
+        if (!is_pointwise_function_predicate(
+            quantifier.body,
+            bv.name,
+            key_var.name,
+        )) return null;
+
+        const quantified_domain = try self.eval_set_materialized(
+            key_var.domain,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        if (quantified_domain != .set_v or
+            !quantified_domain.set_v.eql(domain.set_v, eval_pool))
+        {
+            return null;
+        }
+
+        const domain_count = domain.set_v.len;
+        const codomain_count = codomain.set_v.len;
+        if (domain_count > 256) return null;
+        const pair_count =
+            @as(u64, domain_count) * codomain_count;
+        if (pair_count > 262_144) return null;
+
+        var allowed_bits: [4096]u64 = undefined;
+        const word_count: usize = @intCast((pair_count + 63) / 64);
+        @memset(allowed_bits[0..word_count], 0);
+        var allowed_counts: [256]u32 = @splat(0);
+        const domain_values = domain.set_v.items(eval_pool);
+        const codomain_values = codomain.set_v.items(eval_pool);
+        const scratch_snapshot = eval_pool.snapshot();
+        const context_snap = self.context_snapshot();
+
+        for (domain_values, 0..) |key, domain_index| {
+            for (codomain_values, 0..) |candidate_value, value_index| {
+                const entries = try eval_pool.alloc_values(domain_count);
+                @memset(entries, candidate_value);
+                const candidate = Value{ .function_v = .{
+                    .domain = domain.set_v,
+                    .offset = value_offset(eval_pool, entries.ptr),
+                    .len = domain_count,
+                } };
+                var predicate_ctx = try self.extend_context(
+                    ctx,
+                    bv.name,
+                    candidate,
+                );
+                predicate_ctx = try self.extend_context(
+                    predicate_ctx,
+                    key_var.name,
+                    key,
+                );
+                const predicate = try self.eval_expr(
+                    quantifier.body,
+                    predicate_ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
+                if (predicate.is_truthy()) {
+                    const pair_index =
+                        domain_index * codomain_count + value_index;
+                    const word: usize = @intCast(pair_index / 64);
+                    const bit: u6 = @intCast(pair_index % 64);
+                    allowed_bits[word] |= @as(u64, 1) << bit;
+                    allowed_counts[domain_index] += 1;
+                }
+                eval_pool.restore(scratch_snapshot);
+                self.restore_context_pool(context_snap);
+            }
+            if (allowed_counts[domain_index] == 0) {
+                const empty = try eval_pool.alloc_values(0);
+                return Value{ .set_v = .{
+                    .offset = value_offset(eval_pool, empty.ptr),
+                    .len = 0,
+                } };
+            }
+        }
+
+        var accepted_count: u64 = 1;
+        for (allowed_counts[0..domain_count]) |count| {
+            accepted_count *= count;
+            if (accepted_count > 262_144) return null;
+        }
+        try eval_pool.ensure_value_capacity(
+            accepted_count +
+                accepted_count * domain_count,
+        );
+        const accepted = try eval_pool.alloc_values(
+            @intCast(accepted_count),
+        );
+        var combo: u64 = 0;
+        while (combo < accepted_count) : (combo += 1) {
+            const entries = try eval_pool.alloc_values(domain_count);
+            var ordinal = combo;
+            for (0..domain_count) |domain_index| {
+                const allowed_ordinal =
+                    ordinal % allowed_counts[domain_index];
+                ordinal /= allowed_counts[domain_index];
+                var seen: u32 = 0;
+                var value_index: u32 = 0;
+                while (value_index < codomain_count) : (value_index += 1) {
+                    const pair_index =
+                        domain_index * codomain_count + value_index;
+                    const word: usize = @intCast(pair_index / 64);
+                    const bit: u6 = @intCast(pair_index % 64);
+                    if (allowed_bits[word] &
+                        (@as(u64, 1) << bit) == 0) continue;
+                    if (seen == allowed_ordinal) break;
+                    seen += 1;
+                }
+                assert(value_index < codomain_count);
+                entries[domain_index] = codomain_values[value_index];
+            }
+            accepted[combo] = Value{ .function_v = .{
+                .domain = domain.set_v,
+                .offset = value_offset(eval_pool, entries.ptr),
+                .len = domain_count,
+            } };
+        }
+        return Value{ .set_v = .{
+            .offset = value_offset(eval_pool, accepted.ptr),
+            .len = @intCast(accepted_count),
+        } };
     }
 
     fn eval_set_filter_tuples(
@@ -1132,6 +1454,7 @@ pub const Evaluator = struct {
         }
         const bv = sm.vars[var_idx];
         const item_count = domains[var_idx].set_v.len;
+        const context_snap = self.context_snapshot();
         var stride: usize = 1;
         var j: usize = var_idx + 1;
         while (j < domains.len) : (j += 1) stride *= domains[j].set_v.len;
@@ -1139,6 +1462,7 @@ pub const Evaluator = struct {
             const it = domains[var_idx].set_v.items(eval_pool)[i];
             const new_ctx = try self.extend_context(ctx, bv.name, it);
             try self.eval_set_map_vars(sm, var_idx + 1, domains, new_ctx, s0, eval_pool, state_pool, dest, start + i * stride);
+            self.restore_context_pool(context_snap);
         }
     }
 
@@ -1589,15 +1913,26 @@ pub const Evaluator = struct {
         state_pool: *ValuePool,
     ) Error!Value {
         if (fl.vars.len == 0) return Error.TypeError;
+        if (try self.eval_sequence_field_projection(
+            fl,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        )) |projection| {
+            return projection;
+        }
         if (fl.vars.len == 1) {
             const domain = try self.eval_set_materialized(fl.vars[0].domain, ctx, s0, eval_pool, state_pool);
             const item_count = domain.set_v.len;
             if (item_count > 4096) return self.fail(Error.NotImplemented, "function literal", "domain larger than 4096");
             var scratch: [4096]Value = undefined;
+            const context_snap = self.context_snapshot();
             for (0..item_count) |i| {
                 const it = domain.set_v.items(eval_pool)[i];
                 const new_ctx = try self.extend_context(ctx, fl.vars[0].name, it);
                 scratch[i] = try self.eval_expr(fl.body, new_ctx, s0, eval_pool, state_pool);
+                self.restore_context_pool(context_snap);
             }
             const dest = try eval_pool.alloc_values(item_count);
             @memcpy(dest, scratch[0..item_count]);
@@ -1607,16 +1942,24 @@ pub const Evaluator = struct {
                 .len = item_count,
             } };
         }
-        var domains = std.ArrayList(Value).empty;
-        defer domains.deinit(std.heap.page_allocator);
-        for (fl.vars) |v| {
-            const d = try self.eval_set_materialized(v.domain, ctx, s0, eval_pool, state_pool);
-            try domains.append(std.heap.page_allocator, d);
+        var domains: [32]Value = undefined;
+        if (fl.vars.len > domains.len) {
+            return self.fail(
+                Error.NotImplemented,
+                "function literal",
+                "more than 32 bound variables",
+            );
         }
-        const product = try self.cartesian_product(eval_pool, domains.items);
+        for (fl.vars, 0..) |v, i| {
+            const d = try self.eval_set_materialized(v.domain, ctx, s0, eval_pool, state_pool);
+            assert(d == .set_v);
+            domains[i] = d;
+        }
+        const product = try self.cartesian_product(eval_pool, domains[0..fl.vars.len]);
         const product_set = make_set(eval_pool, product);
         if (product_set.len > 4096) return self.fail(Error.NotImplemented, "function literal", "product domain larger than 4096");
         var scratch: [4096]Value = undefined;
+        const context_snap = self.context_snapshot();
         for (0..product_set.len) |i| {
             const tuple = product_set.items(eval_pool)[i];
             var new_ctx = ctx;
@@ -1625,6 +1968,7 @@ pub const Evaluator = struct {
                 new_ctx = try self.extend_context(new_ctx, v.name, items[j]);
             }
             scratch[i] = try self.eval_expr(fl.body, new_ctx, s0, eval_pool, state_pool);
+            self.restore_context_pool(context_snap);
         }
         const dest = try eval_pool.alloc_values(product_set.len);
         @memcpy(dest, scratch[0..product_set.len]);
@@ -1632,6 +1976,102 @@ pub const Evaluator = struct {
             .domain = product_set,
             .offset = value_offset(eval_pool, dest.ptr),
             .len = product_set.len,
+        } };
+    }
+
+    fn eval_sequence_field_projection(
+        self: Evaluator,
+        fl: *ast.FunctionLiteral,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!?Value {
+        if (fl.vars.len != 1 or fl.body.* != .field) return null;
+        const bound_var = fl.vars[0];
+        const field = fl.body.*.field;
+        if (field.expr.* != .apply) return null;
+        const item_access = field.expr.*.apply;
+        if (item_access.func.* != .ident or
+            item_access.args.len != 1 or
+            item_access.args[0].* != .ident or
+            !name_eql(item_access.args[0].*.ident, bound_var.name))
+        {
+            return null;
+        }
+        const source_name = item_access.func.*.ident;
+        if (bound_var.domain.* != .binary or
+            bound_var.domain.*.binary.op != .range)
+        {
+            return null;
+        }
+        const range = bound_var.domain.*.binary;
+        if (range.left.* != .int_literal or
+            range.left.*.int_literal != 1 or
+            range.right.* != .apply)
+        {
+            return null;
+        }
+        const upper = range.right.*.apply;
+        if (upper.func.* != .ident or
+            !name_eql(upper.func.*.ident, "Len") or
+            upper.args.len != 1 or
+            upper.args[0].* != .ident or
+            !name_eql(upper.args[0].*.ident, source_name))
+        {
+            return null;
+        }
+
+        const source = try self.eval_expr(
+            item_access.func,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        const len: u32 = switch (source) {
+            .tuple_v => |tuple| tuple.len,
+            .function_v => |function| function.len,
+            else => return null,
+        };
+        try eval_pool.ensure_value_capacity(
+            @as(u64, len) * 2,
+        );
+        const domain_values = try eval_pool.alloc_values(len);
+        const result_values = try eval_pool.alloc_values(len);
+        for (0..len) |i| {
+            domain_values[i] = Value{
+                .int_v = @as(i64, @intCast(i)) + 1,
+            };
+            const item = switch (source) {
+                .tuple_v => |tuple| tuple.items(eval_pool)[i],
+                .function_v => |function| function.apply(
+                    eval_pool,
+                    domain_values[i],
+                ) orelse return self.fail(
+                    Error.IndexOutOfBounds,
+                    "sequence field projection",
+                    source_name,
+                ),
+                else => unreachable,
+            };
+            if (item != .record_v) return null;
+            result_values[i] = item.record_v.lookup(
+                eval_pool,
+                field.name,
+            ) orelse return self.fail(
+                Error.UndefinedSymbol,
+                "sequence field projection",
+                field.name,
+            );
+        }
+        return Value{ .function_v = .{
+            .domain = .{
+                .offset = value_offset(eval_pool, domain_values.ptr),
+                .len = len,
+            },
+            .offset = value_offset(eval_pool, result_values.ptr),
+            .len = len,
         } };
     }
 
@@ -1725,20 +2165,34 @@ pub const Evaluator = struct {
                 const next_values = try eval_pool.alloc_values(
                     @intCast(self.module.variables.len),
                 );
-                for (self.module.variables, next_values, current.values) |
+                for (
+                    self.module.variables,
+                    next_values,
+                    current.values,
+                    0..,
+                ) |
                     variable_name,
                     *next_value,
                     current_value,
+                    variable_index,
                 | {
                     next_value.* = if (ctx.lookup(variable_name)) |assigned|
                         assigned
                     else
-                        try current_value.clone(state_pool, eval_pool);
+                        try current_value.clone(
+                            current.value_pool(
+                                @intCast(variable_index),
+                                state_pool,
+                            ),
+                            eval_pool,
+                        );
                 }
                 var partial_next = StateStore.State{
                     .level = current.level + 1,
                     .pred = current.pred,
                     .changed_mask = 0,
+                    .borrowed_mask = 0,
+                    .borrowed_pool = null,
                     .values = next_values,
                 };
 
@@ -1785,6 +2239,10 @@ pub const Evaluator = struct {
                 if (self.find_variable(root_name)) |variable_index| {
                     assert(variable_index < state_v.values.len);
                     var current = state_v.values[variable_index];
+                    const current_pool = state_v.value_pool(
+                        variable_index,
+                        state_pool,
+                    );
                     for (groups[0..group_count]) |group| {
                         if (group.args.len > 8) {
                             return self.fail(
@@ -1821,17 +2279,43 @@ pub const Evaluator = struct {
                         current = try apply_cross_pool(
                             self,
                             current,
-                            state_pool,
+                            current_pool,
                             key,
                             eval_pool,
                         );
                     }
-                    return try current.clone(state_pool, eval_pool);
+                    return try current.clone(current_pool, eval_pool);
                 }
             }
         }
         if (ap.func.* == .ident) {
             const name = self.resolve_alias(ap.func.*.ident);
+            if (std.mem.eql(u8, name, "ReduceSeq") and
+                ap.args.len == 3)
+            {
+                return try self.eval_sequence_fold(
+                    ap.args[0],
+                    ap.args[2],
+                    ap.args[1],
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
+            }
+            if (std.mem.eql(u8, name, "FoldFunction") and
+                ap.args.len == 3)
+            {
+                return try self.eval_sequence_fold(
+                    ap.args[0],
+                    ap.args[1],
+                    ap.args[2],
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
+            }
             // For set operations that require materialized sets, materialize
             // the arguments first.
             if (std.mem.eql(u8, name, "Cardinality") and ap.args.len == 1) {
@@ -1957,7 +2441,13 @@ pub const Evaluator = struct {
                 for (def.params, 0..) |p, i| {
                     new_ctx = try self.extend_context(new_ctx, p, values[i]);
                 }
-                return try self.eval_expr(def.body, new_ctx, s0, eval_pool, state_pool);
+                return try self.eval_expr(
+                    def.body,
+                    new_ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
             }
         }
         const func = try self.eval_expr(ap.func, ctx, s0, eval_pool, state_pool);
@@ -1966,6 +2456,74 @@ pub const Evaluator = struct {
             values[i] = try self.eval_expr(a, ctx, s0, eval_pool, state_pool);
         }
         return try self.apply_values(func, values, eval_pool, state_pool, s0);
+    }
+
+    fn eval_sequence_fold(
+        self: Evaluator,
+        operator_expr: *ast.Expr,
+        accumulator_expr: *ast.Expr,
+        sequence_expr: *ast.Expr,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!Value {
+        const operator = try self.eval_expr(
+            operator_expr,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        var accumulator = try self.eval_expr(
+            accumulator_expr,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        const sequence = try self.eval_expr(
+            sequence_expr,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        const len: u32 = switch (sequence) {
+            .tuple_v => |tuple| tuple.len,
+            .function_v => |function| function.len,
+            else => return self.fail(
+                Error.TypeError,
+                "sequence fold",
+                @tagName(sequence),
+            ),
+        };
+        const context_snap = self.context_snapshot();
+        var index: u32 = 0;
+        while (index < len) : (index += 1) {
+            const element = switch (sequence) {
+                .tuple_v => |tuple| tuple.items(eval_pool)[index],
+                .function_v => |function| function.apply(
+                    eval_pool,
+                    Value{ .int_v = @as(i64, index) + 1 },
+                ) orelse return self.fail(
+                    Error.IndexOutOfBounds,
+                    "sequence fold",
+                    "function domain is not 1..Len",
+                ),
+                else => unreachable,
+            };
+            const args = [_]Value{ element, accumulator };
+            accumulator = try self.apply_values(
+                operator,
+                &args,
+                eval_pool,
+                state_pool,
+                s0,
+            );
+            self.restore_context_pool(context_snap);
+        }
+        return accumulator;
     }
 
     fn eval_fold_function_on_set(
@@ -2149,7 +2707,157 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!Value {
+        if (try self.eval_state_function_quantifier(
+            q,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        )) |result| {
+            return result;
+        }
         return try self.eval_quantifier_vars(q, 0, ctx, s0, eval_pool, state_pool);
+    }
+
+    fn eval_state_function_quantifier(
+        self: Evaluator,
+        q: *ast.Quantifier,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!?Value {
+        const state_v = s0 orelse return null;
+        if (q.kind != .forall or q.vars.len == 0 or q.vars.len > 8 or
+            q.body.* != .binary)
+        {
+            return null;
+        }
+        const comparison = q.body.*.binary;
+        switch (comparison.op) {
+            .eq, .ne, .lt, .le, .gt, .ge => {},
+            else => return null,
+        }
+        if (comparison.left.* != .apply) return null;
+
+        var root_name: []const u8 = "";
+        var groups: [8]ApplicationGroup = undefined;
+        var group_count: u8 = 0;
+        if (!collect_application_groups(
+            comparison.left.*.apply,
+            &root_name,
+            &groups,
+            &group_count,
+        )) return null;
+        const variable_index = self.find_variable(root_name) orelse
+            return null;
+        assert(variable_index < state_v.values.len);
+
+        var group_var_indices: [8]u8 = undefined;
+        for (groups[0..group_count], 0..) |group, group_index| {
+            if (group.args.len != 1 or group.args[0].* != .ident) {
+                return null;
+            }
+            const argument_name = group.args[0].*.ident;
+            var found: ?u8 = null;
+            for (q.vars, 0..) |bound_var, bound_index| {
+                if (name_eql(bound_var.name, argument_name)) {
+                    found = @intCast(bound_index);
+                    break;
+                }
+            }
+            group_var_indices[group_index] = found orelse return null;
+        }
+        if (expr_mentions_bound_names(comparison.right, q.vars)) {
+            return null;
+        }
+
+        var domains: [8]Value = undefined;
+        for (q.vars, 0..) |bound_var, i| {
+            domains[i] = try self.eval_set_materialized(
+                bound_var.domain,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            );
+            if (domains[i] != .set_v) return null;
+        }
+        const right = try self.eval_expr(
+            comparison.right,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        var assignments: [8]Value = undefined;
+        const holds = try self.eval_state_quantifier_combinations(
+            domains[0..q.vars.len],
+            0,
+            &assignments,
+            state_v.values[variable_index],
+            state_v.value_pool(variable_index, state_pool),
+            groups[0..group_count],
+            group_var_indices[0..group_count],
+            comparison.op,
+            right,
+            eval_pool,
+            state_pool,
+        );
+        return Value{ .bool_v = holds };
+    }
+
+    fn eval_state_quantifier_combinations(
+        self: Evaluator,
+        domains: []const Value,
+        depth: usize,
+        assignments: *[8]Value,
+        root: Value,
+        root_pool: *const ValuePool,
+        groups: []const ApplicationGroup,
+        group_var_indices: []const u8,
+        comparison: ast.BinaryOp,
+        right: Value,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!bool {
+        if (depth < domains.len) {
+            for (domains[depth].set_v.items(eval_pool)) |item| {
+                assignments[depth] = item;
+                if (!try self.eval_state_quantifier_combinations(
+                    domains,
+                    depth + 1,
+                    assignments,
+                    root,
+                    root_pool,
+                    groups,
+                    group_var_indices,
+                    comparison,
+                    right,
+                    eval_pool,
+                    state_pool,
+                )) return false;
+            }
+            return true;
+        }
+
+        var current = root;
+        for (groups, group_var_indices) |_, bound_index| {
+            current = try apply_cross_pool(
+                self,
+                current,
+                root_pool,
+                assignments[bound_index],
+                eval_pool,
+            );
+        }
+        return compare_cross_pool_scalars(
+            current,
+            root_pool,
+            right,
+            eval_pool,
+            comparison,
+        ) orelse return Error.TypeError;
     }
 
     fn eval_quantifier_vars(
@@ -2258,6 +2966,8 @@ pub const Evaluator = struct {
         if (c.domain) |domain_expr| {
             const domain = try self.eval_set_materialized(domain_expr, ctx, s0, eval_pool, state_pool);
             const items = domain.set_v.items(eval_pool);
+            const scratch_snapshot = eval_pool.snapshot();
+            const context_snap = self.context_snapshot();
             var chosen: ?Value = null;
             for (items) |it| {
                 const new_ctx = try self.extend_context(ctx, c.var_name, it);
@@ -2269,6 +2979,8 @@ pub const Evaluator = struct {
                         if (cmp < 0) chosen = it;
                     }
                 }
+                eval_pool.restore(scratch_snapshot);
+                self.restore_context_pool(context_snap);
             }
             return chosen orelse self.fail(
                 Error.EmptyChoose,
@@ -2279,8 +2991,12 @@ pub const Evaluator = struct {
         // Domain-free CHOOSE: try fresh model values until the predicate holds.
         var attempt: u32 = 0;
         while (attempt < 1024) : (attempt += 1) {
-            const name = try std.fmt.allocPrint(std.heap.page_allocator, "__choose_{d}", .{attempt});
-            defer std.heap.page_allocator.free(name);
+            var name_buffer: [32]u8 = undefined;
+            const name = std.fmt.bufPrint(
+                &name_buffer,
+                "__choose_{d}",
+                .{attempt},
+            ) catch return Error.OutOfMemory;
             const id = try self.models.intern(name);
             const candidate = Value{ .model_v = id };
             const new_ctx = try self.extend_context(ctx, c.var_name, candidate);
@@ -2298,8 +3014,333 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!Value {
+        if (s0) |state_v| {
+            if (e.func.* == .ident) {
+                if (self.find_variable(e.func.*.ident)) |variable_index| {
+                    assert(variable_index < state_v.values.len);
+                    return try self.except_steps_cross_pool(
+                        state_v.values[variable_index],
+                        state_v.value_pool(variable_index, state_pool),
+                        e.steps,
+                        0,
+                        e.value,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    );
+                }
+            }
+        }
         const original = try self.eval_expr(e.func, ctx, s0, eval_pool, state_pool);
         return try self.except_steps(original, e.steps, 0, e.value, ctx, s0, eval_pool, state_pool);
+    }
+
+    fn except_steps_cross_pool(
+        self: Evaluator,
+        original: Value,
+        original_pool: *const ValuePool,
+        steps: []const ast.AccessStep,
+        idx: u32,
+        value_expr: *ast.Expr,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!Value {
+        assert(idx < steps.len);
+        const step = steps[idx];
+        switch (step) {
+            .index => |index_expr| {
+                const key = try self.eval_expr(
+                    index_expr,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
+                switch (original) {
+                    .function_v => |function| {
+                        const keys = function.domain.items(original_pool);
+                        const entries = function.entries(original_pool);
+                        var selected: ?u32 = null;
+                        for (keys, 0..) |candidate, i| {
+                            if (cross_pool_eql(
+                                candidate,
+                                original_pool,
+                                key,
+                                eval_pool,
+                            )) {
+                                selected = @intCast(i);
+                                break;
+                            }
+                        }
+                        const selected_index = selected orelse
+                            return self.fail(
+                                Error.IndexOutOfBounds,
+                                "except cross-pool function",
+                                @tagName(key),
+                            );
+                        const new_value = try self.except_cross_pool_child(
+                            entries[selected_index],
+                            original_pool,
+                            steps,
+                            idx,
+                            value_expr,
+                            ctx,
+                            s0,
+                            eval_pool,
+                            state_pool,
+                        );
+                        const domain_values = try eval_pool.alloc_values(
+                            function.len,
+                        );
+                        const result_values = try eval_pool.alloc_values(
+                            function.len,
+                        );
+                        const domain_offset = value_offset(
+                            eval_pool,
+                            domain_values.ptr,
+                        );
+                        const result_offset = value_offset(
+                            eval_pool,
+                            result_values.ptr,
+                        );
+                        for (keys, entries, 0..) |
+                            source_key,
+                            source_value,
+                            i,
+                        | {
+                            eval_pool.values[domain_offset + i] =
+                                try source_key.clone(
+                                    original_pool,
+                                    eval_pool,
+                                );
+                            eval_pool.values[result_offset + i] =
+                                if (i == selected_index)
+                                    new_value
+                                else
+                                    try source_value.clone(
+                                        original_pool,
+                                        eval_pool,
+                                    );
+                        }
+                        return Value{ .function_v = .{
+                            .domain = .{
+                                .offset = domain_offset,
+                                .len = function.len,
+                            },
+                            .offset = result_offset,
+                            .len = function.len,
+                        } };
+                    },
+                    .tuple_v => |tuple| {
+                        const selected_index_i64 =
+                            (key.as_int() orelse return self.fail(
+                                Error.TypeError,
+                                "except cross-pool tuple",
+                                @tagName(key),
+                            )) - 1;
+                        if (selected_index_i64 < 0 or
+                            selected_index_i64 >= tuple.len)
+                        {
+                            return self.fail(
+                                Error.IndexOutOfBounds,
+                                "except cross-pool tuple",
+                                @tagName(key),
+                            );
+                        }
+                        const selected_index: u32 =
+                            @intCast(selected_index_i64);
+                        const items = tuple.items(original_pool);
+                        const new_value = try self.except_cross_pool_child(
+                            items[selected_index],
+                            original_pool,
+                            steps,
+                            idx,
+                            value_expr,
+                            ctx,
+                            s0,
+                            eval_pool,
+                            state_pool,
+                        );
+                        const result = try eval_pool.alloc_values(tuple.len);
+                        const result_offset = value_offset(
+                            eval_pool,
+                            result.ptr,
+                        );
+                        for (items, 0..) |item, i| {
+                            eval_pool.values[result_offset + i] =
+                                if (i == selected_index)
+                                    new_value
+                                else
+                                    try item.clone(original_pool, eval_pool);
+                        }
+                        return Value{ .tuple_v = .{
+                            .offset = result_offset,
+                            .len = tuple.len,
+                        } };
+                    },
+                    .record_v => {
+                        if (key != .string_v) {
+                            return self.fail(
+                                Error.TypeError,
+                                "except cross-pool record",
+                                @tagName(key),
+                            );
+                        }
+                        return try self.except_cross_pool_record(
+                            original.record_v,
+                            original_pool,
+                            key.string_v.slice(eval_pool),
+                            steps,
+                            idx,
+                            value_expr,
+                            ctx,
+                            s0,
+                            eval_pool,
+                            state_pool,
+                        );
+                    },
+                    else => return self.fail(
+                        Error.TypeError,
+                        "except cross-pool index",
+                        @tagName(original),
+                    ),
+                }
+            },
+            .field => |field| {
+                if (original != .record_v) {
+                    return self.fail(
+                        Error.TypeError,
+                        "except cross-pool field",
+                        @tagName(original),
+                    );
+                }
+                return try self.except_cross_pool_record(
+                    original.record_v,
+                    original_pool,
+                    field,
+                    steps,
+                    idx,
+                    value_expr,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
+            },
+        }
+    }
+
+    fn except_cross_pool_child(
+        self: Evaluator,
+        old_value: Value,
+        original_pool: *const ValuePool,
+        steps: []const ast.AccessStep,
+        idx: u32,
+        value_expr: *ast.Expr,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!Value {
+        if (idx + 1 < steps.len) {
+            return try self.except_steps_cross_pool(
+                old_value,
+                original_pool,
+                steps,
+                idx + 1,
+                value_expr,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            );
+        }
+        const old_value_eval = try old_value.clone(
+            original_pool,
+            eval_pool,
+        );
+        const new_ctx = try self.extend_context(
+            ctx,
+            "@",
+            old_value_eval,
+        );
+        return try self.eval_expr(
+            value_expr,
+            new_ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+    }
+
+    fn except_cross_pool_record(
+        self: Evaluator,
+        record: value.Record,
+        original_pool: *const ValuePool,
+        field: []const u8,
+        steps: []const ast.AccessStep,
+        idx: u32,
+        value_expr: *ast.Expr,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!Value {
+        const fields = record.fields(original_pool);
+        var selected: ?u32 = null;
+        var i: u32 = 0;
+        while (i < record.len) : (i += 1) {
+            if (std.mem.eql(
+                u8,
+                fields[i * 2].string_v.slice(original_pool),
+                field,
+            )) {
+                selected = i;
+                break;
+            }
+        }
+        const selected_index = selected orelse
+            return self.fail(
+                Error.UndefinedSymbol,
+                "except cross-pool record",
+                field,
+            );
+        const new_value = try self.except_cross_pool_child(
+            fields[selected_index * 2 + 1],
+            original_pool,
+            steps,
+            idx,
+            value_expr,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        const result = try eval_pool.alloc_values(record.len * 2);
+        const result_offset = value_offset(eval_pool, result.ptr);
+        i = 0;
+        while (i < record.len) : (i += 1) {
+            eval_pool.values[result_offset + i * 2] =
+                try fields[i * 2].clone(
+                    original_pool,
+                    eval_pool,
+                );
+            eval_pool.values[result_offset + i * 2 + 1] =
+                if (i == selected_index)
+                    new_value
+                else
+                    try fields[i * 2 + 1].clone(
+                        original_pool,
+                        eval_pool,
+                    );
+        }
+        return Value{ .record_v = .{
+            .offset = result_offset,
+            .len = record.len,
+        } };
     }
 
     fn except_steps(
@@ -2489,6 +3530,168 @@ inline fn name_eql(left: []const u8, right: []const u8) bool {
     if (left.len != right.len) return false;
     if (left.ptr == right.ptr) return true;
     return std.mem.eql(u8, left, right);
+}
+
+fn expr_mentions_bound_names(
+    expr: *const ast.Expr,
+    vars: []const ast.BoundVar,
+) bool {
+    return switch (expr.*) {
+        .bool_literal, .int_literal, .string_literal => false,
+        .ident => |name| blk: {
+            for (vars) |bound_var| {
+                if (name_eql(name, bound_var.name)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => true,
+    };
+}
+
+fn compare_cross_pool_scalars(
+    left: Value,
+    left_pool: *const ValuePool,
+    right: Value,
+    right_pool: *const ValuePool,
+    comparison: ast.BinaryOp,
+) ?bool {
+    return switch (comparison) {
+        .eq => cross_pool_eql(
+            left,
+            left_pool,
+            right,
+            right_pool,
+        ),
+        .ne => !cross_pool_eql(
+            left,
+            left_pool,
+            right,
+            right_pool,
+        ),
+        .lt, .le, .gt, .ge => blk: {
+            const left_int = left.as_int() orelse break :blk null;
+            const right_int = right.as_int() orelse break :blk null;
+            break :blk switch (comparison) {
+                .lt => left_int < right_int,
+                .le => left_int <= right_int,
+                .gt => left_int > right_int,
+                .ge => left_int >= right_int,
+                else => unreachable,
+            };
+        },
+        else => null,
+    };
+}
+
+fn is_pointwise_function_predicate(
+    expr: *const ast.Expr,
+    function_name: []const u8,
+    key_name: []const u8,
+) bool {
+    return switch (expr.*) {
+        .bool_literal, .int_literal, .string_literal => true,
+        .ident => |name| !name_eql(name, function_name),
+        .binary => |binary| is_pointwise_function_predicate(
+            binary.left,
+            function_name,
+            key_name,
+        ) and is_pointwise_function_predicate(
+            binary.right,
+            function_name,
+            key_name,
+        ),
+        .unary => |unary| is_pointwise_function_predicate(
+            unary.operand,
+            function_name,
+            key_name,
+        ),
+        .quantifier => |quantifier| blk: {
+            for (quantifier.vars) |bound_var| {
+                if (name_eql(bound_var.name, function_name) or
+                    name_eql(bound_var.name, key_name) or
+                    !is_pointwise_function_predicate(
+                        bound_var.domain,
+                        function_name,
+                        key_name,
+                    ))
+                {
+                    break :blk false;
+                }
+            }
+            break :blk is_pointwise_function_predicate(
+                quantifier.body,
+                function_name,
+                key_name,
+            );
+        },
+        .if_then_else => |conditional| is_pointwise_function_predicate(
+            conditional.cond,
+            function_name,
+            key_name,
+        ) and is_pointwise_function_predicate(
+            conditional.then_branch,
+            function_name,
+            key_name,
+        ) and is_pointwise_function_predicate(
+            conditional.else_branch,
+            function_name,
+            key_name,
+        ),
+        .apply => |application| blk: {
+            if (application.func.* == .ident and
+                name_eql(
+                    application.func.*.ident,
+                    function_name,
+                ))
+            {
+                break :blk application.args.len == 1 and
+                    application.args[0].* == .ident and
+                    name_eql(
+                        application.args[0].*.ident,
+                        key_name,
+                    );
+            }
+            if (!is_pointwise_function_predicate(
+                application.func,
+                function_name,
+                key_name,
+            )) break :blk false;
+            for (application.args) |argument| {
+                if (!is_pointwise_function_predicate(
+                    argument,
+                    function_name,
+                    key_name,
+                )) break :blk false;
+            }
+            break :blk true;
+        },
+        .field => |field| is_pointwise_function_predicate(
+            field.expr,
+            function_name,
+            key_name,
+        ),
+        .tuple, .set_enum => |items| blk: {
+            for (items) |item| {
+                if (!is_pointwise_function_predicate(
+                    item,
+                    function_name,
+                    key_name,
+                )) break :blk false;
+            }
+            break :blk true;
+        },
+        .record => |fields| blk: {
+            for (fields) |field| {
+                if (!is_pointwise_function_predicate(
+                    field.value,
+                    function_name,
+                    key_name,
+                )) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
 }
 
 fn select_subexpression(expr: *ast.Expr, selector: usize) ?*ast.Expr {
@@ -3307,4 +4510,37 @@ fn make_symbolic_function_set(eval_pool: *ValuePool, n: u32, codomain: Value) er
         .domain_offset = try eval_pool.push_value(domain_set),
         .codomain_offset = try eval_pool.push_value(codomain),
     } };
+}
+
+test "pointwise function predicate requires access by bound key" {
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE Pointwise ----------------------
+        \\CONSTANTS D, C
+        \\Good == {f \in [D -> C] : \A x \in D : f[x] = x}
+        \\Bad == {f \in [D -> C] : \A x \in D : f["other"] = x}
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    try std.testing.expectEqual(@as(usize, 2), module.definitions.len);
+
+    const good = module.definitions[0].body.set_filter;
+    const good_quantifier = good.pred.quantifier;
+    try std.testing.expect(is_pointwise_function_predicate(
+        good_quantifier.body,
+        good.vars[0].name,
+        good_quantifier.vars[0].name,
+    ));
+
+    const bad = module.definitions[1].body.set_filter;
+    const bad_quantifier = bad.pred.quantifier;
+    try std.testing.expect(!is_pointwise_function_predicate(
+        bad_quantifier.body,
+        bad.vars[0].name,
+        bad_quantifier.vars[0].name,
+    ));
 }

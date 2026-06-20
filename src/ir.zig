@@ -284,6 +284,7 @@ pub const IrModule = struct {
 
 pub const ResolveError = error{
     UndefinedSymbol,
+    NotImplemented,
     OutOfMemory,
 };
 
@@ -810,10 +811,14 @@ pub const Resolver = struct {
             const ir_def = self.defs_list.items[i];
             ir_def.body = try self.resolve_definition_body(d);
         }
+        const defs = try self.arena.alloc(IrDef, self.defs_list.items.len);
+        for (self.defs_list.items, defs) |source, *target| {
+            target.* = source.*;
+        }
         return IrModule{
             .name = "",
             .variables = self.variables,
-            .defs = try self.arena.alloc(IrDef, self.defs_list.items.len),
+            .defs = defs,
         };
     }
 };
@@ -884,4 +889,35 @@ fn builtin_op_from_name(name: []const u8) ?BuiltinOp {
         .{ "\\subseteq", .subseteq },
     });
     return map.get(name);
+}
+
+test "resolve_all exports resolved definition bodies" {
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE IrResolve ----------------------
+        \\A == 1
+        \\B == A + 1
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    var resolver = try Resolver.init(
+        &arena,
+        module.variables,
+        module.definitions,
+    );
+    defer resolver.deinit();
+    const resolved = try resolver.resolve_all(module.definitions);
+
+    try std.testing.expectEqual(@as(usize, 2), resolved.defs.len);
+    try std.testing.expectEqualStrings("A", resolved.defs[0].name);
+    try std.testing.expectEqualStrings("B", resolved.defs[1].name);
+    try std.testing.expect(resolved.defs[0].body.* == .int_literal);
+    try std.testing.expect(resolved.defs[1].body.* == .binary);
+    try std.testing.expect(
+        resolved.defs[1].body.binary.left.* == .def_ref,
+    );
 }

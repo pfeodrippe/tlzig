@@ -75,6 +75,11 @@ const default_overrides = [_]OverrideEntry{
     .{ .name = "Append", .func = append },
     .{ .name = "SubSeq", .func = sub_seq },
     .{ .name = "SortSeq", .func = sort_seq },
+    .{ .name = "Range", .func = function_range },
+    .{ .name = "SeqToSet", .func = seq_to_set },
+    .{ .name = "Index", .func = sequence_index },
+    .{ .name = "PermSeqs", .func = permutation_sequences },
+    .{ .name = "INTERSECTION", .func = intersection_all },
     .{ .name = "Permutations", .func = permutations },
     .{ .name = "RandomElement", .func = random_element },
     .{ .name = "Any", .func = random_element },
@@ -210,6 +215,199 @@ fn sub_seq(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Valu
         },
         else => Error.TypeError,
     };
+}
+
+fn function_range(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    const source = switch (args[0]) {
+        .function_v => |function| function.entries(pool),
+        .tuple_v => |tuple| tuple.items(pool),
+        else => return Error.TypeError,
+    };
+    if (values_are_unique(pool, source)) {
+        return Value{ .set_v = .{
+            .offset = value_offset(pool, source.ptr),
+            .len = @intCast(source.len),
+        } };
+    }
+    const values = try pool.alloc_values(@intCast(source.len));
+    @memcpy(values, source);
+    return Value{ .set_v = make_set(pool, values) };
+}
+
+fn seq_to_set(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    const len = sequence_length(args[0]) orelse return Error.TypeError;
+    const source: ?[]const Value = switch (args[0]) {
+        .tuple_v => |tuple| tuple.items(pool),
+        .function_v => |function| function.entries(pool),
+        else => null,
+    };
+    if (source) |items| {
+        if (values_are_unique(pool, items)) {
+            return Value{ .set_v = .{
+                .offset = value_offset(pool, items.ptr),
+                .len = @intCast(items.len),
+            } };
+        }
+    }
+    const values = try pool.alloc_values(len);
+    for (0..len) |i| {
+        values[i] = sequence_item(
+            pool,
+            args[0],
+            @intCast(i),
+        ) orelse return Error.IndexOutOfBounds;
+    }
+    return Value{ .set_v = make_set(pool, values) };
+}
+
+fn values_are_unique(
+    pool: *const ValuePool,
+    values: []const Value,
+) bool {
+    for (values, 0..) |candidate, i| {
+        for (values[0..i]) |existing| {
+            if (existing.eql(candidate, pool)) return false;
+        }
+    }
+    return true;
+}
+
+fn sequence_index(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    const len = sequence_length(args[0]) orelse return Error.TypeError;
+    for (0..len) |i| {
+        const item = sequence_item(
+            pool,
+            args[0],
+            @intCast(i),
+        ) orelse return Error.IndexOutOfBounds;
+        if (item.eql(args[1], pool)) {
+            return Value{ .int_v = @as(i64, @intCast(i)) + 1 };
+        }
+    }
+    return Error.EmptyChoose;
+}
+
+fn permutation_sequences(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 1 or args[0] != .set_v) return Error.TypeError;
+    const items = args[0].set_v.items(pool);
+    if (items.len > 10) return Error.NotImplemented;
+    var permutation_count: u64 = 1;
+    for (2..items.len + 1) |factor| {
+        permutation_count = std.math.mul(
+            u64,
+            permutation_count,
+            factor,
+        ) catch return Error.OutOfMemory;
+    }
+    if (permutation_count > std.math.maxInt(u32)) {
+        return Error.OutOfMemory;
+    }
+    try pool.ensure_value_capacity(
+        permutation_count +
+            permutation_count * items.len,
+    );
+    const permutations_out = try pool.alloc_values(
+        @intCast(permutation_count),
+    );
+    var scratch: [10]Value = undefined;
+    var used: [10]bool = @splat(false);
+    var output_index: u32 = 0;
+    try generate_permutation_sequences(
+        pool,
+        items,
+        scratch[0..items.len],
+        used[0..items.len],
+        0,
+        permutations_out,
+        &output_index,
+    );
+    assert(output_index == permutation_count);
+    return Value{ .set_v = .{
+        .offset = value_offset(pool, permutations_out.ptr),
+        .len = output_index,
+    } };
+}
+
+fn generate_permutation_sequences(
+    pool: *ValuePool,
+    items: []const Value,
+    scratch: []Value,
+    used: []bool,
+    depth: usize,
+    output: []Value,
+    output_index: *u32,
+) Error!void {
+    assert(items.len == scratch.len);
+    assert(items.len == used.len);
+    if (depth == items.len) {
+        assert(output_index.* < output.len);
+        const tuple_values = try pool.alloc_values(
+            @intCast(items.len),
+        );
+        @memcpy(tuple_values, scratch);
+        output[output_index.*] = Value{ .tuple_v = make_tuple(
+            pool,
+            tuple_values,
+        ) };
+        output_index.* += 1;
+        return;
+    }
+    for (items, 0..) |item, item_index| {
+        if (used[item_index]) continue;
+        used[item_index] = true;
+        scratch[depth] = item;
+        try generate_permutation_sequences(
+            pool,
+            items,
+            scratch,
+            used,
+            depth + 1,
+            output,
+            output_index,
+        );
+        used[item_index] = false;
+    }
+}
+
+fn intersection_all(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 1 or args[0] != .set_v) return Error.TypeError;
+    const sets = args[0].set_v.items(pool);
+    if (sets.len == 0) {
+        const empty = try pool.alloc_values(0);
+        return Value{ .set_v = make_set(pool, empty) };
+    }
+    var smallest = sets[0];
+    if (smallest != .set_v) return Error.TypeError;
+    for (sets[1..]) |set| {
+        if (set != .set_v) return Error.TypeError;
+        if (set.set_v.len < smallest.set_v.len) smallest = set;
+    }
+    const candidates = smallest.set_v.items(pool);
+    const result = try pool.alloc_values(
+        @intCast(candidates.len),
+    );
+    var result_count: u32 = 0;
+    for (candidates) |candidate| {
+        var present_in_all = true;
+        for (sets) |set| {
+            assert(set == .set_v);
+            if (!set.set_v.contains(pool, candidate)) {
+                present_in_all = false;
+                break;
+            }
+        }
+        if (present_in_all) {
+            result[result_count] = candidate;
+            result_count += 1;
+        }
+    }
+    return Value{ .set_v = .{
+        .offset = value_offset(pool, result.ptr),
+        .len = result_count,
+    } };
 }
 
 fn union_all(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
@@ -481,7 +679,7 @@ fn make_tuple(pool: *ValuePool, values: []Value) value.Tuple {
     };
 }
 
-fn value_offset(pool: *const ValuePool, ptr: [*]Value) u32 {
+fn value_offset(pool: *const ValuePool, ptr: [*]const Value) u32 {
     const base = @intFromPtr(pool.values.ptr);
     const address = @intFromPtr(ptr);
     assert(address >= base);

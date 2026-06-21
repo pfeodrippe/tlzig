@@ -1974,6 +1974,43 @@ test "MDBTLA MultiShardTxn resolves Range over an empty sequence" {
     try std.testing.expect(result.is_truthy());
 }
 
+test "instance modules retain definitions from extended community modules" {
+    var arena = try Arena.init(256 * 1024 * 1024);
+    defer arena.deinit();
+    const search_paths = [_][]const u8{
+        "vendor/tlaplus-examples/specifications/YoYo",
+        "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+        "vendor/tlaplus-community-modules/modules",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = try loader.load(
+        "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.tla",
+    );
+    if (!find_definition(module, "IsUndirectedGraph")) {
+        return error.MissingIsUndirectedGraph;
+    }
+    if (!find_definition(module, "IsStronglyConnected")) {
+        return error.MissingIsStronglyConnected;
+    }
+}
+
+test "extended modules retain imported EWD687a properties" {
+    var arena = try Arena.init(256 * 1024 * 1024);
+    defer arena.deinit();
+    const search_paths = [_][]const u8{
+        "vendor/tlaplus-examples/specifications/ewd687a",
+        "vendor/tlaplus-standard-modules/tla2sany/StandardModules",
+        "vendor/tlaplus-community-modules/modules",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = try loader.load(
+        "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.tla",
+    );
+    try std.testing.expect(find_definition(module, "CountersConsistent"));
+    try std.testing.expect(find_definition(module, "TreeWithRoot"));
+    try std.testing.expect(find_definition(module, "DT2"));
+}
+
 fn read_test_file(arena: *Arena, path: []const u8) ![]u8 {
     const path_z = try arena.alloc(u8, path.len + 1);
     @memcpy(path_z[0..path.len], path);

@@ -39,11 +39,32 @@ pub const Context = struct {
         }
         return null;
     }
+
+    pub fn lookup_state(self: Context, variable_index: u32) ?StateContextValue {
+        var binding = self.head;
+        while (binding) |current| {
+            if (current.variable_index == variable_index) {
+                assert(current.assignment != .local);
+                return .{
+                    .value = current.value,
+                    .assignment = current.assignment,
+                };
+            }
+            binding = current.parent;
+        }
+        return null;
+    }
+};
+
+pub const StateContextValue = struct {
+    value: Value,
+    assignment: AssignmentKind,
 };
 
 const ContextBinding = struct {
     parent: ?*const ContextBinding,
     name: []const u8,
+    variable_index: ?u32,
     value: Value,
     assignment: AssignmentKind,
 };
@@ -84,16 +105,19 @@ const ContextPool = struct {
         self: *ContextPool,
         context: Context,
         name: []const u8,
+        variable_index: ?u32,
         value_v: Value,
         assignment: AssignmentKind,
     ) Error!Context {
         assert(context.len < 32);
+        assert((assignment == .local) == (variable_index == null));
         if (self.count >= self.bindings.len) return Error.OutOfMemory;
         const binding = &self.bindings[self.count];
         self.count += 1;
         binding.* = .{
             .parent = context.head,
             .name = name,
+            .variable_index = variable_index,
             .value = value_v,
             .assignment = assignment,
         };
@@ -189,7 +213,7 @@ pub const Evaluator = struct {
     err_ctx: *ErrorContext,
 
     pub fn init(module: ast.Module, arena: *Arena, override_ctx: overrides.OverrideContext) !Evaluator {
-        return init_generated(module, arena, override_ctx, &.{});
+        return init_generated(module, arena, override_ctx, &.{}, &.{});
     }
 
     pub fn init_generated(
@@ -197,6 +221,7 @@ pub const Evaluator = struct {
         arena: *Arena,
         override_ctx: overrides.OverrideContext,
         generated: []const generated_runtime.Operator,
+        generated_expressions: []const generated_runtime.Expression,
     ) !Evaluator {
         const models = try arena.alloc_object(ModelTable);
         models.* = try ModelTable.init(arena, 1024);
@@ -210,6 +235,7 @@ pub const Evaluator = struct {
         @memset(constant_slots, null);
         var override_registry = overrides.default_registry(override_ctx);
         override_registry.generated = generated;
+        override_registry.generated_expressions = generated_expressions;
         return Evaluator{
             .module = module,
             .constants = &[_]Constant{},
@@ -270,20 +296,24 @@ pub const Evaluator = struct {
         name: []const u8,
         value_v: Value,
     ) Error!Context {
-        return self.context_pool.extend(context, name, value_v, .local);
+        return self.context_pool.extend(context, name, null, value_v, .local);
     }
 
     pub fn extend_state_context(
         self: Evaluator,
         context: Context,
         name: []const u8,
+        variable_index: u32,
         value_v: Value,
         assignment: AssignmentKind,
     ) Error!Context {
         assert(assignment != .local);
+        assert(variable_index < self.module.variables.len);
+        assert(name_eql(name, self.module.variables[variable_index]));
         return self.context_pool.extend(
             context,
             name,
+            variable_index,
             value_v,
             assignment,
         );
@@ -299,6 +329,103 @@ pub const Evaluator = struct {
             binding.assignment
         else
             .local;
+    }
+
+    pub fn eval_named_zero(
+        self: Evaluator,
+        name: []const u8,
+        context: Context,
+        current_state: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!Value {
+        const resolved = self.resolve_alias(name);
+        if (self.override_registry.find_generated(resolved, 0)) |function| {
+            return self.call_generated(
+                function,
+                &.{},
+                context,
+                current_state,
+                eval_pool,
+                state_pool,
+            );
+        }
+        const definition = self.find_definition(resolved) orelse
+            return Error.UndefinedSymbol;
+        if (definition.params.len != 0) return Error.TypeError;
+        return self.eval_expr(
+            definition.body,
+            context,
+            current_state,
+            eval_pool,
+            state_pool,
+        );
+    }
+
+    pub fn find_generated_expression(
+        self: Evaluator,
+        identity: u32,
+    ) ?generated_runtime.Expression {
+        return self.override_registry.find_generated_expression(identity);
+    }
+
+    pub fn generated_expression_count(self: Evaluator) usize {
+        return self.override_registry.generated_expressions.len;
+    }
+
+    pub fn eval_generated_expression(
+        self: Evaluator,
+        expression: generated_runtime.Expression,
+        context: Context,
+        current_state: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!Value {
+        if (expression.arg_names.len > 32) return Error.NotImplemented;
+        var args: [32]Value = undefined;
+        for (expression.arg_names, 0..) |name, index| {
+            args[index] = context.lookup(name) orelse
+                return Error.UndefinedSymbol;
+        }
+        return self.call_generated(
+            expression.function,
+            args[0..expression.arg_names.len],
+            context,
+            current_state,
+            eval_pool,
+            state_pool,
+        );
+    }
+
+    pub fn make_generated_expression_operator(
+        self: Evaluator,
+        expression: generated_runtime.Expression,
+        arity: u16,
+        context: Context,
+        eval_pool: *ValuePool,
+    ) Error!Value {
+        _ = self;
+        if (arity > expression.arg_names.len) return Error.TypeError;
+        const capture_count = expression.arg_names.len - arity;
+        const captures = try eval_pool.alloc_values(@intCast(capture_count));
+        for (expression.arg_names[0..capture_count], 0..) |name, index| {
+            captures[index] = context.lookup(name) orelse
+                return Error.UndefinedSymbol;
+        }
+        const offset: u32 = if (captures.len == 0)
+            0
+        else
+            @intCast(
+                (@intFromPtr(captures.ptr) -
+                    @intFromPtr(eval_pool.values.ptr)) /
+                    @sizeOf(Value),
+            );
+        return .{ .generated_operator_v = .{
+            .function_address = @intFromPtr(expression.function),
+            .arity = arity,
+            .captured_offset = offset,
+            .captured_len = @intCast(captures.len),
+        } };
     }
 
     pub fn set_next_state(self: *Evaluator, st: ?*state.StateStore.State) void {
@@ -527,7 +654,28 @@ pub const Evaluator = struct {
                 const aliased = self.resolve_alias(name);
                 if (self.find_definition(aliased)) |def| {
                     if (def.params.len != 0) return Error.TypeError;
-                    return try self.eval_expr(def.body, ctx, ns orelse s0, eval_pool, state_pool);
+                    if (ns) |next| {
+                        return try self.eval_expr(
+                            def.body,
+                            ctx,
+                            next,
+                            eval_pool,
+                            state_pool,
+                        );
+                    }
+                    const current = s0 orelse
+                        return self.fail(
+                            Error.TypeError,
+                            "primed definition without current state",
+                            name,
+                        );
+                    return try self.eval_primed_definition(
+                        def,
+                        ctx,
+                        current,
+                        eval_pool,
+                        state_pool,
+                    );
                 }
                 return self.fail(Error.UndefinedSymbol, "primed", name);
             },
@@ -2193,77 +2341,18 @@ pub const Evaluator = struct {
                     );
                 }
 
-                // Action execution evaluates assignments incrementally. A
-                // primed parameterized operator must observe the partial next
-                // state represented by ctx, with unassigned variables copied
-                // from the current state.
                 const current = s0 orelse
                     return self.fail(
                         Error.TypeError,
                         "primed apply without current state",
                         name,
                     );
-                const next_values = try eval_pool.alloc_values(
-                    @intCast(self.module.variables.len),
-                );
-                for (
-                    self.module.variables,
-                    next_values,
-                    current.values,
-                    0..,
-                ) |
-                    variable_name,
-                    *next_value,
-                    current_value,
-                    variable_index,
-                | {
-                    next_value.* = if (ctx.lookup(variable_name)) |assigned|
-                        assigned
-                    else
-                        try current_value.clone(
-                            current.value_pool(
-                                @intCast(variable_index),
-                                state_pool,
-                            ),
-                            eval_pool,
-                        );
-                }
-                var partial_next = StateStore.State{
-                    .level = current.level + 1,
-                    .pred = current.pred,
-                    .changed_mask = 0,
-                    .borrowed_mask = 0,
-                    .borrowed_pool = null,
-                    .values = next_values,
-                };
-
-                var constant_scratch: [256]Constant = undefined;
-                if (self.constants.len > constant_scratch.len) {
-                    return self.fail(
-                        Error.NotImplemented,
-                        "primed apply constants",
-                        "more than 256 constants",
-                    );
-                }
-                for (self.constants, 0..) |constant, i| {
-                    constant_scratch[i] = .{
-                        .name = constant.name,
-                        .value = try constant.value.clone(
-                            state_pool,
-                            eval_pool,
-                        ),
-                    };
-                }
-                var primed_evaluator = self;
-                primed_evaluator.constants =
-                    constant_scratch[0..self.constants.len];
-                primed_evaluator.next_state = &partial_next;
-                return try primed_evaluator.eval_expr(
-                    def.body,
+                return try self.eval_primed_definition(
+                    def,
                     new_ctx,
-                    &partial_next,
+                    current,
                     eval_pool,
-                    eval_pool,
+                    state_pool,
                 );
             }
         }
@@ -2533,6 +2622,74 @@ pub const Evaluator = struct {
         return try self.apply_values(func, values, eval_pool, state_pool, s0);
     }
 
+    fn eval_primed_definition(
+        self: Evaluator,
+        def: ast.Definition,
+        ctx: Context,
+        current: *StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!Value {
+        const next_values = try eval_pool.alloc_values(
+            @intCast(self.module.variables.len),
+        );
+        for (next_values, current.values, 0..) |
+            *next_value,
+            current_value,
+            variable_index,
+        | {
+            next_value.* = if (ctx.lookup_state(
+                @intCast(variable_index),
+            )) |assigned|
+                assigned.value
+            else
+                try current_value.clone(
+                    current.value_pool(
+                        @intCast(variable_index),
+                        state_pool,
+                    ),
+                    eval_pool,
+                );
+        }
+        var partial_next = StateStore.State{
+            .level = current.level + 1,
+            .pred = current.pred,
+            .changed_mask = 0,
+            .borrowed_mask = 0,
+            .borrowed_pool = null,
+            .values = next_values,
+        };
+
+        var constant_scratch: [256]Constant = undefined;
+        if (self.constants.len > constant_scratch.len) {
+            return self.fail(
+                Error.NotImplemented,
+                "primed definition constants",
+                "more than 256 constants",
+            );
+        }
+        for (self.constants, 0..) |constant, index| {
+            constant_scratch[index] = .{
+                .name = constant.name,
+                .value = try constant.value.clone(
+                    state_pool,
+                    eval_pool,
+                ),
+            };
+        }
+        var primed_evaluator = self;
+        primed_evaluator.constants =
+            constant_scratch[0..self.constants.len];
+        primed_evaluator.next_state = &partial_next;
+        return primed_evaluator.eval_expr(
+            def.body,
+            ctx,
+            &partial_next,
+            eval_pool,
+            eval_pool,
+        );
+    }
+
     fn call_generated(
         self: Evaluator,
         function: generated_runtime.OperatorFn,
@@ -2546,7 +2703,8 @@ pub const Evaluator = struct {
         assert(self.module.variables.len <= partial_values.len);
         var binding = evaluator_context.head;
         while (binding) |current| : (binding = current.parent) {
-            const index = self.find_variable(current.name) orelse continue;
+            const index = current.variable_index orelse continue;
+            assert(index < self.module.variables.len);
             if (partial_values[index] == null) {
                 partial_values[index] = current.value;
             }
@@ -2984,6 +3142,17 @@ pub const Evaluator = struct {
             return try self.eval_expr(q.body, ctx, s0, eval_pool, state_pool);
         }
         const bv = q.vars[idx];
+        if (try self.eval_filtered_power_set_quantifier(
+            q,
+            idx,
+            bv,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        )) |result| {
+            return result;
+        }
         const domain = try self.eval_set_materialized(bv.domain, ctx, s0, eval_pool, state_pool);
         assert(domain == .set_v);
         const item_offset = domain.set_v.offset;
@@ -2999,6 +3168,104 @@ pub const Evaluator = struct {
             if (result.is_truthy() != expected) {
                 return Value{ .bool_v = !expected };
             }
+        }
+        return Value{ .bool_v = expected };
+    }
+
+    fn eval_filtered_power_set_quantifier(
+        self: Evaluator,
+        q: *ast.Quantifier,
+        idx: u32,
+        quantified_var: ast.BoundVar,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!?Value {
+        const domain_expr = blk: {
+            if (quantified_var.domain.* == .ident) {
+                const name = self.resolve_alias(quantified_var.domain.ident);
+                const definition = self.find_definition(name) orelse
+                    return null;
+                if (definition.params.len != 0) return null;
+                break :blk definition.body;
+            }
+            break :blk quantified_var.domain;
+        };
+        if (domain_expr.* != .set_filter) return null;
+        const filter = domain_expr.set_filter;
+        if (filter.vars.len != 1) return null;
+
+        const symbolic_domain = try self.eval_expr(
+            filter.vars[0].domain,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        if (symbolic_domain != .power_set_v) return null;
+        const base = try self.materialize_set(
+            symbolic_domain.power_set_v.set(eval_pool),
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        if (base != .set_v or base.set_v.len > 63) return null;
+
+        const base_items = base.set_v.items(eval_pool);
+        const subset_storage = try eval_pool.alloc_values(base.set_v.len);
+        const iteration_snapshot = eval_pool.snapshot();
+        const saved_context_count = self.context_pool.snapshot();
+        const expected = q.kind == .forall;
+        const subset_count = @as(u64, 1) << @intCast(base_items.len);
+        var mask: u64 = 0;
+        while (mask < subset_count) : (mask += 1) {
+            var item_count: u32 = 0;
+            for (base_items, 0..) |item, bit| {
+                if ((mask & (@as(u64, 1) << @intCast(bit))) != 0) {
+                    subset_storage[item_count] = item;
+                    item_count += 1;
+                }
+            }
+            const subset = Value{ .set_v = make_set(
+                eval_pool,
+                subset_storage[0..item_count],
+            ) };
+            const filter_ctx = try self.extend_context(
+                ctx,
+                filter.vars[0].name,
+                subset,
+            );
+            const accepted = try self.eval_expr(
+                filter.pred,
+                filter_ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            );
+            if (accepted.is_truthy()) {
+                const quantified_ctx = try self.extend_context(
+                    ctx,
+                    quantified_var.name,
+                    subset,
+                );
+                const result = try self.eval_quantifier_vars(
+                    q,
+                    idx + 1,
+                    quantified_ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
+                if (result.is_truthy() != expected) {
+                    eval_pool.restore(iteration_snapshot);
+                    self.context_pool.restore(saved_context_count);
+                    return Value{ .bool_v = !expected };
+                }
+            }
+            eval_pool.restore(iteration_snapshot);
+            self.context_pool.restore(saved_context_count);
         }
         return Value{ .bool_v = expected };
     }

@@ -120,6 +120,30 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
 - [x] Compile every upstream-valid MultiShardTxn configuration with zero
   reachable fallbacks. Current strict counts range from 41 generated
   operators for `Storage.cfg` to 83 for the snapshot-invariant config.
+- [x] Remove string-named generated dispatch for `Cardinality`, sequence
+  operators, `Range`, permutations, `INTERSECTION`, `\o`, `@@`, and `:>`.
+  Stored generated models now contain zero `runtime.native` or
+  `runtime.native_binary` calls.
+- [x] Emit deterministic, `zig fmt`-formatted native files under
+  `generated_models/`, with the original TLA+ path, line, operator signature,
+  and declaration attached to every generated operator.
+- [x] Resolve action assignments and `UNCHANGED` to numeric variable slots at
+  compile time. State commits and generated-call partial bindings no longer
+  scan variable names in the hot path.
+- [x] Separate canonical-state capacity from temporary successor capacity.
+  `--max-successors` defaults to 65,536, eliminating the duplicate
+  `max_states`-sized candidate store for each worker.
+- [x] Omit transition-graph storage for invariant-only configurations.
+  Liveness edges previously reserved `max_states * 32` entries even when no
+  temporal property was configured.
+- [x] Keep exhaustive canonical value pools stable and contiguous. The current
+  offset representation cannot relocate safely under macOS memory pressure;
+  large runs pre-size 60 values per state (up to 132 million), disable
+  canonical pool growth, and return a precise `OutOfMemory` instead of
+  triggering a multi-gigabyte relocation copy.
+- [x] Fix arena oversized-allocation growth: dedicated large chunks no longer
+  poison the ordinary growth increment and force a second multi-gigabyte
+  chunk on the next allocation.
 - [x] Add generated-runtime cross-pool state access so emitted Zig traverses
   nested state functions/tuples/records in canonical storage and clones only
   the selected leaf. RC snapshot single-thread improved from `7.13s` to
@@ -131,10 +155,32 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   expression operators are faster, but `Next` still dispatches recursively
   through the generic action executor and AST evaluator. This is the primary
   remaining RC snapshot single-core gap.
+  - [x] Resolve assignment/`UNCHANGED` variable slots and execute deterministic
+    step chains iteratively.
+  - [x] Move parallel candidate constraints, symmetry hashing, and invariants
+    outside the canonical-store mutex. Exhaustive auto improved from
+    `100.33s` to `33.14s`; removing safety-only BFS barriers reached `32.54s`.
+  - [x] Export generated action-expression entry points keyed to resolved
+    action IR, including lexical parameters/bound variables, then make guards,
+    assignment RHS expressions, domains, and branch conditions call native
+    Zig. Full rc-local exhaustive improved from `358.17s/32.54s` to
+    `266.78s/25.90s`.
 - [ ] Re-run exhaustive `CHECK_DEADLOCK FALSE` differential models before
   treating deadlock-stop generated/distinct counts as coverage totals.
   Default MultiShardTxn configs stop at the first valid deadlock, and worker
   scheduling/enumeration order changes those partial counts.
+  - [x] TLC one-core, symmetry enabled, rc-local:
+    `12,467,888` generated / `2,132,765` distinct, depth 35, `357.02s`,
+    8.03 GB peak RSS.
+  - [x] tlzig one-core, symmetry enabled, rc-local:
+    `12,320,318` generated / `2,132,765` distinct, normal completion,
+    `266.78s`, 2.23 GB peak RSS. Distinct states match exactly; tlzig is
+    1.34x faster and uses 72% less peak memory than TLC.
+  - [x] Complete matching TLC/tlzig all-core exhaustive runs with identical
+    `2,132,765` distinct states and normal completion:
+    TLC `30.14s` / 6.55 GB; tlzig `25.90s` / 2.25 GB.
+  - [x] Close both exhaustive speed gaps with generated action-expression
+    entry points: one-core is 1.34x faster and all-core is 1.16x faster.
 - [ ] Current strict AOT full-run performance snapshot:
   - ClientCentric: TLC `2.231s/2.364s`, tlzig `1.550s/1.578s`;
   - Storage: TLC `2.828s/1.516s`, tlzig `1.777s/0.440s`;
@@ -182,6 +228,27 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
     and compile the resolver through a cross-definition unit test.
   - [ ] Implement IR evaluation and differential tests against the AST
     evaluator before enabling it for model checking.
+- [ ] Add explicit type-invariant specialization to CLI/library generation.
+  Accept user-selected invariants such as `TypeOK`, validate them at initial
+  states (and optionally on every successor in debug builds), infer stable
+  variable/path types, and emit no-fallback Zig that can elide proven tag
+  checks and generic set/function/record dispatch. Reject unsupported or
+  ambiguous type invariants instead of silently weakening assumptions.
+  - [ ] Add `--type-invariant NAME` and a matching library option. Never infer
+    trust from an invariant merely named `TypeOK`.
+  - [ ] Parse supported membership/function/record/tuple/sequence clauses into
+    a closed type environment; reject disjunctions, state-dependent domains,
+    and paths whose type is not unique.
+  - [ ] Validate the selected invariant on every initial state before enabling
+    specialization. In Debug, assert it on every committed successor.
+  - [ ] Emit fixed variable/path layouts and direct typed accessors in generated
+    Zig. Remove value-tag switches, generic record lookup, and cross-pool
+    dispatch only where the invariant proves the representation.
+  - [ ] Make specialized generation strict: an unproved access is a generation
+    error, never a fallback to generic `Value` operations.
+- [ ] Benchmark type-specialized code against the same full TLC-valid configs
+  in Debug, ReleaseFast one-core, and all-core modes. Keep specialization only
+  where exact state counts/outcomes match the unspecialized checker.
 - [ ] Match TLC's generated count for `ClientCentricTests` (`1602/801`;
   tlzig currently reaches the same `801` distinct states with different
   generated-state accounting).
@@ -193,6 +260,40 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
 - [ ] `detector_chan96/EnvironmentController.tla` (official Examples;
   documented runtime over two hours):
   https://github.com/tlaplus/Examples/blob/master/specifications/detector_chan96/EnvironmentController.tla
+
+### Validation update (2026-06-20)
+
+- [x] Build Java TLC deterministically from `vendor/tlaplus` before the
+  benchmark. The exact benchmark command no longer depends on
+  `/tmp/tla2tools.jar`; action-composition specs use the checked-in TLC source.
+- [x] Fix CRLF dashed-section lexing. `UndirectedGraphs.tla` no longer loses
+  `ConnectedComponents`, `AreConnectedIn`, and `IsStronglyConnected`; both
+  YoYo configs now match TLC exactly in one-core and all-core runs.
+- [x] Evaluate zero-argument primed definitions against the partial next state,
+  matching the existing parameterized-operator path. This prevents
+  `Serializable'` from accepting invalid self-edges in MCInnerSerial.
+- [x] Remove the last generated action-call argument fallback: action operator
+  arguments are `CompiledExpr` values and strict generated runs require native
+  expression entries for all of them.
+- [x] Restore canonical invariant semantics in parallel runs with worker-local
+  evaluators. MCCRDT is exact at `1,350,001/25,000` without the former SIGBUS;
+  YoYo Pruning is exact at `157/102`.
+- [x] Strict RC native deadlock-stop timings:
+  - snapshot: TLC `5.603s/2.486s`, tlzig `4.718s/0.280s`;
+  - no-prepare-block: TLC `2.011s/1.982s`, tlzig `0.651s/0.077s`;
+  - no-prepare-block-or-ww: TLC `1.889s/1.664s`, tlzig `0.630s/0.075s`;
+  - with-prepare-block: TLC `1.873s/1.633s`, tlzig `0.655s/0.076s`.
+  These configs stop on a deadlock; add `CHECK_DEADLOCK FALSE` differential
+  configs before treating their partial distinct counts as full coverage.
+- [x] Add lazy filtered-power-set quantifier iteration with scratch rollback.
+  It avoids materializing all accepted subsets before existential
+  short-circuiting.
+- [ ] Finish MCInnerSerial performance work. Correct primed semantics removed
+  the false level-2 deadlock, but the full one-core run was stopped after
+  `934.59s`; sampling shows `Serializable'` still spends almost all CPU in
+  finite-relation totality/transitivity quantifiers. Lower finite relations to
+  generated bitsets, using TypeOK-derived record layouts, and rerun the full
+  TLC/tlzig one-core and all-core comparison.
 - [ ] Payment-channel model (reported about two hours / 1,131,490 states):
   https://conf.tlapl.us/2021/MatthiasGrundmann-talk.pdf
 - [ ] Snapshot-isolation database model (reported 44 minutes with three keys):

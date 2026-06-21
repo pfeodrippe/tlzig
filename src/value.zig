@@ -338,6 +338,203 @@ pub const Value = union(ValueTag) {
         };
     }
 
+    pub fn eql_cross_pool(
+        left: Value,
+        left_pool: *const ValuePool,
+        right: Value,
+        right_pool: *const ValuePool,
+    ) bool {
+        if (left.tag() != right.tag()) return false;
+        return switch (left) {
+            .bool_v => |value_v| value_v == right.bool_v,
+            .int_v => |value_v| value_v == right.int_v,
+            .model_v => |value_v| value_v == right.model_v,
+            .string_v => |value_v| std.mem.eql(
+                u8,
+                value_v.slice(left_pool),
+                right.string_v.slice(right_pool),
+            ),
+            .set_v => |set_v| blk: {
+                const right_set = right.set_v;
+                if (set_v.len != right_set.len) break :blk false;
+                for (set_v.items(left_pool)) |left_item| {
+                    var found = false;
+                    for (right_set.items(right_pool)) |right_item| {
+                        if (eql_cross_pool(
+                            left_item,
+                            left_pool,
+                            right_item,
+                            right_pool,
+                        )) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) break :blk false;
+                }
+                break :blk true;
+            },
+            .function_v => |function_v| blk: {
+                const right_function = right.function_v;
+                if (function_v.len != right_function.len) break :blk false;
+                const right_keys = right_function.domain.items(right_pool);
+                const right_entries = right_function.entries(right_pool);
+                for (
+                    function_v.domain.items(left_pool),
+                    function_v.entries(left_pool),
+                ) |left_key, left_entry| {
+                    var found = false;
+                    for (right_keys, right_entries) |right_key, right_entry| {
+                        if (eql_cross_pool(
+                            left_key,
+                            left_pool,
+                            right_key,
+                            right_pool,
+                        ) and eql_cross_pool(
+                            left_entry,
+                            left_pool,
+                            right_entry,
+                            right_pool,
+                        )) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) break :blk false;
+                }
+                break :blk true;
+            },
+            .tuple_v => |tuple_v| blk: {
+                const right_tuple = right.tuple_v;
+                if (tuple_v.len != right_tuple.len) break :blk false;
+                for (
+                    tuple_v.items(left_pool),
+                    right_tuple.items(right_pool),
+                ) |left_item, right_item| {
+                    if (!eql_cross_pool(
+                        left_item,
+                        left_pool,
+                        right_item,
+                        right_pool,
+                    )) break :blk false;
+                }
+                break :blk true;
+            },
+            .record_v => |record_v| blk: {
+                const right_record = right.record_v;
+                if (record_v.len != right_record.len) break :blk false;
+                const left_fields = record_v.fields(left_pool);
+                const right_fields = right_record.fields(right_pool);
+                var field_index: u32 = 0;
+                while (field_index < record_v.len) : (field_index += 1) {
+                    if (!eql_cross_pool(
+                        left_fields[field_index * 2],
+                        left_pool,
+                        right_fields[field_index * 2],
+                        right_pool,
+                    ) or !eql_cross_pool(
+                        left_fields[field_index * 2 + 1],
+                        left_pool,
+                        right_fields[field_index * 2 + 1],
+                        right_pool,
+                    )) break :blk false;
+                }
+                break :blk true;
+            },
+            .range_v => |range_v| range_v.eql(right.range_v),
+            .function_set_v => |set_v| eql_cross_pool(
+                set_v.domain(left_pool),
+                left_pool,
+                right.function_set_v.domain(right_pool),
+                right_pool,
+            ) and eql_cross_pool(
+                set_v.codomain(left_pool),
+                left_pool,
+                right.function_set_v.codomain(right_pool),
+                right_pool,
+            ),
+            .record_set_v => |set_v| blk: {
+                const right_set = right.record_set_v;
+                if (set_v.len != right_set.len) break :blk false;
+                var index: u32 = 0;
+                while (index < set_v.len) : (index += 1) {
+                    if (!eql_cross_pool(
+                        .{ .string_v = set_v.field_name(left_pool, index) },
+                        left_pool,
+                        .{ .string_v = right_set.field_name(right_pool, index) },
+                        right_pool,
+                    ) or !eql_cross_pool(
+                        set_v.field_domain(left_pool, index),
+                        left_pool,
+                        right_set.field_domain(right_pool, index),
+                        right_pool,
+                    )) break :blk false;
+                }
+                break :blk true;
+            },
+            .tuple_set_v => |set_v| blk: {
+                const right_set = right.tuple_set_v;
+                if (set_v.len != right_set.len) break :blk false;
+                for (
+                    set_v.sets(left_pool),
+                    right_set.sets(right_pool),
+                ) |left_set, right_set_value| {
+                    if (!eql_cross_pool(
+                        left_set,
+                        left_pool,
+                        right_set_value,
+                        right_pool,
+                    )) break :blk false;
+                }
+                break :blk true;
+            },
+            .union_v => |set_v| eql_cross_pool(
+                set_v.set(left_pool),
+                left_pool,
+                right.union_v.set(right_pool),
+                right_pool,
+            ),
+            .cup_v, .cap_v, .diff_v => |set_v| eql_cross_pool(
+                set_v.left(left_pool),
+                left_pool,
+                switch (right) {
+                    .cup_v => |right_set| right_set.left(right_pool),
+                    .cap_v => |right_set| right_set.left(right_pool),
+                    .diff_v => |right_set| right_set.left(right_pool),
+                    else => unreachable,
+                },
+                right_pool,
+            ) and eql_cross_pool(
+                set_v.right(left_pool),
+                left_pool,
+                switch (right) {
+                    .cup_v => |right_set| right_set.right(right_pool),
+                    .cap_v => |right_set| right_set.right(right_pool),
+                    .diff_v => |right_set| right_set.right(right_pool),
+                    else => unreachable,
+                },
+                right_pool,
+            ),
+            .seq_set_v => |set_v| eql_cross_pool(
+                set_v.element_set(left_pool),
+                left_pool,
+                right.seq_set_v.element_set(right_pool),
+                right_pool,
+            ),
+            .power_set_v => |set_v| eql_cross_pool(
+                set_v.set(left_pool),
+                left_pool,
+                right.power_set_v.set(right_pool),
+                right_pool,
+            ),
+            .generated_operator_v => |operator| std.meta.eql(
+                operator,
+                right.generated_operator_v,
+            ),
+            .lambda_v => false,
+        };
+    }
+
     pub fn compare(a: Value, b: Value, pool: *const ValuePool) ?i8 {
         assert(pool.value_count <= pool.value_cap);
         assert(pool.string_count <= pool.string_cap);
@@ -911,6 +1108,7 @@ pub const ValuePool = struct {
     string_cap: u32,
     /// Whether this pool is allowed to grow its backing arrays.
     growable: bool = true,
+    string_intern_slots: []String = &.{},
 
     pub fn init(arena: *Arena, value_cap: u32, string_cap: u32) !ValuePool {
         assert(value_cap > 0);
@@ -926,6 +1124,20 @@ pub const ValuePool = struct {
             .value_cap = value_cap,
             .string_cap = string_cap,
         };
+    }
+
+    pub fn enable_string_interning(
+        self: *ValuePool,
+        slot_count: u32,
+    ) !void {
+        assert(self.string_intern_slots.len == 0);
+        assert(slot_count >= 2);
+        assert(std.math.isPowerOfTwo(slot_count));
+        self.string_intern_slots = try self.arena.alloc(String, slot_count);
+        @memset(self.string_intern_slots, .{
+            .offset = std.math.maxInt(u32),
+            .len = 0,
+        });
     }
 
     fn grow_values(self: *ValuePool) !void {
@@ -999,6 +1211,28 @@ pub const ValuePool = struct {
     }
 
     pub fn push_string(self: *ValuePool, s: []const u8) !String {
+        if (self.string_intern_slots.len > 0) {
+            const mask = self.string_intern_slots.len - 1;
+            var slot_index: usize = @intCast(
+                std.hash.Wyhash.hash(0, s) & mask,
+            );
+            var probes: usize = 0;
+            while (probes < self.string_intern_slots.len) : (probes += 1) {
+                const slot = &self.string_intern_slots[slot_index];
+                if (slot.offset == std.math.maxInt(u32)) {
+                    const interned = try self.push_string_uninterned(s);
+                    slot.* = interned;
+                    return interned;
+                }
+                if (std.mem.eql(u8, slot.slice(self), s)) return slot.*;
+                slot_index = (slot_index + 1) & mask;
+            }
+            return error.OutOfMemory;
+        }
+        return self.push_string_uninterned(s);
+    }
+
+    fn push_string_uninterned(self: *ValuePool, s: []const u8) !String {
         while (self.string_count + s.len > self.string_cap) {
             if (self.growable) {
                 try self.grow_strings();
@@ -1033,3 +1267,15 @@ pub const ValuePool = struct {
         string_count: u32,
     };
 };
+
+test "value pool string interning reuses canonical bytes" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 16, 64);
+    try pool.enable_string_interning(16);
+
+    const first = try pool.push_string("status");
+    const second = try pool.push_string("status");
+    try std.testing.expectEqual(first.offset, second.offset);
+    try std.testing.expectEqual(@as(u32, 6), pool.string_count);
+}

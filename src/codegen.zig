@@ -21,6 +21,17 @@ const DefinitionKind = enum {
     unsupported,
 };
 
+const GeneratedExpressionMeta = struct {
+    expression: *const ast.Expr,
+    params: [32][]const u8,
+    param_count: u8,
+    identity: u32,
+
+    fn param_slice(self: *const GeneratedExpressionMeta) []const []const u8 {
+        return self.params[0..self.param_count];
+    }
+};
+
 pub fn emit_module(
     allocator: std.mem.Allocator,
     module: ast.Module,
@@ -75,6 +86,9 @@ pub fn emit_module_with_roots(
     var fallback_count: u32 = 0;
     var unsupported = std.ArrayList([]const u8).empty;
     defer unsupported.deinit(allocator);
+    var generated_expressions =
+        std.ArrayList(GeneratedExpressionMeta).empty;
+    defer generated_expressions.deinit(allocator);
     for (module.definitions, 0..) |definition, definition_index| {
         if (!reachable[definition_index]) continue;
         switch (definition_kind(module, definition)) {
@@ -95,6 +109,40 @@ pub fn emit_module_with_roots(
             },
         }
     }
+    var expression_index: usize = 0;
+    for (module.definitions, 0..) |definition, definition_index| {
+        try collect_generated_expressions(
+            allocator,
+            module,
+            definition.body,
+            definition.params,
+            reachable[definition_index],
+            &expression_index,
+            &generated_expressions,
+        );
+        if (definition.function_domain) |domain| {
+            try collect_generated_expressions(
+                allocator,
+                module,
+                domain,
+                definition.params,
+                false,
+                &expression_index,
+                &generated_expressions,
+            );
+        }
+    }
+    for (module.assumptions) |assumption| {
+        try collect_generated_expressions(
+            allocator,
+            module,
+            assumption,
+            &.{},
+            false,
+            &expression_index,
+            &generated_expressions,
+        );
+    }
     for (module.definitions, 0..) |definition, definition_index| {
         if (reachable[definition_index] and
             operator_supported(module, definition, 0))
@@ -107,6 +155,27 @@ pub fn emit_module_with_roots(
                 definition.params,
             );
         }
+    }
+    for (generated_expressions.items) |entry| {
+        const expression_params = entry.param_slice();
+        const header = try std.fmt.allocPrint(
+            allocator,
+            "fn expr_{d}(context: *runtime.CallContext, args: []const Value) Error!Value {{\n" ++
+                "    std.debug.assert(args.len == {d});\n" ++
+                "    runtime.keep_expression_parameters(context, args);\n" ++
+                "    return ",
+            .{ entry.identity, expression_params.len },
+        );
+        defer allocator.free(header);
+        try append(&output, allocator, header);
+        try emit_expr(
+            &output,
+            allocator,
+            module,
+            entry.expression,
+            expression_params,
+        );
+        try append(&output, allocator, ";\n}\n\n");
     }
 
     try append(&output, allocator,
@@ -130,6 +199,38 @@ pub fn emit_module_with_roots(
         );
         defer allocator.free(line);
         try append(&output, allocator, line);
+    }
+    try append(&output, allocator, "};\n");
+    try append(&output, allocator,
+        \\pub const expressions = [_]runtime.Expression{
+        \\
+    );
+    for (generated_expressions.items) |entry| {
+        const prefix = try std.fmt.allocPrint(
+            allocator,
+            "    .{{ .identity = {d}, .arg_names = &[_][]const u8{{",
+            .{entry.identity},
+        );
+        defer allocator.free(prefix);
+        try append(&output, allocator, prefix);
+        const expression_params = entry.param_slice();
+        for (expression_params, 0..) |param, param_index_v| {
+            if (param_index_v > 0) try append(&output, allocator, ", ");
+            const name = try std.fmt.allocPrint(
+                allocator,
+                "\"{f}\"",
+                .{std.zig.fmtString(param)},
+            );
+            defer allocator.free(name);
+            try append(&output, allocator, name);
+        }
+        const suffix = try std.fmt.allocPrint(
+            allocator,
+            "}}, .function = expr_{d} }},\n",
+            .{entry.identity},
+        );
+        defer allocator.free(suffix);
+        try append(&output, allocator, suffix);
     }
     try append(&output, allocator, "};\n");
     const coverage = try std.fmt.allocPrint(
@@ -319,7 +420,8 @@ fn emit_operator(
             "    return Value{{ .bool_v = try {s}(context, args) }};\n" ++
                 "}}\n\n" ++
                 "fn {s}(context: *runtime.CallContext, args: []const Value) Error!bool {{\n" ++
-                "    std.debug.assert(args.len == {d});\n",
+                "    std.debug.assert(args.len == {d});\n" ++
+                "    runtime.keep_expression_parameters(context, args);\n",
             .{
                 boolean_name,
                 boolean_name,
@@ -2747,9 +2849,9 @@ fn binary_runtime(op: ast.BinaryOp) []const u8 {
         .mod => "try runtime.modulo(",
         .power => "try runtime.power(",
         .range => "try runtime.range(",
-        .concat => "try runtime.native_binary(context, \"\\\\o\", ",
-        .ooverride => "try runtime.native_binary(context, \"@@\", ",
-        .recordto => "try runtime.native_binary(context, \":>\", ",
+        .concat => "try runtime.sequence_concat(context, ",
+        .ooverride => "try runtime.override(context, ",
+        .recordto => "try runtime.record_to(context, ",
         else => unreachable,
     };
 }
@@ -3240,6 +3342,222 @@ fn expression_identity(
     module: ast.Module,
     target: *const ast.Expr,
 ) usize {
+    return find_expression_identity(module, target) orelse unreachable;
+}
+
+fn collect_generated_expressions(
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    expr: *const ast.Expr,
+    params: []const []const u8,
+    enabled: bool,
+    identity: *usize,
+    entries: *std.ArrayList(GeneratedExpressionMeta),
+) !void {
+    identity.* += 1;
+    if (enabled and expr_supported(module, expr, params, 0)) {
+        if (params.len > 32) return error.OutOfMemory;
+        var params_copy: [32][]const u8 = @splat("");
+        @memcpy(params_copy[0..params.len], params);
+        try entries.append(allocator, .{
+            .expression = expr,
+            .params = params_copy,
+            .param_count = @intCast(params.len),
+            .identity = @intCast(identity.*),
+        });
+    }
+    switch (expr.*) {
+        .primed_expr, .unchanged_expr => |operand| try collect_generated_expressions(allocator, module, operand, params, enabled, identity, entries),
+        .binary => |binary| {
+            try collect_generated_expressions(allocator, module, binary.left, params, enabled, identity, entries);
+            try collect_generated_expressions(allocator, module, binary.right, params, enabled, identity, entries);
+        },
+        .unary => |unary| try collect_generated_expressions(allocator, module, unary.operand, params, enabled, identity, entries),
+        .quantifier => |quantifier| {
+            var scoped_storage: [32][]const u8 = @splat("");
+            if (params.len + quantifier.vars.len > scoped_storage.len) {
+                return error.OutOfMemory;
+            }
+            @memcpy(scoped_storage[0..params.len], params);
+            var scoped_len = params.len;
+            for (quantifier.vars) |bound| {
+                try collect_generated_expressions(allocator, module, bound.domain, scoped_storage[0..scoped_len], enabled, identity, entries);
+                scoped_storage[scoped_len] = bound.name;
+                scoped_len += 1;
+            }
+            try collect_generated_expressions(allocator, module, quantifier.body, scoped_storage[0..scoped_len], enabled, identity, entries);
+        },
+        .choose => |choose_value| {
+            if (choose_value.domain) |domain| {
+                try collect_generated_expressions(allocator, module, domain, params, enabled, identity, entries);
+            }
+            var scoped_storage: [32][]const u8 = @splat("");
+            if (params.len + 1 > scoped_storage.len) {
+                return error.OutOfMemory;
+            }
+            @memcpy(scoped_storage[0..params.len], params);
+            scoped_storage[params.len] = choose_value.var_name;
+            try collect_generated_expressions(allocator, module, choose_value.body, scoped_storage[0 .. params.len + 1], enabled, identity, entries);
+        },
+        .if_then_else => |conditional| {
+            try collect_generated_expressions(allocator, module, conditional.cond, params, enabled, identity, entries);
+            try collect_generated_expressions(allocator, module, conditional.then_branch, params, enabled, identity, entries);
+            try collect_generated_expressions(allocator, module, conditional.else_branch, params, enabled, identity, entries);
+        },
+        .apply => |application| {
+            try collect_generated_expressions(allocator, module, application.func, params, enabled, identity, entries);
+            for (application.args) |argument| {
+                try collect_generated_expressions(allocator, module, argument, params, enabled, identity, entries);
+            }
+        },
+        .field => |field_value| try collect_generated_expressions(allocator, module, field_value.expr, params, enabled, identity, entries),
+        .tuple, .set_enum => |items| {
+            for (items) |item| {
+                try collect_generated_expressions(allocator, module, item, params, enabled, identity, entries);
+            }
+        },
+        .record => |fields| {
+            for (fields) |field_value| {
+                try collect_generated_expressions(allocator, module, field_value.value, params, enabled, identity, entries);
+            }
+        },
+        .set_filter => |filter_value| {
+            var scoped_storage: [32][]const u8 = @splat("");
+            if (params.len + filter_value.vars.len > scoped_storage.len) {
+                return error.OutOfMemory;
+            }
+            @memcpy(scoped_storage[0..params.len], params);
+            var scoped_len = params.len;
+            for (filter_value.vars) |bound| {
+                try collect_generated_expressions(allocator, module, bound.domain, scoped_storage[0..scoped_len], enabled, identity, entries);
+                scoped_storage[scoped_len] = bound.name;
+                scoped_len += 1;
+            }
+            try collect_generated_expressions(allocator, module, filter_value.pred, scoped_storage[0..scoped_len], enabled, identity, entries);
+        },
+        .set_map => |map_value| {
+            var scoped_storage: [32][]const u8 = @splat("");
+            if (params.len + map_value.vars.len > scoped_storage.len) {
+                return error.OutOfMemory;
+            }
+            @memcpy(scoped_storage[0..params.len], params);
+            var scoped_len = params.len;
+            for (map_value.vars) |bound| {
+                try collect_generated_expressions(allocator, module, bound.domain, scoped_storage[0..scoped_len], enabled, identity, entries);
+                scoped_storage[scoped_len] = bound.name;
+                scoped_len += 1;
+            }
+            try collect_generated_expressions(allocator, module, map_value.value, scoped_storage[0..scoped_len], enabled, identity, entries);
+        },
+        .set_binary => |set_binary| {
+            try collect_generated_expressions(allocator, module, set_binary.left, params, enabled, identity, entries);
+            try collect_generated_expressions(allocator, module, set_binary.right, params, enabled, identity, entries);
+        },
+        .set_of_functions => |function_set| {
+            try collect_generated_expressions(allocator, module, function_set.domain, params, enabled, identity, entries);
+            try collect_generated_expressions(allocator, module, function_set.codomain, params, enabled, identity, entries);
+        },
+        .function_literal => |function_literal| {
+            var scoped_storage: [32][]const u8 = @splat("");
+            if (params.len + function_literal.vars.len >
+                scoped_storage.len)
+            {
+                return error.OutOfMemory;
+            }
+            @memcpy(scoped_storage[0..params.len], params);
+            var scoped_len = params.len;
+            for (function_literal.vars) |bound| {
+                try collect_generated_expressions(allocator, module, bound.domain, scoped_storage[0..scoped_len], enabled, identity, entries);
+                scoped_storage[scoped_len] = bound.name;
+                scoped_len += 1;
+            }
+            try collect_generated_expressions(allocator, module, function_literal.body, scoped_storage[0..scoped_len], enabled, identity, entries);
+        },
+        .record_set => |record_set_value| {
+            for (record_set_value.fields) |field_value| {
+                try collect_generated_expressions(allocator, module, field_value.domain, params, enabled, identity, entries);
+            }
+        },
+        .except => |except_value| {
+            try collect_generated_expressions(allocator, module, except_value.func, params, enabled, identity, entries);
+            for (except_value.steps) |step| {
+                if (step == .index) {
+                    try collect_generated_expressions(allocator, module, step.index, params, enabled, identity, entries);
+                }
+            }
+            try collect_generated_expressions(allocator, module, except_value.value, params, enabled, identity, entries);
+        },
+        .let_in => |let_value| {
+            var scoped_storage: [32][]const u8 = @splat("");
+            if (params.len + let_value.defs.len > scoped_storage.len) {
+                return error.OutOfMemory;
+            }
+            @memcpy(scoped_storage[0..params.len], params);
+            var scoped_len = params.len;
+            for (let_value.defs) |definition| {
+                var definition_storage: [32][]const u8 = @splat("");
+                if (scoped_len + definition.params.len >
+                    definition_storage.len)
+                {
+                    return error.OutOfMemory;
+                }
+                @memcpy(
+                    definition_storage[0..scoped_len],
+                    scoped_storage[0..scoped_len],
+                );
+                @memcpy(
+                    definition_storage[scoped_len..][0..definition.params.len],
+                    definition.params,
+                );
+                try collect_generated_expressions(allocator, module, definition.body, definition_storage[0 .. scoped_len + definition.params.len], enabled, identity, entries);
+                if (definition.function_domain) |domain| {
+                    try collect_generated_expressions(allocator, module, domain, scoped_storage[0..scoped_len], enabled, identity, entries);
+                }
+                scoped_storage[scoped_len] = definition.name;
+                scoped_len += 1;
+            }
+            try collect_generated_expressions(allocator, module, let_value.body, scoped_storage[0..scoped_len], enabled, identity, entries);
+        },
+        .case_expr => |case_value| {
+            for (case_value.arms) |arm| {
+                try collect_generated_expressions(allocator, module, arm.cond, params, enabled, identity, entries);
+                try collect_generated_expressions(allocator, module, arm.value, params, enabled, identity, entries);
+            }
+            if (case_value.otherwise) |otherwise| {
+                try collect_generated_expressions(allocator, module, otherwise, params, enabled, identity, entries);
+            }
+        },
+        .box_action => |box_action| {
+            try collect_generated_expressions(allocator, module, box_action.action, params, enabled, identity, entries);
+            try collect_generated_expressions(allocator, module, box_action.vars, params, enabled, identity, entries);
+        },
+        .lambda => |lambda_value| {
+            var scoped_storage: [32][]const u8 = @splat("");
+            if (params.len + lambda_value.params.len > scoped_storage.len) {
+                return error.OutOfMemory;
+            }
+            @memcpy(scoped_storage[0..params.len], params);
+            @memcpy(
+                scoped_storage[params.len..][0..lambda_value.params.len],
+                lambda_value.params,
+            );
+            try collect_generated_expressions(allocator, module, lambda_value.body, scoped_storage[0 .. params.len + lambda_value.params.len], enabled, identity, entries);
+        },
+        .ident,
+        .primed,
+        .unchanged,
+        .bool_literal,
+        .int_literal,
+        .string_literal,
+        .at,
+        => {},
+    }
+}
+
+pub fn find_expression_identity(
+    module: ast.Module,
+    target: *const ast.Expr,
+) ?usize {
     var identity: usize = 0;
     for (module.definitions) |definition| {
         if (visit_expression(definition.body, target, &identity)) {
@@ -3256,7 +3574,7 @@ fn expression_identity(
             return identity;
         }
     }
-    unreachable;
+    return null;
 }
 
 fn visit_expression(
@@ -3644,4 +3962,41 @@ test "configuration roots are emitted with transitive dependencies" {
         result.source,
         "pub const root_names = [_][]const u8{\"ConfiguredInvariant\"};",
     ) != null);
+}
+
+test "generated binary operators do not use named native dispatch" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE DirectBinary ----------------------
+        \\Concat == <<1>> \o <<2>>
+        \\Singleton == "key" :> 1
+        \\Override == Singleton @@ ("key" :> 2)
+        \\=================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module(std.testing.allocator, module);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 3), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "runtime.native(") == null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "runtime.native_binary(") == null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "runtime.sequence_concat(") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "runtime.override(") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "runtime.record_to(") != null,
+    );
 }

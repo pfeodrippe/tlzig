@@ -48,6 +48,7 @@ pub const Registry = struct {
     entries: []const OverrideEntry,
     values: []const ValueOverrideEntry,
     generated: []const generated_runtime.Operator,
+    generated_expressions: []const generated_runtime.Expression,
 
     pub fn find(self: Registry, name: []const u8) ?OverrideFn {
         for (self.entries) |e| {
@@ -77,6 +78,16 @@ pub const Registry = struct {
         }
         return null;
     }
+
+    pub fn find_generated_expression(
+        self: Registry,
+        identity: u32,
+    ) ?generated_runtime.Expression {
+        for (self.generated_expressions) |expression| {
+            if (expression.identity == identity) return expression;
+        }
+        return null;
+    }
 };
 
 pub fn default_registry(ctx: OverrideContext) Registry {
@@ -85,6 +96,7 @@ pub fn default_registry(ctx: OverrideContext) Registry {
         .entries = &default_overrides,
         .values = &default_value_overrides,
         .generated = &.{},
+        .generated_expressions = &.{},
     };
 }
 

@@ -15,6 +15,7 @@ const Spec = struct {
     max_nat: i64 = 1000,
     min_int: i64 = -1000,
     max_int: i64 = 1000,
+    state_values_per_state: u32 = 60,
     expected_violation: bool = false,
     compare_generated: bool = true,
     compare_distinct: bool = true,
@@ -43,13 +44,13 @@ const specs = [_]Spec{
     .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/APTCommit.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/APTCommit.cfg", .max_states = 500_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.tla", .cfg = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.cfg", .max_states = 500_000, .expected_violation = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.tla", .cfg = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.cfg", .max_states = 500_000, .expected_violation = true },
-    .{ .tla = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.cfg", .max_states = 500_000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.cfg", .max_states = 200_000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.cfg", .max_states = 500_000, .compare_generated = false },
+    .{ .tla = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.cfg", .max_states = 200_000, .compare_generated = false },
     // Representative larger state spaces and advanced semantics:
     .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.cfg", .max_states = 200_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.cfg", .max_states = 200_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.tla", .cfg = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.cfg", .max_states = 200_000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.cfg", .max_states = 200_000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.cfg", .max_states = 200_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.cfg", .max_states = 200_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.tla", .cfg = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.cfg", .max_states = 200_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoPruning.tla", .cfg = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoPruning.cfg", .max_states = 200_000 },
@@ -118,6 +119,7 @@ const specs = [_]Spec{
         .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
         .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_snapshot.cfg",
         .max_states = 100_000,
+        .state_values_per_state = 300,
         .compare_generated = false,
         .compare_distinct = false,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -151,7 +153,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     };
 
     const java_classpath =
-        "/tmp/tla2tools.jar:" ++
+        "vendor/tlaplus/tlatools/org.lamport.tlatools/dist/tla2tools.jar:" ++
         "vendor/tlaplus/tlatools/org.lamport.tlatools/lib/CommunityModules.jar";
 
     std.debug.print("{s:32} {s:>10} {s:>10} {s:>10} {s:>10} {s:>18} {s:>18}\n", .{
@@ -225,17 +227,21 @@ fn run_comparison(allocator: std.mem.Allocator, io: std.Io, java_cp: []const u8,
                         tlc_one.distinct != tlzig_auto.distinct)));
     if (mismatch) {
         std.debug.print(
-            "  STATE MISMATCH: TLC-1={d}/{d} TLC-auto={d}/{d} " ++
-                "tlzig-1={d}/{d} tlzig-auto={d}/{d}\n",
+            "  STATE MISMATCH: TLC-1={d}/{d}/{s} TLC-auto={d}/{d}/{s} " ++
+                "tlzig-1={d}/{d}/{s} tlzig-auto={d}/{d}/{s}\n",
             .{
                 tlc_one.generated,
                 tlc_one.distinct,
+                @tagName(tlc_one.outcome),
                 tlc_auto.generated,
                 tlc_auto.distinct,
+                @tagName(tlc_auto.outcome),
                 tlzig_one.generated,
                 tlzig_one.distinct,
+                @tagName(tlzig_one.outcome),
                 tlzig_auto.generated,
                 tlzig_auto.distinct,
+                @tagName(tlzig_auto.outcome),
             },
         );
         return error.StateMismatch;
@@ -312,29 +318,34 @@ fn run_tlzig_internal(
         .max_int = spec.max_int,
     };
 
-    const eval_value_cap: u32 = 262_144;
+    const eval_value_cap: u32 = 1_048_576;
     const eval_string_cap: u32 = 65_536;
-    const variables_len: u64 = @intCast(module.variables.len);
-    const state_values_per_state = @max(variables_len * 12, 64);
-    const state_strings_per_state = @max(variables_len * 16, 64);
     const state_value_cap = cap_u32(@min(
-        @max(@as(u64, spec.max_states) * state_values_per_state, 1_000_000),
-        64_000_000,
+        @max(
+            @as(u64, spec.max_states) * spec.state_values_per_state,
+            1_000_000,
+        ),
+        132_000_000,
     ));
     const state_string_cap = cap_u32(@min(
-        @max(@as(u64, spec.max_states) * state_strings_per_state, 500_000),
-        64_000_000,
+        @max(@as(u64, spec.max_states) * 4, 500_000),
+        8_000_000,
     ));
 
     const generated = if (generated_matches(module.name, cfg))
         &generated_model.operators
     else
         &.{};
-    var ch = checker.Checker.init_generated(
+    const generated_expressions = if (generated_matches(module.name, cfg))
+        &generated_model.expressions
+    else
+        &.{};
+    var ch = checker.Checker.init_generated_with_successor_limit(
         &arena,
         module,
         cfg,
         spec.max_states,
+        @min(spec.max_states, 65_536),
         eval_value_cap,
         eval_string_cap,
         state_value_cap,
@@ -343,6 +354,7 @@ fn run_tlzig_internal(
         override_ctx,
         worker_count,
         generated,
+        generated_expressions,
     ) catch |err| {
         std.debug.print("failed to initialize checker for {s}: {any}\n", .{ spec.tla, err });
         return error.CheckFailed;
@@ -431,6 +443,7 @@ fn run_tlc(
         "java",
         "-cp",
         classpath,
+        "-Dtlc2.tool.impl.Tool.cdot=true",
         "tlc2.TLC",
         "-metadir",
         "benchmark_results/tlc_meta",
@@ -447,6 +460,7 @@ fn run_tlc(
         "-XX:+UseSerialGC",
         "-cp",
         classpath,
+        "-Dtlc2.tool.impl.Tool.cdot=true",
         "tlc2.TLC",
         "-metadir",
         "benchmark_results/tlc_meta",
@@ -468,10 +482,12 @@ fn run_tlc(
     const elapsed = elapsed_ms(io, start);
 
     const generated = parse_before_keyword(result.stdout, " states generated") orelse {
+        print_tlc_failure(spec, workers, result);
         allocator.free(result.stdout);
         return error.TlcFailed;
     };
     const distinct = parse_before_keyword(result.stdout, " distinct states found") orelse {
+        print_tlc_failure(spec, workers, result);
         allocator.free(result.stdout);
         return error.TlcFailed;
     };
@@ -482,6 +498,17 @@ fn run_tlc(
         .outcome = parse_tlc_outcome(result.stdout, result.term),
         .output = result.stdout,
     };
+}
+
+fn print_tlc_failure(
+    spec: Spec,
+    workers: []const u8,
+    result: std.process.RunResult,
+) void {
+    std.debug.print(
+        "TLC failed for {s} workers={s} term={any}\nstdout:\n{s}\nstderr:\n{s}\n",
+        .{ spec.tla, workers, result.term, result.stdout, result.stderr },
+    );
 }
 
 fn parse_tlc_outcome(

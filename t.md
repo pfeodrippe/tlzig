@@ -2,7 +2,8 @@
 - [ ] generate performant zig code for model checking  !
   - [x] create overrides for each operator/invariant/temporal property EVERYTHING so the code can be as fast as possible !
   - [x] Also, are we able to add a way in, tlzig, to generate zig code that completely emulates the TLA+ spec so it's faster enough ? Or it's not possible at all ?
-  - [ ] are we able to leverage, when the invariant or invariant types are passed by the user via command line or some flag in the lib when running a spec, TypeOk (or whatever name) invariants so we can create even faster code leveraging real type information ?
+  - [ ] are we able to leverage, when the invariant or invariant types are passed by the user via command line or some flag in the lib when running a spec, TypeOk (or whatever name) invariants so we can create even faster code leveraging real type information really assuming in code (with no fallback) that the type is what it really is (so it's faster af!) ?
+- [ ] port TLC tests
 - [ ] tlzig can have modes or can automatically choose a mode that will make certain kinds of workloads more perfomant
 - [ ] running as a lib (no restart required)
 - [ ] fast

@@ -26,6 +26,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var cfg_path: ?[]const u8 = null;
     var default_cfg = false;
     var max_states: u32 = 100_000;
+    var max_successors: u32 = 65_536;
     var max_seq_len: u32 = 5;
     var max_nat: i64 = 10;
     var min_int: i64 = -10;
@@ -46,6 +47,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         } else if (std.mem.eql(u8, arg, "--max-states")) {
             if (it.next()) |v| {
                 max_states = std.fmt.parseInt(u32, v, 10) catch 1_000_000;
+            }
+        } else if (std.mem.eql(u8, arg, "--max-successors")) {
+            if (it.next()) |v| {
+                max_successors = std.fmt.parseInt(u32, v, 10) catch 65_536;
             }
         } else if (std.mem.eql(u8, arg, "--max-seq-len")) {
             if (it.next()) |v| {
@@ -91,11 +96,16 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     const spec_path_v = spec_path orelse {
-        std.debug.print("usage: tlzig --spec FILE.tla [--emit-zig FILE.zig | --cfg FILE.cfg] [--max-states N]\n", .{});
+        std.debug.print("usage: tlzig --spec FILE.tla [--emit-zig FILE.zig | --cfg FILE.cfg] [--max-states N] [--max-successors N]\n", .{});
         std.process.exit(1);
     };
     if (cfg_path == null and !default_cfg and emit_zig_path == null) {
-        std.debug.print("usage: tlzig --spec FILE.tla (--cfg FILE.cfg | --default-cfg) [--max-states N] ...\n", .{});
+        std.debug.print("usage: tlzig --spec FILE.tla (--cfg FILE.cfg | --default-cfg) [--max-states N] [--max-successors N] ...\n", .{});
+        std.process.exit(1);
+    }
+    max_successors = @min(max_successors, max_states);
+    if (max_successors == 0) {
+        std.debug.print("--max-successors must be greater than zero\n", .{});
         std.process.exit(1);
     }
 
@@ -107,7 +117,10 @@ pub fn main(init: std.process.Init.Minimal) void {
     };
 
     if (unlimited_memory) {
-        std.debug.print("WARNING: --unlimited-memory is set; arenas and value pools will grow without bound. OOM errors will only occur on system memory exhaustion.\n", .{});
+        std.debug.print(
+            "NOTE: --unlimited-memory is set; resettable scratch pools may grow, while canonical storage remains fixed to preserve stable value offsets.\n",
+            .{},
+        );
     }
 
     var arena = Arena.init(arena_bytes) catch {
@@ -231,25 +244,23 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     }
 
-    const eval_value_cap: u32 = 262_144;
+    const eval_value_cap: u32 = 1_048_576;
     const eval_string_cap: u32 = 65_536;
-    const variables_len: u64 = @intCast(module.variables.len);
-    const state_values_per_state = @max(variables_len * 12, 64);
-    const state_strings_per_state = @max(variables_len * 16, 64);
     const state_value_cap = cap_u32(@min(
-        @max(@as(u64, max_states) * state_values_per_state, 1_000_000),
-        64_000_000,
+        @max(@as(u64, max_states) * 60, 1_000_000),
+        132_000_000,
     ));
     const state_string_cap = cap_u32(@min(
-        @max(@as(u64, max_states) * state_strings_per_state, 500_000),
-        64_000_000,
+        @max(@as(u64, max_states) * 4, 500_000),
+        8_000_000,
     ));
 
-    var ch = checker.Checker.init_generated(
+    var ch = checker.Checker.init_generated_with_successor_limit(
         &arena,
         module,
         cfg,
         max_states,
+        max_successors,
         eval_value_cap,
         eval_string_cap,
         state_value_cap,
@@ -258,6 +269,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         override_ctx,
         worker_count,
         &generated_model.operators,
+        &generated_model.expressions,
     ) catch |err| {
         std.debug.print("failed to initialize checker: {any}\n", .{err});
         std.process.exit(1);

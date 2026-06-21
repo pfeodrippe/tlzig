@@ -58,9 +58,23 @@ pub const Arena = struct {
         const aligned_len = std.mem.alignForward(u64, chunk.len, @alignOf(T));
         const new_len = aligned_len + aligned_size;
         if (new_len > chunk.cap) {
-            // Need a new chunk. Grow by at least 2x or enough for this alloc.
-            const grow_size = @max(self.chunk_size * 2, aligned_size + @alignOf(T));
-            self.chunk_size = grow_size;
+            const doubled = std.math.mul(
+                u64,
+                self.chunk_size,
+                2,
+            ) catch std.math.maxInt(u64);
+            const allocation_size = std.math.add(
+                u64,
+                aligned_size,
+                @alignOf(T),
+            ) catch return error.OutOfMemory;
+            const grow_size = @max(doubled, allocation_size);
+            // A one-off oversized allocation gets a dedicated chunk. It must
+            // not turn the next ordinary growth into another multi-gigabyte
+            // allocation.
+            if (allocation_size <= doubled) {
+                self.chunk_size = grow_size;
+            }
             try Arena.grow_chunk(&self.chunks, grow_size);
             self.cur_chunk = self.chunks.items.len - 1;
             chunk = &self.chunks.items[self.cur_chunk];
@@ -107,3 +121,17 @@ pub const Arena = struct {
         return copy;
     }
 };
+
+test "oversized allocation does not inflate ordinary chunk growth" {
+    var arena = try Arena.init(1024);
+    defer arena.deinit();
+
+    _ = try arena.alloc(u8, 16 * 1024);
+    try std.testing.expectEqual(@as(u64, 1024), arena.chunk_size);
+
+    _ = try arena.alloc(u8, 2048);
+    try std.testing.expectEqual(@as(u64, 1024), arena.chunk_size);
+
+    _ = try arena.alloc(u8, 1024);
+    try std.testing.expectEqual(@as(u64, 2048), arena.chunk_size);
+}

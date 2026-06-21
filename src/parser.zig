@@ -372,7 +372,10 @@ pub const Lexer = struct {
 
     fn is_dash_line(self: Lexer) bool {
         var p = self.pos;
-        while (p < self.source.len and self.source[p] != '\n') {
+        while (p < self.source.len and
+            self.source[p] != '\n' and
+            self.source[p] != '\r')
+        {
             if (self.source[p] != '-') return false;
             p += 1;
         }

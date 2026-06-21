@@ -72,6 +72,25 @@ pub fn build(b: *std.Build) void {
 
     const run_bench = b.addRunArtifact(bench);
     run_bench.step.dependOn(b.getInstallStep());
+    const tlc_test_class = b.addSystemCommand(&.{
+        "mkdir",
+        "-p",
+        "vendor/tlaplus/tlatools/org.lamport.tlatools/test-class",
+    });
+    const build_tlc = b.addSystemCommand(&.{
+        "ant",
+        "-f",
+        "customBuild.xml",
+        "compile",
+        "dist",
+        "-Dtest.skip=true",
+        "-Dnoclean=true",
+    });
+    build_tlc.setCwd(
+        b.path("vendor/tlaplus/tlatools/org.lamport.tlatools"),
+    );
+    build_tlc.step.dependOn(&tlc_test_class.step);
+    run_bench.step.dependOn(&build_tlc.step);
     if (b.option(
         []const u8,
         "benchmark-filter",

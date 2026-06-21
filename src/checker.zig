@@ -34,6 +34,9 @@ const WorkerContext = struct {
     eval_pool_base: ValuePool.Snapshot,
     out_states: StateBuffer,
     compose_states: StateBuffer,
+    prepared_fingerprints: []fingerprint.Fingerprint,
+    prepared_invariants: []bool,
+    prepared_generated: u64,
     composition_generated: u64,
     source_snapshot: StateStore,
 
@@ -96,7 +99,9 @@ fn parallel_worker(
             continue;
         };
         const next_level = checker.state_store.get(next_idx).level;
-        if (next_level > parallel.current_level) {
+        if (checker.graph_enabled and
+            next_level > parallel.current_level)
+        {
             if (parallel.active != 0) {
                 parallel_wait(parallel);
                 parallel_unlock(parallel);
@@ -114,6 +119,7 @@ fn parallel_worker(
         worker.candidate_store.reset(worker.candidate_pool_base);
         worker.eval_pool.restore(worker.eval_pool_base);
         worker.out_states.clear();
+        worker.prepared_generated = 0;
         worker.composition_generated = 0;
         var executor = ActionExecutor{
             .evaluator = worker.evaluator,
@@ -129,6 +135,16 @@ fn parallel_worker(
                 state_idx,
                 &worker.out_states,
             ) catch |err| break :blk err;
+            worker.prepared_generated = worker.out_states.items.len;
+            checker.prepare_generated(
+                state_idx,
+                &worker.out_states,
+                &worker.candidate_store,
+                &worker.candidate_evaluator,
+                &worker.eval_pool,
+                worker.prepared_fingerprints,
+                worker.prepared_invariants,
+            ) catch |err| break :blk err;
             break :blk null;
         };
 
@@ -136,7 +152,7 @@ fn parallel_worker(
         if (generation_error) |err| {
             parallel.failure = err;
         } else if (checker.check_deadlock and
-            worker.out_states.items.len == 0)
+            worker.prepared_generated == 0)
         {
             if (checker.diagnostics) {
                 std.debug.print(
@@ -147,8 +163,11 @@ fn parallel_worker(
             }
             parallel.failure = Error.Deadlock;
         } else if (parallel.failure == null) {
+            checker.generated += worker.prepared_generated;
             checker.generated += worker.composition_generated;
-            checker.succ_offsets[state_idx] = checker.succ_count;
+            if (checker.graph_enabled) {
+                checker.succ_offsets[state_idx] = checker.succ_count;
+            }
             checker.check_enabled_invariants(
                 state_idx,
                 worker.out_states.items.len > 0,
@@ -156,11 +175,14 @@ fn parallel_worker(
                 parallel.failure = err;
             };
             if (parallel.failure == null) {
-                checker.process_generated(
+                checker.process_prepared_generated(
                     state_idx,
                     &worker.out_states,
                     &worker.candidate_store,
-                    &worker.candidate_evaluator,
+                    &worker.evaluator,
+                    &worker.eval_pool,
+                    worker.prepared_fingerprints,
+                    worker.prepared_invariants,
                 ) catch |err| {
                     parallel.failure = err;
                 };
@@ -390,6 +412,24 @@ fn symmetry_fingerprint(
     return hash;
 }
 
+const CanonicalValueEntry = struct {
+    hash: fingerprint.Fingerprint = 0,
+    value: Value = .{ .bool_v = false },
+    variable_index: u16 = 0,
+    occupied: bool = false,
+};
+
+fn canonical_value_capacity(max_states: u32) u32 {
+    const target = @min(
+        @as(u64, max_states) * 2,
+        2_097_152,
+    );
+    var capacity: u32 = 1024;
+    while (capacity < target) capacity *= 2;
+    assert(std.math.isPowerOfTwo(capacity));
+    return capacity;
+}
+
 pub const Checker = struct {
     arena: *Arena,
     state_store: StateStore,
@@ -400,13 +440,16 @@ pub const Checker = struct {
     queue: StateQueue,
     fp_set: FpSet,
     symmetry_hash_cache: SymmetryHashCache,
+    canonical_value_entries: []CanonicalValueEntry,
     evaluator: Evaluator,
     init_spec: ?action.CompiledInit,
     next_spec: ?action.CompiledNext,
     invariants: []const *ast.Expr,
     invariant_names: []const []const u8,
     constraints: []const *ast.Expr,
+    constraint_names: []const []const u8,
     action_constraints: []const *ast.Expr,
+    action_constraint_names: []const []const u8,
     properties: []const *ast.Expr,
     safety_properties: []const *ast.Expr,
     eval_arena: *Arena,
@@ -416,6 +459,7 @@ pub const Checker = struct {
     diagnostics: bool,
     worker_count: u16,
     max_states: u32,
+    max_successors: u32,
     generated: u64,
     distinct: u64,
     // Transition graph for liveness/property checking.
@@ -424,6 +468,7 @@ pub const Checker = struct {
     succ_edges: []u32,
     succ_count: u32,
     succ_cap: u32,
+    graph_enabled: bool,
     canonical_states: []bool,
     initial_states: []bool,
     // We record total allocated max_states for successor arrays because the
@@ -460,6 +505,8 @@ pub const Checker = struct {
             eval_arena_bytes,
             override_ctx,
             worker_count,
+            @min(max_states, 65_536),
+            &.{},
             &.{},
         );
     }
@@ -477,6 +524,7 @@ pub const Checker = struct {
         override_ctx: overrides.OverrideContext,
         worker_count: u16,
         generated: []const generated_runtime.Operator,
+        generated_expressions: []const generated_runtime.Expression,
     ) !Checker {
         return init_internal(
             arena,
@@ -490,7 +538,43 @@ pub const Checker = struct {
             eval_arena_bytes,
             override_ctx,
             worker_count,
+            @min(max_states, 65_536),
             generated,
+            generated_expressions,
+        );
+    }
+
+    pub fn init_generated_with_successor_limit(
+        arena: *Arena,
+        module: ast.Module,
+        cfg: Config,
+        max_states: u32,
+        max_successors: u32,
+        eval_value_cap: u32,
+        eval_string_cap: u32,
+        state_value_cap: u32,
+        state_string_cap: u32,
+        eval_arena_bytes: u64,
+        override_ctx: overrides.OverrideContext,
+        worker_count: u16,
+        generated: []const generated_runtime.Operator,
+        generated_expressions: []const generated_runtime.Expression,
+    ) !Checker {
+        return init_internal(
+            arena,
+            module,
+            cfg,
+            max_states,
+            eval_value_cap,
+            eval_string_cap,
+            state_value_cap,
+            state_string_cap,
+            eval_arena_bytes,
+            override_ctx,
+            worker_count,
+            max_successors,
+            generated,
+            generated_expressions,
         );
     }
 
@@ -506,9 +590,13 @@ pub const Checker = struct {
         eval_arena_bytes: u64,
         override_ctx: overrides.OverrideContext,
         worker_count: u16,
+        max_successors: u32,
         generated: []const generated_runtime.Operator,
+        generated_expressions: []const generated_runtime.Expression,
     ) !Checker {
         assert(worker_count > 0);
+        assert(max_successors > 0);
+        assert(max_successors <= max_states);
         var state_store = try StateStore.init(
             arena,
             module.variables,
@@ -516,17 +604,31 @@ pub const Checker = struct {
             state_value_cap,
             state_string_cap,
         );
+        // Canonical values are referenced by stable u32 offsets throughout
+        // stored states. Growing this pool would relocate every backing value
+        // and temporarily duplicate multiple gigabytes on exhaustive models.
+        state_store.values_pool.growable = false;
+        try state_store.values_pool.enable_string_interning(131_072);
         const queue = try StateQueue.init(arena, max_states);
         const fp_set = try FpSet.init(arena, max_states * 2);
         const symmetry_hash_cache = try SymmetryHashCache.init(
             arena,
             worker_count == 1,
         );
+        const canonical_value_entries: []CanonicalValueEntry = if (!cfg.check_deadlock)
+            try arena.alloc(
+                CanonicalValueEntry,
+                canonical_value_capacity(max_states),
+            )
+        else
+            &[_]CanonicalValueEntry{};
+        @memset(canonical_value_entries, .{});
         var evaluator = try Evaluator.init_generated(
             module,
             arena,
             override_ctx,
             generated,
+            generated_expressions,
         );
         evaluator.set_treat_unknown_as_model(true);
         const aliases = try evaluate_aliases(arena, cfg);
@@ -581,8 +683,8 @@ pub const Checker = struct {
         var candidate_store = try StateStore.init(
             candidate_arena,
             module.variables,
-            max_states,
-            @min(state_value_cap, 262_144),
+            max_successors,
+            @min(state_value_cap, 1_048_576),
             @min(state_string_cap, 65_536),
         );
         var candidate_evaluator = try evaluator.fork(candidate_arena);
@@ -719,18 +821,30 @@ pub const Checker = struct {
             break :blk result;
         };
 
-        const succ_cap: u32 = max_states * 32;
-        const succ_offsets = try arena.alloc(u32, max_states + 1);
+        const graph_enabled = properties.len > 0;
+        const graph_states: u32 = if (graph_enabled) max_states else 0;
+        const succ_cap: u32 = if (graph_enabled)
+            std.math.mul(u32, max_states, 32) catch
+                return Error.OutOfMemory
+        else
+            0;
+        const succ_offsets = try arena.alloc(u32, graph_states + 1);
         @memset(succ_offsets, 0);
-        const succ_counts = try arena.alloc(u32, max_states);
+        const succ_counts = try arena.alloc(u32, graph_states);
         @memset(succ_counts, 0);
         const succ_edges = try arena.alloc(u32, succ_cap);
-        const canonical_states = try arena.alloc(bool, max_states);
+        const canonical_states = try arena.alloc(bool, graph_states);
         @memset(canonical_states, false);
-        const initial_states = try arena.alloc(bool, max_states);
+        const initial_states = try arena.alloc(bool, graph_states);
         @memset(initial_states, false);
 
-        const fairness = if (spec_name_v) |sn| try extract_fairness(arena, module, sn) else &[_]FairnessCondition{};
+        const fairness = if (graph_enabled)
+            if (spec_name_v) |sn|
+                try extract_fairness(arena, module, sn)
+            else
+                &[_]FairnessCondition{}
+        else
+            &[_]FairnessCondition{};
 
         return Checker{
             .arena = arena,
@@ -742,13 +856,16 @@ pub const Checker = struct {
             .queue = queue,
             .fp_set = fp_set,
             .symmetry_hash_cache = symmetry_hash_cache,
+            .canonical_value_entries = canonical_value_entries,
             .evaluator = evaluator,
             .init_spec = compiled_init,
             .next_spec = compiled_next,
             .invariants = invariants,
             .invariant_names = invariant_names,
             .constraints = constraints,
+            .constraint_names = cfg.constraints,
             .action_constraints = action_constraints,
+            .action_constraint_names = cfg.action_constraints,
             .properties = properties,
             .safety_properties = safety_properties,
             .eval_arena = eval_arena,
@@ -758,6 +875,7 @@ pub const Checker = struct {
             .diagnostics = true,
             .worker_count = worker_count,
             .max_states = max_states,
+            .max_successors = max_successors,
             .generated = 0,
             .distinct = 0,
             .succ_offsets = succ_offsets,
@@ -765,6 +883,7 @@ pub const Checker = struct {
             .succ_edges = succ_edges,
             .succ_count = 0,
             .succ_cap = succ_cap,
+            .graph_enabled = graph_enabled,
             .canonical_states = canonical_states,
             .initial_states = initial_states,
             .max_states_limit = max_states,
@@ -793,8 +912,8 @@ pub const Checker = struct {
         }
         assert(self.next_spec != null);
 
-        var out_states = try StateBuffer.init(self.arena, self.max_states);
-        var compose_states = try StateBuffer.init(self.arena, self.max_states);
+        var out_states = try StateBuffer.init(self.arena, self.max_successors);
+        var compose_states = try StateBuffer.init(self.arena, self.max_successors);
         var composition_generated: u64 = 0;
 
         var executor = ActionExecutor{
@@ -822,7 +941,9 @@ pub const Checker = struct {
                 assert(idx < self.state_store.count);
                 assert(idx < self.max_states_limit);
                 out_states.clear();
-                self.succ_offsets[idx] = self.succ_count;
+                if (self.graph_enabled) {
+                    self.succ_offsets[idx] = self.succ_count;
+                }
                 self.candidate_store.reset(self.candidate_pool_base);
                 self.eval_pool.restore(self.eval_pool_base);
                 composition_generated = 0;
@@ -917,7 +1038,7 @@ pub const Checker = struct {
         worker.evaluator.set_constants(self.evaluator.constants);
         worker.eval_pool = try ValuePool.init(
             &worker.eval_arena,
-            262_144,
+            1_048_576,
             65_536,
         );
         worker.eval_pool_base = worker.eval_pool.snapshot();
@@ -927,8 +1048,8 @@ pub const Checker = struct {
         worker.candidate_store = try StateStore.init(
             &worker.candidate_arena,
             self.state_store.variable_names,
-            self.max_states,
-            262_144,
+            self.max_successors,
+            1_048_576,
             65_536,
         );
         worker.candidate_evaluator = try worker.evaluator.fork(
@@ -943,14 +1064,138 @@ pub const Checker = struct {
         worker.candidate_pool_base = worker.candidate_store.values_pool.snapshot();
         worker.out_states = try StateBuffer.init(
             &worker.candidate_arena,
-            self.max_states,
+            self.max_successors,
         );
         worker.compose_states = try StateBuffer.init(
             &worker.candidate_arena,
-            self.max_states,
+            self.max_successors,
         );
+        worker.prepared_fingerprints = try worker.candidate_arena.alloc(
+            fingerprint.Fingerprint,
+            self.max_successors,
+        );
+        worker.prepared_invariants = try worker.candidate_arena.alloc(
+            bool,
+            self.max_successors,
+        );
+        worker.prepared_generated = 0;
         worker.composition_generated = 0;
         worker.source_snapshot = self.state_store;
+    }
+
+    fn prepare_generated(
+        self: *Checker,
+        parent_idx: u32,
+        out_states: *StateBuffer,
+        candidate_store: *StateStore,
+        candidate_evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        prepared_fingerprints: []fingerprint.Fingerprint,
+        prepared_invariants: []bool,
+    ) !void {
+        assert(self.worker_count > 1);
+        assert(!self.symmetry_hash_cache.enabled);
+        assert(out_states.items.len <= prepared_fingerprints.len);
+        assert(out_states.items.len <= prepared_invariants.len);
+        var kept_count: u32 = 0;
+        var action_parent = try self.clone_parent_for_action_constraints(
+            parent_idx,
+            candidate_store,
+        );
+        for (out_states.items) |candidate_index| {
+            assert(candidate_index < candidate_store.count);
+            const candidate = candidate_store.get(candidate_index);
+            candidate.pred = parent_idx;
+            candidate.level = self.state_store.get(parent_idx).level + 1;
+            const snapshot = eval_pool.snapshot();
+            defer eval_pool.restore(snapshot);
+            if (!try self.check_candidate_constraints(
+                candidate,
+                candidate_store,
+                candidate_evaluator,
+                eval_pool,
+            )) continue;
+            if (action_parent) |*parent| {
+                if (!try self.check_candidate_action_constraints(
+                    parent,
+                    candidate,
+                    candidate_store,
+                    candidate_evaluator,
+                    eval_pool,
+                )) continue;
+            }
+            const candidate_fingerprint = symmetry_fingerprint(
+                &candidate_store.values_pool,
+                &self.state_store.values_pool,
+                &self.symmetry_hash_cache,
+                candidate,
+                self.symmetry_permutations,
+            );
+            out_states.items[kept_count] = candidate_index;
+            prepared_fingerprints[kept_count] = candidate_fingerprint;
+            prepared_invariants[kept_count] = true;
+            kept_count += 1;
+        }
+        out_states.shrink(kept_count);
+    }
+
+    fn process_prepared_generated(
+        self: *Checker,
+        parent_idx: u32,
+        out_states: *StateBuffer,
+        candidate_store: *StateStore,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        prepared_fingerprints: []const fingerprint.Fingerprint,
+        prepared_invariants: []const bool,
+    ) !void {
+        assert(out_states.items.len <= prepared_fingerprints.len);
+        assert(out_states.items.len <= prepared_invariants.len);
+        for (out_states.items, 0..) |*candidate_index, prepared_index| {
+            const candidate = candidate_store.get(candidate_index.*);
+            const state_fingerprint = prepared_fingerprints[prepared_index];
+            const canonical = self.fp_set.find(state_fingerprint);
+            const is_new = canonical == null;
+            const state_idx = if (canonical) |existing| existing else blk: {
+                const permanent_idx = try self.clone_candidate_state(
+                    candidate,
+                    candidate_store,
+                    parent_idx,
+                );
+                assert(self.fp_set.put_with_index(
+                    state_fingerprint,
+                    permanent_idx,
+                ) == null);
+                break :blk permanent_idx;
+            };
+            if (is_new) {
+                self.distinct += 1;
+                assert(self.distinct <= self.max_states_limit);
+                if (self.graph_enabled) {
+                    self.canonical_states[state_idx] = true;
+                }
+            }
+            const invariant_snapshot = eval_pool.snapshot();
+            const invariants_hold = try self.check_invariants_with(
+                evaluator,
+                eval_pool,
+                self.state_store.get(state_idx),
+            );
+            eval_pool.restore(invariant_snapshot);
+            if (!invariants_hold) {
+                std.debug.print(
+                    "InvariantViolated generated={d} distinct={d}\n",
+                    .{ self.generated, self.distinct },
+                );
+                self.print_trace(state_idx);
+                return Error.InvariantViolated;
+            }
+            if (is_new and !self.queue.enqueue(state_idx)) {
+                return Error.StateSpaceExhausted;
+            }
+            candidate_index.* = state_idx;
+        }
+        try self.record_successors(parent_idx, out_states);
     }
 
     fn process_generated(
@@ -984,6 +1229,7 @@ pub const Checker = struct {
                 candidate,
                 candidate_store,
                 candidate_evaluator,
+                &self.eval_pool,
             );
             if (!constraints_hold) {
                 self.eval_pool.restore(snap);
@@ -997,6 +1243,7 @@ pub const Checker = struct {
                         candidate,
                         candidate_store,
                         candidate_evaluator,
+                        &self.eval_pool,
                     )
                 else
                     true;
@@ -1026,11 +1273,15 @@ pub const Checker = struct {
             if (is_new) {
                 self.distinct += 1;
                 assert(self.distinct <= self.max_states_limit);
-                self.canonical_states[state_idx] = true;
+                if (self.graph_enabled) {
+                    self.canonical_states[state_idx] = true;
+                }
             }
             if (parent_idx == null) {
-                assert(self.canonical_states[state_idx]);
-                self.initial_states[state_idx] = true;
+                if (self.graph_enabled) {
+                    assert(self.canonical_states[state_idx]);
+                    self.initial_states[state_idx] = true;
+                }
             }
             const invariants_hold = try self.check_invariants(self.state_store.get(state_idx));
             self.eval_pool.restore(snap);
@@ -1059,14 +1310,18 @@ pub const Checker = struct {
     ) !void {
         if (parent_idx) |pidx| {
             const count: u32 = @intCast(out_states.items.len);
-            if (self.succ_count + count > self.succ_cap) return Error.OutOfMemory;
-            self.succ_offsets[pidx] = self.succ_count;
-            self.succ_counts[pidx] = count;
-            for (out_states.items, 0..) |idx, i| {
-                assert(idx < self.state_store.count);
-                self.succ_edges[self.succ_count + i] = idx;
+            if (self.graph_enabled) {
+                if (self.succ_count + count > self.succ_cap) {
+                    return Error.OutOfMemory;
+                }
+                self.succ_offsets[pidx] = self.succ_count;
+                self.succ_counts[pidx] = count;
+                for (out_states.items, 0..) |idx, i| {
+                    assert(idx < self.state_store.count);
+                    self.succ_edges[self.succ_count + i] = idx;
+                }
+                self.succ_count += count;
             }
-            self.succ_count += count;
             if (self.safety_properties.len > 0) {
                 const parent = self.state_store.get(pidx);
                 for (out_states.items) |idx| {
@@ -1098,9 +1353,10 @@ pub const Checker = struct {
                 (candidate.changed_mask &
                     (@as(u64, 1) << @intCast(variable_index))) != 0;
             if (changed) {
-                target.* = try source.clone(
+                target.* = try self.intern_canonical_value(
+                    source,
                     &candidate_store.values_pool,
-                    &self.state_store.values_pool,
+                    @intCast(variable_index),
                 );
             } else {
                 target.* = self.state_store.get(parent_idx.?).values[variable_index];
@@ -1109,18 +1365,107 @@ pub const Checker = struct {
         return state_idx;
     }
 
+    fn intern_canonical_value(
+        self: *Checker,
+        source: Value,
+        source_pool: *const ValuePool,
+        variable_index: u16,
+    ) !Value {
+        if (self.canonical_value_entries.len == 0) {
+            return source.clone(
+                source_pool,
+                &self.state_store.values_pool,
+            );
+        }
+        switch (source) {
+            .bool_v, .int_v, .model_v, .string_v, .range_v => {
+                return source.clone(
+                    source_pool,
+                    &self.state_store.values_pool,
+                );
+            },
+            else => {},
+        }
+        assert(self.canonical_value_entries.len > 0);
+        assert(std.math.isPowerOfTwo(self.canonical_value_entries.len));
+        const hash = fingerprint.hash_value(
+            source_pool,
+            source,
+            fingerprint.hash_init(),
+        );
+        const mixed_hash = fingerprint.hash_combine(hash, variable_index);
+        const mask = self.canonical_value_entries.len - 1;
+        var slot: usize = @intCast(mixed_hash & mask);
+        var probes: usize = 0;
+        while (probes < self.canonical_value_entries.len) : (probes += 1) {
+            const entry = &self.canonical_value_entries[slot];
+            if (!entry.occupied) {
+                const canonical = try source.clone(
+                    source_pool,
+                    &self.state_store.values_pool,
+                );
+                entry.* = .{
+                    .hash = hash,
+                    .value = canonical,
+                    .variable_index = variable_index,
+                    .occupied = true,
+                };
+                return canonical;
+            }
+            if (entry.hash == hash and
+                entry.variable_index == variable_index and
+                Value.eql_cross_pool(
+                    source,
+                    source_pool,
+                    entry.value,
+                    &self.state_store.values_pool,
+                ))
+            {
+                return entry.value;
+            }
+            slot = (slot + 1) & mask;
+        }
+        return source.clone(
+            source_pool,
+            &self.state_store.values_pool,
+        );
+    }
+
     fn check_candidate_constraints(
         self: *Checker,
         candidate: *StateStore.State,
         candidate_store: *StateStore,
         candidate_evaluator: *Evaluator,
+        eval_pool: *ValuePool,
     ) !bool {
-        for (self.constraints) |constraint| {
-            const value = try candidate_evaluator.eval_expr(
-                constraint,
+        assert(self.constraint_names.len == self.constraints.len);
+        for (self.constraint_names) |constraint_name| {
+            const value = try candidate_evaluator.eval_named_zero(
+                constraint_name,
                 Context.empty(),
                 candidate,
-                &self.eval_pool,
+                eval_pool,
+                &candidate_store.values_pool,
+            );
+            if (!value.is_truthy()) return false;
+        }
+        return true;
+    }
+
+    fn check_candidate_invariants(
+        self: *Checker,
+        candidate: *StateStore.State,
+        candidate_store: *StateStore,
+        candidate_evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+    ) !bool {
+        assert(self.invariant_names.len == self.invariants.len);
+        for (self.invariant_names) |invariant_name| {
+            const value = try candidate_evaluator.eval_named_zero(
+                invariant_name,
+                Context.empty(),
+                candidate,
+                eval_pool,
                 &candidate_store.values_pool,
             );
             if (!value.is_truthy()) return false;
@@ -1160,16 +1505,19 @@ pub const Checker = struct {
         candidate: *StateStore.State,
         candidate_store: *StateStore,
         candidate_evaluator: *Evaluator,
+        eval_pool: *ValuePool,
     ) !bool {
         assert(self.action_constraints.len > 0);
+        assert(self.action_constraint_names.len ==
+            self.action_constraints.len);
         candidate_evaluator.set_next_state(candidate);
         defer candidate_evaluator.set_next_state(null);
-        for (self.action_constraints) |constraint| {
-            const value = try candidate_evaluator.eval_expr(
-                constraint,
+        for (self.action_constraint_names) |constraint_name| {
+            const value = try candidate_evaluator.eval_named_zero(
+                constraint_name,
                 Context.empty(),
                 parent,
-                &self.eval_pool,
+                eval_pool,
                 &candidate_store.values_pool,
             );
             if (!value.is_truthy()) return false;
@@ -1966,18 +2314,44 @@ pub const Checker = struct {
     }
 
     fn check_constraints(self: *Checker, st: *StateStore.State) !bool {
-        for (self.constraints) |c| {
-            const v = try self.evaluator.eval_expr(c, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool);
+        assert(self.constraint_names.len == self.constraints.len);
+        for (self.constraint_names) |constraint_name| {
+            const v = try self.evaluator.eval_named_zero(
+                constraint_name,
+                Context.empty(),
+                st,
+                &self.eval_pool,
+                &self.state_store.values_pool,
+            );
             if (!v.is_truthy()) return false;
         }
         return true;
     }
 
     fn check_invariants(self: *Checker, st: *StateStore.State) !bool {
+        return self.check_invariants_with(
+            &self.evaluator,
+            &self.eval_pool,
+            st,
+        );
+    }
+
+    fn check_invariants_with(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        st: *StateStore.State,
+    ) !bool {
         assert(self.invariant_names.len == self.invariants.len);
         for (self.invariants, 0..) |inv, i| {
             if (contains_enabled(inv)) continue;
-            const v = self.evaluator.eval_expr(inv, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool) catch |err| {
+            const v = evaluator.eval_named_zero(
+                self.invariant_names[i],
+                Context.empty(),
+                st,
+                eval_pool,
+                &self.state_store.values_pool,
+            ) catch |err| {
                 if (i < self.invariant_names.len) {
                     std.debug.print("Error evaluating invariant {s}: {any}\n", .{ self.invariant_names[i], err });
                 }

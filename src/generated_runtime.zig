@@ -50,6 +50,20 @@ pub const Operator = struct {
     function: ?OperatorFn,
 };
 
+pub const Expression = struct {
+    identity: u32,
+    arg_names: []const []const u8,
+    function: OperatorFn,
+};
+
+pub inline fn keep_expression_parameters(
+    context: *CallContext,
+    args: []const Value,
+) void {
+    _ = context;
+    _ = args;
+}
+
 pub fn variable(context: *CallContext, index: u32) Error!Value {
     if (context.read_primed) return primed_variable(context, index);
     return current_variable(context, index);
@@ -531,6 +545,173 @@ pub fn sequence_append(
     return .{ .tuple_v = .{
         .offset = value_offset(context.eval_pool, result.ptr),
         .len = @intCast(result.len),
+    } };
+}
+
+pub fn sequence_concat(
+    context: *CallContext,
+    left: Value,
+    right: Value,
+) Error!Value {
+    const left_len: u32 = switch (left) {
+        .function_v => |function| function.len,
+        .tuple_v => |tuple_value| tuple_value.len,
+        else => return Error.TypeError,
+    };
+    const right_len: u32 = switch (right) {
+        .function_v => |function| function.len,
+        .tuple_v => |tuple_value| tuple_value.len,
+        else => return Error.TypeError,
+    };
+    const result_len = std.math.add(u32, left_len, right_len) catch
+        return Error.OutOfMemory;
+    try context.eval_pool.ensure_value_capacity(result_len);
+    const result = try context.eval_pool.alloc_values(result_len);
+    const result_offset = value_offset(context.eval_pool, result.ptr);
+    var index: u32 = 0;
+    while (index < left_len) : (index += 1) {
+        context.eval_pool.values[result_offset + index] =
+            sequence_item(context.eval_pool, left, index) orelse
+            return Error.TypeError;
+    }
+    index = 0;
+    while (index < right_len) : (index += 1) {
+        context.eval_pool.values[result_offset + left_len + index] =
+            sequence_item(context.eval_pool, right, index) orelse
+            return Error.TypeError;
+    }
+    return .{ .tuple_v = .{
+        .offset = result_offset,
+        .len = result_len,
+    } };
+}
+
+pub fn record_to(
+    context: *CallContext,
+    key: Value,
+    value_v: Value,
+) Error!Value {
+    try context.eval_pool.ensure_value_capacity(2);
+    const key_values = try context.eval_pool.alloc_values(1);
+    key_values[0] = key;
+    const key_offset = value_offset(context.eval_pool, key_values.ptr);
+    const entries = try context.eval_pool.alloc_values(1);
+    entries[0] = value_v;
+    return .{ .function_v = .{
+        .domain = .{
+            .offset = key_offset,
+            .len = 1,
+        },
+        .offset = value_offset(context.eval_pool, entries.ptr),
+        .len = 1,
+    } };
+}
+
+pub fn override(
+    context: *CallContext,
+    left: Value,
+    right: Value,
+) Error!Value {
+    if (left == .record_v and right == .record_v) {
+        const left_record = left.record_v;
+        const right_record = right.record_v;
+        const capacity = left_record.len + right_record.len;
+        try context.eval_pool.ensure_value_capacity(
+            @as(u64, capacity) * 2,
+        );
+        const fields = try context.eval_pool.alloc_values(capacity * 2);
+        const fields_offset = value_offset(context.eval_pool, fields.ptr);
+        var count: u32 = 0;
+        var left_index: u32 = 0;
+        while (left_index < left_record.len) : (left_index += 1) {
+            const left_fields = left_record.fields(context.eval_pool);
+            const left_name = left_fields[left_index * 2].string_v;
+            var overridden = false;
+            var right_index: u32 = 0;
+            while (right_index < right_record.len) : (right_index += 1) {
+                const right_fields = right_record.fields(context.eval_pool);
+                if (left_name.eql(
+                    right_fields[right_index * 2].string_v,
+                    context.eval_pool,
+                )) {
+                    overridden = true;
+                    break;
+                }
+            }
+            if (!overridden) {
+                const current_left = left_record.fields(context.eval_pool);
+                context.eval_pool.values[fields_offset + count * 2] =
+                    current_left[left_index * 2];
+                context.eval_pool.values[fields_offset + count * 2 + 1] =
+                    current_left[left_index * 2 + 1];
+                count += 1;
+            }
+        }
+        const right_fields = right_record.fields(context.eval_pool);
+        @memcpy(
+            context.eval_pool.values[fields_offset + count * 2 ..][0 .. right_record.len * 2],
+            right_fields,
+        );
+        count += right_record.len;
+        return .{ .record_v = .{
+            .offset = fields_offset,
+            .len = count,
+        } };
+    }
+
+    const left_function = if (left == .function_v)
+        left.function_v
+    else
+        return Error.TypeError;
+    const right_function = if (right == .function_v)
+        right.function_v
+    else
+        return Error.TypeError;
+    const capacity = left_function.len + right_function.len;
+    try context.eval_pool.ensure_value_capacity(
+        @as(u64, capacity) * 2,
+    );
+    const keys = try context.eval_pool.alloc_values(capacity);
+    const keys_offset = value_offset(context.eval_pool, keys.ptr);
+    const entries = try context.eval_pool.alloc_values(capacity);
+    const entries_offset = value_offset(context.eval_pool, entries.ptr);
+    var count: u32 = 0;
+    var left_index: u32 = 0;
+    while (left_index < left_function.len) : (left_index += 1) {
+        const left_keys = left_function.domain.items(context.eval_pool);
+        const left_key = left_keys[left_index];
+        var overridden = false;
+        for (right_function.domain.items(context.eval_pool)) |right_key| {
+            if (left_key.eql(right_key, context.eval_pool)) {
+                overridden = true;
+                break;
+            }
+        }
+        if (!overridden) {
+            context.eval_pool.values[keys_offset + count] = left_key;
+            context.eval_pool.values[entries_offset + count] =
+                left_function.entries(context.eval_pool)[left_index];
+            count += 1;
+        }
+    }
+    const right_keys = right_function.domain.items(context.eval_pool);
+    const right_entries = right_function.entries(context.eval_pool);
+    @memcpy(
+        context.eval_pool.values[keys_offset + count ..][0..right_function.len],
+        right_keys,
+    );
+    @memcpy(
+        context.eval_pool.values[entries_offset + count ..][0..right_function.len],
+        right_entries,
+    );
+    count += right_function.len;
+    return .{ .function_v = .{
+        .domain = .{
+            .offset = keys_offset,
+            .len = count,
+        },
+        .offset = entries_offset,
+        .len = count,
     } };
 }
 
@@ -1427,6 +1608,20 @@ fn value_offset(pool: *const ValuePool, pointer: [*]Value) u32 {
     return offset;
 }
 
+fn sequence_item(pool: *const ValuePool, sequence: Value, index: u32) ?Value {
+    return switch (sequence) {
+        .tuple_v => |tuple_value| if (index < tuple_value.len)
+            tuple_value.items(pool)[index]
+        else
+            null,
+        .function_v => |function| if (index < function.len)
+            function.apply(pool, .{ .int_v = @as(i64, index) + 1 })
+        else
+            null,
+        else => null,
+    };
+}
+
 fn pool_slice_offset(
     pool: *const ValuePool,
     values: []const Value,
@@ -2043,6 +2238,65 @@ test "generated finite values use only the value pool" {
     try std.testing.expectEqual(
         @as(i64, 7),
         (try field(&context, finite_record, "field")).int_v,
+    );
+
+    const left_sequence = try tuple(
+        &context,
+        &.{ .{ .int_v = 1 }, .{ .int_v = 2 } },
+    );
+    const right_sequence = try tuple(
+        &context,
+        &.{.{ .int_v = 3 }},
+    );
+    const concatenated = try sequence_concat(
+        &context,
+        left_sequence,
+        right_sequence,
+    );
+    try std.testing.expectEqual(@as(u32, 3), concatenated.tuple_v.len);
+    try std.testing.expectEqual(
+        @as(i64, 3),
+        concatenated.tuple_v.items(&pool)[2].int_v,
+    );
+
+    const singleton = try record_to(
+        &context,
+        .{ .int_v = 1 },
+        .{ .int_v = 10 },
+    );
+    const replacement = try record_to(
+        &context,
+        .{ .int_v = 1 },
+        .{ .int_v = 20 },
+    );
+    const overridden_function = try override(
+        &context,
+        singleton,
+        replacement,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 20),
+        overridden_function.function_v.apply(
+            &pool,
+            .{ .int_v = 1 },
+        ).?.int_v,
+    );
+
+    const replacement_record = try record(
+        &context,
+        &.{
+            try string(&context, "field"),
+            .{ .int_v = 9 },
+        },
+    );
+    const overridden_record = try override(
+        &context,
+        finite_record,
+        replacement_record,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 9),
+        (try field(&context, overridden_record, "field")).int_v,
     );
 }
 

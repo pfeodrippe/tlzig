@@ -382,12 +382,21 @@ pub const Evaluator = struct {
         state_pool: *ValuePool,
     ) Error!Value {
         if (expression.arg_names.len > 32) return Error.NotImplemented;
+        if (expression.arg_required.len != 0 and
+            expression.arg_required.len != expression.arg_names.len)
+        {
+            return Error.TypeError;
+        }
         var args: [32]Value = undefined;
         for (expression.arg_names, 0..) |name, index| {
             args[index] = context.lookup(name) orelse
-                return Error.UndefinedSymbol;
+                if (expression.arg_required.len == 0 or
+                    expression.arg_required[index])
+                    return Error.UndefinedSymbol
+                else
+                    Value{ .bool_v = false };
         }
-        return self.call_generated(
+        const result = try self.call_generated(
             expression.function,
             args[0..expression.arg_names.len],
             context,
@@ -395,6 +404,7 @@ pub const Evaluator = struct {
             eval_pool,
             state_pool,
         );
+        return result;
     }
 
     pub fn make_generated_expression_operator(

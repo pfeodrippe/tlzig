@@ -181,11 +181,41 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
     TLC `30.14s` / 6.55 GB; tlzig `25.90s` / 2.25 GB.
   - [x] Close both exhaustive speed gaps with generated action-expression
     entry points: one-core is 1.34x faster and all-core is 1.16x faster.
-- [ ] Current strict AOT full-run performance snapshot:
-  - ClientCentric: TLC `2.231s/2.364s`, tlzig `1.550s/1.578s`;
-  - Storage: TLC `2.828s/1.516s`, tlzig `1.777s/0.440s`;
-  - RC snapshot: TLC `5.216s/2.173s`, tlzig `6.392s/0.898s`.
-  RC snapshot single-thread remains the explicit performance blocker.
+- [~] Current strict AOT full-run performance snapshot (2026-06-27,
+  exact-label benchmark filter, generated models with `fallbacks=0` and no
+  `runtime.native` calls):
+  - ClientCentric: TLC `2.265s/2.398s`, tlzig `1.150s/1.137s`,
+    distinct `801/801`.
+  - MCM snapshot invariant/deadlock-stop: TLC `2.212s/1.744s`,
+    tlzig `0.702s/0.096s`; both stop before exhaustive completion, so
+    generated/distinct totals are traversal-order diagnostics only.
+  - MCM rc-local invariant/deadlock-stop: TLC `1.299s/1.440s`,
+    tlzig `0.140s/0.053s`; both stop before exhaustive completion.
+  - Storage: TLC `2.776s/1.444s`, tlzig `1.436s/0.220s`,
+    distinct `13370/13370`.
+  - RC no-prepare-block deadlock-stop: TLC `1.966s/1.843s`,
+    tlzig `0.696s/0.085s`; both reach TLC-compatible deadlock.
+  - RC no-prepare-block-or-ww deadlock-stop: TLC `1.900s/1.604s`,
+    tlzig `0.701s/0.107s`; both reach TLC-compatible deadlock.
+  - RC snapshot deadlock-stop: TLC `5.194s/2.401s`,
+    tlzig `4.918s/0.313s`; both stop before exhaustive completion.
+  - RC with-prepare-block deadlock-stop: TLC `1.878s/1.574s`,
+    tlzig `0.691s/0.101s`; both reach TLC-compatible deadlock.
+  All measured MultiShardTxn rows are faster in tlzig-auto. The next blocker
+  is exhaustive `CHECK_DEADLOCK FALSE` variants for every deadlock-stop row,
+  because partial generated/distinct totals are not valid coverage totals.
+- [x] Make config constant substitutions native in generated code. Applications
+  such as `AbortTransaction(n, tid)` with `AbortTransaction <- FALSE` now emit
+  the configured constant directly and do not evaluate arguments or fall back
+  through generic runtime calls.
+- [x] Make generated-expression identity traversal match generation traversal
+  for native calls and constant substitutions. This keeps strict action
+  expression lookup stable after `runtime.native` removal.
+- [x] Make benchmark label filtering exact while retaining path substring
+  filters, so `MultiShardTxn RC/no-prepare-block` no longer also runs
+  `MultiShardTxn RC/no-prepare-block-or-ww`.
+- [x] Raise benchmark value-pool budgets for RC deadlock-stop rows to avoid
+  flaky `OutOfMemory` in representative generated runs.
 - [x] Stream one-variable filters over finite function sets through resettable
   scratch storage and materialize only accepted functions. This removes
   rejected composite values from `TxnSetsAll` while preserving exact results.
@@ -249,6 +279,25 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
 - [ ] Benchmark type-specialized code against the same full TLC-valid configs
   in Debug, ReleaseFast one-core, and all-core modes. Keep specialization only
   where exact state counts/outcomes match the unspecialized checker.
+- [ ] Add profile-guided generated-model specialization on top of TypeOK.
+  - [ ] Add an instrumented model-run mode that records generated operator,
+    branch, value-tag, collection-cardinality, quantifier short-circuit, and
+    state-path frequencies into a versioned profile tied to the module/config
+    identity and generated-source hash.
+  - [ ] Merge profiles from representative one-core and all-core runs with
+    saturating counters. Reject stale or mismatched profiles.
+  - [ ] Feed the profile into strict Zig generation to order branches, inline
+    hot operators, specialize dominant finite cardinalities, select bitset
+    relation/set layouts, and move cold valid cases out of line.
+  - [ ] Never use observed profiles as type proofs. TypeOK proves which
+    representations are valid; profiles only choose among semantically
+    equivalent implementations.
+  - [ ] Experiment with LLVM instrumentation/use when supported by the pinned
+    Zig toolchain. Keep tlzig-level PGO as the deterministic fallback because
+    Zig 0.17.0-dev.857 exposes no documented PGO option in its CLI/build API.
+  - [ ] Differentially verify PGO binaries against the same unspecialized
+    generated model and Java TLC state counts/outcomes. Benchmark cold-start,
+    trained one-core, trained all-core, and cross-trained profiles.
 - [ ] Match TLC's generated count for `ClientCentricTests` (`1602/801`;
   tlzig currently reaches the same `801` distinct states with different
   generated-state accounting).
@@ -288,12 +337,81 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
 - [x] Add lazy filtered-power-set quantifier iteration with scratch rollback.
   It avoids materializing all accepted subsets before existential
   short-circuiting.
-- [ ] Finish MCInnerSerial performance work. Correct primed semantics removed
-  the false level-2 deadlock, but the full one-core run was stopped after
-  `934.59s`; sampling shows `Serializable'` still spends almost all CPU in
-  finite-relation totality/transitivity quantifiers. Lower finite relations to
-  generated bitsets, using TypeOK-derived record layouts, and rerun the full
-  TLC/tlzig one-core and all-core comparison.
+- [x] Finish MCInnerSerial native performance work.
+  - Fixed generated `variable_path` to honor `read_primed`, matching
+    `variable()`/`primed_variable()` for indexed reads inside primed
+    expressions. This removed the crossed `opQ'`/`opOrder'` false deadlock.
+  - Re-enabled the filtered-power-set quantifier shortcut after proving the
+    rejection was the primed indexed-read bug.
+  - Added strict total-order recognition for existential quantification over
+    `{R \in SUBSET (X \X X) : connex /\ transitive /\ irreflexive}`. The
+    generated model lowers it to `exists_total_order_relation`, enumerating
+    `|X|!` permutation orders instead of `2^(|X|^2)` subsets.
+  - Verified strict generated MCInnerSerial: `fallback_count=0`, exact Java TLC
+    parity `6181 generated / 195 distinct`.
+  - Clean tlzig timings after removing debug probes:
+    one-worker `0.73s`, auto-workers `0.06s`, peak RSS about `19MB/35MB`.
+    Previous Java TLC baseline was about `304.85s` one-worker for the same
+    config.
+- [x] Add no-clone generated comparisons for indexed state reads.
+  - `var[keys...] = rhs` and `var[keys...] # rhs` now lower to
+    `variable_path_equal_bool` / `variable_path_not_equal_bool`, resolving the
+    path in its source pool and comparing via `Value.eql_cross_pool` instead of
+    cloning the leaf into the eval pool.
+  - `field(var[keys...], name) = rhs` and `#` now lower to
+    `variable_path_field_equal_bool` / `variable_path_field_not_equal_bool`,
+    comparing the selected record field in its source pool without cloning the
+    whole record.
+  - MCInnerSerial remains exact at `6181/195`; generated code now has three
+    no-clone path comparisons plus field-fused sites. Timing remains about
+    `0.69s`, as expected because total-order enumeration dominates this spec's
+    gain.
+  - MDBTLA `MCMultiShardTxn_RC_snapshot` generates 116 no-clone path/field
+    comparisons with `fallback_count=0` and remains exact on the one-worker
+    deadlock-stop frontier: `245844 generated / 84692 distinct`, about
+    `4.87s`.
+- [x] Replace `Value.eql`'s `std.meta.eql` identical-representation fast path
+  with explicit `same_repr` payload checks. This preserves the structural
+  fallback and removes a measurable generic-union comparison cost:
+  MCInnerSerial one-worker improved from about `0.72s` to `0.68s`; MDBTLA
+  RC/snapshot remains exact at `245844/84692` and about `4.89s`.
+- [x] Skip invariant reevaluation for duplicate canonical states. State
+  invariants are checked when a canonical state is first inserted; repeated
+  successors with the same fingerprint reuse that already-checked state.
+- [x] Add no-clone generated comparisons for bare state roots:
+  `x = rhs` and `x # rhs` now lower to `variable_equal_bool` /
+  `variable_not_equal_bool` when exactly one side is a state variable. The
+  runtime resolves the root in its source pool and compares with
+  `Value.eql_cross_pool` instead of cloning the whole root into `eval_pool`.
+- [x] Compare generated `UNCHANGED variable` cross-pool without cloning both
+  roots. `Value.eql_cross_pool` now has the same-representation fast path for
+  same-pool values, so borrowed unchanged canonical roots return immediately.
+- [x] Re-validate strict generated benchmarks after these changes:
+  - `MCMultiShardTxn_RC_snapshot`: TLC `5.257s/2.159s`, tlzig
+    `4.794s/0.346s`, deadlock-stop frontier `245844/84692`.
+  - `MCInnerSerial`: TLC `300.209s/32.068s`, tlzig `0.984s/0.112s`, exact
+    `6181/195`.
+- [ ] Implement native/typed state commit for MDBTLA-class specs.
+  Expression-side wins are now mostly exhausted for RC/snapshot. The remaining
+  one-worker cost and `~400MB` RSS are dominated by `commit_state` cloning
+  changed `Value` trees into the candidate store. Use TypeOK-derived layouts
+  and per-successor canonicalization to replace recursive clones with flat
+  typed copies, preserving exact canonical fingerprints and parallel safety.
+- [ ] Review stash `aaaa` follow-ups.
+  - Keep: primed `variable_path` semantics, strict total-order lowering, and
+    indexed no-clone path comparisons were good ideas and have been extracted
+    into the working tree.
+  - Keep, constrained: bare-variable comparison now lands only for one-sided
+    state-root equality/inequality and is covered by strict generated
+    RC/snapshot and MCInnerSerial benchmark runs.
+  - Do not apply wholesale: the candidate-store borrowing/successor callback
+    pipeline in the stash still changes value lifetimes across evaluator-pool
+    restores and the prepared parallel path. Revisit only through a smaller
+    typed-state commit design with differential tests.
+  - Defer: native candidate-store borrowing / successor callback pipeline may
+    attack the MDBTLA commit-state clone hotspot, but it changes state-value
+    lifetime semantics and must not be merged without exact canonicalization,
+    invariant, and parallel-worker tests.
 - [ ] Payment-channel model (reported about two hours / 1,131,490 states):
   https://conf.tlapl.us/2021/MatthiasGrundmann-talk.pdf
 - [ ] Snapshot-isolation database model (reported 44 minutes with three keys):

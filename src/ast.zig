@@ -12,6 +12,17 @@ pub const Module = struct {
     init_name: []const u8,
     next_name: []const u8,
     invariants: []const []const u8,
+    config_replacements: []const ConfigReplacement = &.{},
+};
+
+pub const ConfigReplacement = struct {
+    name: []const u8,
+    value: []const u8,
+    is_substitution: bool = false,
+    kind: enum(u8) {
+        alias,
+        constant,
+    },
 };
 
 pub const Instance = struct {

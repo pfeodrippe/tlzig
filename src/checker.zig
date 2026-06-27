@@ -1175,20 +1175,22 @@ pub const Checker = struct {
                     self.canonical_states[state_idx] = true;
                 }
             }
-            const invariant_snapshot = eval_pool.snapshot();
-            const invariants_hold = try self.check_invariants_with(
-                evaluator,
-                eval_pool,
-                self.state_store.get(state_idx),
-            );
-            eval_pool.restore(invariant_snapshot);
-            if (!invariants_hold) {
-                std.debug.print(
-                    "InvariantViolated generated={d} distinct={d}\n",
-                    .{ self.generated, self.distinct },
+            if (is_new) {
+                const invariant_snapshot = eval_pool.snapshot();
+                const invariants_hold = try self.check_invariants_with(
+                    evaluator,
+                    eval_pool,
+                    self.state_store.get(state_idx),
                 );
-                self.print_trace(state_idx);
-                return Error.InvariantViolated;
+                eval_pool.restore(invariant_snapshot);
+                if (!invariants_hold) {
+                    std.debug.print(
+                        "InvariantViolated generated={d} distinct={d}\n",
+                        .{ self.generated, self.distinct },
+                    );
+                    self.print_trace(state_idx);
+                    return Error.InvariantViolated;
+                }
             }
             if (is_new and !self.queue.enqueue(state_idx)) {
                 return Error.StateSpaceExhausted;
@@ -1283,7 +1285,10 @@ pub const Checker = struct {
                     self.initial_states[state_idx] = true;
                 }
             }
-            const invariants_hold = try self.check_invariants(self.state_store.get(state_idx));
+            const invariants_hold = if (is_new)
+                try self.check_invariants(self.state_store.get(state_idx))
+            else
+                true;
             self.eval_pool.restore(snap);
             if (!invariants_hold) {
                 std.debug.print("InvariantViolated generated={d} distinct={d}\n", .{ self.generated, self.distinct });
@@ -1358,6 +1363,12 @@ pub const Checker = struct {
                     &candidate_store.values_pool,
                     @intCast(variable_index),
                 );
+                assert(Value.eql_cross_pool(
+                    source,
+                    &candidate_store.values_pool,
+                    target.*,
+                    &self.state_store.values_pool,
+                ));
             } else {
                 target.* = self.state_store.get(parent_idx.?).values[variable_index];
             }
@@ -1378,7 +1389,8 @@ pub const Checker = struct {
             );
         }
         switch (source) {
-            .bool_v, .int_v, .model_v, .string_v, .range_v => {
+            .bool_v, .int_v, .model_v, .range_v => return source,
+            .string_v => {
                 return source.clone(
                     source_pool,
                     &self.state_store.values_pool,

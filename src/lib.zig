@@ -1,4 +1,5 @@
 pub const Arena = @import("arena.zig").Arena;
+pub const ast = @import("ast.zig");
 pub const Error = @import("err.zig").Error;
 pub const checker = @import("checker.zig");
 pub const codegen = @import("codegen.zig");

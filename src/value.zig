@@ -2,6 +2,59 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Arena = @import("arena.zig").Arena;
 
+pub inline fn same_repr(a: Value, b: Value) bool {
+    return switch (a) {
+        .bool_v => |value| b == .bool_v and value == b.bool_v,
+        .int_v => |value| b == .int_v and value == b.int_v,
+        .model_v => |value| b == .model_v and value == b.model_v,
+        .string_v => |value| b == .string_v and
+            value.offset == b.string_v.offset and value.len == b.string_v.len,
+        .set_v => |value| b == .set_v and
+            value.offset == b.set_v.offset and value.len == b.set_v.len,
+        .function_v => |value| b == .function_v and
+            value.offset == b.function_v.offset and
+            value.len == b.function_v.len and
+            value.domain.offset == b.function_v.domain.offset and
+            value.domain.len == b.function_v.domain.len,
+        .tuple_v => |value| b == .tuple_v and
+            value.offset == b.tuple_v.offset and value.len == b.tuple_v.len,
+        .record_v => |value| b == .record_v and
+            value.offset == b.record_v.offset and value.len == b.record_v.len,
+        .range_v => |value| b == .range_v and
+            value.lo == b.range_v.lo and value.hi == b.range_v.hi,
+        .union_v => |value| b == .union_v and
+            value.set_offset == b.union_v.set_offset,
+        .cup_v => |value| b == .cup_v and
+            value.left_offset == b.cup_v.left_offset and
+            value.right_offset == b.cup_v.right_offset,
+        .cap_v => |value| b == .cap_v and
+            value.left_offset == b.cap_v.left_offset and
+            value.right_offset == b.cap_v.right_offset,
+        .diff_v => |value| b == .diff_v and
+            value.left_offset == b.diff_v.left_offset and
+            value.right_offset == b.diff_v.right_offset,
+        .power_set_v => |value| b == .power_set_v and
+            value.set_offset == b.power_set_v.set_offset,
+        .function_set_v => |value| b == .function_set_v and
+            value.domain_offset == b.function_set_v.domain_offset and
+            value.codomain_offset == b.function_set_v.codomain_offset,
+        .record_set_v => |value| b == .record_set_v and
+            value.offset == b.record_set_v.offset and
+            value.len == b.record_set_v.len,
+        .tuple_set_v => |value| b == .tuple_set_v and
+            value.offset == b.tuple_set_v.offset and
+            value.len == b.tuple_set_v.len,
+        .seq_set_v => |value| b == .seq_set_v and
+            value.element_set_offset == b.seq_set_v.element_set_offset,
+        .generated_operator_v => |value| b == .generated_operator_v and
+            value.function_address == b.generated_operator_v.function_address and
+            value.arity == b.generated_operator_v.arity and
+            value.captured_offset == b.generated_operator_v.captured_offset and
+            value.captured_len == b.generated_operator_v.captured_len,
+        .lambda_v => false,
+    };
+}
+
 pub const ValueTag = enum(u8) {
     bool_v,
     int_v,
@@ -291,7 +344,7 @@ pub const Value = union(ValueTag) {
         const tag_a = std.meta.activeTag(a);
         const tag_b = std.meta.activeTag(b);
         const tags_equal = tag_a == tag_b;
-        if (tags_equal and a != .lambda_v and std.meta.eql(a, b)) {
+        if (tags_equal and a != .lambda_v and same_repr(a, b)) {
             return true;
         }
         return switch (a) {
@@ -345,6 +398,12 @@ pub const Value = union(ValueTag) {
         right_pool: *const ValuePool,
     ) bool {
         if (left.tag() != right.tag()) return false;
+        if (left_pool == right_pool and
+            left != .lambda_v and
+            same_repr(left, right))
+        {
+            return true;
+        }
         return switch (left) {
             .bool_v => |value_v| value_v == right.bool_v,
             .int_v => |value_v| value_v == right.int_v,
@@ -1109,6 +1168,8 @@ pub const ValuePool = struct {
     /// Whether this pool is allowed to grow its backing arrays.
     growable: bool = true,
     string_intern_slots: []String = &.{},
+    string_intern_log: []u32 = &.{},
+    string_intern_count: u32 = 0,
 
     pub fn init(arena: *Arena, value_cap: u32, string_cap: u32) !ValuePool {
         assert(value_cap > 0);
@@ -1134,6 +1195,7 @@ pub const ValuePool = struct {
         assert(slot_count >= 2);
         assert(std.math.isPowerOfTwo(slot_count));
         self.string_intern_slots = try self.arena.alloc(String, slot_count);
+        self.string_intern_log = try self.arena.alloc(u32, slot_count);
         @memset(self.string_intern_slots, .{
             .offset = std.math.maxInt(u32),
             .len = 0,
@@ -1222,6 +1284,11 @@ pub const ValuePool = struct {
                 if (slot.offset == std.math.maxInt(u32)) {
                     const interned = try self.push_string_uninterned(s);
                     slot.* = interned;
+                    assert(self.string_intern_count <
+                        self.string_intern_log.len);
+                    self.string_intern_log[self.string_intern_count] =
+                        @intCast(slot_index);
+                    self.string_intern_count += 1;
                     return interned;
                 }
                 if (std.mem.eql(u8, slot.slice(self), s)) return slot.*;
@@ -1252,12 +1319,26 @@ pub const ValuePool = struct {
         return .{
             .value_count = self.value_count,
             .string_count = self.string_count,
+            .string_intern_count = self.string_intern_count,
         };
     }
 
     pub fn restore(self: *ValuePool, snap: Snapshot) void {
         assert(snap.value_count <= self.value_cap);
         assert(snap.string_count <= self.string_cap);
+        assert(snap.string_intern_count <= self.string_intern_count);
+        while (self.string_intern_count >
+            snap.string_intern_count)
+        {
+            self.string_intern_count -= 1;
+            const slot_index =
+                self.string_intern_log[self.string_intern_count];
+            assert(slot_index < self.string_intern_slots.len);
+            self.string_intern_slots[slot_index] = .{
+                .offset = std.math.maxInt(u32),
+                .len = 0,
+            };
+        }
         self.value_count = snap.value_count;
         self.string_count = snap.string_count;
     }
@@ -1265,6 +1346,7 @@ pub const ValuePool = struct {
     pub const Snapshot = struct {
         value_count: u32,
         string_count: u32,
+        string_intern_count: u32,
     };
 };
 

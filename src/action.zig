@@ -464,6 +464,15 @@ pub const ActionCompiler = struct {
         return CompiledNext{ .steps = try self.dup_slice(ActionStep, steps.items) };
     }
 
+    fn is_constant_replacement(self: ActionCompiler, name: []const u8) bool {
+        for (self.evaluator.module.config_replacements) |replacement| {
+            if (std.mem.eql(u8, replacement.name, name)) {
+                return replacement.kind == .constant;
+            }
+        }
+        return false;
+    }
+
     fn compile_expr(self: ActionCompiler, expr: *ast.Expr) !CompiledExpr {
         const identity = codegen.find_expression_identity(
             self.evaluator.module,
@@ -533,6 +542,7 @@ pub const ActionCompiler = struct {
         switch (expr.*) {
             .primed, .primed_expr, .unchanged, .unchanged_expr => return true,
             .ident => |name| {
+                if (self.is_constant_replacement(name)) return false;
                 if (self.evaluator.find_constant(name) != null) return false;
                 if (self.evaluator.find_definition(name)) |def| return self.is_action_expr_inner(def.body);
                 return false;
@@ -557,6 +567,9 @@ pub const ActionCompiler = struct {
                         return ap.args.len == 2 and
                             self.is_action_expr(ap.args[0]) and
                             self.is_action_expr(ap.args[1]);
+                    }
+                    if (self.is_constant_replacement(ap.func.*.ident)) {
+                        return false;
                     }
                     if (self.evaluator.find_constant(ap.func.*.ident) != null) {
                         return false;
@@ -757,26 +770,49 @@ pub const ActionCompiler = struct {
                     try self.collect_steps(body, steps, is_init);
                     return;
                 }
-                for (l.defs) |def| {
-                    const use_generated_operator =
-                        def.params.len > 0 and
-                        self.evaluator.generated_expression_count() > 0;
-                    const binding = if (def.params.len > 0 and
-                        !use_generated_operator)
-                        try self.lambda_expr(def.params, def.body)
-                    else
-                        def.body;
-                    try steps.append(
-                        std.heap.page_allocator,
-                        ActionStep{ .let_bind = .{
-                            .name = def.name,
-                            .expr = try self.compile_expr(binding),
-                            .operator_arity = if (use_generated_operator)
-                                @intCast(def.params.len)
-                            else
-                                null,
-                        } },
+                if (l.body.* == .binary and
+                    l.body.binary.op == .and_op)
+                {
+                    var operands: [256]*ast.Expr = undefined;
+                    var operand_count: usize = 0;
+                    flatten_conjunction(
+                        l.body,
+                        &operands,
+                        &operand_count,
                     );
+                    var emitted: [64]bool = @splat(false);
+                    for (operands[0..operand_count]) |operand| {
+                        var required: [64]bool = @splat(false);
+                        for (l.defs, 0..) |def, definition_index| {
+                            if (codegen.expression_references_identifier(
+                                operand,
+                                def.name,
+                            )) {
+                                mark_required_let_bindings(
+                                    l,
+                                    definition_index,
+                                    &required,
+                                );
+                            }
+                        }
+                        for (l.defs, 0..) |def, definition_index| {
+                            if (!required[definition_index] or
+                                emitted[definition_index])
+                            {
+                                continue;
+                            }
+                            try self.append_generated_let_binding(
+                                steps,
+                                def,
+                            );
+                            emitted[definition_index] = true;
+                        }
+                        try self.collect_steps(operand, steps, is_init);
+                    }
+                    return;
+                }
+                for (l.defs) |def| {
+                    try self.append_generated_let_binding(steps, def);
                 }
                 try self.collect_steps(l.body, steps, is_init);
             },
@@ -806,6 +842,13 @@ pub const ActionCompiler = struct {
                         return;
                     }
                     if (self.evaluator.find_constant(func_name) != null) {
+                        try steps.append(
+                            std.heap.page_allocator,
+                            ActionStep{ .condition = try self.compile_expr(expr) },
+                        );
+                        return;
+                    }
+                    if (self.is_constant_replacement(func_name)) {
                         try steps.append(
                             std.heap.page_allocator,
                             ActionStep{ .condition = try self.compile_expr(expr) },
@@ -890,6 +933,32 @@ pub const ActionCompiler = struct {
         }
     }
 
+    fn append_generated_let_binding(
+        self: ActionCompiler,
+        steps: *std.ArrayList(ActionStep),
+        def: ast.Definition,
+    ) !void {
+        const use_generated_operator =
+            def.params.len > 0 and
+            self.evaluator.generated_expression_count() > 0;
+        const binding = if (def.params.len > 0 and
+            !use_generated_operator)
+            try self.lambda_expr(def.params, def.body)
+        else
+            def.body;
+        try steps.append(
+            std.heap.page_allocator,
+            ActionStep{ .let_bind = .{
+                .name = def.name,
+                .expr = try self.compile_expr(binding),
+                .operator_arity = if (use_generated_operator)
+                    @intCast(def.params.len)
+                else
+                    null,
+            } },
+        );
+    }
+
     fn lambda_expr(self: ActionCompiler, params: []const []const u8, body: *ast.Expr) !*ast.Expr {
         assert(params.len > 0);
         const lambda = try self.arena.alloc_object(ast.Lambda);
@@ -933,6 +1002,47 @@ pub const ActionCompiler = struct {
         return copy;
     }
 };
+
+fn flatten_conjunction(
+    expr: *ast.Expr,
+    operands: *[256]*ast.Expr,
+    count: *usize,
+) void {
+    if (expr.* == .binary and expr.binary.op == .and_op) {
+        flatten_conjunction(expr.binary.left, operands, count);
+        flatten_conjunction(expr.binary.right, operands, count);
+        return;
+    }
+    assert(count.* < operands.len);
+    operands[count.*] = expr;
+    count.* += 1;
+}
+
+fn mark_required_let_bindings(
+    let_value: *const ast.LetIn,
+    definition_index: usize,
+    required: *[64]bool,
+) void {
+    assert(definition_index < let_value.defs.len);
+    if (required[definition_index]) return;
+    required[definition_index] = true;
+    const body = let_value.defs[definition_index].body;
+    for (let_value.defs[0..definition_index], 0..) |
+        dependency,
+        dependency_index,
+    | {
+        if (codegen.expression_references_identifier(
+            body,
+            dependency.name,
+        )) {
+            mark_required_let_bindings(
+                let_value,
+                dependency_index,
+                required,
+            );
+        }
+    }
+}
 
 pub const ActionExecutor = struct {
     evaluator: Evaluator,
@@ -1309,6 +1419,12 @@ pub const ActionExecutor = struct {
                         self.eval_pool,
                         &self.candidate_store.values_pool,
                     );
+                    assert(Value.eql_cross_pool(
+                        assigned.value,
+                        self.eval_pool,
+                        destination.*,
+                        &self.candidate_store.values_pool,
+                    ));
                 } else if (s0) |parent| {
                     destination.* = parent.values[variable_index];
                     const parent_pool = parent.value_pool(

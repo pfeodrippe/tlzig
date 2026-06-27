@@ -1,6 +1,7 @@
 const std = @import("std");
 const tlzig = @import("tlzig");
 const Arena = tlzig.Arena;
+const ast = tlzig.ast;
 const checker = tlzig.checker;
 const config = tlzig.config;
 const ModuleLoader = tlzig.ModuleLoader;
@@ -99,6 +100,7 @@ const specs = [_]Spec{
         .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
         .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block.cfg",
         .max_states = 20_000,
+        .state_values_per_state = 120,
         .compare_generated = false,
         .compare_distinct = false,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -109,6 +111,7 @@ const specs = [_]Spec{
         .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
         .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_or_ww.cfg",
         .max_states = 20_000,
+        .state_values_per_state = 120,
         .compare_generated = false,
         .compare_distinct = false,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -130,6 +133,7 @@ const specs = [_]Spec{
         .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
         .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_with_prepare_block.cfg",
         .max_states = 20_000,
+        .state_values_per_state = 120,
         .compare_generated = false,
         .compare_distinct = false,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -164,10 +168,13 @@ pub fn main(init: std.process.Init.Minimal) void {
     var failures: u32 = 0;
     for (specs) |spec| {
         if (filter) |needle| {
+            const label_matches = if (spec.label) |label|
+                std.mem.eql(u8, label, needle)
+            else
+                false;
             if (std.mem.indexOf(u8, spec.tla, needle) == null and
                 std.mem.indexOf(u8, spec.cfg, needle) == null and
-                (spec.label == null or
-                    std.mem.indexOf(u8, spec.label.?, needle) == null))
+                !label_matches)
             {
                 continue;
             }
@@ -298,7 +305,7 @@ fn run_tlzig_internal(
         "vendor/tlaplus-examples/specifications",
     };
     const loader = ModuleLoader.init(&arena, &search_paths);
-    const module = loader.load(spec.tla) catch |err| {
+    var module = loader.load(spec.tla) catch |err| {
         std.debug.print("failed to load spec {s}: {any}\n", .{ spec.tla, err });
         return error.LoadFailed;
     };
@@ -310,6 +317,7 @@ fn run_tlzig_internal(
         std.debug.print("failed to parse cfg {s}: {any}\n", .{ spec.cfg, err });
         return error.LoadFailed;
     };
+    module.config_replacements = try build_codegen_replacements(&arena, cfg);
 
     const override_ctx = overrides.OverrideContext{
         .max_seq_len = 5,
@@ -420,6 +428,31 @@ fn generated_matches(module_name: []const u8, cfg: config.Config) bool {
         if (!generated_root_covered(name)) return false;
     }
     return true;
+}
+
+fn build_codegen_replacements(
+    arena: *Arena,
+    cfg: config.Config,
+) ![]const ast.ConfigReplacement {
+    if (cfg.constants.len == 0) return &.{};
+    const replacements = try arena.alloc(
+        ast.ConfigReplacement,
+        cfg.constants.len,
+    );
+    for (cfg.constants, replacements) |assignment, *replacement| {
+        const value = std.mem.trim(u8, assignment.expr, " \t");
+        replacement.* = .{
+            .name = assignment.name,
+            .value = value,
+            .is_substitution = assignment.is_substitution,
+            .kind = if (assignment.is_substitution and
+                config.is_operator_alias(value))
+                .alias
+            else
+                .constant,
+        };
+    }
+    return replacements;
 }
 
 fn generated_root_covered(optional_name: ?[]const u8) bool {

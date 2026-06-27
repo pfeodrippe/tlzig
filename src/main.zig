@@ -1,6 +1,7 @@
 const std = @import("std");
 const tlzig = @import("tlzig");
 const Arena = tlzig.Arena;
+const ast = tlzig.ast;
 const config = tlzig.config;
 const checker = tlzig.checker;
 const codegen = tlzig.codegen;
@@ -138,7 +139,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         "vendor/tlaplus-examples/specifications",
     };
     const loader = ModuleLoader.init(&arena, &search_paths);
-    const module = loader.load(spec_path_v) catch |err| {
+    var module = loader.load(spec_path_v) catch |err| {
         std.debug.print("failed to load spec: {any}\n", .{err});
         std.process.exit(1);
     };
@@ -156,6 +157,13 @@ pub fn main(init: std.process.Init.Minimal) void {
         defer roots.deinit(std.heap.page_allocator);
         if (default_cfg) {
             const cfg = config.Config.from_module(&arena, module);
+            module.config_replacements = build_codegen_replacements(
+                &arena,
+                cfg,
+            ) catch {
+                std.debug.print("failed to allocate config replacements\n", .{});
+                std.process.exit(1);
+            };
             append_config_roots(&roots, cfg) catch {
                 std.debug.print("failed to allocate config roots\n", .{});
                 std.process.exit(1);
@@ -167,6 +175,13 @@ pub fn main(init: std.process.Init.Minimal) void {
             };
             const cfg = config.parse(&arena, cfg_source) catch {
                 std.debug.print("failed to parse config\n", .{});
+                std.process.exit(1);
+            };
+            module.config_replacements = build_codegen_replacements(
+                &arena,
+                cfg,
+            ) catch {
+                std.debug.print("failed to allocate config replacements\n", .{});
                 std.process.exit(1);
             };
             append_config_roots(&roots, cfg) catch {
@@ -234,6 +249,10 @@ pub fn main(init: std.process.Init.Minimal) void {
             std.process.exit(1);
         };
     };
+    module.config_replacements = build_codegen_replacements(&arena, cfg) catch {
+        std.debug.print("failed to allocate config replacements\n", .{});
+        std.process.exit(1);
+    };
     if (generated_model.generated_count > 0 and
         !generated_config_covers(cfg))
     {
@@ -297,6 +316,31 @@ pub fn main(init: std.process.Init.Minimal) void {
     };
 
     _ = std.c.printf("generated=%llu distinct=%llu\n", result.generated, result.distinct);
+}
+
+fn build_codegen_replacements(
+    arena: *Arena,
+    cfg: config.Config,
+) ![]const ast.ConfigReplacement {
+    if (cfg.constants.len == 0) return &.{};
+    const replacements = try arena.alloc(
+        ast.ConfigReplacement,
+        cfg.constants.len,
+    );
+    for (cfg.constants, replacements) |assignment, *replacement| {
+        const value = std.mem.trim(u8, assignment.expr, " \t");
+        replacement.* = .{
+            .name = assignment.name,
+            .value = value,
+            .is_substitution = assignment.is_substitution,
+            .kind = if (assignment.is_substitution and
+                config.is_operator_alias(value))
+                .alias
+            else
+                .constant,
+        };
+    }
+    return replacements;
 }
 
 fn format_zig(

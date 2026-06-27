@@ -8,6 +8,21 @@ pub const ConstantAssignment = struct {
     is_substitution: bool,
 };
 
+pub fn is_operator_alias(expr: []const u8) bool {
+    const trimmed = std.mem.trim(u8, expr, " \t");
+    if (trimmed.len == 0) return false;
+    if (std.mem.eql(u8, trimmed, "TRUE") or
+        std.mem.eql(u8, trimmed, "FALSE"))
+    {
+        return false;
+    }
+    if (!std.ascii.isAlphabetic(trimmed[0])) return false;
+    for (trimmed[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_') return false;
+    }
+    return true;
+}
+
 pub const Config = struct {
     spec_name: ?[]const u8,
     init_name: ?[]const u8,

@@ -934,6 +934,44 @@ test "same-line implication stays inside its bullet item" {
     try std.testing.expect(!result.is_truthy());
 }
 
+test "parenthesized implication can return a bulleted conjunction" {
+    const source =
+        \\---------------------- MODULE TestParenthesizedImpliesList ----------------------
+        \\EXTENDS Naturals
+        \\WC == "majority"
+        \\epoch == 1
+        \\commitIndex == 2
+        \\WriteCanSucceed(token) ==
+        \\    /\ TRUE
+        \\    /\ (WC = "majority" =>
+        \\        /\ token.epoch = epoch
+        \\        /\ token.checkpoint <= commitIndex)
+        \\Ok == WriteCanSucceed([epoch |-> 1, checkpoint |-> 2])
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 128, 64);
+    var state_pool = try value.ValuePool.init(&arena, 128, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(
+        ok.body,
+        eval.Context.empty(),
+        null,
+        &pool,
+        &state_pool,
+    );
+    try std.testing.expect(result.is_truthy());
+}
+
 test "inline first bullet may dedent to the definition list column" {
     const source =
         \\---------------------- MODULE TestDedentedList ----------------------
@@ -1649,6 +1687,147 @@ test "parameterized namespace call flattens instance and operator arguments" {
     try std.testing.expectEqual(@as(usize, 6), expression.apply.args.len);
 }
 
+test "MDBProps parses through parenthesized bag infix operators" {
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    const source = try read_test_file(
+        &arena,
+        "vendor/MDBTLA/SingleLog/MDBProps.tla",
+    );
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    try expect_definition(module, "WriteCanSucceed");
+    try expect_definition(module, "AddToBag");
+    try expect_definition(module, "RemoveFromBag");
+    try expect_definition(module, "PointsValid");
+    try expect_definition(module, "CommitIndexImpliesDurability");
+    try expect_definition(module, "WritesEventuallyComplete");
+    try expect_definition(module, "ObsoleteValues");
+    try expect_definition(module, "StrongConsistencyCommittedWritesDurable");
+    try expect_definition(module, "ReadYourWrites");
+}
+
+test "parse parenthesized minus infix expression" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    const expression = try parser.Parser.parse_expr_string(
+        &arena,
+        "bag (-) SetToBag({elem})",
+    );
+    try std.testing.expect(expression.* == .apply);
+    try std.testing.expect(expression.apply.func.* == .ident);
+    try std.testing.expectEqualStrings("(-)", expression.apply.func.ident);
+}
+
+test "leads-to property stops before following definition" {
+    const source =
+        \\---------------------- MODULE TestLeadsToBoundary ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE writeHistory
+        \\WritesEventuallyComplete ==
+        \\    \A token \in SessionTokens :
+        \\        /\ \E record \in DOMAIN writeHistory :
+        \\            /\ record.token = token
+        \\            /\ record.state = WriteInitState
+        \\        ~>
+        \\        /\ \E record \in DOMAIN writeHistory :
+        \\            /\ record.token = token
+        \\            /\ record.state \in {
+        \\                WriteSucceededState,
+        \\                WriteFailedState
+        \\               }
+        \\
+        \\---------------------------------------------------------------------
+        \\
+        \\ObsoleteValues(key) ==
+        \\    { log[i].value : i \in { i \in DOMAIN log :
+        \\        /\ i <= readIndex
+        \\        /\ log[i].key = key
+        \\        /\ \E j \in (i+1)..readIndex : log[j].key = key } }
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    try expect_definition(module, "WritesEventuallyComplete");
+    for (module.definitions) |definition| {
+        if (std.mem.eql(u8, definition.name, "WritesEventuallyComplete") and
+            expr_contains_ident(definition.body, "ObsoleteValues"))
+        {
+            return error.NextDefinitionConsumed;
+        }
+    }
+    try expect_definition(module, "ObsoleteValues");
+}
+
+test "set map value may be a function path" {
+    const source =
+        \\---------------------- MODULE TestSetMapPathValue ----------------------
+        \\EXTENDS Naturals
+        \\ObsoleteValues(key) ==
+        \\    { log[i].value : i \in { i \in DOMAIN log :
+        \\        /\ i <= readIndex
+        \\        /\ log[i].key = key
+        \\        /\ \E j \in (i+1)..readIndex : log[j].key = key } }
+        \\After == TRUE
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    try expect_definition(module, "ObsoleteValues");
+    try expect_definition(module, "After");
+}
+
+test "bulleted existential expression parses after leads-to" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    const expression = try parser.Parser.parse_expr_string(&arena,
+        \\/\ \E record \in DOMAIN writeHistory :
+        \\    /\ record.token = token
+        \\    /\ record.state \in {
+        \\        WriteSucceededState,
+        \\        WriteFailedState
+        \\       }
+    );
+    try std.testing.expect(expression.* == .quantifier or expression.* == .binary);
+}
+
+test "leads-to accepts bulleted existential RHS" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    const expression = try parser.Parser.parse_expr_string(&arena,
+        \\/\ \E record \in DOMAIN writeHistory :
+        \\    /\ record.token = token
+        \\    /\ record.state = WriteInitState
+        \\~>
+        \\/\ \E record \in DOMAIN writeHistory :
+        \\    /\ record.token = token
+        \\    /\ record.state \in {
+        \\        WriteSucceededState,
+        \\        WriteFailedState
+        \\       }
+    );
+    try std.testing.expect(expr_contains_ident(expression, "WriteFailedState"));
+}
+
+test "MDBProps loader keeps definitions after bag infix operators" {
+    var arena = try Arena.init(32 * 1024 * 1024);
+    defer arena.deinit();
+    const search_paths = [_][]const u8{
+        "vendor/MDBTLA/SingleLog",
+        "vendor/tlaplus/tlatools/org.lamport.tlatools/src/tla2sany/StandardModules",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = try loader.load("vendor/MDBTLA/SingleLog/MDBProps.tla");
+    try expect_definition(module, "WriteCanSucceed");
+    try expect_definition(module, "ReadYourWrites");
+}
+
 test "action composition publishes only the second action result" {
     const source =
         \\---------------------- MODULE TestActionComposition ----------------------
@@ -2037,6 +2216,20 @@ fn find_definition(module: @import("ast.zig").Module, name: []const u8) bool {
         if (std.mem.eql(u8, definition.name, name)) return true;
     }
     return false;
+}
+
+fn expect_definition(
+    module: @import("ast.zig").Module,
+    name: []const u8,
+) !void {
+    if (find_definition(module, name)) return;
+    std.debug.print("missing parsed definition: {s}\n", .{name});
+    std.debug.print("parsed definitions:", .{});
+    for (module.definitions) |definition| {
+        std.debug.print(" {s}", .{definition.name});
+    }
+    std.debug.print("\n", .{});
+    return error.MissingParsedDefinition;
 }
 
 fn expr_contains_ident(expr: *const @import("ast.zig").Expr, name: []const u8) bool {

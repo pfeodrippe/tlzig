@@ -327,6 +327,105 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
     }
 }
 
+fn inline_local_operator_call(
+    arena: *Arena,
+    expr: *ast.Expr,
+    definition: ast.Definition,
+) !*ast.Expr {
+    switch (expr.*) {
+        .apply => |application| {
+            const new_args = try arena.alloc(*ast.Expr, application.args.len);
+            for (application.args, 0..) |argument, index| {
+                new_args[index] = try inline_local_operator_call(
+                    arena,
+                    argument,
+                    definition,
+                );
+            }
+            if (application.func.* == .ident and
+                std.mem.eql(u8, application.func.ident, definition.name) and
+                application.args.len == definition.params.len)
+            {
+                return inline_expr(
+                    arena,
+                    definition.body,
+                    definition.params,
+                    new_args,
+                );
+            }
+            const apply = try arena.alloc_object(ast.Apply);
+            apply.* = .{
+                .func = try inline_local_operator_call(
+                    arena,
+                    application.func,
+                    definition,
+                ),
+                .args = new_args,
+            };
+            const ptr = try arena.alloc_object(ast.Expr);
+            ptr.* = .{ .apply = apply };
+            return ptr;
+        },
+        .binary => |binary| {
+            const copy = try arena.alloc_object(ast.Binary);
+            copy.* = .{
+                .op = binary.op,
+                .left = try inline_local_operator_call(
+                    arena,
+                    binary.left,
+                    definition,
+                ),
+                .right = try inline_local_operator_call(
+                    arena,
+                    binary.right,
+                    definition,
+                ),
+            };
+            const ptr = try arena.alloc_object(ast.Expr);
+            ptr.* = .{ .binary = copy };
+            return ptr;
+        },
+        .unary => |unary| {
+            const copy = try arena.alloc_object(ast.Unary);
+            copy.* = .{
+                .op = unary.op,
+                .operand = try inline_local_operator_call(
+                    arena,
+                    unary.operand,
+                    definition,
+                ),
+            };
+            const ptr = try arena.alloc_object(ast.Expr);
+            ptr.* = .{ .unary = copy };
+            return ptr;
+        },
+        .if_then_else => |conditional| {
+            const copy = try arena.alloc_object(ast.IfThenElse);
+            copy.* = .{
+                .cond = try inline_local_operator_call(
+                    arena,
+                    conditional.cond,
+                    definition,
+                ),
+                .then_branch = try inline_local_operator_call(
+                    arena,
+                    conditional.then_branch,
+                    definition,
+                ),
+                .else_branch = try inline_local_operator_call(
+                    arena,
+                    conditional.else_branch,
+                    definition,
+                ),
+            };
+            const ptr = try arena.alloc_object(ast.Expr);
+            ptr.* = .{ .if_then_else = copy };
+            return ptr;
+        },
+        else => return inline_expr(arena, expr, &.{}, &.{}),
+    }
+}
+
 pub const ActionStep = union(enum(u8)) {
     assign_var: AssignVar,
     assign_prime: AssignPrime,
@@ -481,11 +580,10 @@ pub const ActionCompiler = struct {
         if (self.evaluator.generated_expression_count() > 0 and
             identity == null)
         {
-            std.debug.print(
-                "generated action expression has no stable identity: {s}\n",
-                .{@tagName(expr.*)},
-            );
-            return Error.NotImplemented;
+            return .{
+                .expr = expr,
+                .generated = null,
+            };
         }
         const generated = if (identity) |expression_id|
             self.evaluator.find_generated_expression(@intCast(expression_id))
@@ -750,6 +848,13 @@ pub const ActionCompiler = struct {
                                 &.{def_body},
                             );
                         } else {
+                            if (def.params.len > 0 and !def.is_function) {
+                                body = try inline_local_operator_call(
+                                    self.arena,
+                                    body,
+                                    def,
+                                );
+                            }
                             const binding = if (def.params.len > 0)
                                 try self.lambda_expr(
                                     def.params,
@@ -770,13 +875,23 @@ pub const ActionCompiler = struct {
                     try self.collect_steps(body, steps, is_init);
                     return;
                 }
-                if (l.body.* == .binary and
-                    l.body.binary.op == .and_op)
+                var action_body = l.body;
+                for (l.defs) |def| {
+                    if (def.params.len > 0 and !def.is_function) {
+                        action_body = try inline_local_operator_call(
+                            self.arena,
+                            action_body,
+                            def,
+                        );
+                    }
+                }
+                if (action_body.* == .binary and
+                    action_body.binary.op == .and_op)
                 {
                     var operands: [256]*ast.Expr = undefined;
                     var operand_count: usize = 0;
                     flatten_conjunction(
-                        l.body,
+                        action_body,
                         &operands,
                         &operand_count,
                     );
@@ -814,7 +929,7 @@ pub const ActionCompiler = struct {
                 for (l.defs) |def| {
                     try self.append_generated_let_binding(steps, def);
                 }
-                try self.collect_steps(l.body, steps, is_init);
+                try self.collect_steps(action_body, steps, is_init);
             },
             .apply => |ap| {
                 if (ap.func.* == .ident) {
@@ -1057,6 +1172,14 @@ pub const ActionExecutor = struct {
         next: ?*const Continuation,
     };
 
+    fn continuation_empty(continuation: ?*const Continuation) bool {
+        var current = continuation;
+        while (current) |next| : (current = next.next) {
+            if (next.steps.len != 0) return false;
+        }
+        return true;
+    }
+
     pub fn execute_init(
         self: ActionExecutor,
         compiled: CompiledInit,
@@ -1101,6 +1224,31 @@ pub const ActionExecutor = struct {
             self.eval_pool,
             &self.source_state_store.values_pool,
         );
+    }
+
+    fn eval_compiled_bool(
+        self: ActionExecutor,
+        compiled: CompiledExpr,
+        context: Context,
+        state: ?*StateStore.State,
+    ) !bool {
+        if (compiled.generated) |generated| {
+            return self.evaluator.eval_generated_expression_bool(
+                generated,
+                context,
+                state,
+                self.eval_pool,
+                &self.source_state_store.values_pool,
+            );
+        }
+        const result = try self.evaluator.eval_expr(
+            compiled.expr,
+            context,
+            state,
+            self.eval_pool,
+            &self.source_state_store.values_pool,
+        );
+        return result.is_truthy();
     }
 
     fn execute_steps(
@@ -1206,8 +1354,7 @@ pub const ActionExecutor = struct {
                     }
                 },
                 .condition => |e| {
-                    const v = try self.eval_compiled_expr(e, current_ctx, s0);
-                    if (!v.is_truthy()) return;
+                    if (!try self.eval_compiled_bool(e, current_ctx, s0)) return;
                     current_steps = rest;
                     continue;
                 },
@@ -1329,8 +1476,11 @@ pub const ActionExecutor = struct {
                     return;
                 },
                 .if_branch => |ib| {
-                    const cond_val = try self.eval_compiled_expr(ib.cond, current_ctx, s0);
-                    const taken = if (cond_val.is_truthy()) ib.then_steps else ib.else_steps;
+                    const taken = if (try self.eval_compiled_bool(
+                        ib.cond,
+                        current_ctx,
+                        s0,
+                    )) ib.then_steps else ib.else_steps;
                     const next = Continuation{ .steps = rest, .next = continuation };
                     const snap = self.eval_pool.snapshot();
                     const context_snap = self.evaluator.context_snapshot();
@@ -1344,8 +1494,11 @@ pub const ActionExecutor = struct {
                     const snap = self.eval_pool.snapshot();
                     const context_snap = self.evaluator.context_snapshot();
                     for (case.arms) |arm| {
-                        const cond = try self.eval_compiled_expr(arm.cond, current_ctx, s0);
-                        if (!cond.is_truthy()) {
+                        if (!try self.eval_compiled_bool(
+                            arm.cond,
+                            current_ctx,
+                            s0,
+                        )) {
                             self.eval_pool.restore(snap);
                             self.evaluator.restore_context_pool(context_snap);
                             continue;
@@ -1366,13 +1519,18 @@ pub const ActionExecutor = struct {
                     if (s0 == null) return Error.TypeError;
                     const source_state = s0.?;
                     assert(unchanged.var_index < source_state.values.len);
-                    const v = try source_state.values[unchanged.var_index].clone(
-                        source_state.value_pool(
-                            unchanged.var_index,
-                            &self.source_state_store.values_pool,
-                        ),
-                        self.eval_pool,
-                    );
+                    const terminal = rest.len == 0 and
+                        continuation_empty(continuation);
+                    const v = if (terminal)
+                        source_state.values[unchanged.var_index]
+                    else
+                        try source_state.values[unchanged.var_index].clone(
+                            source_state.value_pool(
+                                unchanged.var_index,
+                                &self.source_state_store.values_pool,
+                            ),
+                            self.eval_pool,
+                        );
                     current_ctx = try self.evaluator.extend_state_context(
                         current_ctx,
                         unchanged.var_name,
@@ -1411,8 +1569,11 @@ pub const ActionExecutor = struct {
         new_state.changed_mask = 0;
         new_state.borrowed_mask = 0;
         new_state.borrowed_pool = null;
+        var assignments: [64]?eval.StateContextValue = @splat(null);
+        assert(new_state.values.len <= assignments.len);
+        ctx.collect_state_assignments(assignments[0..new_state.values.len]);
         for (new_state.values, 0..) |*destination, variable_index| {
-            if (ctx.lookup_state(@intCast(variable_index))) |assigned| {
+            if (assignments[variable_index]) |assigned| {
                 if (assigned.assignment == .changed) {
                     new_state.changed_mask |= @as(u64, 1) << @intCast(variable_index);
                     destination.* = try assigned.value.clone(

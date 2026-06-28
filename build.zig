@@ -96,8 +96,16 @@ pub fn build(b: *std.Build) void {
         "benchmark-filter",
         "Run only benchmark specs whose path contains this substring",
     );
+    const benchmark_include_long = b.option(
+        bool,
+        "benchmark-include-long",
+        "Include opt-in long benchmark specs and generated benchmark rows",
+    ) orelse false;
     if (benchmark_filter) |filter| {
         run_bench.addArg(filter);
+    }
+    if (benchmark_include_long) {
+        run_bench.addArg("--include-long");
     }
     const benchmark_step = b.step("benchmark", "Benchmark tlzig vs Java TLC");
     benchmark_step.dependOn(&run_bench.step);
@@ -130,9 +138,21 @@ pub fn build(b: *std.Build) void {
                 .filter = "MultiShardTxn RC/no-prepare-block",
             },
             .{
+                .name = "benchmark_mdbtla_rc_no_prepare_exhaustive_aot",
+                .model_path = "generated_models/mdbtla_rc_no_prepare_block_exhaustive.zig",
+                .filter = "MultiShardTxn RC/no-prepare-block exhaustive",
+                .default_enabled = false,
+            },
+            .{
                 .name = "benchmark_mdbtla_rc_no_prepare_ww_aot",
                 .model_path = "generated_models/mdbtla_rc_no_prepare_block_or_ww.zig",
                 .filter = "MultiShardTxn RC/no-prepare-block-or-ww",
+            },
+            .{
+                .name = "benchmark_mdbtla_rc_no_prepare_ww_exhaustive_aot",
+                .model_path = "generated_models/mdbtla_rc_no_prepare_block_or_ww_exhaustive.zig",
+                .filter = "MultiShardTxn RC/no-prepare-block-or-ww exhaustive",
+                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_snapshot_aot",
@@ -140,14 +160,34 @@ pub fn build(b: *std.Build) void {
                 .filter = "MultiShardTxn RC/snapshot",
             },
             .{
+                .name = "benchmark_mdbtla_rc_snapshot_exhaustive_aot",
+                .model_path = "generated_models/mdbtla_rc_snapshot_exhaustive.zig",
+                .filter = "MultiShardTxn RC/snapshot exhaustive",
+                .default_enabled = false,
+            },
+            .{
                 .name = "benchmark_mdbtla_rc_with_prepare_aot",
                 .model_path = "generated_models/mdbtla_rc_with_prepare_block.zig",
                 .filter = "MultiShardTxn RC/with-prepare-block",
+            },
+            .{
+                .name = "benchmark_mdbtla_rc_with_prepare_exhaustive_aot",
+                .model_path = "generated_models/mdbtla_rc_with_prepare_block_exhaustive.zig",
+                .filter = "MultiShardTxn RC/with-prepare-block exhaustive",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_mdbtla_singlelog_mcmdbprops_aot",
+                .model_path = "generated_models/mdbtla_singlelog_mcmdbprops.zig",
+                .filter = "SingleLog MCMDBProps",
+                .default_enabled = false,
             },
         };
         for (generated_benchmarks) |generated_benchmark| {
             if (!generatedBenchmarkMatches(
                 benchmark_filter,
+                benchmark_include_long,
+                generated_benchmark.default_enabled,
                 generated_benchmark.filter,
                 generated_benchmark.model_path,
             )) {
@@ -190,6 +230,7 @@ const GeneratedBenchmark = struct {
     name: []const u8,
     model_path: []const u8,
     filter: []const u8,
+    default_enabled: bool = true,
 };
 
 fn addGeneratedBenchmark(
@@ -226,10 +267,15 @@ fn addGeneratedBenchmark(
 
 fn generatedBenchmarkMatches(
     optional_filter: ?[]const u8,
+    include_long: bool,
+    default_enabled: bool,
     label: []const u8,
     generated_model_path: []const u8,
 ) bool {
-    const filter = optional_filter orelse return true;
-    return std.mem.eql(u8, label, filter) or
+    const filter = optional_filter orelse return include_long or default_enabled;
+    const exact_label_match = std.mem.eql(u8, label, filter);
+    if (!include_long and !default_enabled and !exact_label_match) return false;
+    return exact_label_match or
+        std.mem.indexOf(u8, label, filter) != null or
         std.mem.indexOf(u8, generated_model_path, filter) != null;
 }

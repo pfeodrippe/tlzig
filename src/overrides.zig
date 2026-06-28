@@ -133,8 +133,10 @@ const default_overrides = [_]OverrideEntry{
     .{ .name = "BagIn", .func = bag_in },
     .{ .name = "BagOfSet", .func = bag_of_set },
     .{ .name = "BagCardinality", .func = bag_cardinality },
+    .{ .name = "(+)", .func = bag_cup },
     .{ .name = "BagCup", .func = bag_cup },
     .{ .name = "BagCap", .func = bag_cap },
+    .{ .name = "(-)", .func = bag_difference },
     .{ .name = "BagDifference", .func = bag_difference },
     .{ .name = "WF_vars", .func = wf_vars },
     .{ .name = "SF_vars", .func = sf_vars },
@@ -968,9 +970,45 @@ fn bag_cardinality(_: OverrideContext, _: *ValuePool, args: []const Value) Error
     return Value{ .int_v = 0 };
 }
 
-fn bag_cup(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
+fn bag_cup(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
-    return args[0];
+    const fa = try bag_function(pool, args[0]);
+    const fb = try bag_function(pool, args[1]);
+    const ka = fa.domain.items(pool);
+    const va = fa.entries(pool);
+    const kb = fb.domain.items(pool);
+    const vb = fb.entries(pool);
+    var new_key_count: u32 = 0;
+    for (kb) |key| {
+        if (fa.apply(pool, key) == null) new_key_count += 1;
+    }
+    const count = fa.len + new_key_count;
+    const keys = try pool.alloc_values(count);
+    const vals = try pool.alloc_values(count);
+    @memcpy(keys[0..fa.len], ka);
+    @memcpy(vals[0..fa.len], va);
+    var pos: u32 = fa.len;
+    for (kb, vb) |key, b_value| {
+        const b_count = b_value.as_int() orelse return Error.TypeError;
+        if (fa.apply(pool, key)) |a_value| {
+            const a_count = a_value.as_int() orelse return Error.TypeError;
+            for (keys[0..fa.len], vals[0..fa.len]) |existing, *entry| {
+                if (existing.eql(key, pool)) {
+                    entry.* = Value{ .int_v = a_count + b_count };
+                    break;
+                }
+            }
+        } else {
+            keys[pos] = key;
+            vals[pos] = Value{ .int_v = b_count };
+            pos += 1;
+        }
+    }
+    return Value{ .function_v = .{
+        .domain = make_set(pool, keys),
+        .offset = value_offset(pool, vals.ptr),
+        .len = pos,
+    } };
 }
 
 fn bag_cap(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
@@ -980,11 +1018,8 @@ fn bag_cap(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {
 
 fn bag_difference(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 2) return Error.TypeError;
-    const a = args[0];
-    const b = args[1];
-    if (a != .function_v or b != .function_v) return Error.TypeError;
-    const fa = a.function_v;
-    const fb = b.function_v;
+    const fa = try bag_function(pool, args[0]);
+    const fb = try bag_function(pool, args[1]);
     const ka = fa.domain.items(pool);
     const va = fa.entries(pool);
     var count: u32 = 0;
@@ -1012,6 +1047,21 @@ fn bag_difference(_: OverrideContext, pool: *ValuePool, args: []const Value) Err
         .offset = value_offset(pool, vals.ptr),
         .len = pos,
     } };
+}
+
+fn bag_function(pool: *ValuePool, bag: Value) Error!value.Function {
+    return switch (bag) {
+        .function_v => |function| function,
+        .tuple_v => |tuple| blk: {
+            if (tuple.len != 0) return Error.TypeError;
+            break :blk .{
+                .domain = .{ .offset = pool.value_count, .len = 0 },
+                .offset = pool.value_count,
+                .len = 0,
+            };
+        },
+        else => Error.TypeError,
+    };
 }
 
 fn wf_vars(_: OverrideContext, _: *ValuePool, args: []const Value) Error!Value {

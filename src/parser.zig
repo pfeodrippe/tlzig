@@ -536,6 +536,8 @@ fn switch_word(word: []const u8) Token.Kind {
         .{ "intersect", .cap },
         .{ "leq", .le },
         .{ "geq", .ge },
+        .{ "lnot", .not },
+        .{ "neg", .not },
         .{ "div", .slash },
         .{ "circ", .concat },
     });
@@ -893,6 +895,23 @@ pub const Parser = struct {
         self.def_col = definition_col;
         defer self.def_col = saved_def_col;
 
+        if (try self.read_parenthesized_infix_operator_name_for_def()) |op_name| {
+            const right_param = try self.parse_param_name();
+            try self.expect(.defeq);
+            const body = try self.parse_definition_body();
+            var params = std.ArrayList([]const u8).empty;
+            defer params.deinit(std.heap.page_allocator);
+            try params.append(std.heap.page_allocator, left_param);
+            try params.append(std.heap.page_allocator, right_param);
+            return ast.Definition{
+                .name = op_name,
+                .params = try self.dup_slice([]const u8, params.items),
+                .body = body,
+                .source_line = definition_line,
+                .source_excerpt = definition_excerpt,
+            };
+        }
+
         // Recursive function definition: F[x \in S] == body.
         if (self.current.kind == .lbracket) {
             try self.expect(.lbracket);
@@ -1090,6 +1109,32 @@ pub const Parser = struct {
         return null;
     }
 
+    fn read_parenthesized_infix_operator_name_for_def(
+        self: *Parser,
+    ) !?[]const u8 {
+        if (self.current.kind != .lparen) return null;
+        const saved = self.*;
+        self.advance();
+        const name = switch (self.current.kind) {
+            .plus => "(+)",
+            .minus => "(-)",
+            else => {
+                self.* = saved;
+                return null;
+            },
+        };
+        self.advance();
+        if (!self.match(.rparen)) {
+            self.* = saved;
+            return null;
+        }
+        if (self.current.kind != .ident and self.current.kind != .underscore) {
+            self.* = saved;
+            return null;
+        }
+        return try self.dup(name);
+    }
+
     /// Read a user-defined infix operator name in an expression. This does NOT
     /// consume single-character built-in operators such as `+` or `-`; those are
     /// handled by the dedicated arithmetic parsers. It does consume identifiers
@@ -1140,6 +1185,44 @@ pub const Parser = struct {
             }
         }
         return null;
+    }
+
+    fn read_parenthesized_infix_operator_name_for_expr(
+        self: *Parser,
+    ) !?[]const u8 {
+        if (self.current.kind != .lparen) return null;
+        const saved = self.*;
+        self.advance();
+        const name = switch (self.current.kind) {
+            .plus => "(+)",
+            .minus => "(-)",
+            else => {
+                self.* = saved;
+                return null;
+            },
+        };
+        self.advance();
+        if (!self.match(.rparen)) {
+            self.* = saved;
+            return null;
+        }
+        if (self.current.kind == .defeq) {
+            self.* = saved;
+            return null;
+        }
+        return try self.dup(name);
+    }
+
+    fn is_parenthesized_infix_operator_ahead(self: *Parser) bool {
+        if (self.current.kind != .lparen) return false;
+        const saved = self.*;
+        defer self.* = saved;
+        self.advance();
+        if (self.current.kind != .plus and self.current.kind != .minus) {
+            return false;
+        }
+        self.advance();
+        return self.current.kind == .rparen;
     }
 
     fn parse_definition_body(self: *Parser) !*ast.Expr {
@@ -1211,10 +1294,10 @@ pub const Parser = struct {
         }
         self.pop_list_col();
         if (self.match(.implies)) {
-            return try self.expr_binary(.implies, left, try self.parse_implies());
+            return try self.expr_binary(.implies, left, try self.parse_rhs_expr());
         }
         if (self.match(.leads_to)) {
-            return try self.expr_binary(.leads_to, left, try self.parse_implies());
+            return try self.expr_binary(.leads_to, left, try self.parse_rhs_expr());
         }
         return left;
     }
@@ -1223,10 +1306,30 @@ pub const Parser = struct {
         const left = try self.parse_equiv();
         if (self.current.line != bullet_line) return left;
         if (self.match(.implies)) {
-            return try self.expr_binary(.implies, left, try self.parse_implies());
+            return try self.expr_binary(.implies, left, try self.parse_rhs_expr());
         }
         if (self.match(.leads_to)) {
-            return try self.expr_binary(.leads_to, left, try self.parse_implies());
+            return try self.expr_binary(.leads_to, left, try self.parse_rhs_expr());
+        }
+        return left;
+    }
+
+    fn parse_rhs_expr(self: *Parser) anyerror!*ast.Expr {
+        if (self.current.kind != .and_op and self.current.kind != .or_op) {
+            return try self.parse_expr();
+        }
+        const op: ast.BinaryOp = if (self.current.kind == .and_op)
+            .and_op
+        else
+            .or_op;
+        const op_kind = self.current.kind;
+        const col = self.current.col;
+        self.advance();
+        var left = try self.parse_expr();
+        while (self.current.kind == op_kind and self.current.col == col) {
+            self.advance();
+            const right = try self.parse_expr();
+            left = try self.expr_binary(op, left, right);
         }
         return left;
     }
@@ -1234,11 +1337,11 @@ pub const Parser = struct {
     fn parse_implies(self: *Parser) !*ast.Expr {
         const left = try self.parse_equiv();
         if (self.match(.implies)) {
-            const right = try self.parse_implies();
+            const right = try self.parse_rhs_expr();
             return try self.expr_binary(.implies, left, right);
         }
         if (self.match(.leads_to)) {
-            const right = try self.parse_implies();
+            const right = try self.parse_rhs_expr();
             return try self.expr_binary(.leads_to, left, right);
         }
         return left;
@@ -1398,6 +1501,13 @@ pub const Parser = struct {
         while (true) {
             const infix_name = try self.read_infix_operator_name_for_expr();
             if (infix_name) |name| {
+                const right = try self.parse_multiplicative();
+                left = try self.expr_infix_apply(name, left, right);
+                continue;
+            }
+            const parenthesized_infix =
+                try self.read_parenthesized_infix_operator_name_for_expr();
+            if (parenthesized_infix) |name| {
                 const right = try self.parse_multiplicative();
                 left = try self.expr_infix_apply(name, left, right);
                 continue;
@@ -1650,6 +1760,9 @@ pub const Parser = struct {
     fn parse_suffixes(self: *Parser, expr: *ast.Expr) anyerror!*ast.Expr {
         var result = expr;
         while (true) {
+            if (self.is_parenthesized_infix_operator_ahead()) {
+                break;
+            }
             if (self.match(.lparen)) {
                 const args = try self.parse_expr_list(.rparen);
                 if (result.* == .apply and

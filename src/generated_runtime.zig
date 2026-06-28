@@ -28,12 +28,15 @@ pub const CallContext = struct {
     read_primed: bool,
     constants: []const NamedValue,
     constant_slots: []const ?Value,
+    generated_cache: []?Value,
+    generated_cache_pool: *ValuePool,
     native_context: *const anyopaque,
     native_call: NativeCall,
     max_seq_len: u32,
 };
 
 pub const OperatorFn = *const fn (*CallContext, []const Value) Error!Value;
+pub const OperatorBoolFn = *const fn (*CallContext, []const Value) Error!bool;
 
 pub const QuantifierKind = enum {
     exists,
@@ -56,6 +59,7 @@ pub const Expression = struct {
     arg_names: []const []const u8,
     arg_required: []const bool = &.{},
     function: OperatorFn,
+    boolean_function: ?OperatorBoolFn = null,
 };
 
 pub inline fn keep_expression_parameters(
@@ -246,6 +250,54 @@ pub fn constant_at(
     const value = context.constant_slots[index] orelse
         return Error.UndefinedSymbol;
     return value.clone(context.state_pool, context.eval_pool);
+}
+
+pub fn cached_definition(
+    context: *CallContext,
+    index: u32,
+) Error!?Value {
+    if (index >= context.generated_cache.len) return Error.TypeError;
+    const value = context.generated_cache[index] orelse return null;
+    return try value.clone(context.generated_cache_pool, context.eval_pool);
+}
+
+pub fn put_cached_definition(
+    context: *CallContext,
+    index: u32,
+    value: Value,
+) Error!Value {
+    if (index >= context.generated_cache.len) return Error.TypeError;
+    if (context.generated_cache[index]) |_| return value;
+    context.generated_cache[index] = try value.clone(
+        context.eval_pool,
+        context.generated_cache_pool,
+    );
+    return value;
+}
+
+pub fn nat_set(_: *CallContext) Error!Value {
+    return Value{ .range_v = .{
+        .lo = 0,
+        .hi = std.math.maxInt(i64),
+    } };
+}
+
+pub fn int_set(_: *CallContext) Error!Value {
+    return Value{ .range_v = .{
+        .lo = std.math.minInt(i64),
+        .hi = std.math.maxInt(i64),
+    } };
+}
+
+pub fn boolean_set(context: *CallContext) Error!Value {
+    return set(context, &[_]Value{
+        Value{ .bool_v = false },
+        Value{ .bool_v = true },
+    });
+}
+
+pub fn string_set(context: *CallContext) Error!Value {
+    return string(context, "__STRING_SET__");
 }
 
 pub fn native(
@@ -889,18 +941,7 @@ fn cross_pool_equal(
     right: Value,
     right_pool: *const ValuePool,
 ) bool {
-    if (left.tag() != right.tag()) return false;
-    return switch (left) {
-        .bool_v => |value| value == right.bool_v,
-        .int_v => |value| value == right.int_v,
-        .model_v => |value| value == right.model_v,
-        .string_v => |value| std.mem.eql(
-            u8,
-            value.slice(left_pool),
-            right.string_v.slice(right_pool),
-        ),
-        else => false,
-    };
+    return Value.eql_cross_pool(left, left_pool, right, right_pool);
 }
 
 pub fn tuple(context: *CallContext, items: []const Value) Error!Value {
@@ -1062,6 +1103,149 @@ pub fn cardinality(
     if (args.len != 1) return Error.TypeError;
     const iterable = try materialize_iterable(context, args[0]);
     return .{ .int_v = @intCast(try iterable_count(iterable)) };
+}
+
+pub fn constant_cardinality_at(
+    context: *CallContext,
+    constant_index: u32,
+) Error!Value {
+    std.debug.assert(context.state_pool.value_count <= context.state_pool.value_cap);
+    if (constant_index >= context.constant_slots.len) {
+        return Error.UndefinedSymbol;
+    }
+    const value = context.constant_slots[constant_index] orelse
+        return Error.UndefinedSymbol;
+    return .{ .int_v = @intCast(try iterable_count(value)) };
+}
+
+pub fn set_to_bag(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    const set_value = try materialize_iterable(context, args[0]);
+    if (set_value != .set_v) return Error.TypeError;
+    const entries = try context.eval_pool.alloc_values(set_value.set_v.len);
+    @memset(entries, Value{ .int_v = 1 });
+    return .{ .function_v = .{
+        .domain = set_value.set_v,
+        .offset = value_offset(context.eval_pool, entries.ptr),
+        .len = set_value.set_v.len,
+    } };
+}
+
+pub fn bag_cup(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    const left = try bag_function(context, args[0]);
+    const right = try bag_function(context, args[1]);
+    const left_keys = left.domain.items(context.eval_pool);
+    const left_entries = left.entries(context.eval_pool);
+    const right_keys = right.domain.items(context.eval_pool);
+    const right_entries = right.entries(context.eval_pool);
+
+    var new_key_count: u32 = 0;
+    for (right_keys) |key| {
+        if (left.apply(context.eval_pool, key) == null) new_key_count += 1;
+    }
+    const count = left.len + new_key_count;
+    const keys = try context.eval_pool.alloc_values(count);
+    const entries = try context.eval_pool.alloc_values(count);
+    @memcpy(keys[0..left.len], left_keys);
+    @memcpy(entries[0..left.len], left_entries);
+
+    var out: u32 = left.len;
+    for (right_keys, right_entries) |key, right_value| {
+        const right_count = right_value.as_int() orelse return Error.TypeError;
+        if (left.apply(context.eval_pool, key)) |left_value| {
+            const left_count = left_value.as_int() orelse return Error.TypeError;
+            var index: u32 = 0;
+            while (index < left.len) : (index += 1) {
+                if (keys[index].eql(key, context.eval_pool)) {
+                    entries[index] = .{ .int_v = left_count + right_count };
+                    break;
+                }
+            }
+            std.debug.assert(index < left.len);
+        } else {
+            keys[out] = key;
+            entries[out] = .{ .int_v = right_count };
+            out += 1;
+        }
+    }
+    std.debug.assert(out == count);
+    return .{ .function_v = .{
+        .domain = .{
+            .offset = value_offset(context.eval_pool, keys.ptr),
+            .len = count,
+        },
+        .offset = value_offset(context.eval_pool, entries.ptr),
+        .len = count,
+    } };
+}
+
+pub fn bag_difference(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 2) return Error.TypeError;
+    const left = try bag_function(context, args[0]);
+    const right = try bag_function(context, args[1]);
+    const left_keys = left.domain.items(context.eval_pool);
+    const left_entries = left.entries(context.eval_pool);
+
+    var count: u32 = 0;
+    for (left_keys, left_entries) |key, left_value| {
+        const left_count = left_value.as_int() orelse return Error.TypeError;
+        const right_count = if (right.apply(context.eval_pool, key)) |value|
+            value.as_int() orelse return Error.TypeError
+        else
+            0;
+        if (left_count > right_count) count += 1;
+    }
+
+    const keys = try context.eval_pool.alloc_values(count);
+    const entries = try context.eval_pool.alloc_values(count);
+    var out: u32 = 0;
+    for (left_keys, left_entries) |key, left_value| {
+        const left_count = left_value.as_int() orelse return Error.TypeError;
+        const right_count = if (right.apply(context.eval_pool, key)) |value|
+            value.as_int() orelse return Error.TypeError
+        else
+            0;
+        if (left_count > right_count) {
+            keys[out] = key;
+            entries[out] = .{ .int_v = left_count - right_count };
+            out += 1;
+        }
+    }
+    std.debug.assert(out == count);
+    return .{ .function_v = .{
+        .domain = .{
+            .offset = value_offset(context.eval_pool, keys.ptr),
+            .len = count,
+        },
+        .offset = value_offset(context.eval_pool, entries.ptr),
+        .len = count,
+    } };
+}
+
+fn bag_function(context: *CallContext, value: Value) Error!Function {
+    return switch (value) {
+        .function_v => |function| function,
+        .tuple_v => |tuple_value| blk: {
+            if (tuple_value.len != 0) return Error.TypeError;
+            const offset = context.eval_pool.value_count;
+            break :blk .{
+                .domain = .{ .offset = offset, .len = 0 },
+                .offset = offset,
+                .len = 0,
+            };
+        },
+        else => Error.TypeError,
+    };
 }
 
 pub fn sequence_len(
@@ -1798,6 +1982,45 @@ pub fn quantify_at(
     return .{ .bool_v = result };
 }
 
+pub fn quantify_constant_at(
+    context: *CallContext,
+    operator_args: []const Value,
+    constant_index: u32,
+    kind: QuantifierKind,
+    predicate: OperatorFn,
+    source_identity: u32,
+) Error!Value {
+    _ = source_identity;
+    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);
+    std.debug.assert(context.state_pool.value_count <= context.state_pool.value_cap);
+    if (constant_index >= context.constant_slots.len) {
+        return Error.UndefinedSymbol;
+    }
+    if (operator_args.len + 1 > 64) return Error.NotImplemented;
+    const domain_value = context.constant_slots[constant_index] orelse
+        return Error.UndefinedSymbol;
+    const count = try iterable_count(domain_value);
+    var bound: [1]Value = undefined;
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        bound[0] = try iterable_value_from_pool(
+            context,
+            domain_value,
+            context.state_pool,
+            index,
+        );
+        const accepted = try boolean(try call_bound(
+            context,
+            operator_args,
+            &bound,
+            predicate,
+        ));
+        if (kind == .exists and accepted) return .{ .bool_v = true };
+        if (kind == .forall and !accepted) return .{ .bool_v = false };
+    }
+    return .{ .bool_v = kind == .forall };
+}
+
 pub fn quantify_filtered_power_set(
     context: *CallContext,
     operator_args: []const Value,
@@ -2467,6 +2690,19 @@ pub fn not_member_bool(
     return !try member_bool(context, element, set_value);
 }
 
+pub fn string_literal_member_bool(
+    context: *CallContext,
+    element: Value,
+    literals: []const []const u8,
+) Error!bool {
+    if (element != .string_v) return false;
+    const bytes = element.string_v.slice(context.eval_pool);
+    for (literals) |literal| {
+        if (std.mem.eql(u8, bytes, literal)) return true;
+    }
+    return false;
+}
+
 pub fn subset_equal(
     context: *CallContext,
     left: Value,
@@ -3120,11 +3356,45 @@ pub fn iterable_value(
     };
 }
 
+fn iterable_value_from_pool(
+    context: *CallContext,
+    domain_value: Value,
+    domain_pool: *const ValuePool,
+    index: u32,
+) Error!Value {
+    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);
+    std.debug.assert(domain_pool.value_count <= domain_pool.value_cap);
+    return switch (domain_value) {
+        .set_v => |set_value| blk: {
+            if (index >= set_value.len) return Error.IndexOutOfBounds;
+            const item = set_value.items(domain_pool)[index];
+            break :blk switch (item) {
+                .bool_v,
+                .int_v,
+                .model_v,
+                .generated_operator_v,
+                .lambda_v,
+                => item,
+                else => try item.clone(domain_pool, context.eval_pool),
+            };
+        },
+        .range_v => |range_value| blk: {
+            const count = try iterable_count(domain_value);
+            if (index >= count) return Error.IndexOutOfBounds;
+            break :blk .{
+                .int_v = range_value.lo + @as(i64, @intCast(index)),
+            };
+        },
+        else => Error.NotImplemented,
+    };
+}
+
 test "generated finite values use only the value pool" {
     const Arena = @import("arena.zig").Arena;
     var arena = try Arena.init(1024 * 1024);
     defer arena.deinit();
     var pool = try ValuePool.init(&arena, 256, 256);
+    var generated_cache = [_]?Value{};
     var context = CallContext{
         .eval_pool = &pool,
         .state_pool = &pool,
@@ -3134,6 +3404,8 @@ test "generated finite values use only the value pool" {
         .read_primed = false,
         .constants = &.{},
         .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &pool,
         .native_context = undefined,
         .native_call = test_native_call,
         .max_seq_len = 5,

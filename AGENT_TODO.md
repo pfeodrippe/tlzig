@@ -204,6 +204,24 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   All measured MultiShardTxn rows are faster in tlzig-auto. The next blocker
   is exhaustive `CHECK_DEADLOCK FALSE` variants for every deadlock-stop row,
   because partial generated/distinct totals are not valid coverage totals.
+- [~] Current strict AOT exhaustive no-prepare-block baseline (2026-06-28,
+  ReleaseFast, exact-label benchmark filter, generated model
+  `generated_models/mdbtla_rc_no_prepare_block_exhaustive.zig`, fallbacks
+  `0`):
+  - Full `MultiShardTxn RC/no-prepare-block exhaustive`, all cores:
+    TLC-auto `172.109s` to `174.157s`; tlzig-auto improved from `221.550s`
+    to `202.501s`/`202.590s`. Distinct states match exactly at
+    `17,057,584`; generated counts remain traversal-order diagnostics
+    (`99,713,354` TLC vs `98,533,426` tlzig).
+  - Capped 3M-state ReleaseFast tlzig baseline improved from `30.53s` /
+    `5.196T` retired instructions to best observed `28.84s` / `5.103T`
+    after terminal `UNCHANGED` clone bypass and single-pass commit assignment
+    collection. This is real progress but still not enough to beat TLC on the
+    full row.
+  - Rejected experiments: bool-returning constant quantifier predicates,
+    no-clone boolean `variable_path(...)`, no-op terminal `UNCHANGED` binding
+    skip, and pointer-switching `ActionStep` all failed wall-time validation
+    despite some instruction-count reductions.
 - [x] Make config constant substitutions native in generated code. Applications
   such as `AbortTransaction(n, tid)` with `AbortTransaction <- FALSE` now emit
   the configured constant directly and do not evaluate arguments or fall back
@@ -221,6 +239,44 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
     conditions;
   - evaluate temporal `ENABLED A` compositionally by replaying action `A`
     against stored successor edges, instead of using raw successor count.
+
+### MDBTLA / SingleLog MCMDBProps integration (2026-06-27)
+- [x] Validate the full Java TLC baseline for
+  `vendor/MDBTLA/SingleLog/MCMDBProps.tla`:
+  `3,101,918` generated / `269,881` distinct, depth 11, no errors,
+  `26m46s` wall time including temporal-property checking.
+- [x] Fix parser support needed by `MDBProps.tla`:
+  parenthesized symbolic bag operators `(+)/(-)`, `\lnot`, and bulleted
+  RHS bodies after `=>` / `~>`.
+- [x] Generate strict AOT for `MCMDBProps.cfg` with zero fallbacks:
+  `41` generated operators, `3` direct native bag operators.
+- [x] Fix action-local parameterized `LET` operators such as
+  `modHistory(initState)` by inlining local action calls before step
+  collection, so primed assignments inside local operators become real
+  `ActionStep` assignments instead of boolean-only conditions.
+- [x] Fix bag semantics used by SingleLog write histories:
+  `bag (+) SetToBag({record})` and `bag (-) ...` now accept `<<>>` as the
+  empty bag/function, and both generic and generated paths use structural
+  cross-pool equality for record-valued bag keys.
+- [x] Record the corrected capped performance baseline for
+  `MCMDBProps --max-states 1000` in ReleaseFast:
+  generic tlzig `0.19s` / `515.7M` retired instructions / `8.8 MB` RSS,
+  strict AOT tlzig `0.16s` / `215.5M` retired instructions / `8.5 MB` RSS,
+  both `2,416` generated / `1,000` distinct. Wall time is too small/noisy
+  for a strong ratio at this cap; instruction count improves `2.39x`.
+- [x] Remove the O(SCC²) temporal condensation matrix. The full
+  `MCMDBProps` temporal run previously crashed around 4.7 GB RSS while
+  allocating `scc_count * scc_count` booleans. SCC successor deduplication now
+  stores packed `u64` edge keys, sorts, and uniquifies in O(edges) memory.
+- [x] Run strict AOT `MCMDBProps` without the small cap and compare against
+  TLC's full result, including temporal-property checking:
+  TLC Java `26m46s`, `3,101,918` generated / `269,881` distinct;
+  tlzig strict AOT ReleaseFast `258.99s`, same `3,101,918/269,881`,
+  `578.7 MB` peak RSS. Full-run speedup is `6.2x`.
+- [x] Add `MCMDBProps` as an opt-in long ReleaseFast benchmark row only. It is
+  excluded from the default benchmark because the TLC side is a 26-minute full
+  temporal run. Use exact filter `-Dbenchmark-filter='SingleLog MCMDBProps'`
+  or `-Dbenchmark-include-long=true` to include it.
 - [x] Raise benchmark value-pool budgets for RC deadlock-stop rows to avoid
   flaky `OutOfMemory` in representative generated runs.
 - [x] Add explicit exhaustive `CHECK_DEADLOCK FALSE` benchmark configs for the
@@ -246,6 +302,14 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
     filtered by exact label/path just like the benchmark script.
   - Filtered verification for Storage: generic tlzig `3.886s/0.355s`; strict
     AOT tlzig `1.417s/0.157s`; TLC `2.777s/1.468s`.
+  - Filtered verification after exact-label/long-row tightening:
+    Storage generic tlzig `3.973s/0.356s`; strict AOT tlzig
+    `1.449s/0.285s`; TLC `2.852s/1.432s`. Storage AOT is `1.97x` faster than
+    TLC one-core and `5.02x` faster than TLC auto in this run.
+  - Filtered verification after exact-label/long-row tightening:
+    RC/snapshot generic tlzig `7.840s/0.756s`; strict AOT tlzig
+    `4.983s/0.418s`; TLC `5.141s/2.326s`. RC/snapshot AOT is `1.03x` faster
+    than TLC one-core and `5.56x` faster than TLC auto in this run.
   - Filtered verification for RC/no-prepare-block before filter tightening:
     strict AOT tlzig `0.698s/0.096s`; TLC `1.883s/1.580s`.
   - Full default verification after adding all eight MultiShardTxn AOT rows:
@@ -317,6 +381,15 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   `primed_variable_except_update_equal_bool(...)`. The runtime compares the
   next root with the current root across pools, calls the EXCEPT updater only
   at the changed leaf, and avoids reconstructing the whole updated root.
+- [x] Honor config operator replacements before direct native lowering in
+  generated calls. `Seq <- LimitedSeq` no longer emits unbounded
+  `runtime.sequence_set(...)` for MCBinarySearch; the replacement target is
+  also marked reachable so strict generated files link all referenced
+  operators.
+- [x] Add per-evaluator generated caches for zero-argument context-free
+  operators. Cached values live in a generated-cache pool, not the canonical
+  state pool, so large constant expressions can be reused without consuming
+  canonical-state capacity.
 - [ ] Replace generic generated action assignments:
   `primed_variable = except_update(variable, path, rhs)` should lower to
   native typed/path-indexed next-state writes, not whole-root reconstruction.
@@ -325,7 +398,7 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   are mostly nested EXCEPT chains and value-producing EXCEPT expressions.
 - [ ] Replace generated `variable_path(...)` reads with typed/indexed accessors
   derived from resolved state layout and TypeOK where available. Current audit:
-  `variable_path=8050`.
+  `variable_path=8068`.
 - [ ] Fuse sequence-head record-field guards such as
   `field(sequence_head(variable_path(...)), "op")` into direct helpers that
   read once and compare typed fields. Current audit:
@@ -333,12 +406,18 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   field reads passed into records/operators, not simple boolean guards.
 - [ ] Specialize mapped-set/range construction used in hot MDBTLA actions,
   especially `map_set(function_range(variable_path(...)), ...)`. Current
-  audit: `map_set=284`, `function_range=395`.
+  audit: `map_set=287`, `function_range=395`.
 - [ ] Reduce remaining nested runtime helper chains after the concrete
-  patterns above. Current broad audit count: `nested_runtime_call=9058`.
+  patterns above. Current broad audit count: `nested_runtime_call=9284`.
 - [ ] Investigate and optimize `MCBinarySearch`. It remains correct but
-  materially slower than TLC in the default benchmark
-  (`tlzig ~7.16s` vs TLC-auto `~1.99s` in the 2026-06-27 run).
+  materially slower than TLC in the default ReleaseFast benchmark:
+  TLC `1.703s/1.988s`, generic tlzig `6.261s/6.349s`, exact
+  `34383/27953` states. Strict AOT now compiles with `Seq <- LimitedSeq`
+  honored (`12` generated / `3` native / `0` fallbacks), but it was stopped
+  after more than one minute because the first cached `SortedSeqs` build still
+  materializes `UNION {[1..n -> Values] : n \in 1..MaxSeqLen}` eagerly. The
+  next real fix is a lazy bounded-sequence/filter lowering for this pattern,
+  not adding the AOT row to the default benchmark.
 - [~] Borrow data-oriented ideas from Flecs/ECS, but do not add Flecs as a
   dependency unless a prototype proves it wins on tlzig's state-exploration
   hot paths. Useful ideas are packed/columnar TypeOK-derived state layouts,
@@ -553,6 +632,14 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   changed `Value` trees into the candidate store. Use TypeOK-derived layouts
   and per-successor canonicalization to replace recursive clones with flat
   typed copies, preserving exact canonical fingerprints and parallel safety.
+- [ ] Generate native action executors for MDBTLA-class `Next`.
+  Samples for `MCMultiShardTxn_RC_no_prepare_block_exhaustive` are still
+  dominated by recursive `ActionExecutor.execute_steps` branch/choose/call
+  dispatch (`branch` at `src/action.zig:1472`, `choose` at `1372`, call
+  continuations at `1414`). The strict generated expression layer is native,
+  but action control flow still interprets the `ActionStep` tree. Generate
+  per-action Zig loops/branches with explicit continuation structure before
+  attempting more scalar helper micro-optimizations.
 - [ ] Review stash `aaaa` follow-ups.
   - Keep: primed `variable_path` semantics, strict total-order lowering, and
     indexed no-clone path comparisons were good ideas and have been extracted

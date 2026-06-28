@@ -120,6 +120,12 @@ pub fn emit_module_with_options(
     var generated_expressions =
         std.ArrayList(GeneratedExpressionMeta).empty;
     defer generated_expressions.deinit(allocator);
+    var emitted_helpers = std.StringHashMap(void).init(allocator);
+    defer {
+        var key_iterator = emitted_helpers.keyIterator();
+        while (key_iterator.next()) |key| allocator.free(key.*);
+        emitted_helpers.deinit();
+    }
     for (module.definitions, 0..) |definition, definition_index| {
         if (!reachable[definition_index]) continue;
         switch (definition_kind(module, definition)) {
@@ -184,11 +190,20 @@ pub fn emit_module_with_options(
                 module,
                 definition.body,
                 definition.params,
+                &emitted_helpers,
             );
         }
     }
     for (generated_expressions.items) |entry| {
         const expression_params = entry.param_slice();
+        try emit_helpers(
+            &output,
+            allocator,
+            module,
+            entry.expression,
+            expression_params,
+            &emitted_helpers,
+        );
         const header = try std.fmt.allocPrint(
             allocator,
             "fn expr_{d}(context: *runtime.CallContext, args: []const Value) Error!Value {{\n" ++
@@ -203,16 +218,15 @@ pub fn emit_module_with_options(
             try append(
                 &output,
                 allocator,
-                "Value{ .bool_v = try runtime.boolean(",
+                "Value{ .bool_v = try ",
             );
-            try emit_expr(
-                &output,
+            const bool_name = try expression_boolean_name(
                 allocator,
-                module,
-                entry.expression,
-                expression_params,
+                entry.identity,
             );
-            try append(&output, allocator, ") }");
+            defer allocator.free(bool_name);
+            try append(&output, allocator, bool_name);
+            try append(&output, allocator, "(context, args) }");
         } else {
             try emit_expr(
                 &output,
@@ -223,6 +237,26 @@ pub fn emit_module_with_options(
             );
         }
         try append(&output, allocator, ";\n}\n\n");
+        if (expr_is_boolean(module, entry.expression, 0)) {
+            const bool_header = try std.fmt.allocPrint(
+                allocator,
+                "fn expr_{d}_bool(context: *runtime.CallContext, args: []const Value) Error!bool {{\n" ++
+                    "    std.debug.assert(args.len == {d});\n" ++
+                    "    runtime.keep_expression_parameters(context, args);\n" ++
+                    "    return ",
+                .{ entry.identity, expression_params.len },
+            );
+            defer allocator.free(bool_header);
+            try append(&output, allocator, bool_header);
+            try emit_boolean_expr(
+                &output,
+                allocator,
+                module,
+                entry.expression,
+                expression_params,
+            );
+            try append(&output, allocator, ";\n}\n\n");
+        }
     }
 
     try append(&output, allocator,
@@ -292,11 +326,22 @@ pub fn emit_module_with_options(
                     "false",
             );
         }
-        const expression_suffix = try std.fmt.allocPrint(
-            allocator,
-            "}}, .function = expr_{d} }},\n",
-            .{entry.identity},
-        );
+        const expression_suffix = if (expr_is_boolean(
+            module,
+            entry.expression,
+            0,
+        ))
+            try std.fmt.allocPrint(
+                allocator,
+                "}}, .function = expr_{d}, .boolean_function = expr_{d}_bool }},\n",
+                .{ entry.identity, entry.identity },
+            )
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "}}, .function = expr_{d} }},\n",
+                .{entry.identity},
+            );
         defer allocator.free(expression_suffix);
         try append(&output, allocator, expression_suffix);
     }
@@ -366,6 +411,201 @@ fn definition_is_boolean(
     definition: ast.Definition,
 ) bool {
     return expr_is_boolean(module, definition.body, 0);
+}
+
+fn definition_context_free(
+    module: ast.Module,
+    definition: ast.Definition,
+) bool {
+    if (definition.params.len != 0) return false;
+    return expr_context_free(module, definition.body, 0);
+}
+
+fn expr_context_free(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    depth: u32,
+) bool {
+    if (depth > 64) return false;
+    return switch (expr.*) {
+        .bool_literal,
+        .int_literal,
+        .string_literal,
+        .at,
+        => true,
+        .ident => |name| blk: {
+            if (variable_index(module, name) != null) break :blk false;
+            const resolved_name = resolved_definition_name(
+                module,
+                name,
+            ) orelse break :blk true;
+            const definition = find_definition(module, resolved_name) orelse
+                break :blk true;
+            break :blk expr_context_free(module, definition.body, depth + 1);
+        },
+        .primed,
+        .primed_expr,
+        .unchanged,
+        .unchanged_expr,
+        .box_action,
+        => false,
+        .field => |field_value| expr_context_free(
+            module,
+            field_value.expr,
+            depth + 1,
+        ),
+        .tuple, .set_enum => |items| blk: {
+            for (items) |item| {
+                if (!expr_context_free(module, item, depth + 1)) {
+                    break :blk false;
+                }
+            }
+            break :blk true;
+        },
+        .record => |fields| blk: {
+            for (fields) |field_value| {
+                if (!expr_context_free(module, field_value.value, depth + 1)) {
+                    break :blk false;
+                }
+            }
+            break :blk true;
+        },
+        .set_filter => |filter_value| blk: {
+            for (filter_value.vars) |bound| {
+                if (!expr_context_free(module, bound.domain, depth + 1)) {
+                    break :blk false;
+                }
+            }
+            break :blk expr_context_free(module, filter_value.pred, depth + 1);
+        },
+        .set_map => |map_value| blk: {
+            for (map_value.vars) |bound| {
+                if (!expr_context_free(module, bound.domain, depth + 1)) {
+                    break :blk false;
+                }
+            }
+            break :blk expr_context_free(module, map_value.value, depth + 1);
+        },
+        .set_binary => |set_binary| expr_context_free(
+            module,
+            set_binary.left,
+            depth + 1,
+        ) and expr_context_free(module, set_binary.right, depth + 1),
+        .set_of_functions => |function_set| expr_context_free(
+            module,
+            function_set.domain,
+            depth + 1,
+        ) and expr_context_free(module, function_set.codomain, depth + 1),
+        .function_literal => |function_literal| blk: {
+            for (function_literal.vars) |bound| {
+                if (!expr_context_free(module, bound.domain, depth + 1)) {
+                    break :blk false;
+                }
+            }
+            break :blk expr_context_free(
+                module,
+                function_literal.body,
+                depth + 1,
+            );
+        },
+        .record_set => |record_set_value| blk: {
+            for (record_set_value.fields) |field_value| {
+                if (!expr_context_free(module, field_value.domain, depth + 1)) {
+                    break :blk false;
+                }
+            }
+            break :blk true;
+        },
+        .unary => |unary| expr_context_free(module, unary.operand, depth + 1),
+        .binary => |binary| expr_context_free(
+            module,
+            binary.left,
+            depth + 1,
+        ) and expr_context_free(module, binary.right, depth + 1),
+        .quantifier => |quantifier| blk: {
+            for (quantifier.vars) |bound| {
+                if (!expr_context_free(module, bound.domain, depth + 1)) {
+                    break :blk false;
+                }
+            }
+            break :blk expr_context_free(module, quantifier.body, depth + 1);
+        },
+        .choose => |choose_value| blk: {
+            if (choose_value.domain) |domain| {
+                if (!expr_context_free(module, domain, depth + 1)) {
+                    break :blk false;
+                }
+            }
+            break :blk expr_context_free(module, choose_value.body, depth + 1);
+        },
+        .if_then_else => |conditional| expr_context_free(
+            module,
+            conditional.cond,
+            depth + 1,
+        ) and expr_context_free(
+            module,
+            conditional.then_branch,
+            depth + 1,
+        ) and expr_context_free(module, conditional.else_branch, depth + 1),
+        .apply => |application| blk: {
+            if (variable_application_index(module, application) != null) {
+                break :blk false;
+            }
+            if (!expr_context_free(module, application.func, depth + 1)) {
+                break :blk false;
+            }
+            for (application.args) |argument| {
+                if (!expr_context_free(module, argument, depth + 1)) {
+                    break :blk false;
+                }
+            }
+            break :blk true;
+        },
+        .except => |except_value| blk: {
+            if (!expr_context_free(module, except_value.func, depth + 1)) {
+                break :blk false;
+            }
+            for (except_value.steps) |step| {
+                if (step == .index and
+                    !expr_context_free(module, step.index, depth + 1))
+                {
+                    break :blk false;
+                }
+            }
+            break :blk expr_context_free(module, except_value.value, depth + 1);
+        },
+        .let_in => |let_value| blk: {
+            for (let_value.defs) |local_definition| {
+                if (!expr_context_free(module, local_definition.body, depth + 1)) {
+                    break :blk false;
+                }
+                if (local_definition.function_domain) |domain| {
+                    if (!expr_context_free(module, domain, depth + 1)) {
+                        break :blk false;
+                    }
+                }
+            }
+            break :blk expr_context_free(module, let_value.body, depth + 1);
+        },
+        .case_expr => |case_value| blk: {
+            for (case_value.arms) |arm| {
+                if (!expr_context_free(module, arm.cond, depth + 1) or
+                    !expr_context_free(module, arm.value, depth + 1))
+                {
+                    break :blk false;
+                }
+            }
+            if (case_value.otherwise) |otherwise| {
+                break :blk expr_context_free(module, otherwise, depth + 1);
+            }
+            break :blk true;
+        },
+        .lambda => |lambda_value| expr_context_free(
+            module,
+            lambda_value.body,
+            depth + 1,
+        ),
+    };
 }
 
 fn expr_is_boolean(
@@ -581,6 +821,32 @@ fn emit_operator(
         try append(output, allocator, "}\n\n");
         return;
     }
+    if (definition_context_free(module, definition)) {
+        const cache_prefix = try std.fmt.allocPrint(
+            allocator,
+            "    if (try runtime.cached_definition(context, {d})) |cached| return cached;\n" ++
+                "    const result = ",
+            .{definition_index},
+        );
+        defer allocator.free(cache_prefix);
+        try append(output, allocator, cache_prefix);
+        try emit_expr(
+            output,
+            allocator,
+            module,
+            definition.body,
+            definition.params,
+        );
+        const cache_suffix = try std.fmt.allocPrint(
+            allocator,
+            ";\n    return try runtime.put_cached_definition(context, {d}, result);\n",
+            .{definition_index},
+        );
+        defer allocator.free(cache_suffix);
+        try append(output, allocator, cache_suffix);
+        try append(output, allocator, "}\n\n");
+        return;
+    }
     try emit_function_body(
         output,
         allocator,
@@ -791,6 +1057,14 @@ fn emit_boolean_expr(
                 .subseteq,
                 => {
                     if (binary.op == .in or binary.op == .notin) {
+                        if (try emit_string_literal_set_membership(
+                            output,
+                            allocator,
+                            module,
+                            binary,
+                            params,
+                            .boolean,
+                        )) return;
                         if (try emit_field_path_membership(
                             output,
                             allocator,
@@ -939,6 +1213,11 @@ fn emit_boolean_expr(
             defer allocator.free(call);
             try append(output, allocator, call);
         },
+        .quantifier => {
+            try append(output, allocator, "try runtime.boolean(");
+            try emit_expr(output, allocator, module, expr, params);
+            try append(output, allocator, ")");
+        },
         .unchanged => |names| {
             if (names.len == 0) {
                 try append(output, allocator, "true");
@@ -1033,6 +1312,12 @@ fn emit_expr(
                             "try runtime.constant_at(context, {d})",
                             .{index},
                         )
+                    else if (builtin_value_runtime_name(resolved_name)) |runtime_name|
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "try runtime.{s}(context)",
+                            .{runtime_name},
+                        )
                     else if (find_definition_index(
                         module,
                         resolved_name,
@@ -1057,6 +1342,12 @@ fn emit_expr(
                     allocator,
                     "try runtime.constant_at(context, {d})",
                     .{index},
+                )
+            else if (builtin_value_runtime_name(name)) |runtime_name|
+                try std.fmt.allocPrint(
+                    allocator,
+                    "try runtime.{s}(context)",
+                    .{runtime_name},
                 )
             else if (find_definition_index(module, name)) |index| blk: {
                 const definition = module.definitions[index];
@@ -1339,6 +1630,29 @@ fn emit_expr(
                 );
                 defer allocator.free(suffix);
                 try append(output, allocator, suffix);
+                return;
+            }
+            if (quantifier_constant_domain_index(module, quantifier)) |constant_domain_index| {
+                const helper = try helper_name(
+                    allocator,
+                    expression_identity(module, expr),
+                );
+                defer allocator.free(helper);
+                const call = try std.fmt.allocPrint(
+                    allocator,
+                    "try runtime.quantify_constant_at(context, args, {d}, .{s}, {s}, {d})",
+                    .{
+                        constant_domain_index,
+                        if (quantifier.kind == .exists)
+                            "exists"
+                        else
+                            "forall",
+                        helper,
+                        expression_identity(module, expr),
+                    },
+                );
+                defer allocator.free(call);
+                try append(output, allocator, call);
                 return;
             }
             try append(output, allocator, "try runtime.quantify_at(context, args, &[_]Value{");
@@ -1664,6 +1978,16 @@ fn emit_expr(
                     );
                 },
                 else => {
+                    if (binary.op == .in or binary.op == .notin) {
+                        if (try emit_string_literal_set_membership(
+                            output,
+                            allocator,
+                            module,
+                            binary,
+                            params,
+                            .value,
+                        )) return;
+                    }
                     try append(output, allocator, binary_runtime(binary.op));
                     try emit_expr(
                         output,
@@ -1724,6 +2048,20 @@ fn emit_expr(
                     defer allocator.free(text);
                     try append(output, allocator, text);
                     return;
+                }
+                if (std.mem.eql(u8, application.func.ident, "Cardinality") and
+                    application.args.len == 1)
+                {
+                    if (expr_constant_index(module, application.args[0])) |index| {
+                        const text = try std.fmt.allocPrint(
+                            allocator,
+                            "try runtime.constant_cardinality_at(context, {d})",
+                            .{index},
+                        );
+                        defer allocator.free(text);
+                        try append(output, allocator, text);
+                        return;
+                    }
                 }
             }
             if (is_select_sequence_call(application)) {
@@ -1802,29 +2140,6 @@ fn emit_expr(
                 );
                 try append(output, allocator, "})");
                 return;
-            }
-            if (application.func.* == .ident) {
-                if (direct_native_name(application.func.ident)) |native_name| {
-                    const prefix = try std.fmt.allocPrint(
-                        allocator,
-                        "try runtime.{s}(context, &[_]Value{{",
-                        .{native_name},
-                    );
-                    defer allocator.free(prefix);
-                    try append(output, allocator, prefix);
-                    for (application.args, 0..) |argument, index| {
-                        if (index > 0) try append(output, allocator, ", ");
-                        try emit_expr(
-                            output,
-                            allocator,
-                            module,
-                            argument,
-                            params,
-                        );
-                    }
-                    try append(output, allocator, "})");
-                    return;
-                }
             }
             const target_name = if (application.func.* == .ident)
                 resolved_definition_name(
@@ -1911,6 +2226,29 @@ fn emit_expr(
                 }
                 try append(output, allocator, "})");
             } else {
+                if (application.func.* == .ident) {
+                    if (direct_native_name(application.func.ident)) |native_name| {
+                        const prefix = try std.fmt.allocPrint(
+                            allocator,
+                            "try runtime.{s}(context, &[_]Value{{",
+                            .{native_name},
+                        );
+                        defer allocator.free(prefix);
+                        try append(output, allocator, prefix);
+                        for (application.args, 0..) |argument, index| {
+                            if (index > 0) try append(output, allocator, ", ");
+                            try emit_expr(
+                                output,
+                                allocator,
+                                module,
+                                argument,
+                                params,
+                            );
+                        }
+                        try append(output, allocator, "})");
+                        return;
+                    }
+                }
                 try append(output, allocator, "try runtime.call(context, ");
                 try emit_expr(
                     output,
@@ -2410,8 +2748,10 @@ fn definition_value_supported(
     depth: u32,
 ) bool {
     if (configured_constant_name(module, name) != null) return true;
+    if (builtin_value_runtime_name(name) != null) return true;
     const resolved_name = resolved_definition_name(module, name) orelse
         return false;
+    if (builtin_value_runtime_name(resolved_name) != null) return true;
     const definition = find_definition(module, resolved_name) orelse
         return false;
     return operator_supported(module, definition, depth + 1);
@@ -2458,6 +2798,7 @@ fn emit_helpers(
     module: ast.Module,
     expr: *const ast.Expr,
     params: []const []const u8,
+    emitted_helpers: *std.StringHashMap(void),
 ) error{OutOfMemory}!void {
     switch (expr.*) {
         .primed_expr => |operand| {
@@ -2473,6 +2814,7 @@ fn emit_helpers(
                 helper,
                 operand,
                 params,
+                emitted_helpers,
             );
             try emit_helpers(
                 output,
@@ -2480,6 +2822,7 @@ fn emit_helpers(
                 module,
                 operand,
                 params,
+                emitted_helpers,
             );
         },
         .quantifier => |quantifier| {
@@ -2491,6 +2834,7 @@ fn emit_helpers(
                 quantifier.vars,
                 quantifier.body,
                 params,
+                emitted_helpers,
             );
             for (quantifier.vars) |bound| {
                 try emit_helpers(
@@ -2499,6 +2843,7 @@ fn emit_helpers(
                     module,
                     bound.domain,
                     params,
+                    emitted_helpers,
                 );
             }
             var extended: [64][]const u8 = undefined;
@@ -2512,6 +2857,7 @@ fn emit_helpers(
                 module,
                 quantifier.body,
                 extended[0 .. params.len + quantifier.vars.len],
+                emitted_helpers,
             );
         },
         .set_filter => |filter_value| {
@@ -2523,6 +2869,7 @@ fn emit_helpers(
                 filter_value.vars,
                 filter_value.pred,
                 params,
+                emitted_helpers,
             );
             try emit_bound_children(
                 output,
@@ -2531,6 +2878,7 @@ fn emit_helpers(
                 filter_value.vars,
                 filter_value.pred,
                 params,
+                emitted_helpers,
             );
         },
         .set_map => |map_value| {
@@ -2542,6 +2890,7 @@ fn emit_helpers(
                 map_value.vars,
                 map_value.value,
                 params,
+                emitted_helpers,
             );
             try emit_bound_children(
                 output,
@@ -2550,6 +2899,7 @@ fn emit_helpers(
                 map_value.vars,
                 map_value.value,
                 params,
+                emitted_helpers,
             );
         },
         .choose => |choose_value| {
@@ -2565,6 +2915,7 @@ fn emit_helpers(
                 &vars,
                 choose_value.body,
                 params,
+                emitted_helpers,
             );
             try emit_bound_children(
                 output,
@@ -2573,6 +2924,7 @@ fn emit_helpers(
                 &vars,
                 choose_value.body,
                 params,
+                emitted_helpers,
             );
         },
         .let_in => |let_value| try emit_let_helpers(
@@ -2582,6 +2934,7 @@ fn emit_helpers(
             expr,
             let_value,
             params,
+            emitted_helpers,
         ),
         .except => |except_value| {
             try emit_helpers(
@@ -2590,6 +2943,7 @@ fn emit_helpers(
                 module,
                 except_value.func,
                 params,
+                emitted_helpers,
             );
             for (except_value.steps) |step| {
                 if (step == .index) {
@@ -2599,6 +2953,7 @@ fn emit_helpers(
                         module,
                         step.index,
                         params,
+                        emitted_helpers,
                     );
                 }
             }
@@ -2617,6 +2972,7 @@ fn emit_helpers(
                 helper,
                 except_value.value,
                 extended[0 .. params.len + 1],
+                emitted_helpers,
             );
             try emit_helpers(
                 output,
@@ -2624,6 +2980,7 @@ fn emit_helpers(
                 module,
                 except_value.value,
                 extended[0 .. params.len + 1],
+                emitted_helpers,
             );
         },
         .function_literal => |function_literal| {
@@ -2639,6 +2996,7 @@ fn emit_helpers(
                     function_literal.vars,
                     function_literal.body,
                     params,
+                    emitted_helpers,
                 );
             }
             try emit_bound_children(
@@ -2648,6 +3006,7 @@ fn emit_helpers(
                 function_literal.vars,
                 function_literal.body,
                 params,
+                emitted_helpers,
             );
         },
         .binary => |binary| {
@@ -2657,6 +3016,7 @@ fn emit_helpers(
                 module,
                 binary.left,
                 params,
+                emitted_helpers,
             );
             try emit_helpers(
                 output,
@@ -2664,6 +3024,7 @@ fn emit_helpers(
                 module,
                 binary.right,
                 params,
+                emitted_helpers,
             );
         },
         .unary => |unary| try emit_helpers(
@@ -2672,15 +3033,24 @@ fn emit_helpers(
             module,
             unary.operand,
             params,
+            emitted_helpers,
         ),
         .if_then_else => |conditional| {
-            try emit_helpers(output, allocator, module, conditional.cond, params);
+            try emit_helpers(
+                output,
+                allocator,
+                module,
+                conditional.cond,
+                params,
+                emitted_helpers,
+            );
             try emit_helpers(
                 output,
                 allocator,
                 module,
                 conditional.then_branch,
                 params,
+                emitted_helpers,
             );
             try emit_helpers(
                 output,
@@ -2688,6 +3058,7 @@ fn emit_helpers(
                 module,
                 conditional.else_branch,
                 params,
+                emitted_helpers,
             );
         },
         .apply => |application| {
@@ -2709,6 +3080,7 @@ fn emit_helpers(
                     helper,
                     lambda.body,
                     extended[0 .. params.len + 1],
+                    emitted_helpers,
                 );
                 try emit_helpers(
                     output,
@@ -2716,6 +3088,7 @@ fn emit_helpers(
                     module,
                     lambda.body,
                     extended[0 .. params.len + 1],
+                    emitted_helpers,
                 );
                 try emit_helpers(
                     output,
@@ -2723,6 +3096,7 @@ fn emit_helpers(
                     module,
                     application.args[0],
                     params,
+                    emitted_helpers,
                 );
                 return;
             }
@@ -2747,6 +3121,7 @@ fn emit_helpers(
                     helper,
                     lambda.body,
                     extended[0 .. params.len + lambda.params.len],
+                    emitted_helpers,
                 );
                 try emit_helpers(
                     output,
@@ -2754,6 +3129,7 @@ fn emit_helpers(
                     module,
                     lambda.body,
                     extended[0 .. params.len + lambda.params.len],
+                    emitted_helpers,
                 );
                 try emit_helpers(
                     output,
@@ -2761,6 +3137,7 @@ fn emit_helpers(
                     module,
                     application.args[1],
                     params,
+                    emitted_helpers,
                 );
                 try emit_helpers(
                     output,
@@ -2768,6 +3145,7 @@ fn emit_helpers(
                     module,
                     application.args[2],
                     params,
+                    emitted_helpers,
                 );
                 return;
             }
@@ -2777,6 +3155,7 @@ fn emit_helpers(
                 module,
                 application.func,
                 params,
+                emitted_helpers,
             );
             for (application.args) |argument| {
                 try emit_helpers(
@@ -2785,6 +3164,7 @@ fn emit_helpers(
                     module,
                     argument,
                     params,
+                    emitted_helpers,
                 );
             }
         },
@@ -2794,6 +3174,7 @@ fn emit_helpers(
             module,
             field_value.expr,
             params,
+            emitted_helpers,
         ),
         .tuple, .set_enum => |items| {
             for (items) |item| {
@@ -2803,6 +3184,7 @@ fn emit_helpers(
                     module,
                     item,
                     params,
+                    emitted_helpers,
                 );
             }
         },
@@ -2814,6 +3196,7 @@ fn emit_helpers(
                     module,
                     field_value.value,
                     params,
+                    emitted_helpers,
                 );
             }
         },
@@ -2824,6 +3207,7 @@ fn emit_helpers(
                 module,
                 set_binary.left,
                 params,
+                emitted_helpers,
             );
             try emit_helpers(
                 output,
@@ -2831,6 +3215,7 @@ fn emit_helpers(
                 module,
                 set_binary.right,
                 params,
+                emitted_helpers,
             );
         },
         .set_of_functions => |function_set| {
@@ -2840,6 +3225,7 @@ fn emit_helpers(
                 module,
                 function_set.domain,
                 params,
+                emitted_helpers,
             );
             try emit_helpers(
                 output,
@@ -2847,6 +3233,7 @@ fn emit_helpers(
                 module,
                 function_set.codomain,
                 params,
+                emitted_helpers,
             );
         },
         .record_set => |record_set_value| {
@@ -2857,6 +3244,7 @@ fn emit_helpers(
                     module,
                     field_value.domain,
                     params,
+                    emitted_helpers,
                 );
             }
         },
@@ -2871,6 +3259,7 @@ fn emit_bound_children(
     vars: []const ast.BoundVar,
     body: *const ast.Expr,
     params: []const []const u8,
+    emitted_helpers: *std.StringHashMap(void),
 ) error{OutOfMemory}!void {
     for (vars) |bound| {
         try emit_helpers(
@@ -2879,6 +3268,7 @@ fn emit_bound_children(
             module,
             bound.domain,
             params,
+            emitted_helpers,
         );
     }
     var extended: [64][]const u8 = undefined;
@@ -2892,6 +3282,7 @@ fn emit_bound_children(
         module,
         body,
         extended[0 .. params.len + vars.len],
+        emitted_helpers,
     );
 }
 
@@ -2978,6 +3369,30 @@ fn direct_native_name(name: []const u8) ?[]const u8 {
         .{ .tla = "PermSeqs", .zig = "permutation_sequences" },
         .{ .tla = "Permutations", .zig = "permutations" },
         .{ .tla = "INTERSECTION", .zig = "intersection_all" },
+        .{ .tla = "SetToBag", .zig = "set_to_bag" },
+        .{ .tla = "BagOfSet", .zig = "set_to_bag" },
+        .{ .tla = "(+)", .zig = "bag_cup" },
+        .{ .tla = "BagCup", .zig = "bag_cup" },
+        .{ .tla = "(-)", .zig = "bag_difference" },
+        .{ .tla = "BagDifference", .zig = "bag_difference" },
+    };
+    for (direct) |entry| {
+        if (std.mem.eql(u8, unqualified, entry.tla)) return entry.zig;
+    }
+    return null;
+}
+
+fn builtin_value_runtime_name(name: []const u8) ?[]const u8 {
+    const separator = std.mem.lastIndexOfScalar(u8, name, '!');
+    const unqualified = if (separator) |index| name[index + 1 ..] else name;
+    const direct = [_]struct {
+        tla: []const u8,
+        zig: []const u8,
+    }{
+        .{ .tla = "Nat", .zig = "nat_set" },
+        .{ .tla = "Int", .zig = "int_set" },
+        .{ .tla = "BOOLEAN", .zig = "boolean_set" },
+        .{ .tla = "STRING", .zig = "string_set" },
     };
     for (direct) |entry| {
         if (std.mem.eql(u8, unqualified, entry.tla)) return entry.zig;
@@ -2992,6 +3407,7 @@ fn emit_let_helpers(
     owner: *const ast.Expr,
     let_value: *const ast.LetIn,
     params: []const []const u8,
+    emitted_helpers: *std.StringHashMap(void),
 ) error{OutOfMemory}!void {
     var extended: [64][]const u8 = undefined;
     @memcpy(extended[0..params.len], params);
@@ -3020,6 +3436,7 @@ fn emit_let_helpers(
             helper,
             definition.body,
             helper_params,
+            emitted_helpers,
         );
         try emit_helpers(
             output,
@@ -3027,6 +3444,7 @@ fn emit_let_helpers(
             module,
             definition.body,
             helper_params,
+            emitted_helpers,
         );
         extended[params.len + index] = definition.name;
     }
@@ -3042,6 +3460,7 @@ fn emit_let_helpers(
         body_helper,
         let_value.body,
         extended[0 .. params.len + let_value.defs.len],
+        emitted_helpers,
     );
     try emit_helpers(
         output,
@@ -3049,6 +3468,7 @@ fn emit_let_helpers(
         module,
         let_value.body,
         extended[0 .. params.len + let_value.defs.len],
+        emitted_helpers,
     );
     if (expr_is_boolean(module, let_value.body, 0)) {
         try emit_lazy_boolean_let(
@@ -3059,6 +3479,7 @@ fn emit_let_helpers(
             let_value,
             params,
             extended[0 .. params.len + let_value.defs.len],
+            emitted_helpers,
         );
     }
 }
@@ -3071,10 +3492,15 @@ fn emit_lazy_boolean_let(
     let_value: *const ast.LetIn,
     outer_params: []const []const u8,
     extended_params: []const []const u8,
+    emitted_helpers: *std.StringHashMap(void),
 ) error{OutOfMemory}!void {
     const identity = expression_identity(module, owner);
     const function_name = try let_boolean_name(allocator, identity);
     defer allocator.free(function_name);
+    if (emitted_helpers.contains(function_name)) return;
+    const owned_name = try allocator.dupe(u8, function_name);
+    errdefer allocator.free(owned_name);
+    try emitted_helpers.put(owned_name, {});
     const header = try std.fmt.allocPrint(
         allocator,
         "fn {s}(context: *runtime.CallContext, operator_args: []const Value) Error!bool {{\n" ++
@@ -3233,6 +3659,7 @@ fn emit_bound_helper(
     vars: []const ast.BoundVar,
     body: *const ast.Expr,
     params: []const []const u8,
+    emitted_helpers: *std.StringHashMap(void),
 ) error{OutOfMemory}!void {
     var extended: [64][]const u8 = undefined;
     @memcpy(extended[0..params.len], params);
@@ -3251,6 +3678,7 @@ fn emit_bound_helper(
         helper,
         body,
         extended[0 .. params.len + vars.len],
+        emitted_helpers,
     );
 }
 
@@ -3261,7 +3689,12 @@ fn emit_named_helper(
     name: []const u8,
     body: *const ast.Expr,
     params: []const []const u8,
+    emitted_helpers: *std.StringHashMap(void),
 ) error{OutOfMemory}!void {
+    if (emitted_helpers.contains(name)) return;
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    try emitted_helpers.put(owned_name, {});
     const header = try std.fmt.allocPrint(
         allocator,
         "fn {s}(context: *runtime.CallContext, args: []const Value) Error!Value {{\n" ++
@@ -3536,6 +3969,17 @@ fn helper_name(
     return std.fmt.allocPrint(
         allocator,
         "bound_{x}",
+        .{identity},
+    );
+}
+
+fn expression_boolean_name(
+    allocator: std.mem.Allocator,
+    identity: usize,
+) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "expr_{d}_bool",
         .{identity},
     );
 }
@@ -4006,19 +4450,27 @@ fn mark_reachable_expr(
             mark_reachable_expr(module, reachable, conditional.else_branch);
         },
         .apply => |application| {
-            if (application.func.* == .ident and
-                constant_substitution_name(
-                    module,
-                    application.func.*.ident,
-                ) != null)
-            {
-                return;
-            }
-            const native_call = application.func.* == .ident and
-                is_native_override(application.func.*.ident);
-            if (!is_reduce_sequence_call(application) and
-                !is_select_sequence_call(application) and
-                !native_call)
+            if (application.func.* == .ident) {
+                const name = application.func.*.ident;
+                if (constant_substitution_name(module, name) != null) {
+                    return;
+                }
+                if (resolved_definition_name(module, name)) |resolved_name| {
+                    if (find_definition_index(module, resolved_name)) |index| {
+                        mark_definition(module, reachable, index);
+                    }
+                } else if (!is_reduce_sequence_call(application) and
+                    !is_select_sequence_call(application) and
+                    !is_native_override(name))
+                {
+                    mark_reachable_expr(
+                        module,
+                        reachable,
+                        application.func,
+                    );
+                }
+            } else if (!is_reduce_sequence_call(application) and
+                !is_select_sequence_call(application))
             {
                 mark_reachable_expr(
                     module,
@@ -4715,6 +5167,29 @@ const FilteredPowerSetDomain = struct {
     base: *const ast.Expr,
 };
 
+fn quantifier_constant_domain_index(
+    module: ast.Module,
+    quantifier: *const ast.Quantifier,
+) ?usize {
+    if (quantifier.vars.len != 1) return null;
+    return expr_constant_index(module, quantifier.vars[0].domain);
+}
+
+fn expr_constant_index(
+    module: ast.Module,
+    expr: *const ast.Expr,
+) ?usize {
+    if (expr.* != .ident) return null;
+    const name = expr.ident;
+    if (resolved_config_symbol(module, name)) |symbol| {
+        return switch (symbol) {
+            .constant => |constant_name| constant_index(module, constant_name),
+            .name => |resolved_name| constant_index(module, resolved_name),
+        };
+    }
+    return constant_index(module, name);
+}
+
 fn filtered_power_set_domain(
     module: ast.Module,
     quantifier: *const ast.Quantifier,
@@ -5129,6 +5604,58 @@ fn emit_field_path_membership(
     );
     if (binary.op == .notin) try append(output, allocator, ")");
     return true;
+}
+
+const MembershipResult = enum {
+    boolean,
+    value,
+};
+
+fn emit_string_literal_set_membership(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    binary: *const ast.Binary,
+    params: []const []const u8,
+    result: MembershipResult,
+) error{OutOfMemory}!bool {
+    if (binary.op != .in and binary.op != .notin) return false;
+    const items = string_literal_set_items(binary.right) orelse return false;
+    if (result == .value) {
+        try append(output, allocator, "Value{ .bool_v = ");
+    }
+    if (binary.op == .notin) try append(output, allocator, "!");
+    try append(
+        output,
+        allocator,
+        "try runtime.string_literal_member_bool(context, ",
+    );
+    try emit_expr(output, allocator, module, binary.left, params);
+    try append(output, allocator, ", &[_][]const u8{");
+    for (items, 0..) |item, index| {
+        if (index > 0) try append(output, allocator, ", ");
+        const literal = try std.fmt.allocPrint(
+            allocator,
+            "\"{f}\"",
+            .{std.zig.fmtString(item.string_literal)},
+        );
+        defer allocator.free(literal);
+        try append(output, allocator, literal);
+    }
+    try append(output, allocator, "})");
+    if (result == .value) {
+        try append(output, allocator, " }");
+    }
+    return true;
+}
+
+fn string_literal_set_items(expr: *const ast.Expr) ?[]const *ast.Expr {
+    if (expr.* != .set_enum) return null;
+    if (expr.set_enum.len == 0) return null;
+    for (expr.set_enum) |item| {
+        if (item.* != .string_literal) return null;
+    }
+    return expr.set_enum;
 }
 
 fn emit_sequence_head_field_path_comparison(
@@ -5720,6 +6247,41 @@ test "configuration replacements remove shadowed fallbacks" {
         result.source,
         "pub const config_replacements_hash: u64 = 0x",
     ) != null);
+}
+
+test "configured operator replacement wins over direct native lowering" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE ConfiguredNative ----------------------
+        \\LimitedSeq(S) == {<<1>>}
+        \\Sequences == Seq({1, 2})
+        \\====================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    var module = try module_parser.parse_module();
+    module.config_replacements = &.{
+        .{
+            .name = "Seq",
+            .value = "LimitedSeq",
+            .kind = .alias,
+            .is_substitution = true,
+        },
+    };
+    const result = try emit_module(std.testing.allocator, module);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "runtime.sequence_set(") == null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "try op_0(context") != null,
+    );
 }
 
 test "generated Cartesian products use the direct runtime path" {

@@ -959,7 +959,13 @@ pub const Checker = struct {
                 self.candidate_store.reset(self.candidate_pool_base);
                 self.eval_pool.restore(self.eval_pool_base);
                 composition_generated = 0;
-                try executor.execute_next(self.next_spec.?, idx, &out_states);
+                executor.execute_next(self.next_spec.?, idx, &out_states) catch |err| {
+                    std.debug.print("Error executing Next from state {d}: {any}\n", .{
+                        idx,
+                        err,
+                    });
+                    return err;
+                };
                 self.generated += composition_generated;
                 if (self.check_deadlock and out_states.items.len == 0) {
                     if (self.diagnostics) {
@@ -1464,13 +1470,19 @@ pub const Checker = struct {
     ) !bool {
         assert(self.constraint_names.len == self.constraints.len);
         for (self.constraint_names) |constraint_name| {
-            const value = try candidate_evaluator.eval_named_zero(
+            const value = candidate_evaluator.eval_named_zero(
                 constraint_name,
                 Context.empty(),
                 candidate,
                 eval_pool,
                 &candidate_store.values_pool,
-            );
+            ) catch |err| {
+                std.debug.print("Error evaluating candidate constraint {s}: {any}\n", .{
+                    constraint_name,
+                    err,
+                });
+                return err;
+            };
             if (!value.is_truthy()) return false;
         }
         return true;
@@ -1485,13 +1497,19 @@ pub const Checker = struct {
     ) !bool {
         assert(self.invariant_names.len == self.invariants.len);
         for (self.invariant_names) |invariant_name| {
-            const value = try candidate_evaluator.eval_named_zero(
+            const value = candidate_evaluator.eval_named_zero(
                 invariant_name,
                 Context.empty(),
                 candidate,
                 eval_pool,
                 &candidate_store.values_pool,
-            );
+            ) catch |err| {
+                std.debug.print("Error evaluating candidate invariant {s}: {any}\n", .{
+                    invariant_name,
+                    err,
+                });
+                return err;
+            };
             if (!value.is_truthy()) return false;
         }
         return true;
@@ -1700,6 +1718,18 @@ pub const Checker = struct {
         }
     };
 
+    fn scc_edge_key(from: u32, to: u32) u64 {
+        return (@as(u64, from) << 32) | @as(u64, to);
+    }
+
+    fn scc_edge_key_from(key: u64) u32 {
+        return @intCast(key >> 32);
+    }
+
+    fn scc_edge_key_to(key: u64) u32 {
+        return @intCast(key & 0xffff_ffff);
+    }
+
     fn build_scc_data(self: *Checker) !SccData {
         const n = self.state_store.count;
         const scc_ids = try self.compute_sccs();
@@ -1739,9 +1769,9 @@ pub const Checker = struct {
         var scc_succ_counts = try allocator.alloc(u32, scc_count);
         defer allocator.free(scc_succ_counts);
         @memset(scc_succ_counts, 0);
-        var edge_seen = try allocator.alloc(bool, scc_count * scc_count);
-        defer allocator.free(edge_seen);
-        @memset(edge_seen, false);
+        var scc_edge_keys = try allocator.alloc(u64, self.succ_count);
+        defer allocator.free(scc_edge_keys);
+        var scc_edge_count: u32 = 0;
         for (0..n) |i| {
             const idx: u32 = @intCast(i);
             const from = scc_ids[idx];
@@ -1749,12 +1779,22 @@ pub const Checker = struct {
                 if (succ == idx) continue; // skip stuttering self-loops for liveness
                 const to = scc_ids[succ];
                 if (from == to) continue;
-                const key = from * scc_count + to;
-                if (!edge_seen[key]) {
-                    edge_seen[key] = true;
-                    scc_succ_counts[from] += 1;
-                }
+                assert(scc_edge_count < scc_edge_keys.len);
+                scc_edge_keys[scc_edge_count] = scc_edge_key(from, to);
+                scc_edge_count += 1;
             }
+        }
+        const scc_edges = scc_edge_keys[0..scc_edge_count];
+        std.mem.sort(u64, scc_edges, {}, std.sort.asc(u64));
+        var unique_edge_count: u32 = 0;
+        var previous_key: ?u64 = null;
+        for (scc_edges) |key| {
+            if (previous_key != null and previous_key.? == key) continue;
+            const from = scc_edge_key_from(key);
+            assert(from < scc_count);
+            scc_succ_counts[from] += 1;
+            unique_edge_count += 1;
+            previous_key = key;
         }
 
         var scc_succ_offsets = try allocator.alloc(u32, scc_count + 1);
@@ -1763,25 +1803,24 @@ pub const Checker = struct {
             scc_succ_offsets[i] = total_edges;
             total_edges += scc_succ_counts[i];
         }
+        assert(total_edges == unique_edge_count);
         scc_succ_offsets[scc_count] = total_edges;
 
         var scc_succ_edges = try allocator.alloc(u32, total_edges);
         @memcpy(fill, scc_succ_offsets[0..scc_count]);
-        @memset(edge_seen, false);
-        for (0..n) |i| {
-            const idx: u32 = @intCast(i);
-            const from = scc_ids[idx];
-            for (self.successors(idx)) |succ| {
-                if (succ == idx) continue; // skip stuttering self-loops for liveness
-                const to = scc_ids[succ];
-                if (from == to) continue;
-                const key = from * scc_count + to;
-                if (!edge_seen[key]) {
-                    edge_seen[key] = true;
-                    scc_succ_edges[fill[from]] = to;
-                    fill[from] += 1;
-                }
-            }
+        previous_key = null;
+        for (scc_edges) |key| {
+            if (previous_key != null and previous_key.? == key) continue;
+            const from = scc_edge_key_from(key);
+            const to = scc_edge_key_to(key);
+            assert(from < scc_count);
+            assert(to < scc_count);
+            scc_succ_edges[fill[from]] = to;
+            fill[from] += 1;
+            previous_key = key;
+        }
+        for (0..scc_count) |i| {
+            assert(fill[i] == scc_succ_offsets[i + 1]);
         }
 
         const fair_sccs = try self.compute_fair_sccs(scc_ids, scc_count, scc_states_offsets, scc_states_edges, allocator);
@@ -2435,13 +2474,19 @@ pub const Checker = struct {
     fn check_constraints(self: *Checker, st: *StateStore.State) !bool {
         assert(self.constraint_names.len == self.constraints.len);
         for (self.constraint_names) |constraint_name| {
-            const v = try self.evaluator.eval_named_zero(
+            const v = self.evaluator.eval_named_zero(
                 constraint_name,
                 Context.empty(),
                 st,
                 &self.eval_pool,
                 &self.state_store.values_pool,
-            );
+            ) catch |err| {
+                std.debug.print("Error evaluating constraint {s}: {any}\n", .{
+                    constraint_name,
+                    err,
+                });
+                return err;
+            };
             if (!v.is_truthy()) return false;
         }
         return true;

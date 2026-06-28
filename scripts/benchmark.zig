@@ -154,7 +154,7 @@ const specs = [_]Spec{
         .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_exhaustive.cfg",
         .default_enabled = false,
         .one_core_default = false,
-        .max_states = 10_000_000,
+        .max_states = 30_000_000,
         .state_values_per_state = 120,
         .compare_generated = false,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -166,7 +166,7 @@ const specs = [_]Spec{
         .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_or_ww_exhaustive.cfg",
         .default_enabled = false,
         .one_core_default = false,
-        .max_states = 10_000_000,
+        .max_states = 30_000_000,
         .state_values_per_state = 120,
         .compare_generated = false,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -178,7 +178,7 @@ const specs = [_]Spec{
         .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_snapshot_exhaustive.cfg",
         .default_enabled = false,
         .one_core_default = false,
-        .max_states = 10_000_000,
+        .max_states = 30_000_000,
         .state_values_per_state = 300,
         .compare_generated = false,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -190,9 +190,20 @@ const specs = [_]Spec{
         .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_with_prepare_block_exhaustive.cfg",
         .default_enabled = false,
         .one_core_default = false,
-        .max_states = 10_000_000,
+        .max_states = 30_000_000,
         .state_values_per_state = 120,
         .compare_generated = false,
+        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
+            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
+    },
+    .{
+        .label = "SingleLog MCMDBProps",
+        .tla = "vendor/MDBTLA/SingleLog/MCMDBProps.tla",
+        .cfg = "vendor/MDBTLA/SingleLog/MCMDBProps.cfg",
+        .default_enabled = false,
+        .one_core_default = false,
+        .max_states = 500_000,
+        .state_values_per_state = 180,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -229,9 +240,10 @@ pub fn main(init: std.process.Init.Minimal) void {
     var failures: u32 = 0;
     for (specs) |spec| {
         const explicit_match = filter_matches(spec, options.filter);
+        const exact_label_match = filter_label_matches(spec, options.filter);
         if (options.filter != null and !explicit_match) continue;
-        if (options.filter == null and !options.include_long and
-            !spec.default_enabled)
+        if (!options.include_long and !spec.default_enabled and
+            (options.filter == null or !exact_label_match))
         {
             continue;
         }
@@ -279,13 +291,15 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
 
 fn filter_matches(spec: Spec, optional_filter: ?[]const u8) bool {
     const needle = optional_filter orelse return false;
-    const label_matches = if (spec.label) |label|
-        std.mem.eql(u8, label, needle)
-    else
-        false;
-    return label_matches or
+    return filter_label_matches(spec, optional_filter) or
         std.mem.indexOf(u8, spec.tla, needle) != null or
         std.mem.indexOf(u8, spec.cfg, needle) != null;
+}
+
+fn filter_label_matches(spec: Spec, optional_filter: ?[]const u8) bool {
+    const needle = optional_filter orelse return false;
+    const label = spec.label orelse return false;
+    return std.mem.eql(u8, label, needle);
 }
 
 fn run_comparison(

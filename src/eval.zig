@@ -54,6 +54,23 @@ pub const Context = struct {
         }
         return null;
     }
+
+    pub fn collect_state_assignments(
+        self: Context,
+        assignments: []?StateContextValue,
+    ) void {
+        var binding = self.head;
+        while (binding) |current| : (binding = current.parent) {
+            const variable_index = current.variable_index orelse continue;
+            assert(current.assignment != .local);
+            assert(variable_index < assignments.len);
+            if (assignments[variable_index] != null) continue;
+            assignments[variable_index] = .{
+                .value = current.value,
+                .assignment = current.assignment,
+            };
+        }
+    }
 };
 
 pub const StateContextValue = struct {
@@ -208,6 +225,8 @@ pub const Evaluator = struct {
     next_state: ?*state.StateStore.State,
     enabled_result: ?bool,
     definition_memo: *DefinitionMemo,
+    generated_cache_pool: *ValuePool,
+    generated_cache: []?Value,
     context_pool: *ContextPool,
     /// Error context stored via pointer so all by-value copies share state.
     err_ctx: *ErrorContext,
@@ -229,6 +248,10 @@ pub const Evaluator = struct {
         err_ctx.* = .{};
         const definition_memo = try arena.alloc_object(DefinitionMemo);
         definition_memo.* = .{};
+        const generated_cache_pool = try arena.alloc_object(ValuePool);
+        generated_cache_pool.* = try ValuePool.init(arena, 4096, 4096);
+        const generated_cache = try arena.alloc(?Value, module.definitions.len);
+        @memset(generated_cache, null);
         const context_pool = try arena.alloc_object(ContextPool);
         context_pool.* = try ContextPool.init(arena);
         const constant_slots = try arena.alloc(?Value, module.constants.len);
@@ -247,6 +270,8 @@ pub const Evaluator = struct {
             .next_state = null,
             .enabled_result = null,
             .definition_memo = definition_memo,
+            .generated_cache_pool = generated_cache_pool,
+            .generated_cache = generated_cache,
             .context_pool = context_pool,
             .err_ctx = err_ctx,
         };
@@ -261,6 +286,10 @@ pub const Evaluator = struct {
         err_ctx.* = .{};
         const definition_memo = try arena.alloc_object(DefinitionMemo);
         definition_memo.* = .{};
+        const generated_cache_pool = try arena.alloc_object(ValuePool);
+        generated_cache_pool.* = try ValuePool.init(arena, 4096, 4096);
+        const generated_cache = try arena.alloc(?Value, self.module.definitions.len);
+        @memset(generated_cache, null);
         const context_pool = try arena.alloc_object(ContextPool);
         context_pool.* = try ContextPool.init(arena);
         const constant_slots = try arena.alloc(
@@ -272,6 +301,8 @@ pub const Evaluator = struct {
         copy.next_state = null;
         copy.enabled_result = null;
         copy.definition_memo = definition_memo;
+        copy.generated_cache_pool = generated_cache_pool;
+        copy.generated_cache = generated_cache;
         copy.context_pool = context_pool;
         copy.constant_slots = constant_slots;
         copy.err_ctx = err_ctx;
@@ -405,6 +436,49 @@ pub const Evaluator = struct {
             state_pool,
         );
         return result;
+    }
+
+    pub fn eval_generated_expression_bool(
+        self: Evaluator,
+        expression: generated_runtime.Expression,
+        context: Context,
+        current_state: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!bool {
+        const boolean_function = expression.boolean_function orelse {
+            const result = try self.eval_generated_expression(
+                expression,
+                context,
+                current_state,
+                eval_pool,
+                state_pool,
+            );
+            return result.is_truthy();
+        };
+        if (expression.arg_names.len > 32) return Error.NotImplemented;
+        if (expression.arg_required.len != 0 and
+            expression.arg_required.len != expression.arg_names.len)
+        {
+            return Error.TypeError;
+        }
+        var args: [32]Value = undefined;
+        for (expression.arg_names, 0..) |name, index| {
+            args[index] = context.lookup(name) orelse
+                if (expression.arg_required.len == 0 or
+                    expression.arg_required[index])
+                    return Error.UndefinedSymbol
+                else
+                    Value{ .bool_v = false };
+        }
+        return try self.call_generated_bool(
+            boolean_function,
+            args[0..expression.arg_names.len],
+            context,
+            current_state,
+            eval_pool,
+            state_pool,
+        );
     }
 
     pub fn make_generated_expression_operator(
@@ -2728,6 +2802,45 @@ pub const Evaluator = struct {
             .read_primed = false,
             .constants = self.constants,
             .constant_slots = self.constant_slots,
+            .generated_cache = self.generated_cache,
+            .generated_cache_pool = self.generated_cache_pool,
+            .native_context = &self.override_registry,
+            .native_call = generated_native_call,
+            .max_seq_len = self.override_registry.ctx.max_seq_len,
+        };
+        return function(&context, args);
+    }
+
+    fn call_generated_bool(
+        self: Evaluator,
+        function: generated_runtime.OperatorBoolFn,
+        args: []const Value,
+        evaluator_context: Context,
+        current_state: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!bool {
+        var partial_values: [64]?Value = @splat(null);
+        assert(self.module.variables.len <= partial_values.len);
+        var binding = evaluator_context.head;
+        while (binding) |current| : (binding = current.parent) {
+            const index = current.variable_index orelse continue;
+            assert(index < self.module.variables.len);
+            if (partial_values[index] == null) {
+                partial_values[index] = current.value;
+            }
+        }
+        var context = generated_runtime.CallContext{
+            .eval_pool = eval_pool,
+            .state_pool = state_pool,
+            .state = current_state,
+            .next_state = self.next_state,
+            .partial_values = partial_values[0..self.module.variables.len],
+            .read_primed = false,
+            .constants = self.constants,
+            .constant_slots = self.constant_slots,
+            .generated_cache = self.generated_cache,
+            .generated_cache_pool = self.generated_cache_pool,
             .native_context = &self.override_registry,
             .native_call = generated_native_call,
             .max_seq_len = self.override_registry.ctx.max_seq_len,
@@ -4531,34 +4644,7 @@ fn cross_pool_eql(
     right: Value,
     right_pool: *const ValuePool,
 ) bool {
-    if (left.tag() != right.tag()) return false;
-    return switch (left) {
-        .bool_v => |value_v| value_v == right.bool_v,
-        .int_v => |value_v| value_v == right.int_v,
-        .model_v => |value_v| value_v == right.model_v,
-        .string_v => |value_v| std.mem.eql(
-            u8,
-            value_v.slice(left_pool),
-            right.string_v.slice(right_pool),
-        ),
-        .tuple_v => |tuple| blk: {
-            const right_tuple = right.tuple_v;
-            if (tuple.len != right_tuple.len) break :blk false;
-            for (
-                tuple.items(left_pool),
-                right_tuple.items(right_pool),
-            ) |left_item, right_item| {
-                if (!cross_pool_eql(
-                    left_item,
-                    left_pool,
-                    right_item,
-                    right_pool,
-                )) break :blk false;
-            }
-            break :blk true;
-        },
-        else => false,
-    };
+    return Value.eql_cross_pool(left, left_pool, right, right_pool);
 }
 
 /// Try to evaluate an expression to a symbolic set value without materializing

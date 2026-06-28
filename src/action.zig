@@ -1172,14 +1172,6 @@ pub const ActionExecutor = struct {
         next: ?*const Continuation,
     };
 
-    fn continuation_empty(continuation: ?*const Continuation) bool {
-        var current = continuation;
-        while (current) |next| : (current = next.next) {
-            if (next.steps.len != 0) return false;
-        }
-        return true;
-    }
-
     pub fn execute_init(
         self: ActionExecutor,
         compiled: CompiledInit,
@@ -1519,23 +1511,16 @@ pub const ActionExecutor = struct {
                     if (s0 == null) return Error.TypeError;
                     const source_state = s0.?;
                     assert(unchanged.var_index < source_state.values.len);
-                    const terminal = rest.len == 0 and
-                        continuation_empty(continuation);
-                    const v = if (terminal)
-                        source_state.values[unchanged.var_index]
-                    else
-                        try source_state.values[unchanged.var_index].clone(
-                            source_state.value_pool(
-                                unchanged.var_index,
-                                &self.source_state_store.values_pool,
-                            ),
-                            self.eval_pool,
-                        );
-                    current_ctx = try self.evaluator.extend_state_context(
+                    const source_pool = source_state.value_pool(
+                        unchanged.var_index,
+                        &self.source_state_store.values_pool,
+                    );
+                    current_ctx = try self.evaluator.extend_state_context_from_pool(
                         current_ctx,
                         unchanged.var_name,
                         unchanged.var_index,
-                        v,
+                        source_state.values[unchanged.var_index],
+                        source_pool,
                         .unchanged,
                     );
                     current_steps = rest;
@@ -1576,13 +1561,15 @@ pub const ActionExecutor = struct {
             if (assignments[variable_index]) |assigned| {
                 if (assigned.assignment == .changed) {
                     new_state.changed_mask |= @as(u64, 1) << @intCast(variable_index);
+                    const source_pool = assigned.value_pool orelse
+                        self.eval_pool;
                     destination.* = try assigned.value.clone(
-                        self.eval_pool,
+                        source_pool,
                         &self.candidate_store.values_pool,
                     );
                     assert(Value.eql_cross_pool(
                         assigned.value,
-                        self.eval_pool,
+                        source_pool,
                         destination.*,
                         &self.candidate_store.values_pool,
                     ));
@@ -1602,8 +1589,10 @@ pub const ActionExecutor = struct {
                         new_state.borrowed_pool = parent_pool;
                     }
                 } else {
+                    const source_pool = assigned.value_pool orelse
+                        self.eval_pool;
                     destination.* = try assigned.value.clone(
-                        self.eval_pool,
+                        source_pool,
                         &self.candidate_store.values_pool,
                     );
                 }

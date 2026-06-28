@@ -7,3 +7,6 @@
 - [ ] convert elle algorithms to a module
   - https://github.com/jepsen-io/elle
 - [ ] running as a lib (no restart required)
+- [ ] statistical (among runs properties ?)
+  - [ ] so we can measure perf (e.g. delay or whatever other dist propertiers)
+- [ ] built-in abstractions

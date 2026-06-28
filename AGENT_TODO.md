@@ -407,6 +407,67 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
 - [ ] Specialize mapped-set/range construction used in hot MDBTLA actions,
   especially `map_set(function_range(variable_path(...)), ...)`. Current
   audit: `map_set=287`, `function_range=395`.
+- [ ] Add an explicit statistical benchmark mode for performance-sensitive
+  rows. It should run ReleaseFast specs repeatedly under an opt-in flag, record
+  wall/user/sys/RSS/instructions when the platform exposes them, and report
+  min/median/p95/stddev plus confidence intervals. Keep the default benchmark
+  single-pass/fast; use the statistical mode for noisy all-core runs and delay
+  distribution measurements.
+- [ ] Add tlzig-only meta properties over runs/traces as TLA+-style extension
+  properties, explicitly separated from Java TLC-compatible semantics. They
+  should look and be configured like normal invariants/temporal properties, but
+  their operators quantify over run/trace ensembles, e.g. “at least one
+  explored path reaches event/label X”, “some run includes an allow
+  transition”, “p99 delay across statistical runs stays below a threshold”, or
+  “coverage of action classes is nonzero”. Java TLC will not support these
+  extension operators; tlzig output must label them separately from standard
+  TLC parity.
+- [x] For the strict generated MDBTLA
+  `MCMultiShardTxn_RC_no_prepare_block_exhaustive` model, lower common
+  value-producing path helpers instead of only boolean comparisons:
+  `Len(variable_path(...))`, `Head(variable_path(...)).field`,
+  `variable_path(...).field`, `Range(variable_path(...))`, and
+  `DOMAIN variable_path(...)`. The model still has `fallbacks=0`; current
+  one-file audit after regeneration is `variable_path=523`,
+  `function_range=11`, `field_sequence_head=0`, `nested_runtime_call=896`.
+  Capped 3M ReleaseFast best improved from the previous `28.84s`/`5.103T`
+  accepted baseline to `28.59s`/`4.830T` instructions.
+  Full ReleaseFast exact benchmark row is still slower than TLC:
+  TLC-auto `177.440s`, tlzig-auto `203.328s`, both distinct
+  `17,057,584`.
+- [x] Fuse same-parent, static-key nested generated EXCEPT comparisons such as
+  `[mtxnSnapshots EXCEPT ![n][tid]["active"] = FALSE,
+  ![n][tid]["committed"] = TRUE]` into
+  `primed_variable_double_except_update_equal_bool(...)`. The generated
+  model remains strict with `fallbacks=0`. One-file audit improved
+  `except_update=121 -> 75` and `primed_variable_full_compare=83 -> 64`.
+  Capped 3M ReleaseFast improved only slightly from the accepted
+  `28.59s`/`4.830T` to `28.48s`/`4.825T`, so this is correct direction but
+  not enough to close the full TLC gap.
+- [x] Generalize nested EXCEPT comparison lowering to statically disjoint
+  paths with different depths, while rejecting ancestor/descendant overlaps.
+  This covers hot updates such as `["writeSet"]` and `["data"][k]` under the
+  same `mtxnSnapshots[n][tid]` record. One-file audit improved again to
+  `except_update=61`, `primed_variable_full_compare=63`, `variable_path=523`,
+  `function_range=11`, and `fallbacks=0`. Capped 3M ReleaseFast best improved
+  to `27.75s` / `4.822T` retired instructions / ~`2.98GB` peak footprint.
+- [x] Specialize generated no-clone boolean state-path reads and integer
+  state-path comparisons. This lowered the one-file audit to
+  `variable_path=383`, `nested_runtime_call=876`, and emitted `40`
+  `variable_path*_int_compare_bool` calls with `fallbacks=0`. Capped 3M
+  ReleaseFast is neutral on wall time but lower on retired instructions:
+  `27.78s` / `4.821T` best repeat, with a lower single-run instruction count
+  of `4.818T`. Latest full exact row before this path-compare specialization:
+  TLC-auto `175.588s`, tlzig-auto `195.517s`, both distinct `17,057,584`.
+- [x] Reduce generated-call context clearing in the hot action executor.
+  Generated expression calls now clear only the active variable slice instead
+  of all 64 partial-value slots. Sampling showed this path under
+  `eval_compiled_bool`; capped 3M ReleaseFast improved to `26.52s` /
+  `4.649T` retired instructions / ~`2.97GB` peak footprint. This is the best
+  current tlzig capped baseline and is `7.9%` faster than the earlier
+  `28.84s` accepted baseline. Full exact row improved to TLC-auto
+  `171.622s`, tlzig-auto `183.769s`, both distinct `17,057,584`; tlzig is
+  still slower by ~`7.1%`.
 - [ ] Reduce remaining nested runtime helper chains after the concrete
   patterns above. Current broad audit count: `nested_runtime_call=9284`.
 - [ ] Investigate and optimize `MCBinarySearch`. It remains correct but
@@ -1067,6 +1128,46 @@ allocation-free Zig operator overrides, and
   module/config identity checks; print TLC and tlzig counts separately.
 - [ ] Beat the interpreter and TLC Java on representative single-core and
   all-core MultiShardTxn full runs before enabling AOT generation by default.
+  - 2026-06-28 current target:
+    `MultiShardTxn RC/no-prepare-block exhaustive`
+    (`benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_exhaustive.cfg`).
+  - Previous exact ReleaseFast row after partial slot clearing:
+    TLC-auto 171.622s, tlzig-auto 183.769s,
+    TLC states `99713354/17057584`,
+    tlzig states `98533426/17057584`.
+  - After generated boolean quantifier predicates:
+    capped 3M best run 26.23s, 4.638T instructions, peak footprint
+    2.976GB, generated/distinct `16920402/3000000`.
+    This is better than the prior capped best 26.52s / 4.649T, but not
+    a 10x-class change.
+  - Exact row after generated boolean quantifier predicates:
+    TLC-auto 176.805s, tlzig-auto 183.451s,
+    TLC states `99713354/17057584`,
+    tlzig states `98533426/17057584`.
+    tlzig remains slower than TLC Java on this row by about 3.8%.
+  - After generated-expression batch context lookup plus state-only context
+    chains for generated partial assignments:
+    capped 3M best observed run 26.56s, 4.569T instructions, peak footprint
+    2.974GB, generated/distinct `16913730/3000000`.
+    Exact row: TLC-auto 171.290s, tlzig-auto 182.444s,
+    TLC states `99713354/17057584`,
+    tlzig states `98533426/17057584`.
+    This is the current best exact tlzig time in this thread, but tlzig is
+    still about 6.5% slower than TLC Java for this full row.
+  - After skipping generated partial-state array setup when no state
+    assignments are present:
+    capped 3M best observed run 23.90s, 4.258T instructions, peak footprint
+    2.972GB, generated/distinct `16916698/3000000`.
+    Exact row: TLC-auto 162.754s, tlzig-auto 165.286s,
+    TLC states `99713354/17057584`,
+    tlzig states `98533426/17057584`.
+    This achieves the requested 10x-percent-class improvement over today's
+    accepted tlzig full baseline (183.769s -> 165.286s, about 10.1% faster),
+    but tlzig is still about 1.6% slower than TLC Java on this row.
+  - Next structural target: remove generic action/context churn in
+    `ActionExecutor.execute_steps` and generated expression argument binding;
+    the remaining `Value`-based helper lowering is not enough for the
+    requested speedup.
 
 ## Notes
 - Update this file after every spec/example milestone.

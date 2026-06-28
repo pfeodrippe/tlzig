@@ -204,6 +204,12 @@ pub const FairnessCondition = struct {
     kind: enum { weak, strong },
     action: *ast.Expr,
     vars: *ast.Expr,
+    bindings: []const FairnessBinding = &.{},
+};
+
+pub const FairnessBinding = struct {
+    name: []const u8,
+    value: Value,
 };
 
 const SymmetryHashCache = struct {
@@ -840,12 +846,18 @@ pub const Checker = struct {
 
         const fairness = if (graph_enabled)
             if (spec_name_v) |sn|
-                try extract_fairness(arena, module, sn)
+                try extract_fairness(
+                    arena,
+                    &evaluator,
+                    &eval_pool,
+                    &state_store.values_pool,
+                    module,
+                    sn,
+                )
             else
                 &[_]FairnessCondition{}
         else
             &[_]FairnessCondition{};
-
         return Checker{
             .arena = arena,
             .state_store = state_store,
@@ -1917,8 +1929,20 @@ pub const Checker = struct {
                 const state = self.state_store.get(@intCast(s));
                 for (self.successors(@intCast(s))) |succ| {
                     const child = self.state_store.get(succ);
-                    if (try self.eval_action(fc.action, state, child)) {
-                        const changes_vars = !(try self.eval_vars_equal(fc.vars, state, child));
+                    const context_snap = self.evaluator.context_snapshot();
+                    const fc_context = try self.fairness_context(fc);
+                    const action_holds = try self.eval_action(
+                        fc.action,
+                        fc_context,
+                        state,
+                        child,
+                    );
+                    const changes_vars = if (action_holds)
+                        !(try self.eval_vars_equal(fc.vars, fc_context, state, child))
+                    else
+                        false;
+                    self.evaluator.restore_context_pool(context_snap);
+                    if (action_holds) {
                         // WF_v(A) and SF_v(A) are defined over <<A>>_v, not
                         // over A alone. A stuttering A transition does not make
                         // the fairness action enabled.
@@ -1966,20 +1990,39 @@ pub const Checker = struct {
         return fair_sccs;
     }
 
-    fn eval_action(self: *Checker, action_expr: *ast.Expr, parent: *StateStore.State, child: *StateStore.State) Error!bool {
+    fn fairness_context(
+        self: *Checker,
+        condition: FairnessCondition,
+    ) Error!Context {
+        var context = Context.empty();
+        for (condition.bindings) |binding| {
+            context = try self.evaluator.extend_context(
+                context,
+                binding.name,
+                binding.value,
+            );
+        }
+        return context;
+    }
+
+    fn eval_action(self: *Checker, action_expr: *ast.Expr, context: Context, parent: *StateStore.State, child: *StateStore.State) Error!bool {
         const snap = self.eval_pool.snapshot();
         defer self.eval_pool.restore(snap);
+        const context_snap = self.evaluator.context_snapshot();
+        defer self.evaluator.restore_context_pool(context_snap);
         self.evaluator.set_next_state(child);
         defer self.evaluator.set_next_state(null);
-        const v = try self.evaluator.eval_expr(action_expr, Context.empty(), parent, &self.eval_pool, &self.state_store.values_pool);
+        const v = try self.evaluator.eval_expr(action_expr, context, parent, &self.eval_pool, &self.state_store.values_pool);
         return v.is_truthy();
     }
 
-    fn eval_vars_equal(self: *Checker, vars_expr: *ast.Expr, a: *StateStore.State, b: *StateStore.State) Error!bool {
+    fn eval_vars_equal(self: *Checker, vars_expr: *ast.Expr, context: Context, a: *StateStore.State, b: *StateStore.State) Error!bool {
         const snap = self.eval_pool.snapshot();
         defer self.eval_pool.restore(snap);
-        const va = try self.evaluator.eval_expr(vars_expr, Context.empty(), a, &self.eval_pool, &self.state_store.values_pool);
-        const vb = try self.evaluator.eval_expr(vars_expr, Context.empty(), b, &self.eval_pool, &self.state_store.values_pool);
+        const context_snap = self.evaluator.context_snapshot();
+        defer self.evaluator.restore_context_pool(context_snap);
+        const va = try self.evaluator.eval_expr(vars_expr, context, a, &self.eval_pool, &self.state_store.values_pool);
+        const vb = try self.evaluator.eval_expr(vars_expr, context, b, &self.eval_pool, &self.state_store.values_pool);
         return va.eql(vb, &self.eval_pool);
     }
 
@@ -2005,9 +2048,10 @@ pub const Checker = struct {
                     @memcpy(results, resolved);
                 } else {
                     for (0..n) |i| {
-                        const st = self.state_store.get(@intCast(i));
-                        const v = try self.evaluator.eval_expr(prop, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool);
-                        results[i] = v.is_truthy();
+                        results[i] = try self.eval_temporal_state_expr(
+                            prop,
+                            @intCast(i),
+                        );
                     }
                 }
             },
@@ -2057,15 +2101,34 @@ pub const Checker = struct {
                     },
                     else => {
                         for (0..n) |i| {
-                            const st = self.state_store.get(@intCast(i));
-                            const v = try self.evaluator.eval_expr(prop, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool);
-                            results[i] = v.is_truthy();
+                            results[i] = try self.eval_temporal_state_expr(
+                                prop,
+                                @intCast(i),
+                            );
                         }
                     },
                 }
             },
             .unary => |u| {
                 switch (u.op) {
+                    .not => {
+                        const operand = try self.eval_temporal_property_all(
+                            u.operand,
+                            scc_data,
+                            cache,
+                        );
+                        for (0..n) |i| {
+                            results[i] = !operand[i];
+                        }
+                    },
+                    .enabled => {
+                        for (0..n) |i| {
+                            results[i] = try self.eval_enabled_action(
+                                u.operand,
+                                @intCast(i),
+                            );
+                        }
+                    },
                     .temporal_box => {
                         const operand = try self.eval_temporal_property_all(u.operand, scc_data, cache);
                         const box_results = try self.eval_box_all(operand, scc_data);
@@ -2080,9 +2143,10 @@ pub const Checker = struct {
                     },
                     else => {
                         for (0..n) |i| {
-                            const st = self.state_store.get(@intCast(i));
-                            const v = try self.evaluator.eval_expr(prop, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool);
-                            results[i] = v.is_truthy();
+                            results[i] = try self.eval_temporal_state_expr(
+                                prop,
+                                @intCast(i),
+                            );
                         }
                     },
                 }
@@ -2098,8 +2162,8 @@ pub const Checker = struct {
                     var holds = true;
                     for (self.successors(state_idx)) |succ| {
                         const child = self.state_store.get(succ);
-                        if (try self.eval_action(ba.action, parent, child)) continue;
-                        if (!try self.eval_vars_equal(ba.vars, parent, child)) {
+                        if (try self.eval_action(ba.action, Context.empty(), parent, child)) continue;
+                        if (!try self.eval_vars_equal(ba.vars, Context.empty(), parent, child)) {
                             holds = false;
                             break;
                         }
@@ -2109,15 +2173,58 @@ pub const Checker = struct {
             },
             else => {
                 for (0..n) |i| {
-                    const st = self.state_store.get(@intCast(i));
-                    const v = try self.evaluator.eval_expr(prop, Context.empty(), st, &self.eval_pool, &self.state_store.values_pool);
-                    results[i] = v.is_truthy();
+                    results[i] = try self.eval_temporal_state_expr(
+                        prop,
+                        @intCast(i),
+                    );
                 }
             },
         }
 
         try cache.put(std.heap.page_allocator, prop, results);
         return results;
+    }
+
+    fn eval_enabled_action(
+        self: *Checker,
+        action_expr: *ast.Expr,
+        state_index: u32,
+    ) Error!bool {
+        const parent = self.state_store.get(state_index);
+        for (self.successors(state_index)) |successor| {
+            const child = self.state_store.get(successor);
+            if (try self.eval_action(
+                action_expr,
+                Context.empty(),
+                parent,
+                child,
+            )) return true;
+        }
+        return false;
+    }
+
+    fn eval_temporal_state_expr(
+        self: *Checker,
+        prop: *ast.Expr,
+        state_index: u32,
+    ) Error!bool {
+        const snap = self.eval_pool.snapshot();
+        defer self.eval_pool.restore(snap);
+        if (contains_enabled(prop)) {
+            self.evaluator.set_enabled_result(
+                self.successors(state_index).len > 0,
+            );
+            defer self.evaluator.set_enabled_result(null);
+        }
+        const st = self.state_store.get(state_index);
+        const value = try self.evaluator.eval_expr(
+            prop,
+            Context.empty(),
+            st,
+            &self.eval_pool,
+            &self.state_store.values_pool,
+        );
+        return value.is_truthy();
     }
 
     // The "fair game graph" used for evaluating temporal properties under
@@ -2588,36 +2695,118 @@ fn expr_ident(arena: *Arena, name: []const u8) !*ast.Expr {
     return ptr;
 }
 
-fn collect_fairness(arena: *Arena, expr: *ast.Expr, list: *std.ArrayList(FairnessCondition)) !void {
+fn collect_fairness(
+    arena: *Arena,
+    evaluator: *Evaluator,
+    eval_pool: *ValuePool,
+    state_pool: *ValuePool,
+    expr: *ast.Expr,
+    bindings: []const FairnessBinding,
+    list: *std.ArrayList(FairnessCondition),
+) !void {
     switch (expr.*) {
         .binary => |b| {
             if (b.op == .and_op) {
-                try collect_fairness(arena, b.left, list);
-                try collect_fairness(arena, b.right, list);
+                try collect_fairness(
+                    arena,
+                    evaluator,
+                    eval_pool,
+                    state_pool,
+                    b.left,
+                    bindings,
+                    list,
+                );
+                try collect_fairness(
+                    arena,
+                    evaluator,
+                    eval_pool,
+                    state_pool,
+                    b.right,
+                    bindings,
+                    list,
+                );
             }
         },
         .unary => |u| {
-            try collect_fairness(arena, u.operand, list);
+            try collect_fairness(
+                arena,
+                evaluator,
+                eval_pool,
+                state_pool,
+                u.operand,
+                bindings,
+                list,
+            );
+        },
+        .quantifier => |quantifier| {
+            if (quantifier.kind != .forall or quantifier.vars.len != 1) return;
+            const variable = quantifier.vars[0];
+            const domain_values = try finite_fairness_domain(
+                evaluator,
+                eval_pool,
+                state_pool,
+                variable.domain,
+                bindings,
+            );
+            defer std.heap.page_allocator.free(domain_values);
+            for (domain_values) |value| {
+                var expanded = std.ArrayList(FairnessBinding).empty;
+                defer expanded.deinit(std.heap.page_allocator);
+                try expanded.appendSlice(std.heap.page_allocator, bindings);
+                try expanded.append(std.heap.page_allocator, .{
+                    .name = variable.name,
+                    .value = value,
+                });
+                try collect_fairness(
+                    arena,
+                    evaluator,
+                    eval_pool,
+                    state_pool,
+                    quantifier.body,
+                    expanded.items,
+                    list,
+                );
+            }
         },
         .box_action => |ba| {
-            try collect_fairness(arena, ba.action, list);
+            try collect_fairness(
+                arena,
+                evaluator,
+                eval_pool,
+                state_pool,
+                ba.action,
+                bindings,
+                list,
+            );
         },
         .apply => |ap| {
             if (ap.func.* == .ident and ap.args.len == 1) {
                 const name = ap.func.*.ident;
                 if (starts_with(name, "WF_")) {
                     const vars_name = name[3..];
+                    const saved_bindings = try arena.alloc(
+                        FairnessBinding,
+                        bindings.len,
+                    );
+                    @memcpy(saved_bindings, bindings);
                     try list.append(std.heap.page_allocator, FairnessCondition{
                         .kind = .weak,
                         .action = ap.args[0],
                         .vars = try expr_ident(arena, vars_name),
+                        .bindings = saved_bindings,
                     });
                 } else if (starts_with(name, "SF_")) {
                     const vars_name = name[3..];
+                    const saved_bindings = try arena.alloc(
+                        FairnessBinding,
+                        bindings.len,
+                    );
+                    @memcpy(saved_bindings, bindings);
                     try list.append(std.heap.page_allocator, FairnessCondition{
                         .kind = .strong,
                         .action = ap.args[0],
                         .vars = try expr_ident(arena, vars_name),
+                        .bindings = saved_bindings,
                     });
                 }
             }
@@ -2626,11 +2815,85 @@ fn collect_fairness(arena: *Arena, expr: *ast.Expr, list: *std.ArrayList(Fairnes
     }
 }
 
-fn extract_fairness(arena: *Arena, module: ast.Module, spec_name: []const u8) ![]const FairnessCondition {
+fn finite_fairness_domain(
+    evaluator: *Evaluator,
+    eval_pool: *ValuePool,
+    state_pool: *ValuePool,
+    domain: *ast.Expr,
+    bindings: []const FairnessBinding,
+) ![]Value {
+    const snap = eval_pool.snapshot();
+    defer eval_pool.restore(snap);
+    const context_snap = evaluator.*.context_snapshot();
+    defer evaluator.*.restore_context_pool(context_snap);
+
+    var context = Context.empty();
+    for (bindings) |binding| {
+        context = try evaluator.*.extend_context(
+            context,
+            binding.name,
+            binding.value,
+        );
+    }
+
+    const domain_value = try evaluator.*.eval_expr(
+        domain,
+        context,
+        null,
+        eval_pool,
+        state_pool,
+    );
+    var values = std.ArrayList(Value).empty;
+    errdefer values.deinit(std.heap.page_allocator);
+    switch (domain_value) {
+        .range_v => |range| {
+            if (range.hi < range.lo) {
+                return try values.toOwnedSlice(std.heap.page_allocator);
+            }
+            var item = range.lo;
+            while (item <= range.hi) : (item += 1) {
+                try values.append(std.heap.page_allocator, .{ .int_v = item });
+                if (item == std.math.maxInt(i64)) break;
+            }
+        },
+        .set_v => |set| {
+            for (set.items(eval_pool)) |item| {
+                switch (item) {
+                    .bool_v, .int_v, .model_v => try values.append(
+                        std.heap.page_allocator,
+                        item,
+                    ),
+                    else => return try values.toOwnedSlice(
+                        std.heap.page_allocator,
+                    ),
+                }
+            }
+        },
+        else => {},
+    }
+    return try values.toOwnedSlice(std.heap.page_allocator);
+}
+
+fn extract_fairness(
+    arena: *Arena,
+    evaluator: *Evaluator,
+    eval_pool: *ValuePool,
+    state_pool: *ValuePool,
+    module: ast.Module,
+    spec_name: []const u8,
+) ![]const FairnessCondition {
     var list = std.ArrayList(FairnessCondition).empty;
     defer list.deinit(std.heap.page_allocator);
     const body = resolve_definition(module, spec_name) orelse return &[_]FairnessCondition{};
-    try collect_fairness(arena, body, &list);
+    try collect_fairness(
+        arena,
+        evaluator,
+        eval_pool,
+        state_pool,
+        body,
+        &.{},
+        &list,
+    );
     const result = try arena.alloc(FairnessCondition, list.items.len);
     @memcpy(result, list.items);
     return result;

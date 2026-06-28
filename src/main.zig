@@ -37,6 +37,8 @@ pub fn main(init: std.process.Init.Minimal) void {
     var worker_count: u16 = 1;
     var unlimited_memory = false;
     var emit_zig_path: ?[]const u8 = null;
+    var type_invariants = std.ArrayList([]const u8).empty;
+    defer type_invariants.deinit(std.heap.page_allocator);
 
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--spec")) {
@@ -93,6 +95,13 @@ pub fn main(init: std.process.Init.Minimal) void {
             unlimited_memory = true;
         } else if (std.mem.eql(u8, arg, "--emit-zig")) {
             emit_zig_path = it.next();
+        } else if (std.mem.eql(u8, arg, "--type-invariant")) {
+            if (it.next()) |name| {
+                type_invariants.append(std.heap.page_allocator, name) catch {
+                    std.debug.print("failed to allocate type invariant list\n", .{});
+                    std.process.exit(1);
+                };
+            }
         }
     }
 
@@ -102,6 +111,10 @@ pub fn main(init: std.process.Init.Minimal) void {
     };
     if (cfg_path == null and !default_cfg and emit_zig_path == null) {
         std.debug.print("usage: tlzig --spec FILE.tla (--cfg FILE.cfg | --default-cfg) [--max-states N] [--max-successors N] ...\n", .{});
+        std.process.exit(1);
+    }
+    if (type_invariants.items.len > 0 and emit_zig_path == null) {
+        std.debug.print("--type-invariant currently applies only to --emit-zig strict generation\n", .{});
         std.process.exit(1);
     }
     max_successors = @min(max_successors, max_states);
@@ -189,10 +202,17 @@ pub fn main(init: std.process.Init.Minimal) void {
                 std.process.exit(1);
             };
         }
-        const generated = codegen.emit_module_with_roots(
+        append_type_invariant_roots(module, &roots, type_invariants.items) catch |err| {
+            std.debug.print("invalid type invariant selection: {any}\n", .{err});
+            std.process.exit(1);
+        };
+        const generated = codegen.emit_module_with_options(
             std.heap.page_allocator,
             module,
-            roots.items,
+            .{
+                .extra_roots = roots.items,
+                .type_invariants = type_invariants.items,
+            },
         ) catch |err| {
             std.debug.print("failed to generate Zig: {any}\n", .{err});
             std.process.exit(1);
@@ -383,7 +403,41 @@ fn append_config_roots(
     try roots.appendSlice(std.heap.page_allocator, cfg.action_constraints);
 }
 
+fn append_type_invariant_roots(
+    module: ast.Module,
+    roots: *std.ArrayList([]const u8),
+    type_invariants: []const []const u8,
+) !void {
+    for (type_invariants) |name| {
+        const definition = find_definition(module, name) orelse
+            return error.UndefinedSymbol;
+        if (definition.params.len != 0) return error.TypeError;
+        if (!root_exists(roots.items, name)) {
+            try roots.append(std.heap.page_allocator, name);
+        }
+    }
+}
+
+fn root_exists(roots: []const []const u8, name: []const u8) bool {
+    for (roots) |root| {
+        if (std.mem.eql(u8, root, name)) return true;
+    }
+    return false;
+}
+
+fn find_definition(module: ast.Module, name: []const u8) ?ast.Definition {
+    for (module.definitions) |definition| {
+        if (std.mem.eql(u8, definition.name, name)) return definition;
+    }
+    return null;
+}
+
 fn generated_config_covers(cfg: config.Config) bool {
+    if (generated_model.config_replacements_hash !=
+        config_replacements_hash(cfg))
+    {
+        return false;
+    }
     if (!generated_root_covered(cfg.spec_name)) return false;
     if (!generated_root_covered(cfg.init_name)) return false;
     if (!generated_root_covered(cfg.next_name)) return false;
@@ -401,6 +455,28 @@ fn generated_config_covers(cfg: config.Config) bool {
         if (!generated_root_covered(name)) return false;
     }
     return true;
+}
+
+fn config_replacements_hash(cfg: config.Config) u64 {
+    var hasher = std.hash.Wyhash.init(0x544c_5a49_475f_4347);
+    for (cfg.constants) |assignment| {
+        const value = std.mem.trim(u8, assignment.expr, " \t");
+        hash_bytes(&hasher, assignment.name);
+        hash_bytes(&hasher, value);
+        hasher.update(&.{if (assignment.is_substitution) 1 else 0});
+        hasher.update(&.{if (assignment.is_substitution and
+            config.is_operator_alias(value))
+            1
+        else
+            2});
+    }
+    return hasher.final();
+}
+
+fn hash_bytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    const len: u64 = bytes.len;
+    hasher.update(std.mem.asBytes(&len));
+    hasher.update(bytes);
 }
 
 fn generated_root_covered(optional_name: ?[]const u8) bool {

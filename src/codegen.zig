@@ -15,6 +15,11 @@ pub const Result = struct {
     }
 };
 
+pub const Options = struct {
+    extra_roots: []const []const u8 = &.{},
+    type_invariants: []const []const u8 = &.{},
+};
+
 const DefinitionKind = enum {
     generated,
     native,
@@ -44,12 +49,22 @@ pub fn emit_module_with_roots(
     module: ast.Module,
     extra_roots: []const []const u8,
 ) !Result {
+    return emit_module_with_options(allocator, module, .{
+        .extra_roots = extra_roots,
+    });
+}
+
+pub fn emit_module_with_options(
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    options: Options,
+) !Result {
     var output = std.ArrayList(u8).empty;
     errdefer output.deinit(allocator);
     const reachable = try compute_reachable(
         allocator,
         module,
-        extra_roots,
+        options.extra_roots,
     );
     defer allocator.free(reachable);
 
@@ -64,12 +79,16 @@ pub fn emit_module_with_roots(
     const module_metadata = try std.fmt.allocPrint(
         allocator,
         "pub const module_name = \"{f}\";\n" ++
+            "pub const config_replacements_hash: u64 = 0x{x};\n" ++
             "pub const root_names = [_][]const u8{{",
-        .{std.zig.fmtString(module.name)},
+        .{
+            std.zig.fmtString(module.name),
+            config_replacements_hash(module.config_replacements),
+        },
     );
     defer allocator.free(module_metadata);
     try append(&output, allocator, module_metadata);
-    for (extra_roots, 0..) |root, index| {
+    for (options.extra_roots, 0..) |root, index| {
         const separator = if (index == 0) "" else ", ";
         const root_metadata = try std.fmt.allocPrint(
             allocator,
@@ -78,6 +97,18 @@ pub fn emit_module_with_roots(
         );
         defer allocator.free(root_metadata);
         try append(&output, allocator, root_metadata);
+    }
+    try append(&output, allocator, "};\n\n");
+    try append(&output, allocator, "pub const type_invariant_names = [_][]const u8{");
+    for (options.type_invariants, 0..) |name, index| {
+        const separator = if (index == 0) "" else ", ";
+        const invariant_metadata = try std.fmt.allocPrint(
+            allocator,
+            "{s}\"{f}\"",
+            .{ separator, std.zig.fmtString(name) },
+        );
+        defer allocator.free(invariant_metadata);
+        try append(&output, allocator, invariant_metadata);
     }
     try append(&output, allocator, "};\n\n");
 
@@ -306,6 +337,28 @@ fn definition_kind(
         .generated
     else
         .unsupported;
+}
+
+fn config_replacements_hash(
+    replacements: []const ast.ConfigReplacement,
+) u64 {
+    var hasher = std.hash.Wyhash.init(0x544c_5a49_475f_4347);
+    for (replacements) |replacement| {
+        hash_bytes(&hasher, replacement.name);
+        hash_bytes(&hasher, replacement.value);
+        hasher.update(&.{if (replacement.is_substitution) 1 else 0});
+        hasher.update(&.{switch (replacement.kind) {
+            .alias => 1,
+            .constant => 2,
+        }});
+    }
+    return hasher.final();
+}
+
+fn hash_bytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    const len: u64 = bytes.len;
+    hasher.update(std.mem.asBytes(&len));
+    hasher.update(bytes);
 }
 
 fn definition_is_boolean(
@@ -737,7 +790,30 @@ fn emit_boolean_expr(
                 .notin,
                 .subseteq,
                 => {
+                    if (binary.op == .in or binary.op == .notin) {
+                        if (try emit_field_path_membership(
+                            output,
+                            allocator,
+                            module,
+                            binary,
+                            params,
+                        )) return;
+                        if (try emit_variable_path_membership(
+                            output,
+                            allocator,
+                            module,
+                            binary,
+                            params,
+                        )) return;
+                    }
                     if (binary.op == .eq or binary.op == .ne) {
+                        if (try emit_primed_except_update_comparison(
+                            output,
+                            allocator,
+                            module,
+                            binary,
+                            params,
+                        )) return;
                         if (try emit_field_path_comparison(
                             output,
                             allocator,
@@ -868,26 +944,27 @@ fn emit_boolean_expr(
                 try append(output, allocator, "true");
                 return;
             }
-            for (names, 0..) |name, index| {
-                if (index > 0) try append(output, allocator, " and ");
-                try emit_unchanged_term(
-                    output,
-                    allocator,
-                    module,
-                    name,
-                );
-            }
+            try emit_unchanged_terms(output, allocator, module, names);
         },
         .unchanged_expr => |tuple_expr| {
+            var names = try allocator.alloc([]const u8, tuple_expr.tuple.len);
+            defer allocator.free(names);
             for (tuple_expr.tuple, 0..) |item, index| {
-                if (index > 0) try append(output, allocator, " and ");
-                try emit_unchanged_term(
-                    output,
-                    allocator,
-                    module,
-                    item.ident,
-                );
+                names[index] = item.ident;
             }
+            try emit_unchanged_terms(output, allocator, module, names);
+        },
+        .field => {
+            if (try emit_field_path_boolean(
+                output,
+                allocator,
+                module,
+                expr,
+                params,
+            )) return;
+            try append(output, allocator, "try runtime.boolean(");
+            try emit_expr(output, allocator, module, expr, params);
+            try append(output, allocator, ")");
         },
         else => {
             try append(output, allocator, "try runtime.boolean(");
@@ -1111,6 +1188,13 @@ fn emit_expr(
             try append(output, allocator, "})");
         },
         .set_binary => |set_binary| {
+            if (try emit_permutations_union(
+                output,
+                allocator,
+                module,
+                expr,
+                params,
+            )) return;
             const function_name = switch (set_binary.op) {
                 .union_op => "set_union",
                 .intersection_op => "set_intersection",
@@ -1509,94 +1593,96 @@ fn emit_expr(
             );
             try append(output, allocator, ")");
         },
-        .binary => |binary| switch (binary.op) {
-            .and_op => {
-                try append(output, allocator, "if (try runtime.boolean(");
-                try emit_expr(
-                    output,
-                    allocator,
-                    module,
-                    binary.left,
-                    params,
-                );
-                try append(output, allocator, ")) ");
-                try emit_expr(
-                    output,
-                    allocator,
-                    module,
-                    binary.right,
-                    params,
-                );
-                try append(
-                    output,
-                    allocator,
-                    " else Value{ .bool_v = false }",
-                );
-            },
-            .or_op => {
-                try append(output, allocator, "if (try runtime.boolean(");
-                try emit_expr(
-                    output,
-                    allocator,
-                    module,
-                    binary.left,
-                    params,
-                );
-                try append(
-                    output,
-                    allocator,
-                    ")) Value{ .bool_v = true } else ",
-                );
-                try emit_expr(
-                    output,
-                    allocator,
-                    module,
-                    binary.right,
-                    params,
-                );
-            },
-            .implies => {
-                try append(output, allocator, "if (try runtime.boolean(");
-                try emit_expr(
-                    output,
-                    allocator,
-                    module,
-                    binary.left,
-                    params,
-                );
-                try append(output, allocator, ")) ");
-                try emit_expr(
-                    output,
-                    allocator,
-                    module,
-                    binary.right,
-                    params,
-                );
-                try append(
-                    output,
-                    allocator,
-                    " else Value{ .bool_v = true }",
-                );
-            },
-            else => {
-                try append(output, allocator, binary_runtime(binary.op));
-                try emit_expr(
-                    output,
-                    allocator,
-                    module,
-                    binary.left,
-                    params,
-                );
-                try append(output, allocator, ", ");
-                try emit_expr(
-                    output,
-                    allocator,
-                    module,
-                    binary.right,
-                    params,
-                );
-                try append(output, allocator, ")");
-            },
+        .binary => |binary| {
+            switch (binary.op) {
+                .and_op => {
+                    try append(output, allocator, "if (try runtime.boolean(");
+                    try emit_expr(
+                        output,
+                        allocator,
+                        module,
+                        binary.left,
+                        params,
+                    );
+                    try append(output, allocator, ")) ");
+                    try emit_expr(
+                        output,
+                        allocator,
+                        module,
+                        binary.right,
+                        params,
+                    );
+                    try append(
+                        output,
+                        allocator,
+                        " else Value{ .bool_v = false }",
+                    );
+                },
+                .or_op => {
+                    try append(output, allocator, "if (try runtime.boolean(");
+                    try emit_expr(
+                        output,
+                        allocator,
+                        module,
+                        binary.left,
+                        params,
+                    );
+                    try append(
+                        output,
+                        allocator,
+                        ")) Value{ .bool_v = true } else ",
+                    );
+                    try emit_expr(
+                        output,
+                        allocator,
+                        module,
+                        binary.right,
+                        params,
+                    );
+                },
+                .implies => {
+                    try append(output, allocator, "if (try runtime.boolean(");
+                    try emit_expr(
+                        output,
+                        allocator,
+                        module,
+                        binary.left,
+                        params,
+                    );
+                    try append(output, allocator, ")) ");
+                    try emit_expr(
+                        output,
+                        allocator,
+                        module,
+                        binary.right,
+                        params,
+                    );
+                    try append(
+                        output,
+                        allocator,
+                        " else Value{ .bool_v = true }",
+                    );
+                },
+                else => {
+                    try append(output, allocator, binary_runtime(binary.op));
+                    try emit_expr(
+                        output,
+                        allocator,
+                        module,
+                        binary.left,
+                        params,
+                    );
+                    try append(output, allocator, ", ");
+                    try emit_expr(
+                        output,
+                        allocator,
+                        module,
+                        binary.right,
+                        params,
+                    );
+                    try append(output, allocator, ")");
+                },
+            }
         },
         .if_then_else => |conditional| {
             try append(output, allocator, "if (try runtime.boolean(");
@@ -1848,6 +1934,63 @@ fn emit_expr(
             }
         },
         else => unreachable,
+    }
+}
+
+fn emit_permutations_union(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    expr: *const ast.Expr,
+    params: []const []const u8,
+) !bool {
+    var domains = std.ArrayList(*const ast.Expr).empty;
+    defer domains.deinit(allocator);
+    collect_permutations_union_domains(expr, &domains, allocator) catch
+        return false;
+    if (domains.items.len < 2) return false;
+    try append(
+        output,
+        allocator,
+        "try runtime.permutations_union(context, &[_]Value{",
+    );
+    for (domains.items, 0..) |domain, index| {
+        if (index > 0) try append(output, allocator, ", ");
+        try emit_expr(output, allocator, module, domain, params);
+    }
+    try append(output, allocator, "})");
+    return true;
+}
+
+fn collect_permutations_union_domains(
+    expr: *const ast.Expr,
+    domains: *std.ArrayList(*const ast.Expr),
+    allocator: std.mem.Allocator,
+) error{ OutOfMemory, NotPermutationUnion }!void {
+    switch (expr.*) {
+        .set_binary => |set_binary| {
+            if (set_binary.op != .union_op) return error.NotPermutationUnion;
+            try collect_permutations_union_domains(
+                set_binary.left,
+                domains,
+                allocator,
+            );
+            try collect_permutations_union_domains(
+                set_binary.right,
+                domains,
+                allocator,
+            );
+        },
+        .apply => |application| {
+            if (application.func.* != .ident or
+                !std.mem.eql(u8, application.func.ident, "Permutations") or
+                application.args.len != 1)
+            {
+                return error.NotPermutationUnion;
+            }
+            try domains.append(allocator, application.args[0]);
+        },
+        else => return error.NotPermutationUnion,
     }
 }
 
@@ -3242,39 +3385,30 @@ fn emit_unchanged_guards(
     if (operation != .and_op) return false;
     switch (operand.*) {
         .unchanged => |names| {
-            for (names) |name| {
-                try append(output, allocator, "    if (!");
-                try emit_unchanged_term(
-                    output,
-                    allocator,
-                    module,
-                    name,
-                );
-                try append(
-                    output,
-                    allocator,
-                    ") return Value{ .bool_v = false };\n",
-                );
-            }
+            try emit_unchanged_guard(
+                output,
+                allocator,
+                module,
+                names,
+                "Value{ .bool_v = false }",
+            );
             return true;
         },
         .unchanged_expr => |tuple_expr| {
             if (tuple_expr.* != .tuple) return false;
-            for (tuple_expr.tuple) |item| {
+            var names = try allocator.alloc([]const u8, tuple_expr.tuple.len);
+            defer allocator.free(names);
+            for (tuple_expr.tuple, 0..) |item, index| {
                 if (item.* != .ident) return false;
-                try append(output, allocator, "    if (!");
-                try emit_unchanged_term(
-                    output,
-                    allocator,
-                    module,
-                    item.ident,
-                );
-                try append(
-                    output,
-                    allocator,
-                    ") return Value{ .bool_v = false };\n",
-                );
+                names[index] = item.ident;
             }
+            try emit_unchanged_guard(
+                output,
+                allocator,
+                module,
+                names,
+                "Value{ .bool_v = false }",
+            );
             return true;
         },
         else => return false,
@@ -3291,35 +3425,48 @@ fn emit_boolean_unchanged_guards(
     if (operation != .and_op) return false;
     switch (operand.*) {
         .unchanged => |names| {
-            for (names) |name| {
-                try append(output, allocator, "    if (!");
-                try emit_unchanged_term(
-                    output,
-                    allocator,
-                    module,
-                    name,
-                );
-                try append(output, allocator, ") return false;\n");
-            }
+            try emit_unchanged_guard(
+                output,
+                allocator,
+                module,
+                names,
+                "false",
+            );
             return true;
         },
         .unchanged_expr => |tuple_expr| {
             if (tuple_expr.* != .tuple) return false;
-            for (tuple_expr.tuple) |item| {
+            var names = try allocator.alloc([]const u8, tuple_expr.tuple.len);
+            defer allocator.free(names);
+            for (tuple_expr.tuple, 0..) |item, index| {
                 if (item.* != .ident) return false;
-                try append(output, allocator, "    if (!");
-                try emit_unchanged_term(
-                    output,
-                    allocator,
-                    module,
-                    item.ident,
-                );
-                try append(output, allocator, ") return false;\n");
+                names[index] = item.ident;
             }
+            try emit_unchanged_guard(
+                output,
+                allocator,
+                module,
+                names,
+                "false",
+            );
             return true;
         },
         else => return false,
     }
+}
+
+fn emit_unchanged_guard(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    names: []const []const u8,
+    return_value: []const u8,
+) error{OutOfMemory}!void {
+    try append(output, allocator, "    if (!(");
+    try emit_unchanged_terms(output, allocator, module, names);
+    try append(output, allocator, ")) return ");
+    try append(output, allocator, return_value);
+    try append(output, allocator, ";\n");
 }
 
 fn flatten_boolean_operands(
@@ -3510,15 +3657,7 @@ fn emit_unchanged(
     if (names.len == 0) {
         try append(output, allocator, "true");
     } else {
-        for (names, 0..) |name, index| {
-            if (index > 0) try append(output, allocator, " and ");
-            try emit_unchanged_term(
-                output,
-                allocator,
-                module,
-                name,
-            );
-        }
+        try emit_unchanged_terms(output, allocator, module, names);
     }
     try append(output, allocator, " }");
 }
@@ -3566,17 +3705,56 @@ fn emit_unchanged_tuple(
     if (items.len == 0) {
         try append(output, allocator, "true");
     } else {
+        var names = try allocator.alloc([]const u8, items.len);
+        defer allocator.free(names);
         for (items, 0..) |item, index| {
-            if (index > 0) try append(output, allocator, " and ");
-            try emit_unchanged_term(
-                output,
-                allocator,
-                module,
-                item.*.ident,
-            );
+            names[index] = item.*.ident;
         }
+        try emit_unchanged_terms(output, allocator, module, names);
     }
     try append(output, allocator, " }");
+}
+
+fn emit_unchanged_terms(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    names: []const []const u8,
+) error{OutOfMemory}!void {
+    var emitted = false;
+    var variable_count: usize = 0;
+    for (names) |name| {
+        if (variable_index(module, name) != null) variable_count += 1;
+    }
+    if (variable_count > 0) {
+        try append(
+            output,
+            allocator,
+            "(try runtime.unchanged_variables(context, &[_]u32{",
+        );
+        var index: usize = 0;
+        for (names) |name| {
+            const variable = variable_index(module, name) orelse continue;
+            if (index > 0) try append(output, allocator, ", ");
+            const text = try std.fmt.allocPrint(
+                allocator,
+                "{d}",
+                .{variable},
+            );
+            defer allocator.free(text);
+            try append(output, allocator, text);
+            index += 1;
+        }
+        try append(output, allocator, "}))");
+        emitted = true;
+    }
+    for (names) |name| {
+        if (variable_index(module, name) != null) continue;
+        if (emitted) try append(output, allocator, " and ");
+        try emit_unchanged_term(output, allocator, module, name);
+        emitted = true;
+    }
+    if (!emitted) try append(output, allocator, "true");
 }
 
 fn emit_unchanged_term(
@@ -4827,6 +5005,14 @@ fn emit_field_path_comparison(
     binary: *const ast.Binary,
     params: []const []const u8,
 ) error{OutOfMemory}!bool {
+    if (try emit_sequence_head_field_path_comparison(
+        output,
+        allocator,
+        module,
+        binary,
+        params,
+    )) return true;
+
     const left_is_field_path = binary.left.* == .field and
         binary.left.field.expr.* == .apply and
         variable_application_index(module, binary.left.field.expr.apply) != null and
@@ -4876,6 +5062,195 @@ fn emit_field_path_comparison(
     return true;
 }
 
+fn emit_field_path_boolean(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    expr: *const ast.Expr,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    if (sequence_head_field_path(module, expr)) |field_path| {
+        try emit_field_path_call(
+            output,
+            allocator,
+            module,
+            "variable_path_sequence_head_field_boolean",
+            field_path.variable,
+            field_path.application,
+            field_path.field_name,
+            params,
+            null,
+        );
+        return true;
+    }
+    if (direct_field_path(module, expr)) |field_path| {
+        try emit_field_path_call(
+            output,
+            allocator,
+            module,
+            "variable_path_field_boolean",
+            field_path.variable,
+            field_path.application,
+            field_path.field_name,
+            params,
+            null,
+        );
+        return true;
+    }
+    return false;
+}
+
+fn emit_field_path_membership(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    binary: *const ast.Binary,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    if (binary.right.* == .field) return false;
+    const sequence_path = sequence_head_field_path(module, binary.left);
+    const direct_path = direct_field_path(module, binary.left);
+    const field_path = sequence_path orelse direct_path orelse return false;
+    const function_name = if (sequence_path != null)
+        "variable_path_sequence_head_field_member_bool"
+    else
+        "variable_path_field_member_bool";
+    if (binary.op == .notin) try append(output, allocator, "!(");
+    try emit_field_path_call(
+        output,
+        allocator,
+        module,
+        function_name,
+        field_path.variable,
+        field_path.application,
+        field_path.field_name,
+        params,
+        binary.right,
+    );
+    if (binary.op == .notin) try append(output, allocator, ")");
+    return true;
+}
+
+fn emit_sequence_head_field_path_comparison(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    binary: *const ast.Binary,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    const left = sequence_head_field_path(module, binary.left);
+    const right = sequence_head_field_path(module, binary.right);
+    if (left == null and right == null) return false;
+    if (left != null and right != null) return false;
+    const field_path = left orelse right.?;
+    const other = if (left != null) binary.right else binary.left;
+    const function_name = if (binary.op == .eq)
+        "variable_path_sequence_head_field_equal_bool"
+    else
+        "variable_path_sequence_head_field_not_equal_bool";
+    try emit_field_path_call(
+        output,
+        allocator,
+        module,
+        function_name,
+        field_path.variable,
+        field_path.application,
+        field_path.field_name,
+        params,
+        other,
+    );
+    return true;
+}
+
+fn emit_field_path_call(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    function_name: []const u8,
+    variable: u32,
+    application: *const ast.Apply,
+    field_name: []const u8,
+    params: []const []const u8,
+    extra_arg: ?*const ast.Expr,
+) error{OutOfMemory}!void {
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "try runtime.{s}(context, {d}, &[_]Value{{",
+        .{ function_name, variable },
+    );
+    defer allocator.free(prefix);
+    try append(output, allocator, prefix);
+    try emit_variable_application_keys(
+        output,
+        allocator,
+        module,
+        application,
+        params,
+    );
+    const middle = try std.fmt.allocPrint(
+        allocator,
+        "}}, \"{f}\"",
+        .{std.zig.fmtString(field_name)},
+    );
+    defer allocator.free(middle);
+    try append(output, allocator, middle);
+    if (extra_arg) |argument| {
+        try append(output, allocator, ", ");
+        try emit_expr(output, allocator, module, argument, params);
+    }
+    try append(output, allocator, ")");
+}
+
+const SequenceHeadFieldPath = struct {
+    variable: u32,
+    application: *const ast.Apply,
+    field_name: []const u8,
+};
+
+fn direct_field_path(
+    module: ast.Module,
+    expr: *const ast.Expr,
+) ?SequenceHeadFieldPath {
+    if (expr.* != .field) return null;
+    const field_value = expr.field;
+    if (field_value.expr.* != .apply) return null;
+    const variable = variable_application_index(
+        module,
+        field_value.expr.apply,
+    ) orelse return null;
+    return .{
+        .variable = variable,
+        .application = field_value.expr.apply,
+        .field_name = field_value.name,
+    };
+}
+
+fn sequence_head_field_path(
+    module: ast.Module,
+    expr: *const ast.Expr,
+) ?SequenceHeadFieldPath {
+    if (expr.* != .field) return null;
+    const field_value = expr.field;
+    if (field_value.expr.* != .apply) return null;
+    const head = field_value.expr.apply;
+    if (head.func.* != .ident or
+        !std.mem.eql(u8, head.func.ident, "Head") or
+        head.args.len != 1 or
+        head.args[0].* != .apply)
+    {
+        return null;
+    }
+    const variable = variable_application_index(
+        module,
+        head.args[0].apply,
+    ) orelse return null;
+    return .{
+        .variable = variable,
+        .application = head.args[0].apply,
+        .field_name = field_value.name,
+    };
+}
+
 fn emit_variable_path_comparison(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -4912,6 +5287,157 @@ fn emit_variable_path_comparison(
         }
     }
     return false;
+}
+
+fn emit_variable_path_membership(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    binary: *const ast.Binary,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    if (binary.right.* != .apply) return false;
+    const variable = variable_application_index(
+        module,
+        binary.right.apply,
+    ) orelse return false;
+    const function_name = if (binary.op == .in)
+        "variable_path_member_bool"
+    else
+        "variable_path_not_member_bool";
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "try runtime.{s}(context, {d}, &[_]Value{{",
+        .{ function_name, variable },
+    );
+    defer allocator.free(prefix);
+    try append(output, allocator, prefix);
+    try emit_variable_application_keys(
+        output,
+        allocator,
+        module,
+        binary.right.apply,
+        params,
+    );
+    try append(output, allocator, "}, ");
+    try emit_expr(output, allocator, module, binary.left, params);
+    try append(output, allocator, ")");
+    return true;
+}
+
+fn emit_primed_except_update_comparison(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    binary: *const ast.Binary,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    if (binary.op != .eq and binary.op != .ne) return false;
+
+    if (try emit_one_sided_primed_except_update_comparison(
+        output,
+        allocator,
+        module,
+        binary.op,
+        binary.left,
+        binary.right,
+        params,
+    )) return true;
+
+    return try emit_one_sided_primed_except_update_comparison(
+        output,
+        allocator,
+        module,
+        binary.op,
+        binary.right,
+        binary.left,
+        params,
+    );
+}
+
+fn emit_one_sided_primed_except_update_comparison(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    operator: ast.BinaryOp,
+    primed_expr: *ast.Expr,
+    except_expr: *ast.Expr,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    const variable = primed_variable_index(module, primed_expr) orelse
+        return false;
+    if (except_expr.* != .except) return false;
+    const except_value = except_expr.except;
+    if (except_value.func.* != .ident) return false;
+    const updated_variable: u32 = @intCast(
+        variable_index(module, except_value.func.ident) orelse return false,
+    );
+    if (variable != updated_variable) return false;
+
+    if (operator == .ne) try append(output, allocator, "!(");
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "try runtime.primed_variable_except_update_equal_bool(context, args, {d}, &[_]Value{{",
+        .{variable},
+    );
+    defer allocator.free(prefix);
+    try append(output, allocator, prefix);
+    try emit_except_update_steps(
+        output,
+        allocator,
+        module,
+        except_value.steps,
+        params,
+    );
+    const helper = try helper_name(
+        allocator,
+        expression_identity(module, except_expr),
+    );
+    defer allocator.free(helper);
+    try append(output, allocator, "}, ");
+    try append(output, allocator, helper);
+    try append(output, allocator, ")");
+    if (operator == .ne) try append(output, allocator, ")");
+    return true;
+}
+
+fn primed_variable_index(
+    module: ast.Module,
+    expr: *const ast.Expr,
+) ?u32 {
+    if (expr.* != .primed) return null;
+    const index = variable_index(module, expr.primed) orelse return null;
+    return @intCast(index);
+}
+
+fn emit_except_update_steps(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    steps: []const ast.AccessStep,
+    params: []const []const u8,
+) error{OutOfMemory}!void {
+    for (steps, 0..) |step, index| {
+        if (index > 0) try append(output, allocator, ", ");
+        switch (step) {
+            .field => |field_name| {
+                const field = try std.fmt.allocPrint(
+                    allocator,
+                    "try runtime.string(context, \"{f}\")",
+                    .{std.zig.fmtString(field_name)},
+                );
+                defer allocator.free(field);
+                try append(output, allocator, field);
+            },
+            .index => |index_expr| try emit_expr(
+                output,
+                allocator,
+                module,
+                index_expr,
+                params,
+            ),
+        }
+    }
 }
 
 fn emit_variable_comparison(
@@ -5188,6 +5714,11 @@ test "configuration replacements remove shadowed fallbacks" {
         u8,
         result.source,
         "try op_4(context",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "pub const config_replacements_hash: u64 = 0x",
     ) != null);
 }
 

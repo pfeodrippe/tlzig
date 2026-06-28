@@ -91,14 +91,85 @@ pub fn build(b: *std.Build) void {
     );
     build_tlc.step.dependOn(&tlc_test_class.step);
     run_bench.step.dependOn(&build_tlc.step);
-    if (b.option(
+    const benchmark_filter = b.option(
         []const u8,
         "benchmark-filter",
         "Run only benchmark specs whose path contains this substring",
-    )) |filter| {
+    );
+    if (benchmark_filter) |filter| {
         run_bench.addArg(filter);
     }
-    b.step("benchmark", "Benchmark tlzig vs Java TLC").dependOn(&run_bench.step);
+    const benchmark_step = b.step("benchmark", "Benchmark tlzig vs Java TLC");
+    benchmark_step.dependOn(&run_bench.step);
+    if (generated_model_path == null) {
+        var previous_generated_benchmark: *std.Build.Step = &run_bench.step;
+        const generated_benchmarks = [_]GeneratedBenchmark{
+            .{
+                .name = "benchmark_mdbtla_client_centric_aot",
+                .model_path = "generated_models/mdbtla_client_centric.zig",
+                .filter = "MultiShardTxn ClientCentric",
+            },
+            .{
+                .name = "benchmark_mdbtla_mcm_snapshot_aot",
+                .model_path = "generated_models/mdbtla_mcm_snapshot_invariant.zig",
+                .filter = "MultiShardTxn MCM/snapshot-invariant",
+            },
+            .{
+                .name = "benchmark_mdbtla_mcm_rc_local_aot",
+                .model_path = "generated_models/mdbtla_mcm_rc_local_invariant.zig",
+                .filter = "MultiShardTxn MCM/rc-local-invariant",
+            },
+            .{
+                .name = "benchmark_mdbtla_storage_aot",
+                .model_path = "generated_models/mdbtla_storage.zig",
+                .filter = "MultiShardTxn Storage",
+            },
+            .{
+                .name = "benchmark_mdbtla_rc_no_prepare_aot",
+                .model_path = "generated_models/mdbtla_rc_no_prepare_block.zig",
+                .filter = "MultiShardTxn RC/no-prepare-block",
+            },
+            .{
+                .name = "benchmark_mdbtla_rc_no_prepare_ww_aot",
+                .model_path = "generated_models/mdbtla_rc_no_prepare_block_or_ww.zig",
+                .filter = "MultiShardTxn RC/no-prepare-block-or-ww",
+            },
+            .{
+                .name = "benchmark_mdbtla_rc_snapshot_aot",
+                .model_path = "generated_models/mdbtla_rc_snapshot.zig",
+                .filter = "MultiShardTxn RC/snapshot",
+            },
+            .{
+                .name = "benchmark_mdbtla_rc_with_prepare_aot",
+                .model_path = "generated_models/mdbtla_rc_with_prepare_block.zig",
+                .filter = "MultiShardTxn RC/with-prepare-block",
+            },
+        };
+        for (generated_benchmarks) |generated_benchmark| {
+            if (!generatedBenchmarkMatches(
+                benchmark_filter,
+                generated_benchmark.filter,
+                generated_benchmark.model_path,
+            )) {
+                continue;
+            }
+            const run_generated_benchmark = addGeneratedBenchmark(
+                b,
+                target,
+                optimize,
+                tlzig_module,
+                generated_benchmark.name,
+                generated_benchmark.model_path,
+                generated_benchmark.filter,
+            );
+            run_generated_benchmark.step.dependOn(
+                previous_generated_benchmark,
+            );
+            run_generated_benchmark.step.dependOn(&build_tlc.step);
+            benchmark_step.dependOn(&run_generated_benchmark.step);
+            previous_generated_benchmark = &run_generated_benchmark.step;
+        }
+    }
 
     const harness = b.addExecutable(.{
         .name = "harness",
@@ -113,4 +184,52 @@ pub fn build(b: *std.Build) void {
     const run_harness = b.addRunArtifact(harness);
     run_harness.step.dependOn(b.getInstallStep());
     b.step("harness", "Run spec harness").dependOn(&run_harness.step);
+}
+
+const GeneratedBenchmark = struct {
+    name: []const u8,
+    model_path: []const u8,
+    filter: []const u8,
+};
+
+fn addGeneratedBenchmark(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    tlzig_module: *std.Build.Module,
+    name: []const u8,
+    generated_model_path: []const u8,
+    filter: []const u8,
+) *std.Build.Step.Run {
+    const generated_model_module = b.createModule(.{
+        .root_source_file = b.path(generated_model_path),
+        .target = target,
+        .optimize = optimize,
+    });
+    generated_model_module.addImport("tlzig", tlzig_module);
+
+    const bench = b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    bench.root_module.addImport("tlzig", tlzig_module);
+    bench.root_module.addImport("generated_model", generated_model_module);
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.addArg(filter);
+    run_bench.addArgs(&.{ "--label-suffix", " [AOT]" });
+    return run_bench;
+}
+
+fn generatedBenchmarkMatches(
+    optional_filter: ?[]const u8,
+    label: []const u8,
+    generated_model_path: []const u8,
+) bool {
+    const filter = optional_filter orelse return true;
+    return std.mem.eql(u8, label, filter) or
+        std.mem.indexOf(u8, generated_model_path, filter) != null;
 }

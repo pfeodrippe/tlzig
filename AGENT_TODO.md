@@ -214,8 +214,160 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
 - [x] Make benchmark label filtering exact while retaining path substring
   filters, so `MultiShardTxn RC/no-prepare-block` no longer also runs
   `MultiShardTxn RC/no-prepare-block-or-ww`.
+- [x] Fix default benchmark temporal parity for `MCChangRoberts` and
+  `SpanTree`:
+  - expand simple finite universal fairness clauses such as
+    `\A self \in Node : WF_vars(node(self))` into context-bound fairness
+    conditions;
+  - evaluate temporal `ENABLED A` compositionally by replaying action `A`
+    against stored successor edges, instead of using raw successor count.
 - [x] Raise benchmark value-pool budgets for RC deadlock-stop rows to avoid
   flaky `OutOfMemory` in representative generated runs.
+- [x] Add explicit exhaustive `CHECK_DEADLOCK FALSE` benchmark configs for the
+  four MDBTLA RC model configs under `benchmark_configs/MDBTLA/...`, keeping
+  the vendored upstream cfg files unchanged.
+- [x] Add long/exhaustive benchmark rows as opt-in cases. The default
+  ReleaseFast benchmark skips these rows, and one-core heavy runs are disabled
+  unless `--include-one-core` is passed.
+- [ ] Add a separate batched one-core throughput mode, e.g.
+  `--one-core-batch N`, for running independent one-worker TLC/tlzig jobs in
+  parallel when machine cores and memory allow it. Keep this separate from the
+  isolated one-core latency comparison because concurrent jobs contend for CPU
+  cache, memory bandwidth, and Java heap/GC.
+- [x] Add first-class strict-generated representative benchmark executables to
+  `zig build -Doptimize=ReleaseFast benchmark`. The current benchmark binary
+  can link at most one `-Dgenerated-model`; default MDBTLA rows therefore
+  measure the generic checker unless the whole build is invoked with a single
+  generated model. Add separate build steps for key generated models such as
+  `mdbtla_storage.zig` and `mdbtla_rc_no_prepare_block.zig`, keep long
+  one-core exhaustive rows opt-in, and print them as explicit AOT rows.
+  - Implemented generated benchmark executables for all eight upstream-valid
+    MultiShardTxn generated models, chained after the generic benchmark and
+    filtered by exact label/path just like the benchmark script.
+  - Filtered verification for Storage: generic tlzig `3.886s/0.355s`; strict
+    AOT tlzig `1.417s/0.157s`; TLC `2.777s/1.468s`.
+  - Filtered verification for RC/no-prepare-block before filter tightening:
+    strict AOT tlzig `0.698s/0.096s`; TLC `1.883s/1.580s`.
+  - Full default verification after adding all eight MultiShardTxn AOT rows:
+    - ClientCentric: TLC `2.195s/2.356s`, AOT tlzig `1.152s/1.123s`.
+    - MCM snapshot-invariant: TLC `2.144s/1.768s`, AOT tlzig
+      `0.687s/0.111s`.
+    - MCM rc-local-invariant: TLC `1.256s/1.433s`, AOT tlzig
+      `0.154s/0.053s`.
+    - Storage: TLC `2.773s/1.429s`, AOT tlzig `1.415s/0.161s`.
+    - RC/no-prepare-block: TLC `1.872s/1.761s`, AOT tlzig
+      `0.693s/0.093s`.
+    - RC/no-prepare-block-or-ww: TLC `1.873s/1.632s`, AOT tlzig
+      `0.720s/0.103s`.
+    - RC/snapshot: TLC `5.223s/2.351s`, AOT tlzig `4.965s/0.465s`.
+    - RC/with-prepare-block: TLC `1.816s/1.598s`, AOT tlzig
+      `0.703s/0.104s`.
+    All eight strict AOT rows are faster than TLC in both one-core and auto
+    mode in this run. Deadlock-stop generated/distinct totals remain
+    traversal-order diagnostics where `compare_generated/compare_distinct`
+    are disabled; exhaustive `CHECK_DEADLOCK FALSE` rows remain opt-in.
+  - Generic tlzig to strict AOT tlzig speedups in the same full run:
+    - ClientCentric: generic `2.334s/2.320s` -> AOT `1.152s/1.123s`,
+      `2.03x/2.07x`.
+    - MCM snapshot-invariant: generic `1.240s/0.303s` -> AOT
+      `0.687s/0.111s`, `1.80x/2.73x`.
+    - MCM rc-local-invariant: generic `0.222s/0.093s` -> AOT
+      `0.154s/0.053s`, `1.44x/1.75x`.
+    - Storage: generic `3.932s/0.465s` -> AOT `1.415s/0.161s`,
+      `2.78x/2.89x`.
+    - RC/no-prepare-block: generic `1.084s/0.167s` -> AOT
+      `0.693s/0.093s`, `1.56x/1.80x`.
+    - RC/no-prepare-block-or-ww: generic `1.092s/0.163s` -> AOT
+      `0.720s/0.103s`, `1.52x/1.58x`.
+    - RC/snapshot: generic `7.734s/0.595s` -> AOT `4.965s/0.465s`,
+      `1.56x/1.28x`.
+    - RC/with-prepare-block: generic `1.074s/0.158s` -> AOT
+      `0.703s/0.104s`, `1.53x/1.52x`.
+  - Generated benchmark rows now print with ` [AOT]` label suffix so generic
+    and strict native rows are not visually conflated.
+- [ ] Complete full TLC/tlzig all-core comparisons for the new RC exhaustive
+  rows. The no-prepare-block exhaustive run exceeded the old 3M state cap, and
+  a 10M one-core probe was intentionally stopped after it remained CPU-bound
+  for over ten minutes; do not put that path back into the default benchmark.
+- [x] Add `scripts/audit_generated_patterns.py` to keep generated-code
+  performance debt measurable. Current audit scans `generated_models/*.zig`
+  and reports representative source lines for helper-heavy native code.
+- [x] Tighten generated-model activation with a deterministic config
+  replacement fingerprint. Generated registries now match module, configured
+  roots, and config operator/constant replacements before activation; sibling
+  MDBTLA cfgs with the same roots can no longer accidentally reuse the wrong
+  native model.
+- [x] Specialize generated `Permutations(A) \cup ... \cup Permutations(N)`
+  trees into `runtime.permutations_union(...)`, eliminating nested generic
+  permutation set construction. Audit count for `permutations_union_chain`
+  is now `0`.
+- [x] Batch generated root-variable `UNCHANGED` checks with
+  `runtime.unchanged_variables(...)`. Audit count for individual
+  `unchanged_variable` calls dropped from `6354` to `891`.
+- [x] Specialize boolean guards over `Head(variable_path(...)).field` and
+  `variable_path(...).field`, including equality, membership, and direct bool
+  field tests. The concrete `Head(shardTxnReqs[s][tid]).op = "coordCommit"`,
+  `Head(...).op \in {"read", "write"}`, `Head(...).start`, and
+  `coordInfo[s][tid].self` patterns now emit direct cross-pool helpers.
+- [x] Specialize direct state-path membership guards such as
+  `tid \in participants[s]` into `variable_path_member_bool(...)`, avoiding
+  cloned path values for hot action guards.
+- [x] Fuse simple generated action-assignment checks of the form
+  `v' = [v EXCEPT ![path] = rhs]` into
+  `primed_variable_except_update_equal_bool(...)`. The runtime compares the
+  next root with the current root across pools, calls the EXCEPT updater only
+  at the changed leaf, and avoids reconstructing the whole updated root.
+- [ ] Replace generic generated action assignments:
+  `primed_variable = except_update(variable, path, rhs)` should lower to
+  native typed/path-indexed next-state writes, not whole-root reconstruction.
+  Current audit after the fused simple-EXCEPT path:
+  `except_update=2673`, `primed_variable_full_compare=284`. Remaining sites
+  are mostly nested EXCEPT chains and value-producing EXCEPT expressions.
+- [ ] Replace generated `variable_path(...)` reads with typed/indexed accessors
+  derived from resolved state layout and TypeOK where available. Current audit:
+  `variable_path=8050`.
+- [ ] Fuse sequence-head record-field guards such as
+  `field(sequence_head(variable_path(...)), "op")` into direct helpers that
+  read once and compare typed fields. Current audit:
+  `field_sequence_head=357`; the remaining cases are mostly value-producing
+  field reads passed into records/operators, not simple boolean guards.
+- [ ] Specialize mapped-set/range construction used in hot MDBTLA actions,
+  especially `map_set(function_range(variable_path(...)), ...)`. Current
+  audit: `map_set=284`, `function_range=395`.
+- [ ] Reduce remaining nested runtime helper chains after the concrete
+  patterns above. Current broad audit count: `nested_runtime_call=9058`.
+- [ ] Investigate and optimize `MCBinarySearch`. It remains correct but
+  materially slower than TLC in the default benchmark
+  (`tlzig ~7.16s` vs TLC-auto `~1.99s` in the 2026-06-27 run).
+- [~] Borrow data-oriented ideas from Flecs/ECS, but do not add Flecs as a
+  dependency unless a prototype proves it wins on tlzig's state-exploration
+  hot paths. Useful ideas are packed/columnar TypeOK-derived state layouts,
+  relationship-like indexes for function domains, query/branch planning, and
+  batched candidate commits. The direct Flecs entity/component abstraction is
+  not a natural fit for arbitrary canonical TLA+ values and would fight the
+  TigerStyle/no-allocation hot-path goal.
+- [ ] Keep the current 10x performance target tied to concrete strict
+  generated baselines before further representation work:
+  - `MultiShardTxn RC/no-prepare-block`: tlzig `0.695s/0.102s`; 10x target
+    `0.069s/0.010s`.
+  - `MultiShardTxn Storage`: tlzig `1.447s/0.174s`; 10x target
+    `0.145s/0.017s`.
+  - A packed/power-of-two fingerprint table prototype regressed both rows
+    (`0.713s/0.105s` and `1.467s/0.187s`) and was reverted.
+  - A one-pass sequence-function fingerprint prototype was neutral/noisy:
+    RC/no-prepare-block moved to `0.702s/0.105s`, while Storage varied from
+    `1.430s/0.162s` to `1.444s/0.228s`; it was reverted.
+  - A marker-only `UNCHANGED` prototype removed root clones in the generic
+    action executor, but generated-runtime primed reads still see only
+    partial values without assignment kinds, causing a valid MDBTLA run to
+    fail with `TypeError`; it was reverted. Revisit only with typed/generated
+    action IR carrying assignment metadata end-to-end.
+- [ ] Treat GPU acceleration as a later batched typed-layout experiment, not
+  the next optimization step. The current `Value` evaluator is branch-heavy,
+  pointer/offset traversing, and dedup/queue synchronized; GPU transfer,
+  scheduling, and irregular memory would likely lose. Revisit only after
+  TypeOK-derived flat arrays/bitsets exist for batched hashing, symmetry, and
+  relation/set operations.
 - [x] Stream one-variable filters over finite function sets through resettable
   scratch storage and materialize only accepted functions. This removes
   rejected composite values from `TxnSetsAll` while preserving exact results.
@@ -266,6 +418,10 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   ambiguous type invariants instead of silently weakening assumptions.
   - [ ] Add `--type-invariant NAME` and a matching library option. Never infer
     trust from an invariant merely named `TypeOK`.
+    - [x] CLI strict-generation flag added. Selected invariants must name
+      zero-argument operators, are added as generation roots, and are emitted
+      as `type_invariant_names` metadata. Verified on `Barrier.tla` with
+      `TypeOK` and `fallback_count=0`.
   - [ ] Parse supported membership/function/record/tuple/sequence clauses into
     a closed type environment; reject disjunctions, state-dependent domains,
     and paths whose type is not unique.
@@ -422,7 +578,8 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   `SlushLarge` (~50m), `bcastFolklore` (~30m), MultiCarElevator liveness
   (~11m), `aba-asyn-byz` (~10m), and high-level EWD998 (~50m).
 - [ ] Add only reproducible, TLC-valid configurations to benchmark tiers;
-  keep >10-minute cases opt-in so the default benchmark remains usable.
+  keep long cases and isolated one-core heavy cases opt-in so the default
+  benchmark remains usable.
 
 ### Representative benchmark run (ReleaseFast)
 ```

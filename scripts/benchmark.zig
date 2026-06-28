@@ -12,6 +12,8 @@ const Spec = struct {
     label: ?[]const u8 = null,
     tla: []const u8,
     cfg: []const u8,
+    default_enabled: bool = true,
+    one_core_default: bool = true,
     max_states: u32 = 100_000,
     max_nat: i64 = 1000,
     min_int: i64 = -1000,
@@ -21,6 +23,13 @@ const Spec = struct {
     compare_generated: bool = true,
     compare_distinct: bool = true,
     java_classpath: ?[]const u8 = null,
+};
+
+const Options = struct {
+    filter: ?[]const u8 = null,
+    label_suffix: []const u8 = "",
+    include_long: bool = false,
+    include_one_core: bool = false,
 };
 
 const specs = [_]Spec{
@@ -52,9 +61,9 @@ const specs = [_]Spec{
     .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.cfg", .max_states = 200_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.tla", .cfg = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.cfg", .max_states = 200_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.cfg", .max_states = 200_000, .compare_generated = false },
-    .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.cfg", .max_states = 200_000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.tla", .cfg = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.cfg", .max_states = 200_000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoPruning.tla", .cfg = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoPruning.cfg", .max_states = 200_000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.tla", .cfg = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoPruning.tla", .cfg = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoPruning.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000 },
     .{
         .label = "MultiShardTxn ClientCentric",
         .tla = "vendor/MDBTLA/MultiShardTxn/ClientCentricTests.tla",
@@ -139,6 +148,54 @@ const specs = [_]Spec{
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
+    .{
+        .label = "MultiShardTxn RC/no-prepare-block exhaustive",
+        .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+        .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_exhaustive.cfg",
+        .default_enabled = false,
+        .one_core_default = false,
+        .max_states = 10_000_000,
+        .state_values_per_state = 120,
+        .compare_generated = false,
+        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
+            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
+    },
+    .{
+        .label = "MultiShardTxn RC/no-prepare-block-or-ww exhaustive",
+        .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+        .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_or_ww_exhaustive.cfg",
+        .default_enabled = false,
+        .one_core_default = false,
+        .max_states = 10_000_000,
+        .state_values_per_state = 120,
+        .compare_generated = false,
+        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
+            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
+    },
+    .{
+        .label = "MultiShardTxn RC/snapshot exhaustive",
+        .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+        .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_snapshot_exhaustive.cfg",
+        .default_enabled = false,
+        .one_core_default = false,
+        .max_states = 10_000_000,
+        .state_values_per_state = 300,
+        .compare_generated = false,
+        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
+            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
+    },
+    .{
+        .label = "MultiShardTxn RC/with-prepare-block exhaustive",
+        .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+        .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_with_prepare_block_exhaustive.cfg",
+        .default_enabled = false,
+        .one_core_default = false,
+        .max_states = 10_000_000,
+        .state_values_per_state = 120,
+        .compare_generated = false,
+        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
+            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
+    },
 };
 
 pub fn main(init: std.process.Init.Minimal) void {
@@ -147,9 +204,13 @@ pub fn main(init: std.process.Init.Minimal) void {
     });
     const io = threaded_io.io();
     const allocator = std.heap.page_allocator;
-    var args = std.process.Args.Iterator.init(init.args);
-    std.debug.assert(args.skip());
-    const filter = args.next();
+    const options = parse_options(init) catch {
+        std.debug.print(
+            "usage: benchmark [--include-long] [--include-one-core] [--filter TEXT|TEXT]\n",
+            .{},
+        );
+        std.process.exit(2);
+    };
 
     std.Io.Dir.cwd().createDirPath(io, "benchmark_results") catch |err| {
         std.debug.print("failed to create benchmark_results: {any}\n", .{err});
@@ -167,19 +228,21 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     var failures: u32 = 0;
     for (specs) |spec| {
-        if (filter) |needle| {
-            const label_matches = if (spec.label) |label|
-                std.mem.eql(u8, label, needle)
-            else
-                false;
-            if (std.mem.indexOf(u8, spec.tla, needle) == null and
-                std.mem.indexOf(u8, spec.cfg, needle) == null and
-                !label_matches)
-            {
-                continue;
-            }
+        const explicit_match = filter_matches(spec, options.filter);
+        if (options.filter != null and !explicit_match) continue;
+        if (options.filter == null and !options.include_long and
+            !spec.default_enabled)
+        {
+            continue;
         }
-        run_comparison(allocator, io, java_classpath, spec) catch |err| {
+        run_comparison(
+            allocator,
+            io,
+            java_classpath,
+            spec,
+            options.include_one_core or spec.one_core_default,
+            options.label_suffix,
+        ) catch |err| {
             failures += 1;
             std.debug.print("{s:40} ERROR {any}\n", .{ spec.tla, err });
         };
@@ -190,67 +253,155 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 }
 
-fn run_comparison(allocator: std.mem.Allocator, io: std.Io, java_cp: []const u8, spec: Spec) !void {
+fn parse_options(init: std.process.Init.Minimal) !Options {
+    var args = std.process.Args.Iterator.init(init.args);
+    std.debug.assert(args.skip());
+    var options = Options{};
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--include-long")) {
+            options.include_long = true;
+        } else if (std.mem.eql(u8, arg, "--include-one-core")) {
+            options.include_one_core = true;
+        } else if (std.mem.eql(u8, arg, "--filter")) {
+            options.filter = args.next() orelse return error.InvalidArgs;
+        } else if (std.mem.eql(u8, arg, "--label-suffix")) {
+            options.label_suffix = args.next() orelse return error.InvalidArgs;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.InvalidArgs;
+        } else if (options.filter == null) {
+            options.filter = arg;
+        } else {
+            return error.InvalidArgs;
+        }
+    }
+    return options;
+}
+
+fn filter_matches(spec: Spec, optional_filter: ?[]const u8) bool {
+    const needle = optional_filter orelse return false;
+    const label_matches = if (spec.label) |label|
+        std.mem.eql(u8, label, needle)
+    else
+        false;
+    return label_matches or
+        std.mem.indexOf(u8, spec.tla, needle) != null or
+        std.mem.indexOf(u8, spec.cfg, needle) != null;
+}
+
+fn run_comparison(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    java_cp: []const u8,
+    spec: Spec,
+    run_one_core: bool,
+    label_suffix: []const u8,
+) !void {
     const cpu_count: u16 = @intCast(@min(
         std.Thread.getCpuCount() catch 1,
         std.math.maxInt(u16),
     ));
-    const tlzig_one = try run_tlzig_internal(allocator, io, spec, 1);
-    defer tlzig_one.deinit(allocator);
+    const tlzig_one: ?RunResult = if (run_one_core)
+        try run_tlzig_internal(allocator, io, spec, 1)
+    else
+        null;
+    defer if (tlzig_one) |result| result.deinit(allocator);
     const tlzig_auto = try run_tlzig_internal(allocator, io, spec, cpu_count);
     defer tlzig_auto.deinit(allocator);
     const spec_java_cp = spec.java_classpath orelse java_cp;
-    const tlc_one = try run_tlc(allocator, io, spec_java_cp, spec, "1");
-    defer tlc_one.deinit(allocator);
+    const tlc_one: ?RunResult = if (run_one_core)
+        try run_tlc(allocator, io, spec_java_cp, spec, "1")
+    else
+        null;
+    defer if (tlc_one) |result| result.deinit(allocator);
     const tlc_auto = try run_tlc(allocator, io, spec_java_cp, spec, "auto");
     defer tlc_auto.deinit(allocator);
 
     const basename = spec.label orelse std.fs.path.basename(spec.tla);
-    std.debug.print("{s:32} {d:>10.3} {d:>10.3} {d:>10.3} {d:>10.3} {d:>9}/{d:<8} {d:>9}/{d:<8}\n", .{
-        basename,
-        seconds(tlc_one.elapsed_ms),
-        seconds(tlc_auto.elapsed_ms),
-        seconds(tlzig_one.elapsed_ms),
-        seconds(tlzig_auto.elapsed_ms),
-        tlc_one.generated,
-        tlc_one.distinct,
-        tlzig_one.generated,
-        tlzig_one.distinct,
-    });
+    const display_name = if (label_suffix.len == 0)
+        basename
+    else
+        try std.mem.concat(allocator, u8, &.{ basename, label_suffix });
+    defer if (label_suffix.len != 0) allocator.free(display_name);
+    if (run_one_core) {
+        std.debug.print("{s:32} {d:>10.3} {d:>10.3} {d:>10.3} {d:>10.3} {d:>9}/{d:<8} {d:>9}/{d:<8}\n", .{
+            display_name,
+            seconds(tlc_one.?.elapsed_ms),
+            seconds(tlc_auto.elapsed_ms),
+            seconds(tlzig_one.?.elapsed_ms),
+            seconds(tlzig_auto.elapsed_ms),
+            tlc_one.?.generated,
+            tlc_one.?.distinct,
+            tlzig_one.?.generated,
+            tlzig_one.?.distinct,
+        });
+    } else {
+        std.debug.print("{s:32} {s:>10} {d:>10.3} {s:>10} {d:>10.3} {d:>9}/{d:<8} {d:>9}/{d:<8}\n", .{
+            display_name,
+            "-",
+            seconds(tlc_auto.elapsed_ms),
+            "-",
+            seconds(tlzig_auto.elapsed_ms),
+            tlc_auto.generated,
+            tlc_auto.distinct,
+            tlzig_auto.generated,
+            tlzig_auto.distinct,
+        });
+    }
 
-    const mismatch = tlc_one.outcome != tlzig_one.outcome or
+    const one_core_mismatch = if (run_one_core)
+        tlc_one.?.outcome != tlzig_one.?.outcome or
+            tlc_one.?.outcome != tlc_auto.outcome
+    else
+        false;
+    const mismatch = one_core_mismatch or
         tlc_auto.outcome != tlzig_auto.outcome or
-        tlc_one.outcome != tlc_auto.outcome or
         (if (spec.expected_violation)
-            spec.compare_distinct and tlc_one.distinct != tlzig_one.distinct
+            spec.compare_distinct and run_one_core and
+                tlc_one.?.distinct != tlzig_one.?.distinct
         else
             (spec.compare_generated and
-                (tlc_one.generated != tlc_auto.generated or
-                    tlc_one.generated != tlzig_one.generated or
-                    tlc_one.generated != tlzig_auto.generated)) or
+                ((run_one_core and
+                    (tlc_one.?.generated != tlc_auto.generated or
+                        tlc_one.?.generated != tlzig_one.?.generated)) or
+                    tlc_auto.generated != tlzig_auto.generated)) or
                 (spec.compare_distinct and
-                    (tlc_one.distinct != tlc_auto.distinct or
-                        tlc_one.distinct != tlzig_one.distinct or
-                        tlc_one.distinct != tlzig_auto.distinct)));
+                    ((run_one_core and
+                        (tlc_one.?.distinct != tlc_auto.distinct or
+                            tlc_one.?.distinct != tlzig_one.?.distinct)) or
+                        tlc_auto.distinct != tlzig_auto.distinct)));
     if (mismatch) {
-        std.debug.print(
-            "  STATE MISMATCH: TLC-1={d}/{d}/{s} TLC-auto={d}/{d}/{s} " ++
-                "tlzig-1={d}/{d}/{s} tlzig-auto={d}/{d}/{s}\n",
-            .{
-                tlc_one.generated,
-                tlc_one.distinct,
-                @tagName(tlc_one.outcome),
-                tlc_auto.generated,
-                tlc_auto.distinct,
-                @tagName(tlc_auto.outcome),
-                tlzig_one.generated,
-                tlzig_one.distinct,
-                @tagName(tlzig_one.outcome),
-                tlzig_auto.generated,
-                tlzig_auto.distinct,
-                @tagName(tlzig_auto.outcome),
-            },
-        );
+        if (run_one_core) {
+            std.debug.print(
+                "  STATE MISMATCH: TLC-1={d}/{d}/{s} TLC-auto={d}/{d}/{s} " ++
+                    "tlzig-1={d}/{d}/{s} tlzig-auto={d}/{d}/{s}\n",
+                .{
+                    tlc_one.?.generated,
+                    tlc_one.?.distinct,
+                    @tagName(tlc_one.?.outcome),
+                    tlc_auto.generated,
+                    tlc_auto.distinct,
+                    @tagName(tlc_auto.outcome),
+                    tlzig_one.?.generated,
+                    tlzig_one.?.distinct,
+                    @tagName(tlzig_one.?.outcome),
+                    tlzig_auto.generated,
+                    tlzig_auto.distinct,
+                    @tagName(tlzig_auto.outcome),
+                },
+            );
+        } else {
+            std.debug.print(
+                "  STATE MISMATCH: TLC-auto={d}/{d}/{s} tlzig-auto={d}/{d}/{s}\n",
+                .{
+                    tlc_auto.generated,
+                    tlc_auto.distinct,
+                    @tagName(tlc_auto.outcome),
+                    tlzig_auto.generated,
+                    tlzig_auto.distinct,
+                    @tagName(tlzig_auto.outcome),
+                },
+            );
+        }
         return error.StateMismatch;
     }
 }
@@ -411,6 +562,11 @@ fn generated_matches(module_name: []const u8, cfg: config.Config) bool {
     {
         return false;
     }
+    if (generated_model.config_replacements_hash !=
+        config_replacements_hash(cfg))
+    {
+        return false;
+    }
     if (!generated_root_covered(cfg.spec_name)) return false;
     if (!generated_root_covered(cfg.init_name)) return false;
     if (!generated_root_covered(cfg.next_name)) return false;
@@ -428,6 +584,28 @@ fn generated_matches(module_name: []const u8, cfg: config.Config) bool {
         if (!generated_root_covered(name)) return false;
     }
     return true;
+}
+
+fn config_replacements_hash(cfg: config.Config) u64 {
+    var hasher = std.hash.Wyhash.init(0x544c_5a49_475f_4347);
+    for (cfg.constants) |assignment| {
+        const value = std.mem.trim(u8, assignment.expr, " \t");
+        hash_bytes(&hasher, assignment.name);
+        hash_bytes(&hasher, value);
+        hasher.update(&.{if (assignment.is_substitution) 1 else 0});
+        hasher.update(&.{if (assignment.is_substitution and
+            config.is_operator_alias(value))
+            1
+        else
+            2});
+    }
+    return hasher.final();
+}
+
+fn hash_bytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    const len: u64 = bytes.len;
+    hasher.update(std.mem.asBytes(&len));
+    hasher.update(bytes);
 }
 
 fn build_codegen_replacements(

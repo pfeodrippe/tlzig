@@ -3,6 +3,7 @@ const Value = @import("value.zig").Value;
 const ValuePool = @import("value.zig").ValuePool;
 const Set = @import("value.zig").Set;
 const BinarySet = @import("value.zig").BinarySet;
+const Function = @import("value.zig").Function;
 const State = @import("state.zig").StateStore.State;
 const Error = @import("err.zig").Error;
 
@@ -137,6 +138,34 @@ pub fn variable_not_equal_bool(
     return !try variable_equal_bool(context, index, rhs);
 }
 
+pub fn primed_variable_except_update_equal_bool(
+    context: *CallContext,
+    operator_args: []const Value,
+    index: u32,
+    path: []const Value,
+    updater: OperatorFn,
+) Error!bool {
+    var current_pool: *const ValuePool = context.eval_pool;
+    const current = try resolve_current_variable(
+        context,
+        index,
+        &current_pool,
+    );
+    var next_pool: *const ValuePool = context.eval_pool;
+    const next = try resolve_primed_variable(context, index, &next_pool);
+    return try equal_except_update_path(
+        context,
+        operator_args,
+        next,
+        next_pool,
+        current,
+        current_pool,
+        path,
+        0,
+        updater,
+    );
+}
+
 pub fn primed_expression(
     context: *CallContext,
     args: []const Value,
@@ -173,6 +202,26 @@ pub fn unchanged_variable(
         next.values[index],
         next.value_pool(index, context.state_pool),
     );
+}
+
+pub fn unchanged_variables(
+    context: *CallContext,
+    indices: []const u32,
+) Error!bool {
+    const current = context.state orelse return Error.TypeError;
+    const next = context.next_state orelse return Error.TypeError;
+    for (indices) |index| {
+        if (index >= current.values.len or index >= next.values.len) {
+            return Error.TypeError;
+        }
+        if (!Value.eql_cross_pool(
+            current.values[index],
+            current.value_pool(index, context.state_pool),
+            next.values[index],
+            next.value_pool(index, context.state_pool),
+        )) return false;
+    }
+    return true;
 }
 
 pub fn constant(context: *CallContext, name: []const u8) Error!Value {
@@ -359,6 +408,36 @@ pub fn variable_path_not_equal_bool(
     return !try variable_path_equal_bool(context, index, keys, rhs);
 }
 
+pub fn variable_path_member_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    element: Value,
+) Error!bool {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const set_value = try resolve_path(context, index, keys, &source_pool);
+    return set_member_cross_pool(
+        set_value,
+        source_pool,
+        element,
+        context.eval_pool,
+    );
+}
+
+pub fn variable_path_not_member_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    element: Value,
+) Error!bool {
+    return !try variable_path_member_bool(
+        context,
+        index,
+        keys,
+        element,
+    );
+}
+
 pub fn variable_path_field_equal_bool(
     context: *CallContext,
     index: u32,
@@ -387,6 +466,307 @@ pub fn variable_path_field_not_equal_bool(
     rhs: Value,
 ) Error!bool {
     return !try variable_path_field_equal_bool(
+        context,
+        index,
+        keys,
+        field_name,
+        rhs,
+    );
+}
+
+pub fn variable_path_field_boolean(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    field_name: []const u8,
+) Error!bool {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const value = try resolve_path(context, index, keys, &source_pool);
+    if (value != .record_v) return Error.TypeError;
+    const field_value = value.record_v.lookup(source_pool, field_name) orelse
+        return Error.UndefinedSymbol;
+    if (field_value != .bool_v) return Error.TypeError;
+    return field_value.bool_v;
+}
+
+pub fn variable_path_field_member_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    field_name: []const u8,
+    set_value: Value,
+) Error!bool {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const value = try resolve_path(context, index, keys, &source_pool);
+    if (value != .record_v) return Error.TypeError;
+    const field_value = value.record_v.lookup(source_pool, field_name) orelse
+        return Error.UndefinedSymbol;
+    return try member_cross_pool(context, set_value, field_value, source_pool);
+}
+
+pub fn variable_path_sequence_head_field_equal_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    field_name: []const u8,
+    rhs: Value,
+) Error!bool {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const value = try resolve_path(context, index, keys, &source_pool);
+    const head = try sequence_head_cross_pool(value, source_pool);
+    if (head != .record_v) return Error.TypeError;
+    const field_value = head.record_v.lookup(source_pool, field_name) orelse
+        return Error.UndefinedSymbol;
+    return Value.eql_cross_pool(
+        field_value,
+        source_pool,
+        rhs,
+        context.eval_pool,
+    );
+}
+
+pub fn variable_path_sequence_head_field_boolean(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    field_name: []const u8,
+) Error!bool {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const value = try resolve_path(context, index, keys, &source_pool);
+    const head = try sequence_head_cross_pool(value, source_pool);
+    if (head != .record_v) return Error.TypeError;
+    const field_value = head.record_v.lookup(source_pool, field_name) orelse
+        return Error.UndefinedSymbol;
+    if (field_value != .bool_v) return Error.TypeError;
+    return field_value.bool_v;
+}
+
+pub fn variable_path_sequence_head_field_member_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    field_name: []const u8,
+    set_value: Value,
+) Error!bool {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const value = try resolve_path(context, index, keys, &source_pool);
+    const head = try sequence_head_cross_pool(value, source_pool);
+    if (head != .record_v) return Error.TypeError;
+    const field_value = head.record_v.lookup(source_pool, field_name) orelse
+        return Error.UndefinedSymbol;
+    return try member_cross_pool(context, set_value, field_value, source_pool);
+}
+
+fn member_cross_pool(
+    context: *CallContext,
+    set_value: Value,
+    value: Value,
+    value_pool: *const ValuePool,
+) Error!bool {
+    const materialized = try materialize_iterable(context, set_value);
+    if (materialized != .set_v) return Error.TypeError;
+    for (materialized.set_v.items(context.eval_pool)) |item| {
+        if (Value.eql_cross_pool(
+            item,
+            context.eval_pool,
+            value,
+            value_pool,
+        )) return true;
+    }
+    return false;
+}
+
+fn set_member_cross_pool(
+    set_value: Value,
+    set_pool: *const ValuePool,
+    element: Value,
+    element_pool: *const ValuePool,
+) Error!bool {
+    if (!set_value.is_set_like()) return Error.TypeError;
+    switch (set_value) {
+        .set_v => |set_value_items| {
+            for (set_value_items.items(set_pool)) |item| {
+                if (Value.eql_cross_pool(
+                    item,
+                    set_pool,
+                    element,
+                    element_pool,
+                )) return true;
+            }
+            return false;
+        },
+        .range_v => |range_value| {
+            const int = element.as_int() orelse return false;
+            return int >= range_value.lo and int <= range_value.hi;
+        },
+        else => return Error.NotImplemented,
+    }
+}
+
+fn equal_except_update_path(
+    context: *CallContext,
+    operator_args: []const Value,
+    next: Value,
+    next_pool: *const ValuePool,
+    current: Value,
+    current_pool: *const ValuePool,
+    path: []const Value,
+    path_index: usize,
+    updater: OperatorFn,
+) Error!bool {
+    if (path_index == path.len) {
+        const replacement = try call_bound(
+            context,
+            operator_args,
+            &.{current},
+            updater,
+        );
+        return Value.eql_cross_pool(
+            next,
+            next_pool,
+            replacement,
+            context.eval_pool,
+        );
+    }
+
+    const key = path[path_index];
+    switch (current) {
+        .function_v => |current_function| {
+            if (next != .function_v) return false;
+            const next_function = next.function_v;
+            if (current_function.len != next_function.len) return false;
+            const current_keys = current_function.domain.items(current_pool);
+            const current_entries = current_function.entries(current_pool);
+            for (current_keys, current_entries) |current_key, current_entry| {
+                const next_entry = function_lookup_cross_pool(
+                    next_function,
+                    next_pool,
+                    current_key,
+                    current_pool,
+                ) orelse return false;
+                if (Value.eql_cross_pool(
+                    current_key,
+                    current_pool,
+                    key,
+                    context.eval_pool,
+                )) {
+                    if (!try equal_except_update_path(
+                        context,
+                        operator_args,
+                        next_entry,
+                        next_pool,
+                        current_entry,
+                        current_pool,
+                        path,
+                        path_index + 1,
+                        updater,
+                    )) return false;
+                } else if (!Value.eql_cross_pool(
+                    next_entry,
+                    next_pool,
+                    current_entry,
+                    current_pool,
+                )) return false;
+            }
+            return true;
+        },
+        .tuple_v => |current_tuple| {
+            if (next != .tuple_v) return false;
+            const next_tuple = next.tuple_v;
+            if (current_tuple.len != next_tuple.len) return false;
+            const raw_index = key.as_int() orelse return Error.TypeError;
+            if (raw_index < 1 or raw_index > current_tuple.len) return false;
+            const update_index: usize = @intCast(raw_index - 1);
+            const current_items = current_tuple.items(current_pool);
+            const next_items = next_tuple.items(next_pool);
+            for (current_items, next_items, 0..) |current_item, next_item, item_index| {
+                if (item_index == update_index) {
+                    if (!try equal_except_update_path(
+                        context,
+                        operator_args,
+                        next_item,
+                        next_pool,
+                        current_item,
+                        current_pool,
+                        path,
+                        path_index + 1,
+                        updater,
+                    )) return false;
+                } else if (!Value.eql_cross_pool(
+                    next_item,
+                    next_pool,
+                    current_item,
+                    current_pool,
+                )) return false;
+            }
+            return true;
+        },
+        .record_v => |current_record| {
+            if (next != .record_v or key != .string_v) return false;
+            const next_record = next.record_v;
+            if (current_record.len != next_record.len) return false;
+            const key_name = key.string_v.slice(context.eval_pool);
+            const current_fields = current_record.fields(current_pool);
+            var field_index: u32 = 0;
+            while (field_index < current_record.len) : (field_index += 1) {
+                const field_name = current_fields[field_index * 2].string_v;
+                const current_field = current_fields[field_index * 2 + 1];
+                const next_field = next_record.lookup(
+                    next_pool,
+                    field_name.slice(current_pool),
+                ) orelse return false;
+                if (std.mem.eql(u8, field_name.slice(current_pool), key_name)) {
+                    if (!try equal_except_update_path(
+                        context,
+                        operator_args,
+                        next_field,
+                        next_pool,
+                        current_field,
+                        current_pool,
+                        path,
+                        path_index + 1,
+                        updater,
+                    )) return false;
+                } else if (!Value.eql_cross_pool(
+                    next_field,
+                    next_pool,
+                    current_field,
+                    current_pool,
+                )) return false;
+            }
+            return true;
+        },
+        else => return Error.TypeError,
+    }
+}
+
+fn function_lookup_cross_pool(
+    function: Function,
+    function_pool: *const ValuePool,
+    key: Value,
+    key_pool: *const ValuePool,
+) ?Value {
+    const keys = function.domain.items(function_pool);
+    const entries = function.entries(function_pool);
+    for (keys, entries) |candidate, entry| {
+        if (Value.eql_cross_pool(
+            candidate,
+            function_pool,
+            key,
+            key_pool,
+        )) return entry;
+    }
+    return null;
+}
+
+pub fn variable_path_sequence_head_field_not_equal_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    field_name: []const u8,
+    rhs: Value,
+) Error!bool {
+    return !try variable_path_sequence_head_field_equal_bool(
         context,
         index,
         keys,
@@ -440,6 +820,27 @@ fn resolve_path(
         );
     }
     return value;
+}
+
+fn sequence_head_cross_pool(
+    sequence: Value,
+    sequence_pool: *const ValuePool,
+) Error!Value {
+    return switch (sequence) {
+        .function_v => |function| function.apply(
+            sequence_pool,
+            .{ .int_v = 1 },
+        ) orelse Error.IndexOutOfBounds,
+        .tuple_v => |tuple_value| if (tuple_value.len == 0)
+            Error.IndexOutOfBounds
+        else
+            tuple_value.items(sequence_pool)[0],
+        .string_v => |string_value| if (string_value.len == 0)
+            Error.IndexOutOfBounds
+        else
+            .{ .int_v = string_value.slice(sequence_pool)[0] },
+        else => Error.TypeError,
+    };
 }
 
 fn apply_cross_pool(
@@ -1059,6 +1460,93 @@ pub fn permutations(
         .offset = result_offset,
         .len = count,
     } };
+}
+
+pub fn permutations_union(
+    context: *CallContext,
+    domains: []const Value,
+) Error!Value {
+    var total_permutations: u64 = 0;
+    var total_entries: u64 = 0;
+    for (domains) |domain_value| {
+        const domain_set_value = try materialize_iterable(context, domain_value);
+        if (domain_set_value != .set_v) return Error.TypeError;
+        const item_count = domain_set_value.set_v.len;
+        if (item_count > 10) return Error.NotImplemented;
+        const count = try permutation_count(item_count);
+        total_permutations += count;
+        total_entries += @as(u64, count) * item_count;
+    }
+    if (total_permutations > std.math.maxInt(u32)) return Error.OutOfMemory;
+    try context.eval_pool.ensure_value_capacity(
+        total_permutations + total_entries,
+    );
+
+    const result = try context.eval_pool.alloc_values(
+        @intCast(total_permutations),
+    );
+    const result_offset = value_offset(context.eval_pool, result.ptr);
+    var result_count: u32 = 0;
+    for (domains) |domain_value| {
+        const domain_set =
+            (try materialize_iterable(context, domain_value)).set_v;
+        try append_permutations(
+            context,
+            domain_set,
+            result_offset,
+            &result_count,
+        );
+    }
+    return .{ .set_v = .{
+        .offset = result_offset,
+        .len = result_count,
+    } };
+}
+
+fn append_permutations(
+    context: *CallContext,
+    function_domain: Set,
+    result_offset: u32,
+    result_count: *u32,
+) Error!void {
+    const items = function_domain.items(context.eval_pool);
+    var order: [10]u8 = undefined;
+    for (order[0..items.len], 0..) |*entry, index| {
+        entry.* = @intCast(index);
+    }
+    while (true) {
+        const entries = try context.eval_pool.alloc_values(
+            @intCast(items.len),
+        );
+        const entries_offset = value_offset(
+            context.eval_pool,
+            entries.ptr,
+        );
+        for (order[0..items.len], 0..) |source_index, index| {
+            context.eval_pool.values[entries_offset + index] =
+                items[source_index];
+        }
+        const candidate = Value{ .function_v = .{
+            .domain = function_domain,
+            .offset = entries_offset,
+            .len = @intCast(items.len),
+        } };
+        var duplicate = false;
+        for (
+            context.eval_pool.values[result_offset .. result_offset + result_count.*],
+        ) |existing| {
+            if (candidate.eql(existing, context.eval_pool)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            context.eval_pool.values[result_offset + result_count.*] =
+                candidate;
+            result_count.* += 1;
+        }
+        if (!next_permutation(order[0..items.len])) break;
+    }
 }
 
 fn permutation_count(item_count: usize) Error!u32 {

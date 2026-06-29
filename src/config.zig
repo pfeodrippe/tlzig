@@ -321,6 +321,19 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
         } else if (eql(first_word, "SYMMETRY")) {
             if (rest.len > 0) {
                 cfg.symmetry_name = try arena_dup(arena, first_token(rest));
+            } else {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
+                    if (t.len == 0) continue;
+                    if (is_comment(t)) continue;
+                    if (is_directive(t)) {
+                        i -= 1;
+                        break;
+                    }
+                    cfg.symmetry_name = try arena_dup(arena, first_token(t));
+                    break;
+                }
             }
         } else if (eql(first_word, "ALIAS") or
             eql(first_word, "VIEW") or
@@ -676,6 +689,23 @@ test "parse symmetry operator" {
         \\INIT Init
         \\NEXT Next
         \\SYMMETRY ModelSymmetry
+    ;
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+
+    const cfg = try parse(&arena, source);
+    try std.testing.expectEqualStrings(
+        "ModelSymmetry",
+        cfg.symmetry_name.?,
+    );
+}
+
+test "parse block symmetry operator" {
+    const source =
+        \\INIT Init
+        \\NEXT Next
+        \\SYMMETRY
+        \\    ModelSymmetry
     ;
     var arena = try Arena.init(4096);
     defer arena.deinit();

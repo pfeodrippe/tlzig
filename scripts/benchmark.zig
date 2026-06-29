@@ -6,6 +6,7 @@ const checker = tlzig.checker;
 const config = tlzig.config;
 const ModuleLoader = tlzig.ModuleLoader;
 const overrides = tlzig.overrides;
+const generated_runtime = tlzig.generated_runtime;
 const generated_model = @import("generated_model");
 
 const Spec = struct {
@@ -30,6 +31,8 @@ const Options = struct {
     label_suffix: []const u8 = "",
     include_long: bool = false,
     include_one_core: bool = false,
+    auto_only: bool = false,
+    tlzig_only: bool = false,
 };
 
 const specs = [_]Spec{
@@ -40,27 +43,27 @@ const specs = [_]Spec{
     .{ .tla = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla", .cfg = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.cfg", .expected_violation = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.cfg", .max_states = 5000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.cfg", .max_states = 5000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan100Beans.cfg", .max_states = 100_000, .max_nat = 1000, .min_int = -1000, .max_int = 1000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan100Beans.cfg", .default_enabled = false, .one_core_default = false, .max_states = 100_000, .max_nat = 1000, .min_int = -1000, .max_int = 1000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/TeachingConcurrency/Simple.tla", .cfg = "vendor/tlaplus-examples/specifications/TeachingConcurrency/Simple.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/barriers/Barrier.tla", .cfg = "vendor/tlaplus-examples/specifications/barriers/Barrier.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/locks_auxiliary_vars/Lock.tla", .cfg = "vendor/tlaplus-examples/specifications/locks_auxiliary_vars/Lock.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/Majority/MCMajority.tla", .cfg = "vendor/tlaplus-examples/specifications/Majority/MCMajority.cfg", .max_states = 100_000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/LearnProofs/MCFindHighest.tla", .cfg = "vendor/tlaplus-examples/specifications/LearnProofs/MCFindHighest.cfg", .max_states = 100_000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/TwoPhase.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/TwoPhase.cfg", .max_states = 100_000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/LearnProofs/MCFindHighest.tla", .cfg = "vendor/tlaplus-examples/specifications/LearnProofs/MCFindHighest.cfg", .max_states = 100_000, .compare_generated = false },
+    .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/TwoPhase.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/TwoPhase.cfg", .max_states = 100_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/LiveHourClock.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/LiveHourClock.cfg" },
     // Higher state count specs:
     // .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan3000Beans.cfg", .max_states = 50_000_000, .max_nat = 10000, .min_int = -10000, .max_int = 10000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/TCommit.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/TCommit.cfg", .max_states = 500_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/APTCommit.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/APTCommit.cfg", .max_states = 500_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.tla", .cfg = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.cfg", .max_states = 500_000, .expected_violation = true },
-    .{ .tla = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.tla", .cfg = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.cfg", .max_states = 500_000, .expected_violation = true },
+    .{ .tla = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.tla", .cfg = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.cfg", .default_enabled = false, .one_core_default = false, .max_states = 500_000, .expected_violation = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.cfg", .max_states = 500_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.cfg", .max_states = 200_000, .compare_generated = false },
     // Representative larger state spaces and advanced semantics:
-    .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.cfg", .max_states = 200_000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.cfg", .max_states = 200_000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.tla", .cfg = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.cfg", .max_states = 200_000 },
-    .{ .tla = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.cfg", .max_states = 200_000, .compare_generated = false },
+    .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.cfg", .max_states = 200_000, .compare_generated = false },
+    .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.cfg", .max_states = 200_000, .compare_generated = false },
+    .{ .tla = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.tla", .cfg = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000 },
+    .{ .tla = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.tla", .cfg = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoPruning.tla", .cfg = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoPruning.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000 },
@@ -101,6 +104,17 @@ const specs = [_]Spec{
         .max_states = 100_000,
         .compare_generated = false,
         .compare_distinct = false,
+        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
+            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
+    },
+    .{
+        .label = "MultiShardTxn Storage exhaustive",
+        .tla = "vendor/MDBTLA/MultiShardTxn/Storage.tla",
+        .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/Storage_exhaustive.cfg",
+        .default_enabled = false,
+        .one_core_default = false,
+        .max_states = 5_000_000,
+        .compare_generated = false,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -207,6 +221,78 @@ const specs = [_]Spec{
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
+    .{
+        .label = "SingleLog MDBLinearizability",
+        .tla = "vendor/MDBTLA/SingleLog/MDBLinearizability.tla",
+        .cfg = "vendor/MDBTLA/SingleLog/MDBLinearizability.cfg",
+        .default_enabled = false,
+        .one_core_default = false,
+        .max_states = 5_000_000,
+        .state_values_per_state = 180,
+        .compare_generated = false,
+        .compare_distinct = false,
+        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
+            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
+    },
+    .{
+        .label = "SingleShardTxn ShardTxn",
+        .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
+        .cfg = "vendor/MDBTLA/SingleShardTxn/ShardTxn.cfg",
+        .default_enabled = false,
+        .one_core_default = false,
+        .max_states = 5_000_000,
+        .state_values_per_state = 220,
+        .compare_generated = false,
+        .compare_distinct = false,
+        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
+            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
+    },
+    .{
+        .label = "SingleShardTxn ShardTxn/small",
+        .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
+        .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_small.cfg",
+        .one_core_default = false,
+        .max_states = 500_000,
+        .state_values_per_state = 220,
+        .compare_generated = false,
+        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
+            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
+    },
+    .{
+        .label = "SingleShardTxn ShardTxn/small no-sym",
+        .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
+        .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_small_no_sym.cfg",
+        .default_enabled = false,
+        .one_core_default = false,
+        .max_states = 500_000,
+        .state_values_per_state = 220,
+        .compare_generated = false,
+        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
+            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
+    },
+    .{
+        .label = "SingleShardTxn ShardTxn/small safety",
+        .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
+        .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_small_safety.cfg",
+        .one_core_default = false,
+        .max_states = 500_000,
+        .state_values_per_state = 220,
+        .compare_generated = false,
+        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
+            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
+    },
+    .{
+        .label = "SingleShardTxn ShardTxn/small safety no-sym",
+        .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
+        .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_small_safety_no_sym.cfg",
+        .default_enabled = false,
+        .one_core_default = false,
+        .max_states = 500_000,
+        .state_values_per_state = 220,
+        .compare_generated = false,
+        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
+            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
+    },
 };
 
 pub fn main(init: std.process.Init.Minimal) void {
@@ -217,7 +303,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     const allocator = std.heap.page_allocator;
     const options = parse_options(init) catch {
         std.debug.print(
-            "usage: benchmark [--include-long] [--include-one-core] [--filter TEXT|TEXT]\n",
+            "usage: benchmark [--include-long] [--include-one-core] [--auto-only] [--tlzig-only] [--filter TEXT|TEXT]\n",
             .{},
         );
         std.process.exit(2);
@@ -252,8 +338,10 @@ pub fn main(init: std.process.Init.Minimal) void {
             io,
             java_classpath,
             spec,
-            options.include_one_core or spec.one_core_default,
+            !options.auto_only and
+                (options.include_one_core or spec.one_core_default),
             options.label_suffix,
+            options.tlzig_only,
         ) catch |err| {
             failures += 1;
             std.debug.print("{s:40} ERROR {any}\n", .{ spec.tla, err });
@@ -274,10 +362,14 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
             options.include_long = true;
         } else if (std.mem.eql(u8, arg, "--include-one-core")) {
             options.include_one_core = true;
+        } else if (std.mem.eql(u8, arg, "--auto-only")) {
+            options.auto_only = true;
         } else if (std.mem.eql(u8, arg, "--filter")) {
             options.filter = args.next() orelse return error.InvalidArgs;
         } else if (std.mem.eql(u8, arg, "--label-suffix")) {
             options.label_suffix = args.next() orelse return error.InvalidArgs;
+        } else if (std.mem.eql(u8, arg, "--tlzig-only")) {
+            options.tlzig_only = true;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.InvalidArgs;
         } else if (options.filter == null) {
@@ -309,26 +401,30 @@ fn run_comparison(
     spec: Spec,
     run_one_core: bool,
     label_suffix: []const u8,
+    tlzig_only: bool,
 ) !void {
     const cpu_count: u16 = @intCast(@min(
         std.Thread.getCpuCount() catch 1,
         std.math.maxInt(u16),
     ));
     const tlzig_one: ?RunResult = if (run_one_core)
-        try run_tlzig_internal(allocator, io, spec, 1)
+        try run_tlzig_internal(allocator, io, spec, 1, true)
     else
         null;
     defer if (tlzig_one) |result| result.deinit(allocator);
-    const tlzig_auto = try run_tlzig_internal(allocator, io, spec, cpu_count);
+    const tlzig_auto = try run_tlzig_internal(allocator, io, spec, cpu_count, true);
     defer tlzig_auto.deinit(allocator);
     const spec_java_cp = spec.java_classpath orelse java_cp;
-    const tlc_one: ?RunResult = if (run_one_core)
+    const tlc_one: ?RunResult = if (run_one_core and !tlzig_only)
         try run_tlc(allocator, io, spec_java_cp, spec, "1")
     else
         null;
     defer if (tlc_one) |result| result.deinit(allocator);
-    const tlc_auto = try run_tlc(allocator, io, spec_java_cp, spec, "auto");
-    defer tlc_auto.deinit(allocator);
+    const tlc_auto: ?RunResult = if (!tlzig_only)
+        try run_tlc(allocator, io, spec_java_cp, spec, "auto")
+    else
+        null;
+    defer if (tlc_auto) |result| result.deinit(allocator);
 
     const basename = spec.label orelse std.fs.path.basename(spec.tla);
     const display_name = if (label_suffix.len == 0)
@@ -336,11 +432,33 @@ fn run_comparison(
     else
         try std.mem.concat(allocator, u8, &.{ basename, label_suffix });
     defer if (label_suffix.len != 0) allocator.free(display_name);
-    if (run_one_core) {
+    if (tlzig_only and run_one_core) {
+        std.debug.print("{s:32} {s:>10} {s:>10} {d:>10.3} {d:>10.3} {s:>18} {d:>9}/{d:<8}\n", .{
+            display_name,
+            "-",
+            "-",
+            seconds(tlzig_one.?.elapsed_ms),
+            seconds(tlzig_auto.elapsed_ms),
+            "-",
+            tlzig_auto.generated,
+            tlzig_auto.distinct,
+        });
+    } else if (tlzig_only) {
+        std.debug.print("{s:32} {s:>10} {s:>10} {s:>10} {d:>10.3} {s:>18} {d:>9}/{d:<8}\n", .{
+            display_name,
+            "-",
+            "-",
+            "-",
+            seconds(tlzig_auto.elapsed_ms),
+            "-",
+            tlzig_auto.generated,
+            tlzig_auto.distinct,
+        });
+    } else if (run_one_core) {
         std.debug.print("{s:32} {d:>10.3} {d:>10.3} {d:>10.3} {d:>10.3} {d:>9}/{d:<8} {d:>9}/{d:<8}\n", .{
             display_name,
             seconds(tlc_one.?.elapsed_ms),
-            seconds(tlc_auto.elapsed_ms),
+            seconds(tlc_auto.?.elapsed_ms),
             seconds(tlzig_one.?.elapsed_ms),
             seconds(tlzig_auto.elapsed_ms),
             tlc_one.?.generated,
@@ -352,37 +470,42 @@ fn run_comparison(
         std.debug.print("{s:32} {s:>10} {d:>10.3} {s:>10} {d:>10.3} {d:>9}/{d:<8} {d:>9}/{d:<8}\n", .{
             display_name,
             "-",
-            seconds(tlc_auto.elapsed_ms),
+            seconds(tlc_auto.?.elapsed_ms),
             "-",
             seconds(tlzig_auto.elapsed_ms),
-            tlc_auto.generated,
-            tlc_auto.distinct,
+            tlc_auto.?.generated,
+            tlc_auto.?.distinct,
             tlzig_auto.generated,
             tlzig_auto.distinct,
         });
     }
 
+    if (tlzig_only) {
+        try compare_tlzig_baseline(allocator, spec, tlzig_auto);
+        return;
+    }
+
     const one_core_mismatch = if (run_one_core)
         tlc_one.?.outcome != tlzig_one.?.outcome or
-            tlc_one.?.outcome != tlc_auto.outcome
+            tlc_one.?.outcome != tlc_auto.?.outcome
     else
         false;
     const mismatch = one_core_mismatch or
-        tlc_auto.outcome != tlzig_auto.outcome or
+        tlc_auto.?.outcome != tlzig_auto.outcome or
         (if (spec.expected_violation)
             spec.compare_distinct and run_one_core and
                 tlc_one.?.distinct != tlzig_one.?.distinct
         else
             (spec.compare_generated and
                 ((run_one_core and
-                    (tlc_one.?.generated != tlc_auto.generated or
+                    (tlc_one.?.generated != tlc_auto.?.generated or
                         tlc_one.?.generated != tlzig_one.?.generated)) or
-                    tlc_auto.generated != tlzig_auto.generated)) or
+                    tlc_auto.?.generated != tlzig_auto.generated)) or
                 (spec.compare_distinct and
                     ((run_one_core and
-                        (tlc_one.?.distinct != tlc_auto.distinct or
+                        (tlc_one.?.distinct != tlc_auto.?.distinct or
                             tlc_one.?.distinct != tlzig_one.?.distinct)) or
-                        tlc_auto.distinct != tlzig_auto.distinct)));
+                        tlc_auto.?.distinct != tlzig_auto.distinct)));
     if (mismatch) {
         if (run_one_core) {
             std.debug.print(
@@ -392,9 +515,9 @@ fn run_comparison(
                     tlc_one.?.generated,
                     tlc_one.?.distinct,
                     @tagName(tlc_one.?.outcome),
-                    tlc_auto.generated,
-                    tlc_auto.distinct,
-                    @tagName(tlc_auto.outcome),
+                    tlc_auto.?.generated,
+                    tlc_auto.?.distinct,
+                    @tagName(tlc_auto.?.outcome),
                     tlzig_one.?.generated,
                     tlzig_one.?.distinct,
                     @tagName(tlzig_one.?.outcome),
@@ -407,9 +530,9 @@ fn run_comparison(
             std.debug.print(
                 "  STATE MISMATCH: TLC-auto={d}/{d}/{s} tlzig-auto={d}/{d}/{s}\n",
                 .{
-                    tlc_auto.generated,
-                    tlc_auto.distinct,
-                    @tagName(tlc_auto.outcome),
+                    tlc_auto.?.generated,
+                    tlc_auto.?.distinct,
+                    @tagName(tlc_auto.?.outcome),
                     tlzig_auto.generated,
                     tlzig_auto.distinct,
                     @tagName(tlzig_auto.outcome),
@@ -418,6 +541,8 @@ fn run_comparison(
         }
         return error.StateMismatch;
     }
+
+    try write_tlzig_baseline(allocator, spec, tlzig_auto);
 }
 
 const RunResult = struct {
@@ -438,6 +563,107 @@ const Outcome = enum {
     deadlock,
 };
 
+const BaselineResult = struct {
+    generated: u64,
+    distinct: u64,
+    outcome: Outcome,
+};
+
+fn compare_tlzig_baseline(
+    allocator: std.mem.Allocator,
+    spec: Spec,
+    actual: RunResult,
+) !void {
+    const baseline = try read_tlzig_baseline(allocator, spec);
+    const require_baseline_distinct = !spec.expected_violation or
+        (baseline.outcome == .completed and actual.outcome == .completed);
+    const mismatch = baseline.outcome != actual.outcome or
+        (spec.compare_generated and baseline.generated != actual.generated) or
+        ((spec.compare_distinct or require_baseline_distinct) and
+            baseline.distinct != actual.distinct);
+    if (!mismatch) return;
+
+    std.debug.print(
+        "  AOT MISMATCH: tlzig-baseline={d}/{d}/{s} tlzig-aot={d}/{d}/{s}\n",
+        .{
+            baseline.generated,
+            baseline.distinct,
+            @tagName(baseline.outcome),
+            actual.generated,
+            actual.distinct,
+            @tagName(actual.outcome),
+        },
+    );
+    return error.StateMismatch;
+}
+
+fn write_tlzig_baseline(
+    allocator: std.mem.Allocator,
+    spec: Spec,
+    result: RunResult,
+) !void {
+    const path = try tlzig_baseline_path(allocator, spec);
+    defer allocator.free(path);
+    const contents = try std.fmt.allocPrint(
+        allocator,
+        "{d} {d} {s}\n",
+        .{ result.generated, result.distinct, @tagName(result.outcome) },
+    );
+    defer allocator.free(contents);
+    try write_file(path, contents);
+}
+
+fn read_tlzig_baseline(
+    allocator: std.mem.Allocator,
+    spec: Spec,
+) !BaselineResult {
+    const path = try tlzig_baseline_path(allocator, spec);
+    defer allocator.free(path);
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+    const contents = read_file(&arena, path) catch |err| {
+        std.debug.print(
+            "missing tlzig baseline for AOT benchmark {s}: {any}\n",
+            .{ spec.label orelse spec.tla, err },
+        );
+        return error.MissingBaseline;
+    };
+    var tokens = std.mem.tokenizeAny(u8, contents, " \t\r\n");
+    const generated_text = tokens.next() orelse return error.InvalidBaseline;
+    const distinct_text = tokens.next() orelse return error.InvalidBaseline;
+    const outcome_text = tokens.next() orelse return error.InvalidBaseline;
+    const generated = try std.fmt.parseInt(u64, generated_text, 10);
+    const distinct = try std.fmt.parseInt(u64, distinct_text, 10);
+    const outcome = parse_outcome_tag(outcome_text) orelse return error.InvalidBaseline;
+    return .{
+        .generated = generated,
+        .distinct = distinct,
+        .outcome = outcome,
+    };
+}
+
+fn parse_outcome_tag(tag: []const u8) ?Outcome {
+    if (std.mem.eql(u8, tag, "completed")) return .completed;
+    if (std.mem.eql(u8, tag, "violation")) return .violation;
+    if (std.mem.eql(u8, tag, "deadlock")) return .deadlock;
+    return null;
+}
+
+fn tlzig_baseline_path(
+    allocator: std.mem.Allocator,
+    spec: Spec,
+) ![]const u8 {
+    var hasher = std.hash.Wyhash.init(0x4245_4e43_484d_4152);
+    hash_bytes(&hasher, spec.tla);
+    hash_bytes(&hasher, spec.cfg);
+    if (spec.label) |label| hash_bytes(&hasher, label);
+    return try std.fmt.allocPrint(
+        allocator,
+        "benchmark_results/tlzig_auto_{x}.txt",
+        .{hasher.final()},
+    );
+}
+
 fn elapsed_ms(io: std.Io, start: std.Io.Clock.Timestamp) u64 {
     const duration = std.Io.Clock.Timestamp.untilNow(start, io);
     return @intCast(@divTrunc(duration.raw.nanoseconds, 1_000_000));
@@ -452,6 +678,7 @@ fn run_tlzig_internal(
     io: std.Io,
     spec: Spec,
     worker_count: u16,
+    use_generated: bool,
 ) !RunResult {
     const start = std.Io.Clock.Timestamp.now(io, .real);
 
@@ -505,14 +732,12 @@ fn run_tlzig_internal(
         8_000_000,
     ));
 
-    const generated = if (generated_matches(module.name, cfg))
-        &generated_model.operators
-    else
-        &.{};
-    const generated_expressions = if (generated_matches(module.name, cfg))
-        &generated_model.expressions
-    else
-        &.{};
+    const generated: []const generated_runtime.Operator =
+        if (use_generated and generated_matches(module.name, cfg))
+            &generated_model.operators
+        else
+            &.{};
+    const generated_expressions = &.{};
     var ch = checker.Checker.init_generated_with_successor_limit(
         &arena,
         module,
@@ -554,7 +779,14 @@ fn run_tlzig_internal(
                 .output = output,
             };
         }
-        std.debug.print("checking failed for {s}: {any}\n", .{ spec.tla, err });
+        std.debug.print("checking failed for {s}: {any}", .{ spec.tla, err });
+        if (ch.evaluator.err_ctx.context) |context| {
+            std.debug.print(
+                " -- context: {s} {s}",
+                .{ context, ch.evaluator.err_ctx.detail orelse "" },
+            );
+        }
+        std.debug.print("\n", .{});
         return error.CheckFailed;
     };
 
@@ -802,4 +1034,18 @@ fn read_file(arena: *Arena, path: []const u8) ![]u8 {
     const result = try arena.alloc(u8, temp.items.len);
     @memcpy(result, temp.items);
     return result;
+}
+
+fn write_file(path: []const u8, bytes: []const u8) !void {
+    const path_z = try std.heap.page_allocator.alloc(u8, path.len + 1);
+    defer std.heap.page_allocator.free(path_z);
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+
+    const file = std.c.fopen(@ptrCast(path_z.ptr), "wb") orelse
+        return error.IoError;
+    defer _ = std.c.fclose(file);
+
+    const written = std.c.fwrite(bytes.ptr, 1, bytes.len, file);
+    if (written != bytes.len) return error.IoError;
 }

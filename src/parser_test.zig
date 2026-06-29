@@ -1548,7 +1548,28 @@ test "FoldFunctionOnSet folds without recursive set allocation" {
     const source =
         \\---------------------- MODULE TestFoldFunction ----------------------
         \\F == [i \in 1..4 |-> i]
-        \\Ok == FoldFunctionOnSet(+, 0, F, 1..4) = 10
+        \\Ok == Functions!FoldFunctionOnSet(+, 0, F, 1..4) = 10
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
+    var pool = try value.ValuePool.init(&arena, 128, 64);
+    var state_pool = try value.ValuePool.init(&arena, 128, 64);
+    const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "user FoldFunctionOnSet definition is not bypassed by module override" {
+    const source =
+        \\---------------------- MODULE TestFoldFunctionShadow ----------------------
+        \\FoldFunctionOnSet(op(_, _), base, fun, indices) == 42
+        \\F == [i \in 1..4 |-> i]
+        \\Ok == FoldFunctionOnSet(+, 0, F, 1..4) = 42
         \\==============================================================
         \\
     ;

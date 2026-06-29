@@ -36,6 +36,7 @@ const WorkerContext = struct {
     compose_states: StateBuffer,
     prepared_fingerprints: []fingerprint.Fingerprint,
     prepared_invariants: []bool,
+    prepared_edge_masks: []u64,
     prepared_generated: u64,
     composition_generated: u64,
     source_snapshot: StateStore,
@@ -128,6 +129,8 @@ fn parallel_worker(
             .eval_pool = &worker.eval_pool,
             .compose_states = &worker.compose_states,
             .composition_generated = &worker.composition_generated,
+            .fairness_markers = checker.fairness_markers,
+            .edge_action_masks = worker.prepared_edge_masks,
         };
         const generation_error: ?Error = blk: {
             executor.execute_next(
@@ -144,6 +147,7 @@ fn parallel_worker(
                 &worker.eval_pool,
                 worker.prepared_fingerprints,
                 worker.prepared_invariants,
+                worker.prepared_edge_masks,
             ) catch |err| break :blk err;
             break :blk null;
         };
@@ -163,7 +167,6 @@ fn parallel_worker(
             }
             parallel.failure = Error.Deadlock;
         } else if (parallel.failure == null) {
-            checker.generated += worker.prepared_generated;
             checker.generated += worker.composition_generated;
             if (checker.graph_enabled) {
                 checker.succ_offsets[state_idx] = checker.succ_count;
@@ -183,6 +186,7 @@ fn parallel_worker(
                     &worker.eval_pool,
                     worker.prepared_fingerprints,
                     worker.prepared_invariants,
+                    worker.prepared_edge_masks,
                 ) catch |err| {
                     parallel.failure = err;
                 };
@@ -204,13 +208,11 @@ pub const FairnessCondition = struct {
     kind: enum { weak, strong },
     action: *ast.Expr,
     vars: *ast.Expr,
+    full_vars: bool = false,
     bindings: []const FairnessBinding = &.{},
 };
 
-pub const FairnessBinding = struct {
-    name: []const u8,
-    value: Value,
-};
+pub const FairnessBinding = action.FairnessBinding;
 
 const SymmetryHashCache = struct {
     const Entry = struct {
@@ -472,6 +474,7 @@ pub const Checker = struct {
     succ_offsets: []u32,
     succ_counts: []u32,
     succ_edges: []u32,
+    edge_action_masks: []u64,
     succ_count: u32,
     succ_cap: u32,
     graph_enabled: bool,
@@ -484,6 +487,7 @@ pub const Checker = struct {
     max_states_limit: u32,
     // Fairness conditions extracted from the specification formula.
     fairness: []const FairnessCondition,
+    fairness_markers: []const action.FairnessMarker,
     symmetry_permutations: []const []const u32,
 
     pub fn init(
@@ -839,6 +843,7 @@ pub const Checker = struct {
         const succ_counts = try arena.alloc(u32, graph_states);
         @memset(succ_counts, 0);
         const succ_edges = try arena.alloc(u32, succ_cap);
+        const edge_action_masks = try arena.alloc(u64, succ_cap);
         const canonical_states = try arena.alloc(bool, graph_states);
         @memset(canonical_states, false);
         const initial_states = try arena.alloc(bool, graph_states);
@@ -858,6 +863,7 @@ pub const Checker = struct {
                 &[_]FairnessCondition{}
         else
             &[_]FairnessCondition{};
+        const fairness_markers = try build_fairness_markers(arena, fairness);
         return Checker{
             .arena = arena,
             .state_store = state_store,
@@ -893,6 +899,7 @@ pub const Checker = struct {
             .succ_offsets = succ_offsets,
             .succ_counts = succ_counts,
             .succ_edges = succ_edges,
+            .edge_action_masks = edge_action_masks,
             .succ_count = 0,
             .succ_cap = succ_cap,
             .graph_enabled = graph_enabled,
@@ -900,6 +907,7 @@ pub const Checker = struct {
             .initial_states = initial_states,
             .max_states_limit = max_states,
             .fairness = fairness,
+            .fairness_markers = fairness_markers,
             .symmetry_permutations = symmetry_permutations,
         };
     }
@@ -926,6 +934,7 @@ pub const Checker = struct {
 
         var out_states = try StateBuffer.init(self.arena, self.max_successors);
         var compose_states = try StateBuffer.init(self.arena, self.max_successors);
+        const edge_masks = try self.arena.alloc(u64, self.max_successors);
         var composition_generated: u64 = 0;
 
         var executor = ActionExecutor{
@@ -935,6 +944,8 @@ pub const Checker = struct {
             .eval_pool = &self.eval_pool,
             .compose_states = &compose_states,
             .composition_generated = &composition_generated,
+            .fairness_markers = self.fairness_markers,
+            .edge_action_masks = edge_masks,
         };
 
         self.candidate_store.reset(self.candidate_pool_base);
@@ -945,6 +956,7 @@ pub const Checker = struct {
             &out_states,
             &self.candidate_store,
             &self.candidate_evaluator,
+            edge_masks,
         );
         self.eval_pool.restore(self.eval_pool_base);
 
@@ -983,6 +995,7 @@ pub const Checker = struct {
                     &out_states,
                     &self.candidate_store,
                     &self.candidate_evaluator,
+                    edge_masks,
                 );
                 self.eval_pool.restore(self.eval_pool_base);
             }
@@ -1096,6 +1109,10 @@ pub const Checker = struct {
             bool,
             self.max_successors,
         );
+        worker.prepared_edge_masks = try worker.candidate_arena.alloc(
+            u64,
+            self.max_successors,
+        );
         worker.prepared_generated = 0;
         worker.composition_generated = 0;
         worker.source_snapshot = self.state_store;
@@ -1110,11 +1127,13 @@ pub const Checker = struct {
         eval_pool: *ValuePool,
         prepared_fingerprints: []fingerprint.Fingerprint,
         prepared_invariants: []bool,
+        prepared_edge_masks: []u64,
     ) !void {
         assert(self.worker_count > 1);
         assert(!self.symmetry_hash_cache.enabled);
         assert(out_states.items.len <= prepared_fingerprints.len);
         assert(out_states.items.len <= prepared_invariants.len);
+        assert(out_states.items.len <= prepared_edge_masks.len);
         var kept_count: u32 = 0;
         var action_parent = try self.clone_parent_for_action_constraints(
             parent_idx,
@@ -1152,6 +1171,9 @@ pub const Checker = struct {
             out_states.items[kept_count] = candidate_index;
             prepared_fingerprints[kept_count] = candidate_fingerprint;
             prepared_invariants[kept_count] = true;
+            prepared_edge_masks[kept_count] = prepared_edge_masks[
+                @intCast(candidate_index)
+            ];
             kept_count += 1;
         }
         out_states.shrink(kept_count);
@@ -1166,9 +1188,12 @@ pub const Checker = struct {
         eval_pool: *ValuePool,
         prepared_fingerprints: []const fingerprint.Fingerprint,
         prepared_invariants: []const bool,
+        prepared_edge_masks: []u64,
     ) !void {
         assert(out_states.items.len <= prepared_fingerprints.len);
         assert(out_states.items.len <= prepared_invariants.len);
+        assert(out_states.items.len <= prepared_edge_masks.len);
+        var kept_count: u32 = 0;
         for (out_states.items, 0..) |*candidate_index, prepared_index| {
             const candidate = candidate_store.get(candidate_index.*);
             const state_fingerprint = prepared_fingerprints[prepared_index];
@@ -1213,9 +1238,20 @@ pub const Checker = struct {
             if (is_new and !self.queue.enqueue(state_idx)) {
                 return Error.StateSpaceExhausted;
             }
+            if (deduplicate_successor(
+                out_states.items[0..kept_count],
+                prepared_edge_masks[0..kept_count],
+                state_idx,
+                prepared_edge_masks[prepared_index],
+            )) continue;
+            self.generated += 1;
             candidate_index.* = state_idx;
+            out_states.items[kept_count] = state_idx;
+            prepared_edge_masks[kept_count] = prepared_edge_masks[prepared_index];
+            kept_count += 1;
         }
-        try self.record_successors(parent_idx, out_states);
+        out_states.shrink(kept_count);
+        try self.record_successors(parent_idx, out_states, prepared_edge_masks);
     }
 
     fn process_generated(
@@ -1224,6 +1260,7 @@ pub const Checker = struct {
         out_states: *StateBuffer,
         candidate_store: *StateStore,
         candidate_evaluator: *Evaluator,
+        edge_masks: []u64,
     ) !void {
         // First pass: check constraints/invariants, canonicalize duplicates,
         // and enqueue newly discovered states. After this loop, out_states
@@ -1238,7 +1275,7 @@ pub const Checker = struct {
             null;
         for (out_states.items) |*idx| {
             assert(idx.* < candidate_store.count);
-            self.generated += 1;
+            const candidate_index = idx.*;
             const candidate = candidate_store.get(idx.*);
             if (parent_idx) |pidx| {
                 candidate.pred = pidx;
@@ -1318,21 +1355,31 @@ pub const Checker = struct {
                     return Error.StateSpaceExhausted;
                 }
             }
+            if (deduplicate_successor(
+                out_states.items[0..kept_count],
+                edge_masks[0..kept_count],
+                state_idx,
+                edge_masks[@intCast(candidate_index)],
+            )) continue;
+            self.generated += 1;
             idx.* = state_idx;
             out_states.items[kept_count] = state_idx;
+            edge_masks[kept_count] = edge_masks[@intCast(candidate_index)];
             kept_count += 1;
         }
         out_states.shrink(kept_count);
-        try self.record_successors(parent_idx, out_states);
+        try self.record_successors(parent_idx, out_states, edge_masks);
     }
 
     fn record_successors(
         self: *Checker,
         parent_idx: ?u32,
         out_states: *StateBuffer,
+        edge_masks: []const u64,
     ) !void {
         if (parent_idx) |pidx| {
             const count: u32 = @intCast(out_states.items.len);
+            assert(edge_masks.len >= count);
             if (self.graph_enabled) {
                 if (self.succ_count + count > self.succ_cap) {
                     return Error.OutOfMemory;
@@ -1342,6 +1389,7 @@ pub const Checker = struct {
                 for (out_states.items, 0..) |idx, i| {
                     assert(idx < self.state_store.count);
                     self.succ_edges[self.succ_count + i] = idx;
+                    self.edge_action_masks[self.succ_count + i] = edge_masks[i];
                 }
                 self.succ_count += count;
             }
@@ -1356,6 +1404,21 @@ pub const Checker = struct {
                 }
             }
         }
+    }
+
+    fn deduplicate_successor(
+        states: []const u32,
+        edge_masks: []u64,
+        state_idx: u32,
+        edge_mask: u64,
+    ) bool {
+        assert(edge_masks.len >= states.len);
+        for (states, 0..) |existing, index| {
+            if (existing != state_idx) continue;
+            edge_masks[index] |= edge_mask;
+            return true;
+        }
+        return false;
     }
 
     fn clone_candidate_state(
@@ -1965,37 +2028,24 @@ pub const Checker = struct {
             enabled[fi] = try allocator.alloc(bool, n);
             @memset(enabled[fi], false);
             for (0..n) |s| {
-                const state = self.state_store.get(@intCast(s));
-                for (self.successors(@intCast(s))) |succ| {
-                    const child = self.state_store.get(succ);
-                    const context_snap = self.evaluator.context_snapshot();
-                    const fc_context = try self.fairness_context(fc);
-                    const action_holds = try self.eval_action(
-                        fc.action,
-                        fc_context,
-                        state,
-                        child,
-                    );
-                    const changes_vars = if (action_holds)
-                        !(try self.eval_vars_equal(fc.vars, fc_context, state, child))
-                    else
-                        false;
-                    self.evaluator.restore_context_pool(context_snap);
-                    if (action_holds) {
-                        // WF_v(A) and SF_v(A) are defined over <<A>>_v, not
-                        // over A alone. A stuttering A transition does not make
-                        // the fairness action enabled.
-                        if (changes_vars) {
-                            enabled[fi][s] = true;
-                            const from_scc = scc_ids[s];
-                            const to_scc = scc_ids[succ];
-                            if (from_scc == to_scc) {
-                                has_angle[fi * scc_count + from_scc] = true;
-                            }
+                const state_index: u32 = @intCast(s);
+                const begin = self.succ_offsets[state_index];
+                const end = begin + self.succ_counts[state_index];
+                for (begin..end) |edge_index_usize| {
+                    const edge_index: u32 = @intCast(edge_index_usize);
+                    const succ = self.succ_edges[edge_index];
+                    const mask = self.edge_action_masks[edge_index];
+                    if ((mask & (@as(u64, 1) << @intCast(fi))) != 0) {
+                        enabled[fi][s] = true;
+                        const from_scc = scc_ids[state_index];
+                        const to_scc = scc_ids[succ];
+                        if (from_scc == to_scc) {
+                            has_angle[fi * scc_count + from_scc] = true;
                         }
                     }
                 }
             }
+            _ = fc;
         }
         defer for (enabled) |e| allocator.free(e);
 
@@ -2027,21 +2077,6 @@ pub const Checker = struct {
             fair_sccs[scc_id] = fair;
         }
         return fair_sccs;
-    }
-
-    fn fairness_context(
-        self: *Checker,
-        condition: FairnessCondition,
-    ) Error!Context {
-        var context = Context.empty();
-        for (condition.bindings) |binding| {
-            context = try self.evaluator.extend_context(
-                context,
-                binding.name,
-                binding.value,
-            );
-        }
-        return context;
     }
 
     fn eval_action(self: *Checker, action_expr: *ast.Expr, context: Context, parent: *StateStore.State, child: *StateStore.State) Error!bool {
@@ -2829,6 +2864,7 @@ fn collect_fairness(
                 const name = ap.func.*.ident;
                 if (starts_with(name, "WF_")) {
                     const vars_name = name[3..];
+                    const full_vars = std.mem.eql(u8, vars_name, "vars");
                     const saved_bindings = try arena.alloc(
                         FairnessBinding,
                         bindings.len,
@@ -2838,10 +2874,12 @@ fn collect_fairness(
                         .kind = .weak,
                         .action = ap.args[0],
                         .vars = try expr_ident(arena, vars_name),
+                        .full_vars = full_vars,
                         .bindings = saved_bindings,
                     });
                 } else if (starts_with(name, "SF_")) {
                     const vars_name = name[3..];
+                    const full_vars = std.mem.eql(u8, vars_name, "vars");
                     const saved_bindings = try arena.alloc(
                         FairnessBinding,
                         bindings.len,
@@ -2851,6 +2889,7 @@ fn collect_fairness(
                         .kind = .strong,
                         .action = ap.args[0],
                         .vars = try expr_ident(arena, vars_name),
+                        .full_vars = full_vars,
                         .bindings = saved_bindings,
                     });
                 }
@@ -2942,6 +2981,23 @@ fn extract_fairness(
     const result = try arena.alloc(FairnessCondition, list.items.len);
     @memcpy(result, list.items);
     return result;
+}
+
+fn build_fairness_markers(
+    arena: *Arena,
+    fairness: []const FairnessCondition,
+) ![]const action.FairnessMarker {
+    assert(fairness.len <= 64);
+    if (fairness.len == 0) return &[_]action.FairnessMarker{};
+    const markers = try arena.alloc(action.FairnessMarker, fairness.len);
+    for (fairness, 0..) |condition, index| {
+        markers[index] = .{
+            .action = condition.action,
+            .bindings = condition.bindings,
+            .bit_index = @intCast(index),
+        };
+    }
+    return markers;
 }
 
 fn extract_spec_names(module: ast.Module, spec_name: []const u8) !SpecNames {

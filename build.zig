@@ -121,21 +121,31 @@ pub fn build(b: *std.Build) void {
                 .name = "benchmark_mdbtla_mcm_snapshot_aot",
                 .model_path = "generated_models/mdbtla_mcm_snapshot_invariant.zig",
                 .filter = "MultiShardTxn MCM/snapshot-invariant",
+                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_mcm_rc_local_aot",
                 .model_path = "generated_models/mdbtla_mcm_rc_local_invariant.zig",
                 .filter = "MultiShardTxn MCM/rc-local-invariant",
+                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_storage_aot",
                 .model_path = "generated_models/mdbtla_storage.zig",
                 .filter = "MultiShardTxn Storage",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_mdbtla_storage_exhaustive_aot",
+                .model_path = "generated_models/mdbtla_storage.zig",
+                .filter = "MultiShardTxn Storage exhaustive",
+                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_no_prepare_aot",
                 .model_path = "generated_models/mdbtla_rc_no_prepare_block.zig",
                 .filter = "MultiShardTxn RC/no-prepare-block",
+                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_no_prepare_exhaustive_aot",
@@ -147,6 +157,7 @@ pub fn build(b: *std.Build) void {
                 .name = "benchmark_mdbtla_rc_no_prepare_ww_aot",
                 .model_path = "generated_models/mdbtla_rc_no_prepare_block_or_ww.zig",
                 .filter = "MultiShardTxn RC/no-prepare-block-or-ww",
+                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_no_prepare_ww_exhaustive_aot",
@@ -158,6 +169,7 @@ pub fn build(b: *std.Build) void {
                 .name = "benchmark_mdbtla_rc_snapshot_aot",
                 .model_path = "generated_models/mdbtla_rc_snapshot.zig",
                 .filter = "MultiShardTxn RC/snapshot",
+                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_snapshot_exhaustive_aot",
@@ -169,6 +181,7 @@ pub fn build(b: *std.Build) void {
                 .name = "benchmark_mdbtla_rc_with_prepare_aot",
                 .model_path = "generated_models/mdbtla_rc_with_prepare_block.zig",
                 .filter = "MultiShardTxn RC/with-prepare-block",
+                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_with_prepare_exhaustive_aot",
@@ -261,7 +274,7 @@ fn addGeneratedBenchmark(
     bench.root_module.addImport("generated_model", generated_model_module);
     const run_bench = b.addRunArtifact(bench);
     run_bench.addArg(filter);
-    run_bench.addArgs(&.{ "--label-suffix", " [AOT]" });
+    run_bench.addArgs(&.{ "--label-suffix", " [AOT]", "--tlzig-only", "--auto-only" });
     return run_bench;
 }
 

@@ -648,6 +648,22 @@ pub const Evaluator = struct {
         return name;
     }
 
+    fn is_module_operator(
+        self: Evaluator,
+        name: []const u8,
+        module_name: []const u8,
+        operator_name: []const u8,
+    ) bool {
+        if (std.mem.eql(u8, name, operator_name)) {
+            const definition = self.find_definition(name) orelse return false;
+            return definition_source_module(definition, module_name);
+        }
+        const bang = std.mem.lastIndexOfScalar(u8, name, '!') orelse
+            return false;
+        return std.mem.eql(u8, name[0..bang], module_name) and
+            std.mem.eql(u8, name[bang + 1 ..], operator_name);
+    }
+
     pub fn find_constant(self: Evaluator, name: []const u8) ?Value {
         for (self.constants) |c| {
             if (name_eql(c.name, name)) return c.value;
@@ -1293,29 +1309,39 @@ pub const Evaluator = struct {
                 break :blk try eval_union_all(eval_pool, mat);
             },
             .domain => {
-                if (operand == .function_v) return Value{ .set_v = operand.function_v.domain };
-                if (operand == .record_v) {
-                    const fields = operand.record_v.fields(eval_pool);
+                const domain_operand = if (operand == .generated_operator_v)
+                    try self.apply_values(
+                        operand,
+                        &.{},
+                        eval_pool,
+                        state_pool,
+                        s0,
+                    )
+                else
+                    operand;
+                if (domain_operand == .function_v) return Value{ .set_v = domain_operand.function_v.domain };
+                if (domain_operand == .record_v) {
+                    const fields = domain_operand.record_v.fields(eval_pool);
                     const names = try eval_pool.alloc_values(
-                        operand.record_v.len,
+                        domain_operand.record_v.len,
                     );
                     var i: u32 = 0;
-                    while (i < operand.record_v.len) : (i += 1) {
+                    while (i < domain_operand.record_v.len) : (i += 1) {
                         assert(fields[i * 2] == .string_v);
                         names[i] = fields[i * 2];
                     }
                     return Value{ .set_v = make_set(eval_pool, names) };
                 }
                 // Tuples (sequences) have domain 1..Len.
-                if (operand == .tuple_v) {
-                    const n = operand.tuple_v.len;
+                if (domain_operand == .tuple_v) {
+                    const n = domain_operand.tuple_v.len;
                     if (n == 0) {
                         const empty = try eval_pool.alloc_values(0);
                         return Value{ .set_v = make_set(eval_pool, empty) };
                     }
                     return Value{ .range_v = .{ .lo = 1, .hi = @intCast(n) } };
                 }
-                return self.fail(Error.TypeError, "DOMAIN", @tagName(operand));
+                return self.fail(Error.TypeError, "DOMAIN", @tagName(domain_operand));
             },
             .enabled, .temporal_box, .temporal_diamond => unreachable,
         };
@@ -2590,20 +2616,7 @@ pub const Evaluator = struct {
         }
         if (ap.func.* == .ident) {
             const name = self.resolve_alias(ap.func.*.ident);
-            if (std.mem.eql(u8, name, "ReduceSeq") and
-                ap.args.len == 3)
-            {
-                return try self.eval_sequence_fold(
-                    ap.args[0],
-                    ap.args[2],
-                    ap.args[1],
-                    ctx,
-                    s0,
-                    eval_pool,
-                    state_pool,
-                );
-            }
-            if (std.mem.eql(u8, name, "FoldFunction") and
+            if (self.is_module_operator(name, "Functions", "FoldFunction") and
                 ap.args.len == 3)
             {
                 return try self.eval_sequence_fold(
@@ -2635,7 +2648,9 @@ pub const Evaluator = struct {
             if (std.mem.eql(u8, name, "SelectSeq")) {
                 return try self.eval_select_seq(ap, ctx, s0, eval_pool, state_pool);
             }
-            if (std.mem.eql(u8, name, "FoldFunctionOnSet") and ap.args.len == 4) {
+            if (self.is_module_operator(name, "Functions", "FoldFunctionOnSet") and
+                ap.args.len == 4)
+            {
                 return try self.eval_fold_function_on_set(ap, ctx, s0, eval_pool, state_pool);
             }
             if (try ctx.lookup_value(name, eval_pool)) |local_function| {
@@ -3107,6 +3122,34 @@ pub const Evaluator = struct {
     }
 
     fn apply_values(self: Evaluator, func: Value, args: []const Value, eval_pool: *ValuePool, state_pool: *ValuePool, s0: ?*StateStore.State) Error!Value {
+        if (func == .generated_operator_v) {
+            const operator_value = func.generated_operator_v;
+            if (args.len != operator_value.arity) {
+                return self.fail(
+                    Error.TypeError,
+                    "apply generated operator arity",
+                    "argument count mismatch",
+                );
+            }
+            if (operator_value.captured_len + args.len > 64) {
+                return Error.NotImplemented;
+            }
+            const generated_function: generated_runtime.OperatorFn = @ptrFromInt(
+                operator_value.function_address,
+            );
+            var combined: [64]Value = undefined;
+            const captured = eval_pool.values[operator_value.captured_offset..][0..operator_value.captured_len];
+            @memcpy(combined[0..captured.len], captured);
+            @memcpy(combined[captured.len..][0..args.len], args);
+            return try self.call_generated(
+                generated_function,
+                combined[0 .. captured.len + args.len],
+                Context.empty(),
+                s0,
+                eval_pool,
+                state_pool,
+            );
+        }
         if (args.len == 0) return func;
         if (args.len == 1) return try self.apply_value(func, args[0], eval_pool, state_pool, s0);
         if (func == .lambda_v) {
@@ -4143,6 +4186,16 @@ inline fn name_eql(left: []const u8, right: []const u8) bool {
     if (left.len != right.len) return false;
     if (left.ptr == right.ptr) return true;
     return std.mem.eql(u8, left, right);
+}
+
+fn definition_source_module(
+    definition: ast.Definition,
+    module_name: []const u8,
+) bool {
+    const file_name = std.fs.path.basename(definition.source_path);
+    if (file_name.len != module_name.len + ".tla".len) return false;
+    return std.mem.eql(u8, file_name[0..module_name.len], module_name) and
+        std.mem.eql(u8, file_name[module_name.len..], ".tla");
 }
 
 fn generated_native_call(

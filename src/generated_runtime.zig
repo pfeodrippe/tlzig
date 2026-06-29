@@ -434,6 +434,10 @@ pub fn field(
     record_value: Value,
     name: []const u8,
 ) Error!Value {
+    if (record_value == .generated_operator_v) {
+        if (record_value.generated_operator_v.arity != 0) return Error.TypeError;
+        return try field(context, try call(context, record_value, &.{}), name);
+    }
     if (record_value != .record_v) return Error.TypeError;
     const fields = record_value.record_v.fields(context.eval_pool);
     var index: u32 = 0;
@@ -2283,6 +2287,10 @@ pub fn record_set(
 
 pub fn domain(context: *CallContext, operand: Value) Error!Value {
     return switch (operand) {
+        .generated_operator_v => |operator_value| blk: {
+            if (operator_value.arity != 0) return Error.TypeError;
+            break :blk try domain(context, try call(context, operand, &.{}));
+        },
         .function_v => |function| .{ .set_v = function.domain },
         .tuple_v => |tuple_value| .{ .range_v = .{
             .lo = 1,
@@ -2308,6 +2316,12 @@ fn domain_cross_pool(
     source_pool: *const ValuePool,
 ) Error!Value {
     return switch (value) {
+        .generated_operator_v => |operator_value| blk: {
+            if (operator_value.arity != 0 or source_pool != context.eval_pool) {
+                return Error.TypeError;
+            }
+            break :blk try domain(context, try call(context, value, &.{}));
+        },
         .function_v => |function| .{
             .set_v = try function.domain.clone(source_pool, context.eval_pool),
         },

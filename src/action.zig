@@ -430,6 +430,7 @@ pub const ActionStep = union(enum(u8)) {
     assign_var: AssignVar,
     assign_prime: AssignPrime,
     condition: CompiledExpr,
+    mark_action: MarkAction,
     choose: Choose,
     branch: Branch,
     if_branch: IfBranch,
@@ -462,6 +463,22 @@ pub const Unchanged = struct {
 pub const CompiledExpr = struct {
     expr: *ast.Expr,
     generated: ?generated_runtime.Expression,
+};
+
+pub const MarkAction = struct {
+    name: []const u8,
+    args: []const CompiledExpr,
+};
+
+pub const FairnessBinding = struct {
+    name: []const u8,
+    value: Value,
+};
+
+pub const FairnessMarker = struct {
+    action: *ast.Expr,
+    bindings: []const FairnessBinding,
+    bit_index: u6,
 };
 
 pub const Choose = struct {
@@ -751,6 +768,13 @@ pub const ActionCompiler = struct {
                         ActionStep{ .condition = try self.compile_expr(expr) },
                     );
                 } else if (self.evaluator.find_definition(name)) |def| {
+                    try steps.append(
+                        std.heap.page_allocator,
+                        ActionStep{ .mark_action = .{
+                            .name = name,
+                            .args = &.{},
+                        } },
+                    );
                     try self.collect_steps(def.body, steps, is_init);
                 } else {
                     try steps.append(std.heap.page_allocator, ActionStep{ .condition = try self.compile_expr(expr) });
@@ -972,6 +996,14 @@ pub const ActionCompiler = struct {
                     }
                     if (self.evaluator.find_definition(func_name)) |def| {
                         if (def.params.len == ap.args.len) {
+                            const mark_args = try self.compile_exprs(ap.args);
+                            try steps.append(
+                                std.heap.page_allocator,
+                                ActionStep{ .mark_action = .{
+                                    .name = func_name,
+                                    .args = mark_args,
+                                } },
+                            );
                             if (self.evaluator.generated_expression_count() ==
                                 0)
                             {
@@ -1166,6 +1198,8 @@ pub const ActionExecutor = struct {
     eval_pool: *ValuePool,
     compose_states: ?*StateBuffer = null,
     composition_generated: ?*u64 = null,
+    fairness_markers: []const FairnessMarker = &.{},
+    edge_action_masks: ?[]u64 = null,
 
     const Continuation = struct {
         steps: []const ActionStep,
@@ -1180,7 +1214,7 @@ pub const ActionExecutor = struct {
         assert(compiled.steps.len >= 0);
         assert(out_states.items.len == 0);
         self.evaluator.reset_context_pool();
-        try self.execute_steps(compiled.steps, null, Context.empty(), null, out_states, true);
+        try self.execute_steps(compiled.steps, null, Context.empty(), null, out_states, true, 0);
     }
 
     pub fn execute_next(
@@ -1191,7 +1225,7 @@ pub const ActionExecutor = struct {
     ) !void {
         const s0 = self.source_state_store.get(s0_idx);
         self.evaluator.reset_context_pool();
-        try self.execute_steps(compiled.steps, null, Context.empty(), s0, out_states, false);
+        try self.execute_steps(compiled.steps, null, Context.empty(), s0, out_states, false, 0);
     }
 
     fn eval_compiled_expr(
@@ -1200,7 +1234,10 @@ pub const ActionExecutor = struct {
         context: Context,
         state: ?*StateStore.State,
     ) !Value {
-        if (compiled.generated) |generated| {
+        if (compiled.generated) |generated| generated: {
+            if (!generated_args_available(generated, context)) {
+                break :generated;
+            }
             return self.evaluator.eval_generated_expression(
                 generated,
                 context,
@@ -1224,7 +1261,10 @@ pub const ActionExecutor = struct {
         context: Context,
         state: ?*StateStore.State,
     ) !bool {
-        if (compiled.generated) |generated| {
+        if (compiled.generated) |generated| generated: {
+            if (!generated_args_available(generated, context)) {
+                break :generated;
+            }
             return self.evaluator.eval_generated_expression_bool(
                 generated,
                 context,
@@ -1243,6 +1283,19 @@ pub const ActionExecutor = struct {
         return result.is_truthy();
     }
 
+    fn generated_args_available(
+        generated: generated_runtime.Expression,
+        context: Context,
+    ) bool {
+        if (generated.arg_names.len == 0) return true;
+        for (generated.arg_names, 0..) |name, index| {
+            const required = generated.arg_required.len == 0 or
+                generated.arg_required[index];
+            if (required and context.lookup(name) == null) return false;
+        }
+        return true;
+    }
+
     fn execute_steps(
         self: ActionExecutor,
         steps: []const ActionStep,
@@ -1251,6 +1304,7 @@ pub const ActionExecutor = struct {
         s0: ?*StateStore.State,
         out_states: *StateBuffer,
         is_init: bool,
+        action_mask: u64,
     ) !void {
         assert(self.eval_pool.value_count <= self.eval_pool.value_cap);
         assert(self.source_state_store.values_pool.value_count <=
@@ -1269,10 +1323,17 @@ pub const ActionExecutor = struct {
                         s0,
                         out_states,
                         is_init,
+                        action_mask,
                     );
                     return;
                 }
-                try self.commit_state(current_ctx, s0, out_states, is_init);
+                try self.commit_state(
+                    current_ctx,
+                    s0,
+                    out_states,
+                    is_init,
+                    action_mask,
+                );
                 return;
             }
             const step = current_steps[0];
@@ -1295,7 +1356,7 @@ pub const ActionExecutor = struct {
                                 it,
                                 .changed,
                             );
-                            try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
+                            try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init, action_mask);
                             self.eval_pool.restore(snap);
                             self.evaluator.restore_context_pool(context_snap);
                         }
@@ -1328,7 +1389,7 @@ pub const ActionExecutor = struct {
                                 it,
                                 .changed,
                             );
-                            try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init);
+                            try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init, action_mask);
                             self.eval_pool.restore(snap);
                             self.evaluator.restore_context_pool(context_snap);
                         }
@@ -1350,6 +1411,28 @@ pub const ActionExecutor = struct {
                     current_steps = rest;
                     continue;
                 },
+                .mark_action => |marker| {
+                    current_steps = rest;
+                    mask_update: {
+                        const additional_mask = try self.fairness_marker_mask(
+                            marker,
+                            current_ctx,
+                            s0,
+                        );
+                        if (additional_mask == 0) break :mask_update;
+                        try self.execute_steps(
+                            rest,
+                            continuation,
+                            current_ctx,
+                            s0,
+                            out_states,
+                            is_init,
+                            action_mask | additional_mask,
+                        );
+                        return;
+                    }
+                    continue;
+                },
                 .choose => |c| {
                     const set_v = try self.eval_compiled_expr(c.domain, current_ctx, s0);
                     if (!set_v.is_set_like()) return Error.TypeError;
@@ -1361,7 +1444,7 @@ pub const ActionExecutor = struct {
                     const context_snap = self.evaluator.context_snapshot();
                     for (items) |it| {
                         const new_ctx = try self.evaluator.extend_context(current_ctx, c.var_name, it);
-                        try self.execute_steps(c.body_steps, &next, new_ctx, s0, out_states, is_init);
+                        try self.execute_steps(c.body_steps, &next, new_ctx, s0, out_states, is_init, action_mask);
                         self.eval_pool.restore(snap);
                         self.evaluator.restore_context_pool(context_snap);
                     }
@@ -1403,7 +1486,7 @@ pub const ActionExecutor = struct {
                     }
                     const next = Continuation{ .steps = rest, .next = continuation };
                     const snap = self.eval_pool.snapshot();
-                    try self.execute_steps(c.body_steps, &next, call_ctx, s0, out_states, is_init);
+                    try self.execute_steps(c.body_steps, &next, call_ctx, s0, out_states, is_init, action_mask);
                     self.eval_pool.restore(snap);
                     self.evaluator.restore_context_pool(context_snap);
                     return;
@@ -1420,6 +1503,7 @@ pub const ActionExecutor = struct {
                         s0,
                         intermediates,
                         false,
+                        action_mask,
                     );
                     self.evaluator.restore_context_pool(left_context_snapshot);
                     const next = Continuation{
@@ -1441,6 +1525,8 @@ pub const ActionExecutor = struct {
                             .eval_pool = self.eval_pool,
                             .compose_states = null,
                             .composition_generated = self.composition_generated,
+                            .fairness_markers = self.fairness_markers,
+                            .edge_action_masks = self.edge_action_masks,
                         };
                         try second.execute_steps(
                             composition.right_steps,
@@ -1449,6 +1535,7 @@ pub const ActionExecutor = struct {
                             self.candidate_store.get(intermediate_idx),
                             out_states,
                             false,
+                            action_mask,
                         );
                         self.eval_pool.restore(snapshot);
                         self.evaluator.restore_context_pool(context_snapshot);
@@ -1461,7 +1548,7 @@ pub const ActionExecutor = struct {
                     const snap = self.eval_pool.snapshot();
                     const context_snap = self.evaluator.context_snapshot();
                     for (b.options) |opt| {
-                        try self.execute_steps(opt, &next, current_ctx, s0, out_states, is_init);
+                        try self.execute_steps(opt, &next, current_ctx, s0, out_states, is_init, action_mask);
                         self.eval_pool.restore(snap);
                         self.evaluator.restore_context_pool(context_snap);
                     }
@@ -1476,7 +1563,7 @@ pub const ActionExecutor = struct {
                     const next = Continuation{ .steps = rest, .next = continuation };
                     const snap = self.eval_pool.snapshot();
                     const context_snap = self.evaluator.context_snapshot();
-                    try self.execute_steps(taken, &next, current_ctx, s0, out_states, is_init);
+                    try self.execute_steps(taken, &next, current_ctx, s0, out_states, is_init, action_mask);
                     self.eval_pool.restore(snap);
                     self.evaluator.restore_context_pool(context_snap);
                     return;
@@ -1495,13 +1582,13 @@ pub const ActionExecutor = struct {
                             self.evaluator.restore_context_pool(context_snap);
                             continue;
                         }
-                        try self.execute_steps(arm.steps, &next, current_ctx, s0, out_states, is_init);
+                        try self.execute_steps(arm.steps, &next, current_ctx, s0, out_states, is_init, action_mask);
                         self.eval_pool.restore(snap);
                         self.evaluator.restore_context_pool(context_snap);
                         return;
                     }
                     if (case.otherwise_steps) |otherwise| {
-                        try self.execute_steps(otherwise, &next, current_ctx, s0, out_states, is_init);
+                        try self.execute_steps(otherwise, &next, current_ctx, s0, out_states, is_init, action_mask);
                         self.eval_pool.restore(snap);
                         self.evaluator.restore_context_pool(context_snap);
                     }
@@ -1530,12 +1617,126 @@ pub const ActionExecutor = struct {
         }
     }
 
+    fn fairness_marker_mask(
+        self: ActionExecutor,
+        marker: MarkAction,
+        ctx: Context,
+        s0: ?*StateStore.State,
+    ) !u64 {
+        if (self.fairness_markers.len == 0) return 0;
+        assert(self.fairness_markers.len <= 64);
+        var mask: u64 = 0;
+        for (self.fairness_markers) |fairness| {
+            if (try self.fairness_marker_matches(
+                marker,
+                fairness,
+                ctx,
+                s0,
+            )) {
+                mask |= @as(u64, 1) << fairness.bit_index;
+            }
+        }
+        return mask;
+    }
+
+    fn fairness_marker_matches(
+        self: ActionExecutor,
+        marker: MarkAction,
+        fairness: FairnessMarker,
+        ctx: Context,
+        s0: ?*StateStore.State,
+    ) !bool {
+        switch (fairness.action.*) {
+            .ident => |name| {
+                if (!std.mem.eql(u8, marker.name, name)) return false;
+                if (marker.args.len != 0) return false;
+            },
+            .apply => |ap| {
+                if (ap.func.* != .ident) return false;
+                if (!std.mem.eql(u8, marker.name, ap.func.*.ident)) {
+                    return false;
+                }
+                if (marker.args.len != ap.args.len) return false;
+                var i: usize = 0;
+                while (i < marker.args.len) : (i += 1) {
+                    const actual = try self.eval_compiled_expr(
+                        marker.args[i],
+                        ctx,
+                        s0,
+                    );
+                    const expected = try self.eval_fairness_arg(
+                        ap.args[i],
+                        fairness.bindings,
+                    );
+                    if (!Value.eql_cross_pool(
+                        actual,
+                        self.eval_pool,
+                        expected,
+                        self.eval_pool,
+                    )) return false;
+                }
+            },
+            else => return false,
+        }
+        return try self.fairness_bindings_match(fairness.bindings, ctx);
+    }
+
+    fn eval_fairness_arg(
+        self: ActionExecutor,
+        expr: *ast.Expr,
+        bindings: []const FairnessBinding,
+    ) !Value {
+        if (expr.* == .ident) {
+            for (bindings) |binding| {
+                if (std.mem.eql(u8, expr.*.ident, binding.name)) {
+                    return binding.value;
+                }
+            }
+        }
+        const context_snapshot = self.evaluator.context_snapshot();
+        defer self.evaluator.restore_context_pool(context_snapshot);
+        var fairness_ctx = Context.empty();
+        for (bindings) |binding| {
+            fairness_ctx = try self.evaluator.extend_context(
+                fairness_ctx,
+                binding.name,
+                binding.value,
+            );
+        }
+        return self.evaluator.eval_expr(
+            expr,
+            fairness_ctx,
+            null,
+            self.eval_pool,
+            &self.source_state_store.values_pool,
+        );
+    }
+
+    fn fairness_bindings_match(
+        self: ActionExecutor,
+        bindings: []const FairnessBinding,
+        ctx: Context,
+    ) !bool {
+        for (bindings) |binding| {
+            const actual = (try ctx.lookup_value(binding.name, self.eval_pool)) orelse
+                return false;
+            if (!Value.eql_cross_pool(
+                actual,
+                self.eval_pool,
+                binding.value,
+                self.eval_pool,
+            )) return false;
+        }
+        return true;
+    }
+
     fn commit_state(
         self: ActionExecutor,
         ctx: Context,
         s0: ?*StateStore.State,
         out_states: *StateBuffer,
         is_init: bool,
+        action_mask: u64,
     ) !void {
         _ = is_init;
         const new_idx = try self.candidate_store.alloc_state();
@@ -1612,6 +1813,10 @@ pub const ActionExecutor = struct {
             } else {
                 destination.* = Value{ .bool_v = false };
             }
+        }
+        if (self.edge_action_masks) |masks| {
+            assert(out_states.items.len < masks.len);
+            masks[out_states.items.len] = action_mask;
         }
         try out_states.append(new_idx);
     }

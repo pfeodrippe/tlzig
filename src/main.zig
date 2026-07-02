@@ -28,6 +28,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var default_cfg = false;
     var max_states: u32 = 100_000;
     var max_successors: u32 = 65_536;
+    var state_values_per_state: u32 = 60;
     var max_seq_len: u32 = 5;
     var max_nat: i64 = 10;
     var min_int: i64 = -10;
@@ -35,6 +36,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var arena_bytes: u64 = 16 * 1024 * 1024;
     var eval_arena_bytes: u64 = 16 * 1024 * 1024;
     var worker_count: u16 = 1;
+    var progress_interval_states: u64 = 0;
     var unlimited_memory = false;
     var emit_zig_path: ?[]const u8 = null;
     var type_invariants = std.ArrayList([]const u8).empty;
@@ -54,6 +56,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         } else if (std.mem.eql(u8, arg, "--max-successors")) {
             if (it.next()) |v| {
                 max_successors = std.fmt.parseInt(u32, v, 10) catch 65_536;
+            }
+        } else if (std.mem.eql(u8, arg, "--state-values-per-state")) {
+            if (it.next()) |v| {
+                state_values_per_state = std.fmt.parseInt(u32, v, 10) catch 60;
             }
         } else if (std.mem.eql(u8, arg, "--max-seq-len")) {
             if (it.next()) |v| {
@@ -91,6 +97,10 @@ pub fn main(init: std.process.Init.Minimal) void {
                 }
                 if (worker_count == 0) worker_count = 1;
             }
+        } else if (std.mem.eql(u8, arg, "--progress-interval-states")) {
+            if (it.next()) |v| {
+                progress_interval_states = std.fmt.parseInt(u64, v, 10) catch 0;
+            }
         } else if (std.mem.eql(u8, arg, "--unlimited-memory")) {
             unlimited_memory = true;
         } else if (std.mem.eql(u8, arg, "--emit-zig")) {
@@ -120,6 +130,10 @@ pub fn main(init: std.process.Init.Minimal) void {
     max_successors = @min(max_successors, max_states);
     if (max_successors == 0) {
         std.debug.print("--max-successors must be greater than zero\n", .{});
+        std.process.exit(1);
+    }
+    if (state_values_per_state == 0) {
+        std.debug.print("--state-values-per-state must be greater than zero\n", .{});
         std.process.exit(1);
     }
 
@@ -286,8 +300,11 @@ pub fn main(init: std.process.Init.Minimal) void {
     const eval_value_cap: u32 = 1_048_576;
     const eval_string_cap: u32 = 65_536;
     const state_value_cap = cap_u32(@min(
-        @max(@as(u64, max_states) * 60, 1_000_000),
-        132_000_000,
+        @max(
+            @as(u64, max_states) * state_values_per_state,
+            1_000_000,
+        ),
+        192_000_000,
     ));
     const state_string_cap = cap_u32(@min(
         @max(@as(u64, max_states) * 4, 500_000),
@@ -314,6 +331,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     };
     defer ch.deinit();
+    ch.set_progress_interval(progress_interval_states);
 
     const result = ch.check() catch |err| {
         std.debug.print("checking failed: {any}", .{err});

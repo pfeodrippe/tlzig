@@ -484,19 +484,24 @@ pub const Value = union(ValueTag) {
                 if (record_v.len != right_record.len) break :blk false;
                 const left_fields = record_v.fields(left_pool);
                 const right_fields = right_record.fields(right_pool);
-                var field_index: u32 = 0;
-                while (field_index < record_v.len) : (field_index += 1) {
-                    if (!eql_cross_pool(
-                        left_fields[field_index * 2],
-                        left_pool,
-                        right_fields[field_index * 2],
-                        right_pool,
-                    ) or !eql_cross_pool(
-                        left_fields[field_index * 2 + 1],
-                        left_pool,
-                        right_fields[field_index * 2 + 1],
-                        right_pool,
-                    )) break :blk false;
+                var left_index: u32 = 0;
+                while (left_index < record_v.len) : (left_index += 1) {
+                    const left_name = left_fields[left_index * 2].string_v.slice(left_pool);
+                    var found = false;
+                    var right_index: u32 = 0;
+                    while (right_index < right_record.len) : (right_index += 1) {
+                        const right_name = right_fields[right_index * 2].string_v.slice(right_pool);
+                        if (!std.mem.eql(u8, left_name, right_name)) continue;
+                        found = true;
+                        if (!eql_cross_pool(
+                            left_fields[left_index * 2 + 1],
+                            left_pool,
+                            right_fields[right_index * 2 + 1],
+                            right_pool,
+                        )) break :blk false;
+                        break;
+                    }
+                    if (!found) break :blk false;
                 }
                 break :blk true;
             },
@@ -613,10 +618,9 @@ pub const Value = union(ValueTag) {
     pub fn clone(self: Value, source: *const ValuePool, target: *ValuePool) error{ OutOfMemory, NotImplemented }!Value {
         assert(source.value_count <= source.value_cap);
         assert(source.string_count <= source.string_cap);
+        assert(target.value_count <= target.value_cap);
         assert(target.string_count <= target.string_cap);
-        if (source == target) {
-            try target.ensure_value_capacity(self.clone_value_count(source));
-        }
+        try target.ensure_value_capacity(self.clone_value_count(source));
         return self.clone_assume_capacity(source, target);
     }
 
@@ -903,6 +907,9 @@ pub const Set = extern struct {
 
     pub fn contains(self: Set, pool: *const ValuePool, v: Value) bool {
         assert(self.offset + self.len <= pool.value_count);
+        if (dense_contains_probe(self.items(pool), v)) |found| {
+            return found;
+        }
         for (self.items(pool)) |it| {
             if (it.eql(v, pool)) return true;
         }
@@ -938,6 +945,29 @@ pub const Set = extern struct {
         return Set{ .offset = offset, .len = @intCast(src_items.len) };
     }
 };
+
+fn dense_contains_probe(items: []const Value, value: Value) ?bool {
+    if (items.len == 0) return false;
+    const index = switch (value) {
+        .int_v => |value_int| blk: {
+            if (items[0] != .int_v) return null;
+            const delta = std.math.sub(i64, value_int, items[0].int_v) catch
+                return null;
+            if (delta < 0) return null;
+            break :blk @as(u64, @intCast(delta));
+        },
+        .model_v => |value_model| blk: {
+            if (items[0] != .model_v) return null;
+            if (value_model < items[0].model_v) return null;
+            break :blk @as(u64, value_model - items[0].model_v);
+        },
+        else => return null,
+    };
+    if (index >= items.len) return null;
+    const index_u: usize = @intCast(index);
+    if (!same_repr(items[index_u], value)) return null;
+    return true;
+}
 
 pub const Function = extern struct {
     domain: Set,
@@ -1052,11 +1082,11 @@ pub const Record = extern struct {
         assert(other.offset + other.len * 2 <= pool.value_count);
         if (self.len != other.len) return false;
         const a = self.fields(pool);
-        const b = other.fields(pool);
         var i: u32 = 0;
         while (i < self.len) : (i += 1) {
-            if (!a[i * 2].string_v.eql(b[i * 2].string_v, pool)) return false;
-            if (!a[i * 2 + 1].eql(b[i * 2 + 1], pool)) return false;
+            const name = a[i * 2].string_v.slice(pool);
+            const other_value = other.lookup(pool, name) orelse return false;
+            if (!a[i * 2 + 1].eql(other_value, pool)) return false;
         }
         return true;
     }
@@ -1204,7 +1234,9 @@ pub const ValuePool = struct {
 
     fn grow_values(self: *ValuePool) !void {
         assert(self.value_count <= self.value_cap);
-        const new_cap = self.value_cap * 2;
+        const new_cap_u64 = @as(u64, self.value_cap) * 2;
+        if (new_cap_u64 > std.math.maxInt(u32)) return error.OutOfMemory;
+        const new_cap: u32 = @intCast(new_cap_u64);
         const new_values = try self.arena.alloc(Value, new_cap);
         @memcpy(new_values[0..self.value_count], self.values[0..self.value_count]);
         self.values = new_values;
@@ -1212,7 +1244,10 @@ pub const ValuePool = struct {
     }
 
     fn grow_strings(self: *ValuePool) !void {
-        const new_cap = self.string_cap * 2;
+        assert(self.string_count <= self.string_cap);
+        const new_cap_u64 = @as(u64, self.string_cap) * 2;
+        if (new_cap_u64 > std.math.maxInt(u32)) return error.OutOfMemory;
+        const new_cap: u32 = @intCast(new_cap_u64);
         const new_strings = try self.arena.alloc(u8, new_cap);
         @memcpy(new_strings[0..self.string_count], self.strings[0..self.string_count]);
         self.strings = new_strings;
@@ -1246,7 +1281,11 @@ pub const ValuePool = struct {
     }
 
     pub fn push_values(self: *ValuePool, vs: []const Value) !u32 {
-        while (self.value_count + vs.len > self.value_cap) {
+        assert(self.value_count <= self.value_cap);
+        if (vs.len > std.math.maxInt(u32)) return error.OutOfMemory;
+        const needed = @as(u64, self.value_count) + @as(u64, @intCast(vs.len));
+        if (needed > std.math.maxInt(u32)) return error.OutOfMemory;
+        while (needed > self.value_cap) {
             if (self.growable) {
                 try self.grow_values();
             } else {
@@ -1255,12 +1294,15 @@ pub const ValuePool = struct {
         }
         const start = self.value_count;
         @memcpy(self.values[start..][0..vs.len], vs);
-        self.value_count += @intCast(vs.len);
+        self.value_count = @intCast(needed);
         return start;
     }
 
     pub fn alloc_values(self: *ValuePool, count: u32) ![]Value {
-        while (self.value_count + count > self.value_cap) {
+        assert(self.value_count <= self.value_cap);
+        const needed = @as(u64, self.value_count) + @as(u64, count);
+        if (needed > std.math.maxInt(u32)) return error.OutOfMemory;
+        while (needed > self.value_cap) {
             if (self.growable) {
                 try self.grow_values();
             } else {
@@ -1268,7 +1310,7 @@ pub const ValuePool = struct {
             }
         }
         const start = self.value_count;
-        self.value_count += count;
+        self.value_count = @intCast(needed);
         return self.values[start..][0..count];
     }
 
@@ -1300,7 +1342,11 @@ pub const ValuePool = struct {
     }
 
     fn push_string_uninterned(self: *ValuePool, s: []const u8) !String {
-        while (self.string_count + s.len > self.string_cap) {
+        assert(self.string_count <= self.string_cap);
+        if (s.len > std.math.maxInt(u32)) return error.OutOfMemory;
+        const needed = @as(u64, self.string_count) + @as(u64, @intCast(s.len));
+        if (needed > std.math.maxInt(u32)) return error.OutOfMemory;
+        while (needed > self.string_cap) {
             if (self.growable) {
                 try self.grow_strings();
             } else {
@@ -1309,7 +1355,7 @@ pub const ValuePool = struct {
         }
         const start = self.string_count;
         @memcpy(self.strings[start..][0..s.len], s);
-        self.string_count += @intCast(s.len);
+        self.string_count = @intCast(needed);
         return String{ .offset = start, .len = @intCast(s.len) };
     }
 
@@ -1360,4 +1406,75 @@ test "value pool string interning reuses canonical bytes" {
     const second = try pool.push_string("status");
     try std.testing.expectEqual(first.offset, second.offset);
     try std.testing.expectEqual(@as(u32, 6), pool.string_count);
+}
+
+test "set contains dense probe falls back for sparse and unsorted sets" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 16, 64);
+
+    const items = [_]Value{
+        .{ .int_v = 5 },
+        .{ .int_v = 1 },
+    };
+    const offset = try pool.push_values(&items);
+    const set_value = Set{ .offset = offset, .len = items.len };
+
+    try std.testing.expect(set_value.contains(&pool, .{ .int_v = 1 }));
+    try std.testing.expect(set_value.contains(&pool, .{ .int_v = 5 }));
+    try std.testing.expect(!set_value.contains(&pool, .{ .int_v = 4 }));
+}
+
+test "record equality ignores field order" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 32, 64);
+
+    const a_name = try pool.push_string("a");
+    const b_name = try pool.push_string("b");
+    const left_items = [_]Value{
+        .{ .string_v = a_name },
+        .{ .int_v = 1 },
+        .{ .string_v = b_name },
+        .{ .int_v = 2 },
+    };
+    const right_items = [_]Value{
+        .{ .string_v = b_name },
+        .{ .int_v = 2 },
+        .{ .string_v = a_name },
+        .{ .int_v = 1 },
+    };
+    const left_offset = try pool.push_values(&left_items);
+    const right_offset = try pool.push_values(&right_items);
+    const left = Value{ .record_v = .{ .offset = left_offset, .len = 2 } };
+    const right = Value{ .record_v = .{ .offset = right_offset, .len = 2 } };
+
+    try std.testing.expect(left.eql(right, &pool));
+
+    var clone_arena = try Arena.init(1024 * 1024);
+    defer clone_arena.deinit();
+    var clone_pool = try ValuePool.init(&clone_arena, 32, 64);
+    const cloned_right = try right.clone(&pool, &clone_pool);
+    try std.testing.expect(Value.eql_cross_pool(left, &pool, cloned_right, &clone_pool));
+}
+
+test "deep cross-pool clone reserves capacity before recursive writes" {
+    var source_arena = try Arena.init(1024 * 1024);
+    defer source_arena.deinit();
+    var target_arena = try Arena.init(1024 * 1024);
+    defer target_arena.deinit();
+
+    var source = try ValuePool.init(&source_arena, 16, 64);
+    var target = try ValuePool.init(&target_arena, 1, 64);
+
+    const inner_items = [_]Value{ .{ .int_v = 1 }, .{ .int_v = 2 } };
+    const inner_offset = try source.push_values(&inner_items);
+    const inner = Value{ .set_v = .{ .offset = inner_offset, .len = inner_items.len } };
+    const outer_items = [_]Value{ inner, inner, inner };
+    const outer_offset = try source.push_values(&outer_items);
+    const outer = Value{ .set_v = .{ .offset = outer_offset, .len = outer_items.len } };
+
+    const cloned = try outer.clone(&source, &target);
+    try std.testing.expect(cloned.eql(outer, &target));
+    try std.testing.expect(target.value_cap >= target.value_count);
 }

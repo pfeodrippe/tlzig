@@ -649,6 +649,117 @@ test "spec-shaped temporal property is checked from initial states" {
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
 }
 
+test "recursive action property may update derived view" {
+    const source =
+        \\---------------------- MODULE TestRecursiveActionProperty ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\view == x
+        \\Init == x = 0
+        \\Next == x' = 1
+        \\Spec == Init /\ [][Next]_x
+        \\RECURSIVE AbsStep(_, _)
+        \\AbsStep(n, next_view) ==
+        \\    IF n = 0
+        \\    THEN view' = next_view
+        \\    ELSE AbsStep(n - 1, 1)
+        \\AbsInit == view = 0
+        \\AbsNext == AbsStep(1, view)
+        \\Refinement == AbsInit /\ [][AbsNext]_view
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Refinement"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "recursive action property may update chosen function view" {
+    const source =
+        \\---------------------- MODULE TestChosenFunctionViewProperty ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Keys == {"k1", "k2"}
+        \\Read(k) ==
+        \\    IF x = 0 \/ k = "k2"
+        \\    THEN {0}
+        \\    ELSE {1}
+        \\view == [k \in Keys |-> CHOOSE r \in Read(k) : TRUE]
+        \\Init == x = 0
+        \\Next == x' = 1
+        \\Spec == Init /\ [][Next]_x
+        \\RECURSIVE AbsStep(_, _)
+        \\AbsStep(n, next_view) ==
+        \\    IF n = 0
+        \\    THEN view' = next_view
+        \\    ELSE AbsStep(n - 1, [next_view EXCEPT !["k1"] = 1])
+        \\AbsInit == view = [k \in Keys |-> 0]
+        \\AbsNext == AbsStep(1, view)
+        \\Refinement == AbsInit /\ [][AbsNext]_view
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Refinement"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
 test "parallel exploration preserves branching temporal state space" {
     const source =
         \\---------------------- MODULE TestParallel ----------------------

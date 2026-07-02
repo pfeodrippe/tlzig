@@ -359,16 +359,75 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
     interpreted tlzig, then writes a tlzig-auto baseline only after the normal
     TLC comparison passes. The AOT row reads that baseline and compares the
     generated tlzig result against it.
-  - Default generated benchmark coverage is intentionally reduced to
-    `MultiShardTxn ClientCentric [AOT]` until the other generated models match
-    their interpreted tlzig baselines under the stricter AOT check. Exact
-    filters and `-Dbenchmark-include-long=true` still run the disabled AOT
-    rows for investigation, but the default benchmark must not present
-    known-drifting generated paths as green.
-  - Current ReleaseFast check after cleanup:
-    `MultiShardTxn ClientCentric` normal row TLC-auto `2.330s`,
-    interpreted tlzig-auto `4.817s`, exact `1602/801`; AOT row runs no TLC,
-    generated tlzig-auto `1.174s`, exact `1602/801`.
+  - 2026-06-29 default ReleaseFast benchmark check after regenerated models,
+    `record_static(...)`, generated-runtime `UNCHANGED` changed-mask checks,
+    and stricter AOT-vs-tlzig baseline comparison: all default AOT rows run
+    and pass; AOT rows run no duplicate Java TLC process.
+    - ClientCentric: generic TLC-auto `2.318s`, interpreted tlzig-auto
+      `5.233s`, AOT tlzig-auto `0.951s`, exact `1602/801`.
+    - MCM snapshot-invariant: TLC-auto `1.607s`, interpreted tlzig-auto
+      `0.543s`, AOT tlzig-auto `0.181s`.
+    - MCM rc-local-invariant: TLC-auto `1.317s`, interpreted tlzig-auto
+      `0.150s`, AOT tlzig-auto `0.135s`.
+    - Storage: TLC-auto `1.417s`, interpreted tlzig-auto `0.496s`,
+      AOT tlzig-auto `0.298s`.
+    - RC/no-prepare-block: TLC-auto `1.741s`, interpreted tlzig-auto
+      `0.215s`, AOT tlzig-auto `0.165s`.
+    - RC/no-prepare-block-or-ww: TLC-auto `1.646s`, interpreted tlzig-auto
+      `0.225s`, AOT tlzig-auto `0.199s`.
+    - RC/snapshot: TLC-auto `2.383s`, interpreted tlzig-auto `0.455s`,
+      AOT tlzig-auto `0.535s`.
+    - RC/with-prepare-block: TLC-auto `1.581s`, interpreted tlzig-auto
+      `0.231s`, AOT tlzig-auto `0.190s`.
+    - SingleShard small: TLC-auto `2.345s`, interpreted tlzig-auto
+      `3.400s`, AOT tlzig-auto `0.486s`.
+    - SingleShard no-sym: AOT tlzig-auto `1.319s`.
+    - SingleShard safety: TLC-auto `1.915s`, interpreted tlzig-auto
+      `3.055s`, AOT tlzig-auto `0.203s`.
+    - SingleShard safety no-sym: AOT tlzig-auto `0.371s`.
+  - 2026-06-29 long Storage exhaustive exact benchmark:
+    safe default AOT operators only: TLC-auto `32.344s`, interpreted
+    tlzig-auto `77.105s`, AOT tlzig-auto `25.621s`, exact tlzig/AOT
+    `3,858,487/1,078,623`; AOT is `1.26x` faster than TLC-auto and `3.01x`
+    faster than interpreted tlzig-auto for the same tlzig state graph.
+  - 2026-06-30 generated action-expression AOT is default for generated
+    benchmark rows. The previous SingleShard failure was a generic codegen bug:
+    bracketed string-key application such as `pc["Router"]` was lowered to a
+    record-field helper even though TLA+ treats it as function application.
+    Codegen now keeps bracketed keys on the function/path helper path unless a
+    future TypeOK-derived layout proves a true record field. All MDBTLA
+    generated benchmark models were regenerated with `fallbacks=0`.
+  - 2026-06-30 final default ReleaseFast benchmark with expression-AOT default:
+    invariant-violation rows have the same violation outcome, while complete
+    rows are exact on state counts.
+    - ClientCentric: TLC-auto `2.457s`, interpreted tlzig-auto `5.407s`,
+      AOT tlzig-auto `0.931s`, exact `1602/801`.
+    - MCM snapshot-invariant: TLC-auto `1.752s`, interpreted tlzig-auto
+      `0.695s`, AOT tlzig-auto `0.162s`.
+    - MCM rc-local-invariant: TLC-auto `1.538s`, interpreted tlzig-auto
+      `0.174s`, AOT tlzig-auto `0.123s`.
+    - Storage: TLC-auto `1.361s`, interpreted tlzig-auto `0.572s`,
+      AOT tlzig-auto `0.270s`.
+    - RC/no-prepare-block: TLC-auto `1.590s`, interpreted tlzig-auto
+      `0.244s`, AOT tlzig-auto `0.152s`.
+    - RC/no-prepare-block-or-ww: TLC-auto `1.636s`, interpreted tlzig-auto
+      `0.244s`, AOT tlzig-auto `0.152s`.
+    - RC/snapshot: TLC-auto `2.462s`, interpreted tlzig-auto `0.668s`,
+      AOT tlzig-auto `0.475s`.
+    - RC/with-prepare-block: TLC-auto `1.612s`, interpreted tlzig-auto
+      `0.233s`, AOT tlzig-auto `0.162s`.
+    - SingleShard small: TLC-auto `2.402s`, interpreted tlzig-auto `3.360s`,
+      AOT tlzig-auto `0.494s`, exact `44363/17975`.
+    - SingleShard no-sym: AOT tlzig-auto `1.338s`, exact `78245/33787`.
+    - SingleShard safety: TLC-auto `1.902s`, interpreted tlzig-auto `3.071s`,
+      AOT tlzig-auto `0.205s`, exact `44363/17975`.
+    - SingleShard safety no-sym: AOT tlzig-auto `0.378s`, exact
+      `78245/33787`.
+  - 2026-06-30 long Storage exhaustive exact benchmark with expression-AOT:
+    TLC-auto `35.895s`, interpreted tlzig-auto `77.061s`, AOT tlzig-auto
+    `17.466s`, exact tlzig/AOT `3,858,487/1,078,623`; AOT is `2.05x` faster
+    than TLC-auto and `4.41x` faster than interpreted tlzig-auto for the same
+    tlzig state graph.
 - [ ] Complete full TLC/tlzig all-core comparisons for the new RC exhaustive
   rows. The no-prepare-block exhaustive run exceeded the old 3M state cap, and
   a 10M one-core probe was intentionally stopped after it remained CPU-bound
@@ -426,7 +485,29 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
   field reads passed into records/operators, not simple boolean guards.
 - [ ] Specialize mapped-set/range construction used in hot MDBTLA actions,
   especially `map_set(function_range(variable_path(...)), ...)`. Current
-  audit: `map_set=287`, `function_range=395`.
+  audit: `map_set=524`, `function_range=173` across generated benchmark models.
+- [x] Reduce allocation in cross-pool generated function-range paths:
+  `variable_path_function_range` and `variable_path_field_function_range` now
+  build a set with cross-pool deduplication and clone only accepted unique
+  values into the eval pool, instead of cloning every source entry and then
+  allocating/copying again through `set()`. Added a runtime unit test with
+  duplicate composite values from a separate pool to prove only one tuple
+  payload is cloned. ReleaseFast validation:
+  `zig build test --summary none`,
+  `zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='MultiShardTxn RC/snapshot'`,
+  and full `zig build -Doptimize=ReleaseFast benchmark` all completed. In the
+  final default run, `MultiShardTxn RC/snapshot [AOT]` was `0.371s` versus the
+  previous recorded default baseline `0.475s`; this row is still
+  traversal-outcome based, so do not call its state counts exhaustive parity.
+- [x] Reduce allocation in duplicate-heavy generated `map_set`:
+  `map_set` now snapshots the eval pool before each mapper call and restores
+  it when the mapped value is a duplicate, so duplicate composite results do
+  not keep their scratch payloads. The runtime test maps a three-element range
+  to duplicate tuple values and verifies the final pool growth is only the
+  materialized range, output slots, and one accepted tuple payload. ReleaseFast
+  `MultiShardTxn RC/snapshot` exact filter completed with AOT `0.401s`; the
+  subsequent full default ReleaseFast benchmark completed with
+  `MultiShardTxn RC/snapshot [AOT]` at `0.371s`.
 - [ ] Add an explicit statistical benchmark mode for performance-sensitive
   rows. It should run ReleaseFast specs repeatedly under an opt-in flag, record
   wall/user/sys/RSS/instructions when the platform exposes them, and report
@@ -1230,6 +1311,48 @@ allocation-free Zig operator overrides, and
   `SingleShardTxn ShardTxn/small` row was TLC-auto `2.449s`,
   tlzig-auto `1.910s`, exact `44491/17975`; the safety row was TLC-auto
   `1.832s`, tlzig-auto `1.552s`, exact `44491/17975`.
+- [x] Add generic generated `CASE` lowering and SingleShardTxn AOT rows:
+  strict generation now supports TLA+ `CASE` expressions in both value and
+  boolean contexts, including inside function literals like the PlusCal
+  generated `pc = [self \in ProcSet |-> CASE ...]` initialization. This is a
+  generic codegen feature, not a SingleShard-specific runtime override. Added
+  a regression test for `CASE` inside a function literal.
+  - `ShardTxn_small.cfg` strict generation:
+    `generated Zig operators=44 native=2 fallbacks=0`.
+  - `ShardTxn_small_safety.cfg` strict generation:
+    `generated Zig operators=44 native=1 fallbacks=0`.
+  - Both generated files are included as default AOT benchmark rows:
+    `generated_models/mdbtla_single_shard_txn_small.zig` and
+    `generated_models/mdbtla_single_shard_txn_small_safety.zig`.
+  - ReleaseFast small row:
+    `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='SingleShardTxn ShardTxn/small'`
+    measured TLC-auto `2.716s`, interpreted tlzig-auto `2.943s`, AOT
+    tlzig-auto `0.479s`, exact tlzig `44363/17975`. AOT is about `6.14x`
+    faster than interpreted tlzig in that run and about `5.67x` faster than TLC
+    Java.
+  - ReleaseFast safety row:
+    `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='SingleShardTxn ShardTxn/small safety'`
+    measured TLC-auto `1.946s`, interpreted tlzig-auto `2.699s`, AOT
+    tlzig-auto `0.203s`, exact tlzig `44363/17975`. AOT is about `13.30x`
+    faster than interpreted tlzig in that run and about `9.59x` faster than TLC
+    Java.
+  - The generated benchmark label matcher now avoids pulling sibling detailed
+    labels such as `SingleShardTxn ShardTxn/small safety` when the filter is the
+    exact detailed prefix `SingleShardTxn ShardTxn/small`.
+- [x] Keep generated/AOT benchmark correctness explicit:
+  generated-model benchmark binaries compare against the interpreted tlzig
+  baseline. Completed rows must keep exact state-count parity; invariant
+  violation rows may stop at a different first violating frontier and are
+  tracked by outcome plus targeted follow-up, not silently treated as full
+  exhaustive parity. Regenerated default MDBTLA generated models report
+  `fallbacks=0`.
+- [x] Re-run corrected default ReleaseFast benchmark:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully after disabling the semantically suspect MultiShard AOT
+  rows. Default AOT rows now include only correctness-clean generated models:
+  `MultiShardTxn ClientCentric [AOT]` `0.945s`, exact `1602/801`;
+  `SingleShardTxn ShardTxn/small [AOT]` `0.497s`, exact `44363/17975`; and
+  `SingleShardTxn ShardTxn/small safety [AOT]` `0.209s`, exact `44363/17975`.
 - [x] Do not add hand-written overrides for user-spec operators such as
   MDBTLA `ClientCentric` operators. Performance work for user TLA+ must come
   from parsed TLA+ analysis, generated Zig, and generic runtime improvements.
@@ -1249,23 +1372,97 @@ allocation-free Zig operator overrides, and
     `1602/801`.
   - AOT row now runs tlzig only, without repeating TLC Java and without the
     one-core run by default: tlzig-auto `1.129s`, exact `1602/801`.
-  - AOT benchmark currently disables generated-expression acceleration and
-    keeps generated operators enabled. The old generated expression table can
-    map current AST identities incorrectly after codegen changes, e.g. an
-    applied `parentState(execution, transaction)` expression can resolve to
-    the `parentState` operator value. Keep it off until strict regeneration
-    supports the higher-order `Functions`/`Folds`/MDBTLA definitions without
-    stale identity reuse.
-- [ ] Re-enable generated-expression acceleration only after `--emit-zig`
-  strict generation supports the MDBTLA higher-order/community-module path
-  generically:
-  `ReduceSeq`, `FoldFunction`, `FoldFunctionOnSet`, `MapThenFoldSet`, and the
-  affected `CC!/CCGen!` operators must be generated from parsed TLA+ without
-  global helper-name overrides.
-- [ ] Verify `SingleLog` upstream configs with full TLC/tlzig comparisons.
-- [ ] After `SingleShardTxn` temporal+symmetry is correct, proceed through the
+  - AOT benchmark now enables generated-expression acceleration by default
+    after the 2026-06-30 bracketed string-key fix and strict regeneration.
+    Exact generated rows are still compared against the interpreted tlzig
+    baseline before being accepted.
+- [x] Verify the remaining raw upstream `MultiShardTxn` cfgs before treating
+  them as tlzig coverage gaps:
+  - `vendor/MDBTLA/MultiShardTxn/MultiShardTxn.cfg` is rejected by TLC Java:
+    `The constant parameter Timestamps is not assigned a value by the
+    configuration file.`
+  - `vendor/MDBTLA/MultiShardTxn/models/MultiShardTxn_RC.cfg` is rejected by
+    TLC Java with the same missing `Timestamps` constant.
+  - The valid upstream MultiShardTxn configs are represented by current
+    benchmark rows; synthetic exhaustive rows remain opt-in.
+- [ ] Continue replacing remaining generated expression helper-heavy paths
+  with parsed-TLA+ native lowering, especially higher-order/community-module
+  operators:
+  `ReduceSeq`, `FoldFunction`, `FoldFunctionOnSet`, `MapThenFoldSet`, and
+  affected `CC!/CCGen!` operators should be generated from parsed TLA+ into
+  direct Zig loops/accumulators where possible, without global helper-name
+  overrides or user-spec runtime semantics.
+  2026-06-30 audit baseline from `scripts/audit_generated_patterns.py` over
+  21 generated models:
+  `nested_runtime_call=14132`, `variable_path=4885`,
+  `primed_variable_full_compare=941`, `except_update=882`, `map_set=524`,
+  `unchanged_expression=422`, `function_range=173`. Already-cleared patterns:
+  `unchanged_variable=0`, `field_sequence_head=0`,
+  `permutations_union_chain=0`.
+- [x] Verify `SingleLog` upstream configs with full TLC/tlzig comparisons.
+  2026-06-30 evidence: `SingleLog MCMDBProps` is a genuinely long temporal
+  model, not a quick default candidate. The ReleaseFast benchmark row was
+  interrupted after about six minutes with the benchmark binary still CPU-bound.
+  Direct TLC Java was then interrupted after `295.69s` wall time; before the
+  interrupt TLC had checked 366 temporal branches over a 45,377,046-state
+  temporal state space and resumed BFS at `753,958` generated /
+  `123,982` distinct. Keep this as an opt-in long target and optimize tlzig
+  temporal/invariant execution before promoting it.
+  2026-07-01 correctness update: fixed generic record equality so TLA+ records
+  compare by field name rather than declaration/order. This removed the
+  `SingleLog MDBLinearizability` false property violation caused by comparing
+  `[value |-> ..., logIndex |-> ...]` against
+  `[logIndex |-> ..., value |-> ...]`. ReleaseFast
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='SingleLog MDBLinearizability' -Dbenchmark-include-long=true`
+  now completes: TLC-auto `2.173s`, tlzig-auto `8.529s`, TLC states
+  `21748/2247`, tlzig states `13360/2247`. Generated transition counts are not
+  compared for this row; distinct state count matches. `SingleLog MCMDBProps`
+  was rerun after the fix and interrupted after several minutes with the
+  ReleaseFast benchmark binary still CPU-bound and no immediate correctness
+  failure printed; keep it opt-in until temporal checking is fast enough for a
+  full comparison.
+  2026-07-02 correctness update: after the generic liveness SCC predecessor
+  traversal fix, full upstream `vendor/MDBTLA/SingleLog/MCMDBProps.cfg`
+  completed in ReleaseFast tlzig with no error:
+  `generated=1409270 distinct=269881`. This matches the recorded TLC Java
+  full baseline outcome and distinct count (`3,101,918` generated /
+  `269,881` distinct, no errors); generated transitions remain a diagnostic
+  count because tlzig deduplicates canonical successor edges before counting.
+  Keep `SingleLog MCMDBProps` opt-in because it is still a long temporal row.
+  2026-07-02 generated/AOT update: added an explicit
+  `--write-tlzig-baseline` benchmark mode so long generated rows can compare
+  against an interpreted tlzig baseline without rerunning TLC. Interpreted
+  ReleaseFast `SingleLog MCMDBProps` wrote baseline `1409270/269881`; the
+  generated model `generated_models/mdbtla_singlelog_mcmdbprops.zig` then
+  passed strict tlzig-only AOT comparison at `1409270/269881`.
+  2026-07-02 exact benchmark update: the long ReleaseFast benchmark row now
+  compares outcome/distinct against TLC and treats generated transitions as
+  diagnostic. Exact command
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='SingleLog MCMDBProps' -Dbenchmark-include-long=true`
+  completed successfully: TLC-auto `1412.693s`, tlzig-auto `376.289s`,
+  TLC states `3101918/269881`, tlzig states `1409270/269881`; generated AOT
+  follow-up completed at `152.741s`, `1409270/269881`.
+- [x] After `SingleShardTxn` temporal+symmetry is correct, proceed through the
   remaining MDBTLA folders/configs and add only passing representative rows to
   default benchmark; long rows remain opt-in.
+  2026-07-01 coverage update: full upstream
+  `vendor/MDBTLA/SingleShardTxn/ShardTxn.cfg` was started with
+  `-Dbenchmark-filter='SingleShardTxn ShardTxn' -Dbenchmark-include-long=true`
+  after the record-equality fix. TLC completed before row output and the run
+  moved into the ReleaseFast benchmark/tlzig process; it was interrupted after
+  about 11 minutes with CPU still active and no benchmark row result. The
+  representative `SingleShardTxn ShardTxn/small` and safety/no-sym rows remain
+  the default correctness/perf coverage until the full upstream row can finish
+  within an opt-in long budget.
+  2026-07-02 correctness update: direct TLC Java full upstream
+  `vendor/MDBTLA/SingleShardTxn/ShardTxn.cfg` completed with no error at
+  `14,931,205` generated / `5,502,547` distinct, depth 28. Direct ReleaseFast
+  tlzig with `--workers auto --max-states 6000000 --max-successors 65536
+  --state-values-per-state 220` completed with no error at
+  `14,929,261` generated / `5,502,547` distinct. Distinct count and outcome
+  match TLC; generated differs by canonical successor counting. The full
+  upstream row remains opt-in and now has strict distinct comparison in the
+  benchmark spec.
 - [ ] Re-enable default benchmark rows after fixing TLC mismatches observed in
   ReleaseFast default benchmark:
   - `CoffeeCan100Beans.cfg`: TLC completed at `20002/5150`, tlzig reported a
@@ -1306,10 +1503,10 @@ allocation-free Zig operator overrides, and
   generated row is the tlzig AOT measurement for the same spec/config.
 - [x] Tighten AOT benchmark correctness gates:
   AOT rows now compare against the same-run interpreted tlzig-auto baseline.
-  Non-expected-violation specs must match distinct-state counts; all rows must
-  match outcome. Exact-filter verification for `MultiShardTxn Storage [AOT]`
-  now fails with `AOT MISMATCH` instead of silently passing while its generated
-  path drifts from the interpreted baseline.
+  Rows match outcome unconditionally, and match generated/distinct state counts
+  only when the benchmark row enables those comparisons. This avoids rejecting
+  valid parallel deadlock rows where `compare_distinct = false` because the
+  first deadlock can be reached after different traversal counts.
 - [x] Add a stable Storage full-search benchmark row:
   `benchmark_configs/MDBTLA/MultiShardTxn/Storage_exhaustive.cfg` keeps the
   upstream Storage constants and symmetry but sets `CHECK_DEADLOCK FALSE`, so
@@ -1330,6 +1527,11 @@ allocation-free Zig operator overrides, and
   `1,078,623` distinct states. This is `1.21x` faster than the previous AOT
   baseline (`29.182s`) and `2.98x` faster than interpreted tlzig in the same
   run.
+  2026-06-30 correction: the bracketed string-key part of this optimization was
+  reverted because TLA+ `pc["Router"]` is function application, not record-field
+  syntax. Only real record-field syntax (`expr.field`) may use field helpers
+  unless a future trusted TypeOK-derived layout proves an equivalent record
+  access.
 - [x] Regenerate benchmark-wired MDBTLA generated models where strict
   generation succeeds:
   regenerated RC/no-prepare, RC/no-prepare exhaustive, RC/no-prepare-or-ww,
@@ -1341,12 +1543,572 @@ allocation-free Zig operator overrides, and
   `INTERSECTION`, `CC!*`, etc.); do not enable those generated rows by default
   until those operators are lowered generically.
 - [ ] Optimize Storage exhaustive beyond the current AOT baseline:
-  current AOT is faster than TLC (`24.114s` vs `35.952s`) and `2.98x` faster
-  than interpreted tlzig (`71.952s`), but it is not yet the requested `10x`
+  current AOT is faster than TLC (`24.039s` vs `36.695s`) and `3.03x` faster
+  than interpreted tlzig (`72.835s`), but it is not yet the requested `10x`
   tlzig improvement target. Next work should attack remaining generic `Value`
   churn in generated operators, `EXCEPT` update comparison paths, and
   set/function lookup overhead using model-derived type information only when
   guarded by a trusted `TypeOK`/profiling contract.
+- [x] Lower generated `EXCEPT` comparison paths to static path keys:
+  generated equality checks for `x' = [x EXCEPT ![...] = ...]` now emit
+  `runtime.PathKey` segments. Static field access and string-literal index
+  access become `.field = "name"` segments instead of allocating/boxing
+  `Value.string_v` path keys. For `generated_models/mdbtla_storage.zig`, the
+  audited bad pattern
+  `primed_variable_*except_update*_equal_bool(... runtime.string(context,
+  "writeSet"/"readSet"/"aborted"/...))` is `0` sites after regeneration.
+  ReleaseFast exact-filter result:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='MultiShardTxn Storage exhaustive'`
+  gave TLC-auto `36.695s`, interpreted tlzig-auto `72.835s`, AOT tlzig-auto
+  `24.039s`, exact `1,078,623` distinct states. This is only `1.003x` faster
+  than the prior AOT (`24.114s`), so keep looking for larger wins.
+- [x] Make benchmark run steps non-cacheable:
+  `build.zig` now marks both interpreter and generated benchmark `Run` steps as
+  `has_side_effects = true`. The benchmark writes `benchmark_results/*`
+  baseline files used by generated/AOT rows, so Zig build caching can otherwise
+  replay stdout without refreshing the baseline files.
+- [x] Fix AOT baseline comparison for non-exact deadlock rows:
+  `scripts/benchmark.zig` no longer forces distinct-state equality when a row
+  explicitly has `compare_distinct = false`. Fresh ReleaseFast checks after the
+  fix:
+  - `MultiShardTxn Storage`: TLC-auto `1.358s`, interpreted tlzig-auto
+    `0.459s`, AOT tlzig-auto `0.276s`; outcome matched, distinct comparison
+    disabled for this deadlock-order-dependent row.
+  - `MultiShardTxn RC/no-prepare-block`: TLC-auto `1.681s`, interpreted
+    tlzig-auto `0.172s`, AOT tlzig-auto `0.157s`; outcome matched.
+  - `MultiShardTxn RC/no-prepare-block-or-ww`: TLC-auto `1.614s`,
+    interpreted tlzig-auto `0.171s`, AOT tlzig-auto `0.155s`; outcome matched.
+  - `MultiShardTxn RC/with-prepare-block`: TLC-auto `1.539s`, interpreted
+    tlzig-auto `0.168s`, AOT tlzig-auto `0.163s`; outcome matched.
+  - `MultiShardTxn RC/snapshot`: TLC-auto `2.428s`, interpreted tlzig-auto
+    `0.404s`, AOT tlzig-auto `0.540s`; outcome matched but AOT is slower than
+    interpreted on this short deadlock run, so this remains a perf target.
+- [x] Re-run the default ReleaseFast benchmark after the benchmark harness fix:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. MultiShardTxn default rows from that run:
+  ClientCentric TLC-auto `2.366s`, interpreted tlzig-auto `5.322s`, AOT
+  `1.190s`; MCM/snapshot TLC-auto `1.602s`, tlzig-auto `0.464s`;
+  MCM/rc-local TLC-auto `1.501s`, tlzig-auto `0.159s`; Storage TLC-auto
+  `1.414s`, tlzig-auto `0.444s`; RC/no-prepare TLC-auto `1.805s`,
+  tlzig-auto `0.185s`; RC/no-prepare-or-ww TLC-auto `1.816s`, tlzig-auto
+  `0.212s`; RC/snapshot TLC-auto `2.394s`, tlzig-auto `0.561s`;
+  RC/with-prepare TLC-auto `1.572s`, tlzig-auto `0.200s`.
+- [x] Make ClientCentric strict generation reproducible under the current
+  generator:
+  fresh generation now succeeds for
+  `vendor/MDBTLA/MultiShardTxn/ClientCentricTests.tla` with
+  `generated Zig operators=67 native=0 fallbacks=0`. The generic fixes were:
+  recognize direct native lowerings through instantiated operator names
+  (`Range`, `SeqToSet`, `Index`, `PermSeqs`, `INTERSECTION`), avoid marking
+  those source helper definitions reachable, and lower `ReduceSeq(LAMBDA, seq,
+  acc)` directly instead of requiring a spec-specific runtime override.
+- [x] Fix generated ClientCentric AOT crash during initialization:
+  lldb showed the generated path crashing in `Value.clone_assume_capacity`
+  while cloning a cached generated definition into `generated_cache_pool`.
+  `Value.clone` now reserves recursive value capacity for every target pool,
+  not only same-pool clones, and `ValuePool` growth/allocation paths use checked
+  `u64` capacity arithmetic before casting back to `u32`. This avoids
+  destination-slice invalidation during recursive cross-pool clones and catches
+  capacity overflow explicitly. Added a unit test that clones a nested set into
+  a target pool with capacity `1`.
+- [x] Re-run ClientCentric strict AOT after the clone fix:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='MultiShardTxn ClientCentric'`
+  completed with TLC-auto `2.382s`, interpreted tlzig-auto `4.925s`, AOT
+  tlzig-auto `0.944s`, exact `1602/801`. A second broader run measured AOT
+  `0.933s`. Compared with the previous stale AOT row (`1.190s`), this is about
+  `1.26x` faster; compared with interpreted tlzig-auto in the same filtered run,
+  AOT is about `5.22x` faster. This is a real win, but not the requested `10x`,
+  so keep optimizing typed/generated hot paths.
+- [x] Add representative short MultiShardTxn AOT rows to the default benchmark:
+  the default ReleaseFast `benchmark` step now runs generated/AOT rows for
+  ClientCentric, both MCM invariant configs, Storage, and the four short RC
+  configs. Exhaustive AOT rows remain opt-in via `-Dbenchmark-include-long=true`
+  to keep the default benchmark from spending too long in one full-state run.
+- [x] Re-run expanded default ReleaseFast benchmark:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully after enabling the short AOT rows. MultiShardTxn
+  normal rows: ClientCentric TLC-auto `2.374s`, interpreted tlzig-auto
+  `5.398s`; MCM/snapshot TLC-auto `1.761s`, tlzig-auto `0.611s`; MCM/rc-local
+  TLC-auto `1.411s`, tlzig-auto `0.186s`; Storage TLC-auto `1.412s`,
+  tlzig-auto `0.379s`; RC/no-prepare TLC-auto `1.669s`, tlzig-auto `0.194s`;
+  RC/no-prepare-or-ww TLC-auto `1.699s`, tlzig-auto `0.213s`; RC/snapshot
+  TLC-auto `2.391s`, tlzig-auto `0.841s`; RC/with-prepare TLC-auto `1.701s`,
+  tlzig-auto `0.196s`. AOT rows: ClientCentric `0.935s`; MCM/snapshot
+  `0.186s`; MCM/rc-local `0.104s`; Storage `0.247s`; RC/no-prepare `0.174s`;
+  RC/no-prepare-or-ww `0.195s`; RC/snapshot `0.727s`; RC/with-prepare
+  `0.175s`.
+- [x] Replace broad boolean-helper emission with value fallback:
+  always emitting `_bool` helpers made ClientCentric compile, but it could
+  create boolean wrappers for non-boolean LET/bound bodies. `emit_boolean_expr`
+  now falls back to the normal value helper plus `runtime.boolean(...)` when a
+  LET or quantifier body cannot be emitted through the boolean helper path, and
+  helper generation is again gated by `expr_can_emit_boolean`. Fresh
+  ClientCentric strict generation still reports `operators=67 native=0
+  fallbacks=0`, and ReleaseFast `MultiShardTxn ClientCentric [AOT]` completed
+  at `0.938s`, exact `1602/801`.
+- [ ] Continue generated-code performance work without user-spec runtime hacks:
+  no generated file in the default MultiShardTxn AOT set contains
+  `runtime.native(...)` or a nonzero `fallback_count`. The remaining speed work
+  should lower generated code toward typed state/value access, TypeOK-derived
+  representation assumptions, and columnar/contiguous arrays where the type
+  proof is explicit. Zig vectors/SIMD are only honest after that typed lowering,
+  because the current `Value` union representation is not a primitive array.
+- [x] Add first-stage TypeOK-derived generated metadata:
+  `--type-invariant NAME` generation now emits `type_facts` for simple integer
+  state-variable facts of the form `x \in lo..hi`, including negative integer
+  endpoints. This is metadata only and does not change semantics yet; it is the
+  trust boundary needed before replacing `Value` unions with typed/contiguous
+  layouts. Added a codegen regression for `TypeOK == x \in 0..2 /\ y \in
+  -1..1`. ClientCentric without a selected type invariant emits an empty
+  `type_facts` table, still reports `fallback_count = 0`, and ReleaseFast
+  `MultiShardTxn ClientCentric [AOT]` completed at `0.938s`, exact `1602/801`
+  versus TLC-auto `2.401s`.
+- [x] Tighten direct-native helper recognition with AST-shape checks:
+  exact unqualified helper names such as `Range`, `SeqToSet`, `Index`,
+  `PermSeqs`, and `INTERSECTION` are generic reusable helper names, not runtime
+  overrides, but lowering by name alone can be wrong if a user shadows one with
+  different semantics. Keep standard-module builtins fast, but for user-visible
+  helper definitions require a recognized body shape before replacing the
+  generated operator with a runtime primitive. Added generator regression tests:
+  helper-shaped `Range(f) == {f[x] : x \in DOMAIN f}` lowers to
+  `runtime.function_range`, while shadowed `Range(x) == 42` stays generated and
+  never emits `runtime.function_range`. Fresh ClientCentric generation still
+  reports `operators=67 native=0 fallbacks=0`, and ReleaseFast
+  `MultiShardTxn ClientCentric [AOT]` completed at `0.915s`, exact `1602/801`
+  versus TLC-auto `2.252s`.
+- [x] Re-run the full `MultiShardTxn` ReleaseFast filter after helper-shape
+  tightening:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='MultiShardTxn'`
+  completed successfully. Normal rows: ClientCentric TLC-auto `2.480s`,
+  interpreted tlzig-auto `5.357s`; MCM/snapshot TLC-auto `1.588s`,
+  tlzig-auto `0.537s`; MCM/rc-local TLC-auto `1.372s`, tlzig-auto `0.149s`;
+  Storage TLC-auto `1.470s`, tlzig-auto `0.619s`; RC/no-prepare TLC-auto
+  `1.575s`, tlzig-auto `0.180s`; RC/no-prepare-or-ww TLC-auto `1.474s`,
+  tlzig-auto `0.164s`; RC/snapshot TLC-auto `2.294s`, tlzig-auto `0.797s`;
+  RC/with-prepare TLC-auto `1.289s`, tlzig-auto `0.187s`. AOT rows:
+  ClientCentric `0.930s`; MCM/snapshot `0.179s`; MCM/rc-local `0.105s`;
+  Storage `0.302s`; RC/no-prepare `0.180s`; RC/no-prepare-or-ww `0.181s`;
+  RC/snapshot `0.685s`; RC/with-prepare `0.158s`.
+- [x] Fuse generated `Index(seq, a) < Index(seq, b)` comparisons:
+  added generic `runtime.sequence_index_order_bool` and a codegen pattern for
+  `<`/`<=` comparisons between two `Index` calls over the same sequence
+  expression. Fresh ClientCentric generation emits 10 fused calls. ReleaseFast
+  `MultiShardTxn ClientCentric [AOT]` completed at `0.932s`, exact `1602/801`;
+  this is a small improvement from the prior `0.938s`, so the large remaining
+  win still has to come from typed/columnar state/value lowering rather than
+  isolated expression fusions.
+- [x] Reject per-worker symmetry hash cache for generated parallel runs:
+  a generic per-worker cache avoided shared mutable state, but the same
+  ReleaseFast Storage exhaustive AOT row regressed to `24.518s` while exact
+  state counts stayed correct. The experiment was reverted.
+- [x] Reject generated string-literal equality helpers for Storage:
+  lowering `x = "literal"` and `record.field = "literal"` to byte-string
+  helpers reduced generated string boxing patterns from `43` to `6`, but the
+  same ReleaseFast Storage exhaustive AOT row regressed to `24.500s` while
+  exact state counts stayed correct. The experiment was reverted.
+- [x] Fix generated primed-EXCEPT equality on missing update paths:
+  `runtime.primed_variable_*except_update*_equal_bool` now rejects absent
+  function keys, absent record fields, and out-of-range tuple paths instead of
+  accepting an unchanged next value. This is a generic runtime correctness fix
+  for generated EXCEPT comparisons, not a spec-specific override. Deterministic
+  ReleaseFast one-worker `MCMultiShardTxn_rc_local.cfg` now matches interpreted
+  and generated execution at `3334/1468` with the same deadlock. The auto
+  benchmark row passes with outcome parity; parallel early-deadlock counts are
+  intentionally not compared as exact graph counts because the first discovered
+  deadlock is scheduler-dependent.
+- [x] Re-enable representative `MultiShardTxn MCM/rc-local-invariant [AOT]`
+  by default:
+  exact ReleaseFast benchmark command
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='MultiShardTxn MCM/rc-local-invariant' -Dbenchmark-include-long=true`
+  completed successfully after the EXCEPT fix. In the visible run,
+  TLC-auto was `1.377s`, interpreted tlzig-auto was `0.112s`, and AOT was
+  `0.134s`. Storage AOT remains opt-in because its completed-looking auto row
+  still reports different counts (`33021/13370` interpreted versus
+  `52955/22120` AOT in the latest ReleaseFast check), so it needs a stronger
+  graph-diff harness before being default-enabled.
+- [x] Re-run default ReleaseFast benchmark with rc-local AOT enabled:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. Relevant default MDBTLA rows from that run:
+  ClientCentric TLC-auto `2.363s`, interpreted tlzig-auto `5.327s`, AOT
+  `0.934s`, exact `1602/801`; MCM/rc-local TLC-auto `1.392s`, interpreted
+  tlzig-auto `0.167s`, AOT `0.091s`; SingleShard small TLC-auto `2.410s`,
+  interpreted tlzig-auto `3.381s`, AOT `0.490s`, exact `44363/17975`;
+  SingleShard small safety TLC-auto `1.861s`, interpreted tlzig-auto `3.075s`,
+  AOT `0.207s`, exact `44363/17975`.
+- [x] Re-enable representative short `MultiShardTxn Storage [AOT]` by default:
+  deterministic one-worker ReleaseFast runs for `Storage.cfg` now match
+  interpreted and generated execution at `33021/13370` with the same deadlock.
+  The auto benchmark is an early-deadlock run, so generated/distinct counts can
+  differ by worker scheduling; outcome parity plus deterministic one-worker
+  parity is the current correctness evidence for the short benchmark. Exact
+  ReleaseFast benchmark command
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='MultiShardTxn Storage'`
+  completed successfully with TLC-auto `1.845s`, interpreted tlzig-auto
+  `0.652s`, and AOT `0.245s`. The exhaustive Storage row remains opt-in.
+- [x] Re-enable representative short `MultiShardTxn` RC AOT rows by default:
+  ReleaseFast filtered checks completed successfully before enabling them:
+  `RC/no-prepare-block` TLC-auto `1.625s`, interpreted tlzig-auto `0.181s`,
+  AOT `0.173s`; `RC/no-prepare-block-or-ww` TLC-auto `1.528s`,
+  interpreted tlzig-auto `0.184s`, AOT `0.161s`; `RC/with-prepare-block`
+  TLC-auto `1.592s`, interpreted tlzig-auto `0.178s`, AOT `0.156s`;
+  `RC/snapshot` TLC-auto `2.289s`, interpreted tlzig-auto `0.799s`, AOT
+  `0.447s`. These are short early-deadlock rows; exhaustive RC rows remain
+  opt-in through `-Dbenchmark-include-long=true`.
+- [x] Remove remaining named native dispatch from stored generated models:
+  generated code now lowers `SubSeq` to generic
+  `runtime.sequence_subseq(context, ...)` instead of
+  `runtime.native(context, "SubSeq", ...)`. Regenerated
+  `generated_models/mdbtla_singlelog_mcmdbprops.zig` in ReleaseFast:
+  `generated Zig operators=40 native=3 fallbacks=0`. A repository scan now
+  finds no `runtime.native(...)`, no `runtime.native_binary(...)`, and no
+  nonzero `fallback_count` in `generated_models/`; the only remaining
+  `runtime.native` string is the fail-closed fallback emitter in
+  `src/codegen.zig`.
+- [x] Keep `SingleLog MCMDBProps` opt-in:
+  after the `SubSeq` lowering, the generated model is clean (`fallbacks=0`, no
+  named native dispatch), but the ReleaseFast benchmark command
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='SingleLog MCMDBProps' -Dbenchmark-include-long=true`
+  produced no timed row after roughly 90 seconds and was interrupted. Do not
+  put this row into the default benchmark until it has a smaller representative
+  config or a dedicated long-run path with explicit user opt-in.
+  2026-07-02 update: dedicated long-run path exists now via interpreted
+  `--write-tlzig-baseline` followed by generated `--tlzig-only` comparison.
+  This keeps TLC's 26-minute baseline out of routine benchmarking while still
+  allowing strict generated-row correctness checks.
+- [x] Re-run default ReleaseFast benchmark after the short RC/default AOT
+  update:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. Relevant MDBTLA normal rows from the run:
+  ClientCentric TLC-auto `2.387s`, interpreted tlzig-auto `5.366s`, exact
+  `1602/801`; MCM/snapshot TLC-auto `1.684s`, interpreted tlzig-auto `0.490s`;
+  MCM/rc-local TLC-auto `1.328s`, interpreted tlzig-auto `0.183s`; Storage
+  TLC-auto `1.370s`, interpreted tlzig-auto `0.626s`; RC/no-prepare TLC-auto
+  `1.737s`, interpreted tlzig-auto `0.203s`; RC/no-prepare-or-ww TLC-auto
+  `1.640s`, interpreted tlzig-auto `0.215s`; RC/snapshot TLC-auto `2.299s`,
+  interpreted tlzig-auto `0.837s`; RC/with-prepare TLC-auto `1.640s`,
+  interpreted tlzig-auto `0.218s`. Default AOT rows in the same run:
+  ClientCentric `0.927s`, MCM/rc-local `0.109s`, Storage `0.270s`,
+  RC/no-prepare `0.175s`, RC/no-prepare-or-ww `0.171s`, RC/snapshot `0.458s`,
+  RC/with-prepare `0.163s`, SingleShard small `0.490s`, and SingleShard small
+  safety `0.194s`.
+- [x] Re-enable representative `MultiShardTxn MCM/snapshot-invariant [AOT]`
+  by default after deterministic parity:
+  ReleaseFast exact-filter benchmark
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='MultiShardTxn MCM/snapshot-invariant' -Dbenchmark-include-long=true`
+  completed with TLC-auto `1.715s`, interpreted tlzig-auto `0.474s`, and AOT
+  `0.171s`. Parallel early-stop counts differ by scheduler, so I also ran
+  direct one-worker interpreted and generated checks with `--max-states 100000`,
+  `--max-successors 65536`, and `--workers 1`; both stopped at the same
+  deadlock with `25294/10768`.
+- [x] Re-run default ReleaseFast benchmark with both MCM AOT rows enabled:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. Relevant MDBTLA normal rows: ClientCentric TLC-auto
+  `2.363s`, interpreted tlzig-auto `5.366s`; MCM/snapshot TLC-auto `1.684s`,
+  interpreted tlzig-auto `0.510s`; MCM/rc-local TLC-auto `1.374s`,
+  interpreted tlzig-auto `0.166s`; Storage TLC-auto `1.551s`, interpreted
+  tlzig-auto `0.582s`; RC/no-prepare TLC-auto `1.606s`, interpreted
+  tlzig-auto `0.207s`; RC/no-prepare-or-ww TLC-auto `1.666s`, interpreted
+  tlzig-auto `0.235s`; RC/snapshot TLC-auto `2.403s`, interpreted tlzig-auto
+  `0.559s`; RC/with-prepare TLC-auto `1.678s`, interpreted tlzig-auto
+  `0.217s`. Default AOT rows in that run: ClientCentric `0.941s`,
+  MCM/snapshot `0.180s`, MCM/rc-local `0.090s`, Storage `0.309s`,
+  RC/no-prepare `0.161s`, RC/no-prepare-or-ww `0.200s`, RC/snapshot `0.744s`,
+  RC/with-prepare `0.160s`, SingleShard small `0.483s`, and SingleShard small
+  safety `0.193s`.
+- [x] Add SingleShardTxn no-sym AOT coverage:
+  strict generation now succeeds for both representative no-sym configs:
+  `ShardTxn_small_no_sym.cfg` generated `43` operators, `2` native, `0`
+  fallbacks; `ShardTxn_small_safety_no_sym.cfg` generated `43` operators, `1`
+  native, `0` fallbacks. ReleaseFast filtered checks completed successfully:
+  `SingleShardTxn ShardTxn/small no-sym` TLC-auto `2.746s`, interpreted
+  tlzig-auto `6.549s`, AOT `1.327s`, exact `78245/33787`; safety no-sym
+  TLC-auto `2.208s`, interpreted tlzig-auto `5.482s`, AOT `0.366s`, exact
+  `78245/33787`. Both no-sym AOT rows are default-enabled because they are
+  quick, exact, and cover the non-symmetry state-space path.
+- [x] Re-run default ReleaseFast benchmark with SingleShardTxn no-sym AOT rows:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. New default AOT rows from that run:
+  `SingleShardTxn ShardTxn/small no-sym [AOT]` `1.301s`, exact
+  `78245/33787`; `SingleShardTxn ShardTxn/small safety no-sym [AOT]`
+  `0.362s`, exact `78245/33787`. Other relevant AOT rows in the same run:
+  ClientCentric `0.946s`, MCM/snapshot `0.194s`, MCM/rc-local `0.092s`,
+  Storage `0.256s`, RC/no-prepare `0.159s`, RC/no-prepare-or-ww `0.179s`,
+  RC/snapshot `0.524s`, RC/with-prepare `0.158s`, SingleShard small `0.482s`,
+  and SingleShard small safety `0.192s`.
+- [ ] Continue correctness-first MultiShardTxn/MDBTLA validation:
+  keep default rows limited to representative short configs. Before enabling
+  additional MDBTLA AOT rows such as `MCM/snapshot` or long SingleLog temporal
+  runs by default, require ReleaseFast outcome parity plus either exact
+  completed graph parity or deterministic one-worker parity for
+  scheduler-dependent early-stop runs. Do not add user-spec runtime overrides.
+- [x] Lower generated record literals to static field-name construction:
+  `src/codegen.zig` now emits `runtime.record_static(context, ...)` for TLA+
+  record literals, and `src/generated_runtime.zig` has a matching helper that
+  avoids building field-name `Value` objects through `runtime.string(...)` at
+  every call site. A runtime equivalence test checks `record_static` against
+  the existing generic `record` path. Regenerated stored generated models now
+  contain `1251` `runtime.record_static(` call sites, `0` old
+  `runtime.record(context, &[_]Value{ try runtime.string(context, ...)`
+  call sites in generated models, `0` `runtime.native(` call sites, and all
+  generated-model `fallback_count` values remain `0`.
+- [x] Split short and exhaustive Storage generated models:
+  `build.zig` now uses `generated_models/mdbtla_storage.zig` for
+  `MultiShardTxn Storage [AOT]` and
+  `generated_models/mdbtla_storage_exhaustive.zig` for the opt-in
+  `MultiShardTxn Storage exhaustive [AOT]` row. Both are generated from their
+  matching cfg files, preventing the short deadlock row and completed
+  exhaustive row from overwriting each other.
+- [x] Tighten generated benchmark baseline comparison:
+  `scripts/benchmark.zig` now compares both generated and distinct counts
+  between interpreted tlzig and generated AOT when a generated model is active
+  and both runs complete, even if TLC-vs-tlzig generated-count comparison is
+  disabled for that spec. Early violation/deadlock rows still compare outcome
+  because scheduler-dependent early stop counts are not stable.
+- [x] Add generic `UNCHANGED` changed-mask fast path:
+  `runtime.unchanged_variable` and `runtime.unchanged_variables` now return
+  immediately when the candidate next state's `changed_mask` proves the
+  variable was copied unchanged from the parent. Changed variables still use
+  full cross-pool equality, so `x' = x` assignments remain correct. A runtime
+  test covers the no-change mask path and the changed-but-equal path.
+- [x] ReleaseFast validation after `record_static`, Storage split, baseline
+  tightening, and `UNCHANGED` fast path:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build test --summary none`
+  passed; the known negative tests still print expected property-violation
+  lines while returning exit code `0`. Storage exhaustive opt-in command
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='MultiShardTxn Storage exhaustive' -Dbenchmark-include-long=true`
+  completed with TLC-auto `35.959s`, interpreted tlzig-auto `74.634s`, and
+  AOT `25.294s`, exact tlzig/AOT graph `3858487/1078623`. This is a small
+  improvement from the immediately prior AOT `25.403s`, not a 10x win.
+- [x] Re-run default ReleaseFast benchmark after the generic runtime/codegen
+  changes:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. Relevant MDBTLA normal rows from that run:
+  ClientCentric TLC-auto `2.345s`, interpreted tlzig-auto `5.327s`, exact
+  `1602/801`; MCM/snapshot TLC-auto `1.658s`, interpreted tlzig-auto
+  `0.525s`; MCM/rc-local TLC-auto `1.431s`, interpreted tlzig-auto `0.178s`;
+  Storage TLC-auto `1.354s`, interpreted tlzig-auto `0.681s`; RC/no-prepare
+  TLC-auto `1.559s`, interpreted tlzig-auto `0.195s`; RC/no-prepare-or-ww
+  TLC-auto `1.517s`, interpreted tlzig-auto `0.231s`; RC/snapshot TLC-auto
+  `2.350s`, interpreted tlzig-auto `0.682s`; RC/with-prepare TLC-auto
+  `1.583s`, interpreted tlzig-auto `0.221s`; SingleShard small TLC-auto
+  `2.578s`, interpreted tlzig-auto `3.456s`; SingleShard small safety
+  TLC-auto `1.823s`, interpreted tlzig-auto `3.107s`. Default AOT rows in
+  the same run: ClientCentric `0.962s`, MCM/snapshot `0.188s`,
+  MCM/rc-local `0.118s`, Storage `0.253s`, RC/no-prepare `0.173s`,
+  RC/no-prepare-or-ww `0.175s`, RC/snapshot `0.600s`, RC/with-prepare
+  `0.180s`, SingleShard small `0.499s`, SingleShard small no-sym `1.327s`,
+  SingleShard small safety `0.201s`, and SingleShard small safety no-sym
+  `0.374s`.
+- [ ] Continue real performance work beyond `UNCHANGED`:
+  the changed-mask fast path produced only small measured gains on AOT
+  Storage exhaustive (`25.403s` -> `25.294s`) and did not improve the
+  SingleShard no-sym AOT row (`1.301s` prior default -> `1.327s` latest
+  default). The next generic hotspots remain `runtime.constant_function(`
+  (`5843` generated-model sites), `runtime.variable_path(` (`4397` sites),
+  `runtime.set(context` (`3380` sites), and generated action/state storage
+  layout. After regenerating all stored generated models, the generated-model
+  audit reports `0` old record/string construction sites, `1251`
+  `record_static` sites, `0` `runtime.native(` sites, and `0` nonzero
+  fallbacks. Do not claim the requested 10x target until ReleaseFast benchmark
+  evidence shows it.
+- [x] Avoid materializing integer ranges just to iterate:
+  `src/generated_runtime.zig` now keeps `.range_v` lazy for quantifiers,
+  boolean quantifiers, filters, set comprehensions, function maps, and
+  `CHOOSE`, while still materializing symbolic sets that do not have a cheap
+  indexable representation. Runtime allocation tests cover range-filter and
+  range-map behavior and assert the expected value-pool growth. This is a
+  generic bounded-allocation cleanup, not a spec-specific override.
+- [x] ReleaseFast validation after lazy range iteration:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build test --summary none`
+  passed. Filtered `SingleShardTxn ShardTxn/small` benchmark completed with
+  TLC-auto `2.549s`, interpreted tlzig-auto `3.005s`, and AOT `0.482s`,
+  exact AOT graph `44363/17975`; this is effectively unchanged from the
+  previous AOT `~0.49s`, so do not count it as a wall-time speedup.
+- [x] Re-run default ReleaseFast benchmark after lazy range iteration:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. Relevant normal rows: ClientCentric TLC-auto
+  `2.380s`, interpreted tlzig-auto `5.361s`, exact `1602/801`; Storage
+  TLC-auto `1.532s`, interpreted tlzig-auto `0.555s`; RC/snapshot TLC-auto
+  `2.339s`, interpreted tlzig-auto `0.696s`; SingleShard small TLC-auto
+  `2.490s`, interpreted tlzig-auto `3.373s`; SingleShard small safety
+  TLC-auto `1.801s`, interpreted tlzig-auto `3.038s`. Default AOT rows in
+  the same run: ClientCentric `0.943s`, MCM/snapshot `0.169s`,
+  MCM/rc-local `0.118s`, Storage `0.211s`, RC/no-prepare `0.146s`,
+  RC/no-prepare-or-ww `0.149s`, RC/snapshot `0.362s`, RC/with-prepare
+  `0.165s`, SingleShard small `0.484s`, SingleShard no-sym `1.323s`,
+  SingleShard safety `0.201s`, and SingleShard safety no-sym `0.371s`.
+- [ ] Continue native-first performance work from the latest audit:
+  `python3 scripts/audit_generated_patterns.py --examples 2` scanned `21`
+  generated files after the lazy range change and reported
+  `nested_runtime_call=14132`, `except_update=882`, `variable_path=4885`,
+  `primed_variable_full_compare=941`, `unchanged_expression=422`,
+  `map_set=524`, and `function_range=173`, with `unchanged_variable=0`,
+  `field_sequence_head=0`, and `permutations_union_chain=0`. The next
+  performance work should target generic typed/indexed lowering for
+  `variable_path`, fused `EXCEPT` reconstruction, and map/filter pipelines
+  that can operate on flat typed arrays when TypeOK-derived facts prove the
+  representation.
+- [x] Add a scalar cross-pool equality fast path:
+  generated runtime path traversal now compares bool/int/model/string keys
+  directly before falling back to full composite `Value.eql_cross_pool`.
+  This is generic and affects function-domain lookup/path-key matching without
+  encoding user-spec semantics. `zig build test --summary none` passed.
+  Filtered ReleaseFast `MultiShardTxn ClientCentric` completed with TLC-auto
+  `2.339s`, interpreted tlzig-auto `4.965s`, and AOT `0.956s`, exact
+  `1602/801`; the AOT row did not improve versus the prior `0.943s` run.
+- [x] Re-run default ReleaseFast benchmark after scalar equality fast path:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. Relevant normal rows: ClientCentric TLC-auto
+  `2.354s`, interpreted tlzig-auto `5.337s`, exact `1602/801`; Storage
+  TLC-auto `1.387s`, interpreted tlzig-auto `0.456s`; RC/snapshot TLC-auto
+  `2.444s`, interpreted tlzig-auto `0.601s`; SingleShard small TLC-auto
+  `2.393s`, interpreted tlzig-auto `3.358s`; SingleShard safety TLC-auto
+  `1.855s`, interpreted tlzig-auto `3.044s`. Default AOT rows in the same
+  run: ClientCentric `0.935s`, MCM/snapshot `0.172s`, MCM/rc-local `0.115s`,
+  Storage `0.224s`, RC/no-prepare `0.158s`, RC/no-prepare-or-ww `0.162s`,
+  RC/snapshot `0.564s`, RC/with-prepare `0.165s`, SingleShard small
+  `0.485s`, SingleShard no-sym `1.329s`, SingleShard safety `0.209s`, and
+  SingleShard safety no-sym `0.371s`. Timings are mixed/noisy; treat this as
+  a correctness-preserving cleanup, not a proven AOT speedup.
+- [x] Add a generic dense-domain function lookup probe:
+  generated runtime function application now probes the direct slot first when
+  a function domain looks like a dense integer or model-value sequence. The
+  probe only returns if the calculated slot still equals the requested key and
+  otherwise falls back to the existing scan, so sparse/unsorted domains keep
+  the old semantics. This is runtime-generic and contains no user-spec
+  semantics. `zig build test --summary none` passed.
+- [x] ReleaseFast validation after dense-domain probe:
+  filtered exact rows completed: `MultiShardTxn ClientCentric` TLC-auto
+  `2.331s`, interpreted tlzig-auto `5.033s`, AOT `0.955s`, exact `1602/801`;
+  `SingleShardTxn ShardTxn/small` TLC-auto `2.154s`, interpreted tlzig-auto
+  `3.322s`, AOT `0.488s`, exact `44363/17975`.
+- [x] Re-run default ReleaseFast benchmark after dense-domain probe:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. Relevant normal rows: ClientCentric TLC-auto
+  `2.326s`, interpreted tlzig-auto `5.369s`, exact `1602/801`; Storage
+  TLC-auto `1.346s`, interpreted tlzig-auto `0.463s`; RC/snapshot TLC-auto
+  `2.289s`, interpreted tlzig-auto `0.948s`; SingleShard small TLC-auto
+  `2.379s`, interpreted tlzig-auto `3.484s`; SingleShard safety TLC-auto
+  `1.973s`, interpreted tlzig-auto `3.167s`. Default AOT rows in the same
+  run: ClientCentric `0.945s`, MCM/snapshot `0.155s`, MCM/rc-local `0.104s`,
+  Storage `0.226s`, RC/no-prepare `0.151s`, RC/no-prepare-or-ww `0.154s`,
+  RC/snapshot `0.396s`, RC/with-prepare `0.168s`, SingleShard small
+  `0.483s`, SingleShard no-sym `1.332s`, SingleShard safety `0.196s`, and
+  SingleShard safety no-sym `0.363s`. Evidence is mixed; this stays as a
+  safe generic shortcut, but the 10x target still requires TypeOK-derived
+  typed/indexed state layout rather than more tagged-`Value` lookup tweaks.
+- [x] Add verified dense-set membership probes:
+  `Set.contains`, generated runtime cross-pool membership, and
+  `variable_path_member_bool` paths now probe a direct dense int/model-value
+  slot before scanning. The probe only returns true when the computed slot
+  equals the requested value; sparse or unsorted sets fall back to the full
+  scan. Added same-pool and cross-pool tests for sparse unsorted sets such as
+  `{5, 1}` to prevent unsound negative shortcuts. `zig build test --summary none`
+  passed.
+- [x] ReleaseFast validation after dense-set membership probes:
+  targeted `MultiShardTxn RC/snapshot` completed with TLC-auto `2.411s`,
+  interpreted tlzig-auto `0.797s`, and AOT `0.354s`; targeted
+  `SingleShardTxn ShardTxn/small` completed with TLC-auto `2.272s`,
+  interpreted tlzig-auto `3.382s`, and AOT `0.491s`, exact `44363/17975`.
+- [x] Re-run default ReleaseFast benchmark after dense-set membership probes:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. Relevant normal rows: ClientCentric TLC-auto
+  `2.360s`, interpreted tlzig-auto `5.353s`, exact `1602/801`; Storage
+  TLC-auto `1.399s`, interpreted tlzig-auto `0.518s`; RC/snapshot TLC-auto
+  `2.349s`, interpreted tlzig-auto `0.485s`; SingleShard small TLC-auto
+  `2.483s`, interpreted tlzig-auto `3.560s`; SingleShard safety TLC-auto
+  `1.756s`, interpreted tlzig-auto `3.223s`. Default AOT rows in the same
+  run: ClientCentric `0.885s`, MCM/snapshot `0.170s`, MCM/rc-local `0.120s`,
+  Storage `0.251s`, RC/no-prepare `0.177s`, RC/no-prepare-or-ww `0.173s`,
+  RC/snapshot `0.357s`, RC/with-prepare `0.148s`, SingleShard small
+  `0.471s`, SingleShard no-sym `1.303s`, SingleShard safety `0.193s`, and
+  SingleShard safety no-sym `0.354s`. This is a real improvement for several
+  AOT rows but still mixed; Storage worsened versus the preceding `0.226s`
+  AOT run, and the 10x goal still needs TypeOK-backed layout lowering.
+- [x] Re-run default ReleaseFast benchmark after record-order equality fix and
+  default-enable `SingleLog MDBLinearizability`:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. Relevant normal rows: `MultiShardTxn ClientCentric`
+  TLC-auto `2.357s`, tlzig-auto `5.383s`, exact `1602/801`;
+  `MultiShardTxn Storage` TLC-auto `1.464s`, tlzig-auto `0.612s`;
+  `MultiShardTxn RC/snapshot` TLC-auto `2.158s`, tlzig-auto `0.575s`;
+  `SingleLog MDBLinearizability` TLC-auto `2.025s`, tlzig-auto `8.531s`,
+  distinct `2247` on both sides; `SingleShardTxn ShardTxn/small` TLC-auto
+  `2.457s`, tlzig-auto `3.577s`; `SingleShardTxn ShardTxn/small safety`
+  TLC-auto `1.883s`, tlzig-auto `3.259s`. Default AOT rows completed:
+  ClientCentric `0.940s`, MCM/snapshot `0.172s`, MCM/rc-local `0.142s`,
+  Storage `0.175s`, RC/no-prepare `0.187s`, RC/no-prepare-or-ww `0.148s`,
+  RC/snapshot `0.414s`, RC/with-prepare `0.143s`, SingleShard small
+  `0.483s`, SingleShard no-sym `1.308s`, SingleShard safety `0.194s`,
+  SingleShard safety no-sym `0.361s`.
+- [x] Remove remaining user-helper-specific generated-code recognition:
+  `src/codegen.zig` no longer recognizes MDBTLA `Util.tla` `ReduceSeq` by
+  name or emits the direct `runtime.reduce_sequence` path from that name. This
+  keeps native/AOT generation honest: standard operators may still use native
+  paths, but user-spec helper semantics must come from parsed TLA+ lowering,
+  not global name checks. `rg` now finds no `ReduceSeq` or
+  `is_reduce_sequence_call` in codegen/overrides/evaluator paths; only the
+  unbound internal runtime helper name `reduce_sequence` remains.
+- [x] Add direct CLI state-pool parity with benchmark rows:
+  `tlzig --state-values-per-state N` now controls the canonical state value
+  pool multiplier used outside the benchmark harness. This is needed for full
+  MDBTLA configs such as upstream `SingleShardTxn/ShardTxn.cfg`, whose
+  benchmark row uses `state_values_per_state = 220`; the previous CLI was
+  hard-coded to `60` and could under-provision direct correctness runs.
+- [x] Resolve full upstream `SingleShardTxn/ShardTxn.cfg`:
+  the first direct ReleaseFast run reached `5,177,881` distinct states and
+  failed with `error.OutOfMemory` at the old `132,000,000` canonical value
+  cap. The benchmark/direct cap was raised to `192,000,000`, the full
+  benchmark row was raised to `max_states = 6_000_000`, and a generic temporal
+  fairness SCC pass was fixed to traverse a reverse SCC graph instead of
+  scanning every SCC for each popped SCC. Direct TLC Java completed with no
+  error at `14,931,205/5,502,547`; direct ReleaseFast tlzig completed with no
+  error at `14,929,261/5,502,547`.
+- [x] Re-validate after removing `ReduceSeq` codegen recognition:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build test --summary none`
+  passed with expected negative-property diagnostics. ReleaseFast
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='SingleShardTxn ShardTxn/small safety'`
+  completed: TLC-auto `2.019s`, interpreted tlzig-auto `3.006s`,
+  `44491/17975` vs `44363/17975`; AOT `0.194s`, `44363/17975`.
+- [x] Re-run default ReleaseFast benchmark after removing `ReduceSeq` codegen
+  recognition:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. MDBTLA rows included `MultiShardTxn ClientCentric`
+  TLC-auto `2.431s`, tlzig-auto `5.378s`, exact `1602/801`;
+  `MultiShardTxn Storage` TLC-auto `1.358s`, tlzig-auto `0.631s`;
+  `MultiShardTxn RC/snapshot` TLC-auto `2.339s`, tlzig-auto `0.577s`;
+  `SingleLog MDBLinearizability` TLC-auto `1.982s`, tlzig-auto `8.544s`,
+  distinct `2247` on both sides; `SingleShardTxn ShardTxn/small` TLC-auto
+  `2.359s`, tlzig-auto `3.404s`; and `SingleShardTxn ShardTxn/small safety`
+  TLC-auto `1.931s`, tlzig-auto `3.076s`. Default AOT rows still completed:
+  ClientCentric `0.953s`, MCM/snapshot `0.165s`, MCM/rc-local `0.160s`,
+  Storage `0.211s`, RC/no-prepare `0.190s`, RC/no-prepare-or-ww `0.160s`,
+  RC/snapshot `0.482s`, RC/with-prepare `0.147s`, SingleShard small
+  `0.481s`, SingleShard no-sym `1.302s`, SingleShard safety `0.191s`, and
+  SingleShard safety no-sym `0.359s`.
+- [x] Re-run tests and default ReleaseFast benchmark after the MCMDBProps
+  baseline harness change:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build test --summary none`
+  passed. `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. Current MDBTLA default rows include
+  `MultiShardTxn ClientCentric` exact `1602/801`, `SingleLog
+  MDBLinearizability` distinct `2247` on both TLC/tlzig, `SingleShardTxn
+  ShardTxn/small` AOT exact `44363/17975`, and `SingleShardTxn
+  ShardTxn/small no-sym` AOT exact `78245/33787`. Long full upstream
+  `SingleShardTxn/ShardTxn.cfg` and `SingleLog/MCMDBProps.cfg` remain
+  correctness-verified and opt-in, not default.
+- [x] Re-run full exact `SingleLog MCMDBProps` long benchmark after setting
+  `.compare_generated = false` for the row:
+  TLC/tlzig distinct and outcome match through the benchmark harness, and the
+  generated/AOT row also matches the interpreted tlzig baseline. This closes
+  the last known MDBTLA benchmark correctness gap for the upstream cfg set.
+- [x] Re-run default ReleaseFast benchmark after the `MCMDBProps`
+  `.compare_generated = false` row fix:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. Representative MDBTLA rows: `ClientCentric`
+  `1602/801`, `SingleLog MDBLinearizability` distinct `2247` on TLC/tlzig,
+  `SingleShardTxn ShardTxn/small` AOT `44363/17975`, and
+  `SingleShardTxn ShardTxn/small no-sym` AOT `78245/33787`.
 
 ## Notes
 - Update this file after every spec/example milestone.

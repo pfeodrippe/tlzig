@@ -37,6 +37,12 @@ const GeneratedExpressionMeta = struct {
     }
 };
 
+const TypeFact = struct {
+    variable_index: u32,
+    min_int: i64,
+    max_int: i64,
+};
+
 pub fn emit_module(
     allocator: std.mem.Allocator,
     module: ast.Module,
@@ -67,6 +73,12 @@ pub fn emit_module_with_options(
         options.extra_roots,
     );
     defer allocator.free(reachable);
+    const type_facts = try collect_type_facts(
+        allocator,
+        module,
+        options.type_invariants,
+    );
+    defer allocator.free(type_facts);
 
     try append(&output, allocator,
         \\const std = @import("std");
@@ -109,6 +121,25 @@ pub fn emit_module_with_options(
         );
         defer allocator.free(invariant_metadata);
         try append(&output, allocator, invariant_metadata);
+    }
+    try append(&output, allocator, "};\n\n");
+    const type_fact_header = try std.fmt.allocPrint(
+        allocator,
+        "pub const TypeFact = struct {{ variable_index: u32, min_int: i64, max_int: i64 }};\n" ++
+            "pub const type_facts = [_]TypeFact{{",
+        .{},
+    );
+    defer allocator.free(type_fact_header);
+    try append(&output, allocator, type_fact_header);
+    for (type_facts, 0..) |fact, index| {
+        const separator = if (index == 0) "" else ", ";
+        const fact_text = try std.fmt.allocPrint(
+            allocator,
+            "{s}.{{ .variable_index = {d}, .min_int = {d}, .max_int = {d} }}",
+            .{ separator, fact.variable_index, fact.min_int, fact.max_int },
+        );
+        defer allocator.free(fact_text);
+        try append(&output, allocator, fact_text);
     }
     try append(&output, allocator, "};\n\n");
 
@@ -373,7 +404,8 @@ fn definition_kind(
     definition: ast.Definition,
 ) DefinitionKind {
     if (!is_codegen_definition_name(definition.name) or
-        is_native_override(definition.name))
+        is_native_override(definition.name) or
+        direct_native_name(module, definition.name) != null)
     {
         return .native;
     }
@@ -732,6 +764,97 @@ fn expr_can_emit_boolean(
     };
 }
 
+fn collect_type_facts(
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    type_invariants: []const []const u8,
+) ![]TypeFact {
+    var facts = std.ArrayList(TypeFact).empty;
+    errdefer facts.deinit(allocator);
+    for (type_invariants) |name| {
+        const definition = find_definition(module, name) orelse continue;
+        if (definition.params.len != 0) continue;
+        try collect_type_facts_from_expr(
+            allocator,
+            module,
+            definition.body,
+            &facts,
+        );
+    }
+    return facts.toOwnedSlice(allocator);
+}
+
+fn collect_type_facts_from_expr(
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    expr: *const ast.Expr,
+    facts: *std.ArrayList(TypeFact),
+) !void {
+    if (expr.* == .binary and expr.binary.op == .and_op) {
+        try collect_type_facts_from_expr(
+            allocator,
+            module,
+            expr.binary.left,
+            facts,
+        );
+        try collect_type_facts_from_expr(
+            allocator,
+            module,
+            expr.binary.right,
+            facts,
+        );
+        return;
+    }
+    const fact = type_fact_from_expr(module, expr) orelse return;
+    for (facts.items) |existing| {
+        if (existing.variable_index == fact.variable_index) return;
+    }
+    try facts.append(allocator, fact);
+}
+
+fn type_fact_from_expr(module: ast.Module, expr: *const ast.Expr) ?TypeFact {
+    if (expr.* != .binary or expr.binary.op != .in) return null;
+    if (expr.binary.left.* != .ident) return null;
+    const variable = variable_index(module, expr.binary.left.ident) orelse
+        return null;
+    const range = int_range_expr(expr.binary.right) orelse return null;
+    return .{
+        .variable_index = @intCast(variable),
+        .min_int = range.min,
+        .max_int = range.max,
+    };
+}
+
+const IntRange = struct {
+    min: i64,
+    max: i64,
+};
+
+fn int_range_expr(expr: *const ast.Expr) ?IntRange {
+    if (expr.* != .binary or expr.binary.op != .range) return null;
+    const min = int_literal_value(expr.binary.left) orelse return null;
+    const max = int_literal_value(expr.binary.right) orelse return null;
+    return .{
+        .min = min,
+        .max = max,
+    };
+}
+
+fn int_literal_value(expr: *const ast.Expr) ?i64 {
+    return switch (expr.*) {
+        .int_literal => |value| value,
+        .unary => |unary| blk: {
+            if (unary.op != .neg or unary.operand.* != .int_literal) {
+                break :blk null;
+            }
+            break :blk std.math.negate(
+                unary.operand.int_literal,
+            ) catch null;
+        },
+        else => null,
+    };
+}
+
 fn expr_is_temporal(
     module: ast.Module,
     expr: *const ast.Expr,
@@ -1052,27 +1175,15 @@ fn emit_boolean_expr(
                 }
             }
             if (variable_application_index(module, application)) |variable| {
-                if (static_field_application(module, application)) |field_path| {
-                    try emit_static_field_path_call(
-                        output,
-                        allocator,
-                        module,
-                        "variable_path_field_boolean",
-                        field_path,
-                        params,
-                        null,
-                    );
-                } else {
-                    try emit_variable_path_call(
-                        output,
-                        allocator,
-                        module,
-                        "variable_path_boolean",
-                        variable,
-                        application,
-                        params,
-                    );
-                }
+                try emit_variable_path_call(
+                    output,
+                    allocator,
+                    module,
+                    "variable_path_boolean",
+                    variable,
+                    application,
+                    params,
+                );
                 return;
             }
             try append(output, allocator, "try runtime.boolean(");
@@ -1140,13 +1251,6 @@ fn emit_boolean_expr(
                             binary,
                             params,
                         )) return;
-                        if (try emit_static_field_path_membership(
-                            output,
-                            allocator,
-                            module,
-                            binary,
-                            params,
-                        )) return;
                         if (try emit_variable_path_membership(
                             output,
                             allocator,
@@ -1186,6 +1290,13 @@ fn emit_boolean_expr(
                         )) return;
                     }
                     if (try emit_variable_path_int_comparison(
+                        output,
+                        allocator,
+                        module,
+                        binary,
+                        params,
+                    )) return;
+                    if (try emit_sequence_index_order_comparison(
                         output,
                         allocator,
                         module,
@@ -1281,7 +1392,60 @@ fn emit_boolean_expr(
                 params,
             );
         },
-        .let_in => {
+        .case_expr => |case_value| {
+            const label = try std.fmt.allocPrint(
+                allocator,
+                "case_bool_{d}",
+                .{expression_identity(module, expr)},
+            );
+            defer allocator.free(label);
+            try append(output, allocator, label);
+            try append(output, allocator, ": {");
+            for (case_value.arms) |arm| {
+                try append(output, allocator, " if (");
+                try emit_boolean_expr(
+                    output,
+                    allocator,
+                    module,
+                    arm.cond,
+                    params,
+                );
+                try append(output, allocator, ") break :");
+                try append(output, allocator, label);
+                try append(output, allocator, " ");
+                try emit_boolean_expr(
+                    output,
+                    allocator,
+                    module,
+                    arm.value,
+                    params,
+                );
+                try append(output, allocator, ";");
+            }
+            if (case_value.otherwise) |otherwise| {
+                try append(output, allocator, " break :");
+                try append(output, allocator, label);
+                try append(output, allocator, " ");
+                try emit_boolean_expr(
+                    output,
+                    allocator,
+                    module,
+                    otherwise,
+                    params,
+                );
+                try append(output, allocator, ";");
+            } else {
+                try append(output, allocator, " return Error.TypeError;");
+            }
+            try append(output, allocator, " }");
+        },
+        .let_in => |let_value| {
+            if (!expr_can_emit_boolean(module, let_value.body, 0)) {
+                try append(output, allocator, "try runtime.boolean(");
+                try emit_expr(output, allocator, module, expr, params);
+                try append(output, allocator, ")");
+                return;
+            }
             const helper = try let_boolean_name(
                 allocator,
                 expression_identity(module, expr),
@@ -1297,6 +1461,12 @@ fn emit_boolean_expr(
         },
         .quantifier => |quantifier| {
             if (filtered_power_set_domain(module, quantifier) != null) {
+                try append(output, allocator, "try runtime.boolean(");
+                try emit_expr(output, allocator, module, expr, params);
+                try append(output, allocator, ")");
+                return;
+            }
+            if (!expr_can_emit_boolean(module, quantifier.body, 0)) {
                 try append(output, allocator, "try runtime.boolean(");
                 try emit_expr(output, allocator, module, expr, params);
                 try append(output, allocator, ")");
@@ -1444,11 +1614,11 @@ fn emit_expr(
                     .name => |resolved_name| if (constant_index(
                         module,
                         resolved_name,
-                    )) |index|
+                    ) != null)
                         try std.fmt.allocPrint(
                             allocator,
-                            "try runtime.constant_at(context, {d})",
-                            .{index},
+                            "try runtime.constant(context, \"{f}\")",
+                            .{std.zig.fmtString(resolved_name)},
                         )
                     else if (builtin_value_runtime_name(resolved_name)) |runtime_name|
                         try std.fmt.allocPrint(
@@ -1475,11 +1645,11 @@ fn emit_expr(
                             );
                     } else unreachable,
                 }
-            else if (constant_index(module, name)) |index|
+            else if (constant_index(module, name)) |_|
                 try std.fmt.allocPrint(
                     allocator,
-                    "try runtime.constant_at(context, {d})",
-                    .{index},
+                    "try runtime.constant(context, \"{f}\")",
+                    .{std.zig.fmtString(name)},
                 )
             else if (builtin_value_runtime_name(name)) |runtime_name|
                 try std.fmt.allocPrint(
@@ -1623,17 +1793,21 @@ fn emit_expr(
             try append(
                 output,
                 allocator,
-                "try runtime.record(context, &[_]Value{",
+                "try runtime.record_static(context, &[_][]const u8{",
             );
             for (fields, 0..) |field, index| {
                 if (index > 0) try append(output, allocator, ", ");
-                const key = try std.fmt.allocPrint(
+                const field_name = try std.fmt.allocPrint(
                     allocator,
-                    "try runtime.string(context, \"{f}\"), ",
+                    "\"{f}\"",
                     .{std.zig.fmtString(field.name)},
                 );
-                defer allocator.free(key);
-                try append(output, allocator, key);
+                defer allocator.free(field_name);
+                try append(output, allocator, field_name);
+            }
+            try append(output, allocator, "}, &[_]Value{");
+            for (fields, 0..) |field, index| {
+                if (index > 0) try append(output, allocator, ", ");
                 try emit_expr(
                     output,
                     allocator,
@@ -2235,6 +2409,53 @@ fn emit_expr(
                 params,
             );
         },
+        .case_expr => |case_value| {
+            const label = try std.fmt.allocPrint(
+                allocator,
+                "case_value_{d}",
+                .{expression_identity(module, expr)},
+            );
+            defer allocator.free(label);
+            try append(output, allocator, label);
+            try append(output, allocator, ": {");
+            for (case_value.arms) |arm| {
+                try append(output, allocator, " if (");
+                try emit_boolean_expr(
+                    output,
+                    allocator,
+                    module,
+                    arm.cond,
+                    params,
+                );
+                try append(output, allocator, ") break :");
+                try append(output, allocator, label);
+                try append(output, allocator, " ");
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    arm.value,
+                    params,
+                );
+                try append(output, allocator, ";");
+            }
+            if (case_value.otherwise) |otherwise| {
+                try append(output, allocator, " break :");
+                try append(output, allocator, label);
+                try append(output, allocator, " ");
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    otherwise,
+                    params,
+                );
+                try append(output, allocator, ";");
+            } else {
+                try append(output, allocator, " return Error.TypeError;");
+            }
+            try append(output, allocator, " }");
+        },
         .apply => |application| {
             if (application.func.* == .ident) {
                 if (constant_substitution_name(
@@ -2284,7 +2505,7 @@ fn emit_expr(
                         return;
                     }
                 }
-                if (direct_native_name(application.func.ident)) |native_name| {
+                if (direct_native_name(module, application.func.ident)) |native_name| {
                     if (std.mem.eql(u8, native_name, "function_range") and
                         application.args.len == 1)
                     {
@@ -2345,55 +2566,10 @@ fn emit_expr(
                 try append(output, allocator, ")");
                 return;
             }
-            if (is_reduce_sequence_call(application)) {
-                const lambda = application.args[0].*.lambda;
-                try append(
-                    output,
-                    allocator,
-                    "try runtime.reduce_sequence(context, args, ",
-                );
-                try emit_expr(
-                    output,
-                    allocator,
-                    module,
-                    application.args[1],
-                    params,
-                );
-                try append(output, allocator, ", ");
-                try emit_expr(
-                    output,
-                    allocator,
-                    module,
-                    application.args[2],
-                    params,
-                );
-                const helper = try helper_name(
-                    allocator,
-                    expression_identity(module, application.args[0]),
-                );
-                defer allocator.free(helper);
-                try append(output, allocator, ", ");
-                try append(output, allocator, helper);
-                try append(output, allocator, ")");
-                std.debug.assert(lambda.params.len == 2);
-                return;
-            }
             if (variable_application_index(
                 module,
                 application,
             )) |variable| {
-                if (static_field_application(module, application)) |field_path| {
-                    try emit_static_field_path_call(
-                        output,
-                        allocator,
-                        module,
-                        "variable_path_field",
-                        field_path,
-                        params,
-                        null,
-                    );
-                    return;
-                }
                 const prefix = try std.fmt.allocPrint(
                     allocator,
                     "try runtime.variable_path(context, {d}, &[_]Value{{",
@@ -2467,7 +2643,7 @@ fn emit_expr(
                     try append(output, allocator, "try ");
                     try append(output, allocator, function_name);
                     try append(output, allocator, "(context, &[_]Value{");
-                } else if (direct_native_name(definition.name)) |native_name| {
+                } else if (direct_native_name(module, definition.name)) |native_name| {
                     const prefix = try std.fmt.allocPrint(
                         allocator,
                         "try runtime.{s}(context, &[_]Value{{",
@@ -2497,7 +2673,7 @@ fn emit_expr(
                 try append(output, allocator, "})");
             } else {
                 if (application.func.* == .ident) {
-                    if (direct_native_name(application.func.ident)) |native_name| {
+                    if (direct_native_name(module, application.func.ident)) |native_name| {
                         const prefix = try std.fmt.allocPrint(
                             allocator,
                             "try runtime.{s}(context, &[_]Value{{",
@@ -2609,7 +2785,7 @@ fn operator_supported(
 ) bool {
     if (depth > 64 or
         definition.is_function or
-        definition_kind_shallow(definition) != .generated)
+        definition_kind_shallow(module, definition) != .generated)
     {
         return false;
     }
@@ -2621,13 +2797,17 @@ fn operator_supported(
     );
 }
 
-fn definition_kind_shallow(definition: ast.Definition) DefinitionKind {
+fn definition_kind_shallow(
+    module: ast.Module,
+    definition: ast.Definition,
+) DefinitionKind {
     if (!is_codegen_definition_name(definition.name) or
         is_native_override(definition.name))
     {
         return .native;
     }
     if (definition.is_function) return .unsupported;
+    if (direct_native_name(module, definition.name) != null) return .native;
     return .generated;
 }
 
@@ -2872,6 +3052,19 @@ fn expr_supported_impl(
                 params,
                 depth,
             ),
+        .case_expr => |case_value| blk: {
+            for (case_value.arms) |arm| {
+                if (!expr_supported(module, arm.cond, params, depth) or
+                    !expr_supported(module, arm.value, params, depth))
+                {
+                    break :blk false;
+                }
+            }
+            if (case_value.otherwise) |otherwise| {
+                break :blk expr_supported(module, otherwise, params, depth);
+            }
+            break :blk true;
+        },
         .apply => |application| blk: {
             if (application.func.* == .ident and
                 constant_substitution_name(
@@ -2904,40 +3097,8 @@ fn expr_supported_impl(
                     depth,
                 );
             }
-            if (is_reduce_sequence_call(application)) {
-                const lambda = application.args[0].*.lambda;
-                if (lambda.params.len != 2 or
-                    params.len + lambda.params.len > 64 or
-                    !expr_supported(
-                        module,
-                        application.args[1],
-                        params,
-                        depth,
-                    ) or
-                    !expr_supported(
-                        module,
-                        application.args[2],
-                        params,
-                        depth,
-                    ))
-                {
-                    break :blk false;
-                }
-                var extended: [64][]const u8 = undefined;
-                @memcpy(extended[0..params.len], params);
-                @memcpy(
-                    extended[params.len..][0..lambda.params.len],
-                    lambda.params,
-                );
-                break :blk expr_supported(
-                    module,
-                    lambda.body,
-                    extended[0 .. params.len + lambda.params.len],
-                    depth,
-                );
-            }
             if (application.func.* == .ident and
-                direct_native_name(application.func.ident) != null)
+                direct_native_name(module, application.func.ident) != null)
             {
                 for (application.args) |argument| {
                     if (!expr_supported(
@@ -3370,55 +3531,6 @@ fn emit_helpers(
                 );
                 return;
             }
-            if (is_reduce_sequence_call(application)) {
-                const lambda_expr = application.args[0];
-                const lambda = lambda_expr.*.lambda;
-                var extended: [64][]const u8 = undefined;
-                @memcpy(extended[0..params.len], params);
-                @memcpy(
-                    extended[params.len..][0..lambda.params.len],
-                    lambda.params,
-                );
-                const helper = try helper_name(
-                    allocator,
-                    expression_identity(module, lambda_expr),
-                );
-                defer allocator.free(helper);
-                try emit_named_helper(
-                    output,
-                    allocator,
-                    module,
-                    helper,
-                    lambda.body,
-                    extended[0 .. params.len + lambda.params.len],
-                    emitted_helpers,
-                );
-                try emit_helpers(
-                    output,
-                    allocator,
-                    module,
-                    lambda.body,
-                    extended[0 .. params.len + lambda.params.len],
-                    emitted_helpers,
-                );
-                try emit_helpers(
-                    output,
-                    allocator,
-                    module,
-                    application.args[1],
-                    params,
-                    emitted_helpers,
-                );
-                try emit_helpers(
-                    output,
-                    allocator,
-                    module,
-                    application.args[2],
-                    params,
-                    emitted_helpers,
-                );
-                return;
-            }
             try emit_helpers(
                 output,
                 allocator,
@@ -3596,11 +3708,6 @@ fn let_supported(
     );
 }
 
-fn is_reduce_sequence_call(application: *const ast.Apply) bool {
-    _ = application;
-    return false;
-}
-
 fn is_select_sequence_call(application: *const ast.Apply) bool {
     if (application.func.* != .ident or
         application.args.len != 2 or
@@ -3614,9 +3721,40 @@ fn is_select_sequence_call(application: *const ast.Apply) bool {
     return std.mem.eql(u8, unqualified, "SelectSeq");
 }
 
-fn direct_native_name(name: []const u8) ?[]const u8 {
+fn is_sequence_index_call(application: *const ast.Apply) bool {
+    if (application.func.* != .ident or application.args.len != 2) return false;
+    const name = operator_unqualified_name(application.func.ident);
+    return std.mem.eql(u8, name, "Index");
+}
+
+fn expr_same_shape(left: *const ast.Expr, right: *const ast.Expr) bool {
+    if (std.meta.activeTag(left.*) != std.meta.activeTag(right.*)) return false;
+    return switch (left.*) {
+        .ident => |name| std.mem.eql(u8, name, right.ident),
+        .int_literal => |value| value == right.int_literal,
+        .string_literal => |value| std.mem.eql(u8, value, right.string_literal),
+        .bool_literal => |value| value == right.bool_literal,
+        .field => |field| std.mem.eql(u8, field.name, right.field.name) and
+            expr_same_shape(field.expr, right.field.expr),
+        .apply => |application| blk: {
+            const other = right.apply;
+            if (!expr_same_shape(application.func, other.func) or
+                application.args.len != other.args.len)
+            {
+                break :blk false;
+            }
+            for (application.args, other.args) |left_arg, right_arg| {
+                if (!expr_same_shape(left_arg, right_arg)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn direct_native_name(module: ast.Module, name: []const u8) ?[]const u8 {
     const unqualified = standard_native_unqualified_name(name) orelse
-        return null;
+        operator_unqualified_name(name);
     const direct = [_]struct {
         tla: []const u8,
         zig: []const u8,
@@ -3626,8 +3764,14 @@ fn direct_native_name(name: []const u8) ?[]const u8 {
         .{ .tla = "Head", .zig = "sequence_head" },
         .{ .tla = "Tail", .zig = "sequence_tail" },
         .{ .tla = "Append", .zig = "sequence_append" },
+        .{ .tla = "SubSeq", .zig = "sequence_subseq" },
         .{ .tla = "Seq", .zig = "sequence_set" },
+        .{ .tla = "Range", .zig = "function_range" },
+        .{ .tla = "SeqToSet", .zig = "sequence_to_set" },
+        .{ .tla = "Index", .zig = "sequence_index" },
         .{ .tla = "Permutations", .zig = "permutations" },
+        .{ .tla = "PermSeqs", .zig = "permutation_sequences" },
+        .{ .tla = "INTERSECTION", .zig = "intersection_all" },
         .{ .tla = "SetToBag", .zig = "set_to_bag" },
         .{ .tla = "(+)", .zig = "bag_cup" },
         .{ .tla = "BagCup", .zig = "bag_cup" },
@@ -3635,9 +3779,173 @@ fn direct_native_name(name: []const u8) ?[]const u8 {
         .{ .tla = "BagDiff", .zig = "bag_difference" },
     };
     for (direct) |entry| {
-        if (std.mem.eql(u8, unqualified, entry.tla)) return entry.zig;
+        if (std.mem.eql(u8, unqualified, entry.tla)) {
+            if (direct_helper_requires_shape(entry.tla) and
+                !direct_helper_definition_matches(module, name, entry.tla))
+            {
+                return null;
+            }
+            return entry.zig;
+        }
     }
     return null;
+}
+
+fn direct_helper_requires_shape(name: []const u8) bool {
+    const helpers = [_][]const u8{
+        "Range",
+        "SeqToSet",
+        "Index",
+        "PermSeqs",
+        "INTERSECTION",
+    };
+    for (helpers) |helper| {
+        if (std.mem.eql(u8, name, helper)) return true;
+    }
+    return false;
+}
+
+fn direct_helper_definition_matches(
+    module: ast.Module,
+    name: []const u8,
+    helper: []const u8,
+) bool {
+    const resolved = resolved_definition_name(module, name) orelse name;
+    const definition = find_definition(module, resolved) orelse return false;
+    if (std.mem.eql(u8, helper, "Range") or
+        std.mem.eql(u8, helper, "SeqToSet"))
+    {
+        return range_like_helper_definition(definition);
+    }
+    if (std.mem.eql(u8, helper, "Index")) {
+        return index_helper_definition(definition);
+    }
+    if (std.mem.eql(u8, helper, "INTERSECTION")) {
+        return intersection_helper_definition(definition);
+    }
+    if (std.mem.eql(u8, helper, "PermSeqs")) {
+        return permutation_sequences_helper_definition(definition);
+    }
+    return false;
+}
+
+fn range_like_helper_definition(definition: ast.Definition) bool {
+    if (definition.params.len != 1 or definition.body.* != .set_map) {
+        return false;
+    }
+    const parameter = definition.params[0];
+    const map_value = definition.body.set_map;
+    if (map_value.vars.len != 1) return false;
+    const bound = map_value.vars[0].name;
+    return expr_is_domain_of_identifier(map_value.vars[0].domain, parameter) and
+        expr_is_application_of_identifier(map_value.value, parameter, bound);
+}
+
+fn index_helper_definition(definition: ast.Definition) bool {
+    if (definition.params.len != 2 or definition.body.* != .choose) return false;
+    const sequence_name = definition.params[0];
+    const element_name = definition.params[1];
+    const choose_value = definition.body.choose;
+    const domain = choose_value.domain orelse return false;
+    if (!expr_is_one_to_len_of_identifier(
+        domain,
+        sequence_name,
+    )) return false;
+    if (choose_value.body.* != .binary or
+        choose_value.body.binary.op != .eq)
+    {
+        return false;
+    }
+    const left = choose_value.body.binary.left;
+    const right = choose_value.body.binary.right;
+    return (expr_is_application_of_identifier(
+        left,
+        sequence_name,
+        choose_value.var_name,
+    ) and expr_is_identifier(right, element_name)) or
+        (expr_is_application_of_identifier(
+            right,
+            sequence_name,
+            choose_value.var_name,
+        ) and expr_is_identifier(left, element_name));
+}
+
+fn intersection_helper_definition(definition: ast.Definition) bool {
+    if (definition.params.len != 1 or definition.body.* != .apply) return false;
+    const parameter = definition.params[0];
+    const application = definition.body.apply;
+    if (application.func.* != .ident or
+        !std.mem.eql(u8, operator_unqualified_name(application.func.ident), "ReduceSet") or
+        application.args.len != 3)
+    {
+        return false;
+    }
+    return expr_is_identifier(application.args[1], parameter) and
+        application.args[2].* == .unary and
+        application.args[2].unary.op == .union_all and
+        expr_is_identifier(application.args[2].unary.operand, parameter);
+}
+
+fn permutation_sequences_helper_definition(definition: ast.Definition) bool {
+    if (definition.params.len != 1 or definition.body.* != .let_in) return false;
+    const parameter = definition.params[0];
+    const let_value = definition.body.let_in;
+    if (let_value.defs.len != 1 or !let_value.defs[0].is_function) {
+        return false;
+    }
+    if (let_value.body.* != .apply) return false;
+    const application = let_value.body.apply;
+    return application.func.* == .ident and
+        std.mem.eql(u8, application.func.ident, let_value.defs[0].name) and
+        application.args.len == 1 and
+        expr_is_identifier(application.args[0], parameter);
+}
+
+fn expr_is_identifier(expr: *const ast.Expr, name: []const u8) bool {
+    return expr.* == .ident and std.mem.eql(u8, expr.ident, name);
+}
+
+fn expr_is_domain_of_identifier(expr: *const ast.Expr, name: []const u8) bool {
+    return expr.* == .unary and
+        expr.unary.op == .domain and
+        expr_is_identifier(expr.unary.operand, name);
+}
+
+fn expr_is_application_of_identifier(
+    expr: *const ast.Expr,
+    function_name: []const u8,
+    argument_name: []const u8,
+) bool {
+    if (expr.* != .apply) return false;
+    const application = expr.apply;
+    return application.func.* == .ident and
+        std.mem.eql(u8, application.func.ident, function_name) and
+        application.args.len == 1 and
+        expr_is_identifier(application.args[0], argument_name);
+}
+
+fn expr_is_one_to_len_of_identifier(
+    expr: *const ast.Expr,
+    name: []const u8,
+) bool {
+    if (expr.* != .binary or expr.binary.op != .range) return false;
+    if (expr.binary.left.* != .int_literal or
+        expr.binary.left.int_literal != 1 or
+        expr.binary.right.* != .apply)
+    {
+        return false;
+    }
+    const application = expr.binary.right.apply;
+    return application.func.* == .ident and
+        std.mem.eql(u8, operator_unqualified_name(application.func.ident), "Len") and
+        application.args.len == 1 and
+        expr_is_identifier(application.args[0], name);
+}
+
+fn operator_unqualified_name(name: []const u8) []const u8 {
+    const separator = std.mem.lastIndexOfScalar(u8, name, '!') orelse
+        return name;
+    return name[separator + 1 ..];
 }
 
 fn builtin_value_runtime_name(name: []const u8) ?[]const u8 {
@@ -3751,7 +4059,7 @@ fn emit_let_helpers(
         extended[0 .. params.len + let_value.defs.len],
         emitted_helpers,
     );
-    if (expr_is_boolean(module, let_value.body, 0)) {
+    if (expr_can_emit_boolean(module, let_value.body, 0)) {
         try emit_lazy_boolean_let(
             output,
             allocator,
@@ -4812,23 +5120,23 @@ fn mark_reachable_expr(
                 if (constant_substitution_name(module, name) != null) {
                     return;
                 }
-                if (resolved_definition_name(module, name)) |resolved_name| {
+                if (is_select_sequence_call(application) or
+                    direct_native_name(module, name) != null or
+                    is_native_override(name))
+                {
+                    // These calls are lowered directly by codegen/runtime.
+                } else if (resolved_definition_name(module, name)) |resolved_name| {
                     if (find_definition_index(module, resolved_name)) |index| {
                         mark_definition(module, reachable, index);
                     }
-                } else if (!is_reduce_sequence_call(application) and
-                    !is_select_sequence_call(application) and
-                    !is_native_override(name))
-                {
+                } else {
                     mark_reachable_expr(
                         module,
                         reachable,
                         application.func,
                     );
                 }
-            } else if (!is_reduce_sequence_call(application) and
-                !is_select_sequence_call(application))
-            {
+            } else if (!is_select_sequence_call(application)) {
                 mark_reachable_expr(
                     module,
                     reachable,
@@ -5027,8 +5335,7 @@ fn collect_generated_expressions(
                 ) != null;
             const native_call = application.func.* == .ident and
                 is_native_override(application.func.*.ident);
-            if (!is_reduce_sequence_call(application) and
-                !is_select_sequence_call(application) and
+            if (!is_select_sequence_call(application) and
                 !native_call and
                 !resolved_call)
             {
@@ -5289,8 +5596,7 @@ fn visit_expression(
                 ) != null;
             const native_call = application.func.* == .ident and
                 is_native_override(application.func.*.ident);
-            if (!is_reduce_sequence_call(application) and
-                !is_select_sequence_call(application) and
+            if (!is_select_sequence_call(application) and
                 !native_call and
                 !resolved_call)
             {
@@ -5975,32 +6281,6 @@ fn emit_field_path_membership(
     return true;
 }
 
-fn emit_static_field_path_membership(
-    output: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    module: ast.Module,
-    binary: *const ast.Binary,
-    params: []const []const u8,
-) error{OutOfMemory}!bool {
-    if (binary.left.* != .apply) return false;
-    const field_path = static_field_application(
-        module,
-        binary.left.apply,
-    ) orelse return false;
-    if (binary.op == .notin) try append(output, allocator, "!(");
-    try emit_static_field_path_call(
-        output,
-        allocator,
-        module,
-        "variable_path_field_member_bool",
-        field_path,
-        params,
-        binary.right,
-    );
-    if (binary.op == .notin) try append(output, allocator, ")");
-    return true;
-}
-
 const MembershipResult = enum {
     boolean,
     value,
@@ -6149,84 +6429,11 @@ fn emit_field_path_call(
     try append(output, allocator, ")");
 }
 
-fn emit_static_field_path_call(
-    output: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    module: ast.Module,
-    function_name: []const u8,
-    field_path: StaticFieldPath,
-    params: []const []const u8,
-    extra_arg: ?*const ast.Expr,
-) error{OutOfMemory}!void {
-    const prefix = try std.fmt.allocPrint(
-        allocator,
-        "try runtime.{s}(context, {d}, &[_]Value{{",
-        .{ function_name, field_path.variable },
-    );
-    defer allocator.free(prefix);
-    try append(output, allocator, prefix);
-    if (field_path.prefix_application) |prefix_application| {
-        try emit_variable_application_keys(
-            output,
-            allocator,
-            module,
-            prefix_application,
-            params,
-        );
-    }
-    const middle = try std.fmt.allocPrint(
-        allocator,
-        "}}, \"{f}\"",
-        .{std.zig.fmtString(field_path.field_name)},
-    );
-    defer allocator.free(middle);
-    try append(output, allocator, middle);
-    if (extra_arg) |argument| {
-        try append(output, allocator, ", ");
-        try emit_expr(output, allocator, module, argument, params);
-    }
-    try append(output, allocator, ")");
-}
-
 const SequenceHeadFieldPath = struct {
     variable: u32,
     application: *const ast.Apply,
     field_name: []const u8,
 };
-
-const StaticFieldPath = struct {
-    variable: u32,
-    prefix_application: ?*const ast.Apply,
-    field_name: []const u8,
-};
-
-fn static_field_application(
-    module: ast.Module,
-    application: *const ast.Apply,
-) ?StaticFieldPath {
-    if (application.args.len != 1) return null;
-    if (application.args[0].* != .string_literal) return null;
-    switch (application.func.*) {
-        .ident => |name| {
-            const index = variable_index(module, name) orelse return null;
-            return .{
-                .variable = @intCast(index),
-                .prefix_application = null,
-                .field_name = application.args[0].string_literal,
-            };
-        },
-        .apply => |parent| {
-            const variable = variable_application_index(module, parent) orelse
-                return null;
-            return .{
-                .variable = variable,
-                .prefix_application = parent,
-                .field_name = application.args[0].string_literal,
-            };
-        },
-        else => return null,
-    }
-}
 
 fn direct_field_path(
     module: ast.Module,
@@ -6279,42 +6486,6 @@ fn emit_variable_path_comparison(
     binary: *const ast.Binary,
     params: []const []const u8,
 ) error{OutOfMemory}!bool {
-    if (binary.left.* == .apply and binary.right.* != .apply) {
-        if (static_field_application(module, binary.left.apply)) |field_path| {
-            const function_name = if (binary.op == .eq)
-                "variable_path_field_equal_bool"
-            else
-                "variable_path_field_not_equal_bool";
-            try emit_static_field_path_call(
-                output,
-                allocator,
-                module,
-                function_name,
-                field_path,
-                params,
-                binary.right,
-            );
-            return true;
-        }
-    }
-    if (binary.right.* == .apply and binary.left.* != .apply) {
-        if (static_field_application(module, binary.right.apply)) |field_path| {
-            const function_name = if (binary.op == .eq)
-                "variable_path_field_equal_bool"
-            else
-                "variable_path_field_not_equal_bool";
-            try emit_static_field_path_call(
-                output,
-                allocator,
-                module,
-                function_name,
-                field_path,
-                params,
-                binary.left,
-            );
-            return true;
-        }
-    }
     if (binary.left.* == .apply and binary.right.* != .apply) {
         if (variable_application_index(module, binary.left.apply)) |index| {
             return try emit_one_sided_path_comparison(
@@ -6418,24 +6589,6 @@ fn emit_variable_path_int_comparison(
         return true;
     }
     if (binary.left.* == .apply) {
-        if (static_field_application(module, binary.left.apply)) |field_path| {
-            if (binary.right.* == .apply and
-                variable_application_index(module, binary.right.apply) != null)
-            {
-                return false;
-            }
-            try emit_static_field_path_int_compare_call(
-                output,
-                allocator,
-                module,
-                field_path,
-                binary.right,
-                compare_op,
-                true,
-                params,
-            );
-            return true;
-        }
         if (variable_application_index(module, binary.left.apply)) |variable| {
             if (binary.right.* == .apply and
                 variable_application_index(module, binary.right.apply) != null)
@@ -6457,19 +6610,6 @@ fn emit_variable_path_int_comparison(
         }
     }
     if (binary.right.* == .apply) {
-        if (static_field_application(module, binary.right.apply)) |field_path| {
-            try emit_static_field_path_int_compare_call(
-                output,
-                allocator,
-                module,
-                field_path,
-                binary.left,
-                compare_op,
-                false,
-                params,
-            );
-            return true;
-        }
         if (variable_application_index(module, binary.right.apply)) |variable| {
             try emit_variable_path_int_compare_call(
                 output,
@@ -6486,6 +6626,45 @@ fn emit_variable_path_int_comparison(
         }
     }
     return false;
+}
+
+fn emit_sequence_index_order_comparison(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    binary: *const ast.Binary,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    const inclusive = switch (binary.op) {
+        .lt => false,
+        .le => true,
+        else => return false,
+    };
+    if (binary.left.* != .apply or binary.right.* != .apply) return false;
+    const left = binary.left.apply;
+    const right = binary.right.apply;
+    if (!is_sequence_index_call(left) or !is_sequence_index_call(right)) {
+        return false;
+    }
+    if (!expr_same_shape(left.args[0], right.args[0])) return false;
+    try append(
+        output,
+        allocator,
+        "try runtime.sequence_index_order_bool(context, &[_]Value{",
+    );
+    try emit_expr(output, allocator, module, left.args[0], params);
+    try append(output, allocator, ", ");
+    try emit_expr(output, allocator, module, left.args[1], params);
+    try append(output, allocator, ", ");
+    try emit_expr(output, allocator, module, right.args[1], params);
+    const suffix = try std.fmt.allocPrint(
+        allocator,
+        "}}, {s})",
+        .{if (inclusive) "true" else "false"},
+    );
+    defer allocator.free(suffix);
+    try append(output, allocator, suffix);
+    return true;
 }
 
 fn emit_variable_path_int_compare_call(
@@ -6565,55 +6744,6 @@ fn emit_field_path_int_compare_call(
     try append(output, allocator, suffix);
 }
 
-fn emit_static_field_path_int_compare_call(
-    output: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    module: ast.Module,
-    field_path: StaticFieldPath,
-    other: *const ast.Expr,
-    compare_op: []const u8,
-    path_left: bool,
-    params: []const []const u8,
-) error{OutOfMemory}!void {
-    const prefix = try std.fmt.allocPrint(
-        allocator,
-        "try runtime.variable_path_field_int_compare_bool(context, {d}, &[_]Value{{",
-        .{field_path.variable},
-    );
-    defer allocator.free(prefix);
-    try append(output, allocator, prefix);
-    if (field_path.prefix_application) |prefix_application| {
-        try emit_variable_application_keys(
-            output,
-            allocator,
-            module,
-            prefix_application,
-            params,
-        );
-    }
-    const middle = try std.fmt.allocPrint(
-        allocator,
-        "}}, \"{f}\", ",
-        .{std.zig.fmtString(field_path.field_name)},
-    );
-    defer allocator.free(middle);
-    try append(output, allocator, middle);
-    try emit_expr(
-        output,
-        allocator,
-        module,
-        other,
-        params,
-    );
-    const suffix = try std.fmt.allocPrint(
-        allocator,
-        ", .{s}, {s})",
-        .{ compare_op, if (path_left) "true" else "false" },
-    );
-    defer allocator.free(suffix);
-    try append(output, allocator, suffix);
-}
-
 fn compare_op_literal(op: ast.BinaryOp) ?[]const u8 {
     return switch (op) {
         .lt => "lt",
@@ -6684,12 +6814,12 @@ fn emit_one_sided_primed_except_update_comparison(
                 if (operator == .ne) try append(output, allocator, "!(");
                 const prefix = try std.fmt.allocPrint(
                     allocator,
-                    "try runtime.primed_variable_double_except_update_equal_bool(context, args, {d}, &[_]Value{{",
+                    "try runtime.primed_variable_double_except_update_path_equal_bool(context, args, {d}, &[_]runtime.PathKey{{",
                     .{variable},
                 );
                 defer allocator.free(prefix);
                 try append(output, allocator, prefix);
-                try emit_except_update_steps(
+                try emit_except_update_path_steps(
                     output,
                     allocator,
                     module,
@@ -6703,8 +6833,8 @@ fn emit_one_sided_primed_except_update_comparison(
                 defer allocator.free(inner_helper);
                 try append(output, allocator, "}, ");
                 try append(output, allocator, inner_helper);
-                try append(output, allocator, ", &[_]Value{");
-                try emit_except_update_steps(
+                try append(output, allocator, ", &[_]runtime.PathKey{");
+                try emit_except_update_path_steps(
                     output,
                     allocator,
                     module,
@@ -6733,12 +6863,12 @@ fn emit_one_sided_primed_except_update_comparison(
     if (operator == .ne) try append(output, allocator, "!(");
     const prefix = try std.fmt.allocPrint(
         allocator,
-        "try runtime.primed_variable_except_update_equal_bool(context, args, {d}, &[_]Value{{",
+        "try runtime.primed_variable_except_update_path_equal_bool(context, args, {d}, &[_]runtime.PathKey{{",
         .{variable},
     );
     defer allocator.free(prefix);
     try append(output, allocator, prefix);
-    try emit_except_update_steps(
+    try emit_except_update_path_steps(
         output,
         allocator,
         module,
@@ -6882,6 +7012,50 @@ fn emit_except_update_steps(
                 index_expr,
                 params,
             ),
+        }
+    }
+}
+
+fn emit_except_update_path_steps(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    steps: []const ast.AccessStep,
+    params: []const []const u8,
+) error{OutOfMemory}!void {
+    for (steps, 0..) |step, index| {
+        if (index > 0) try append(output, allocator, ", ");
+        switch (step) {
+            .field => |field_name| {
+                const field = try std.fmt.allocPrint(
+                    allocator,
+                    ".{{ .field = \"{f}\" }}",
+                    .{std.zig.fmtString(field_name)},
+                );
+                defer allocator.free(field);
+                try append(output, allocator, field);
+            },
+            .index => |index_expr| {
+                if (index_expr.* == .string_literal) {
+                    const field = try std.fmt.allocPrint(
+                        allocator,
+                        ".{{ .field = \"{f}\" }}",
+                        .{std.zig.fmtString(index_expr.string_literal)},
+                    );
+                    defer allocator.free(field);
+                    try append(output, allocator, field);
+                } else {
+                    try append(output, allocator, ".{ .value = ");
+                    try emit_expr(
+                        output,
+                        allocator,
+                        module,
+                        index_expr,
+                        params,
+                    );
+                    try append(output, allocator, " }");
+                }
+            },
         }
     }
 }
@@ -7046,6 +7220,7 @@ test "emit scalar and direct native operators without fallbacks" {
         \\Inc(x) == x + 1
         \\Positive(x) == Inc(x) > 0
         \\Unsupported(S) == Cardinality(S)
+        \\Sub == SubSeq(<<1, 2>>, 1, 1)
         \\==============================================================
         \\
     ;
@@ -7059,7 +7234,7 @@ test "emit scalar and direct native operators without fallbacks" {
     );
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u32, 3), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 4), result.generated_count);
     try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
     try std.testing.expectEqual(@as(usize, 0), result.unsupported.len);
     try std.testing.expect(
@@ -7072,6 +7247,11 @@ test "emit scalar and direct native operators without fallbacks" {
         u8,
         result.source,
         "runtime.cardinality(context",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.sequence_subseq(context",
     ) != null);
 }
 
@@ -7267,4 +7447,158 @@ test "generated binary operators do not use named native dispatch" {
     try std.testing.expect(
         std.mem.indexOf(u8, result.source, "runtime.sequence_set(") != null,
     );
+}
+
+test "generated record literals use static field names" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE StaticRecordGeneration ----------------------
+        \\Record == [op |-> "read", key |-> 1]
+        \\============================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module(std.testing.allocator, module);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.record_static(context",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.record(context, &[_]Value{ try runtime.string(context,",
+    ) == null);
+}
+
+test "direct helper lowering requires recognized helper body" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE HelperShape ----------------------
+        \\Range(f) == {f[x] : x \in DOMAIN f}
+        \\Use(f) == Range(f)
+        \\================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module(std.testing.allocator, module);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 1), result.native_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "runtime.function_range(") != null,
+    );
+}
+
+test "shadowed direct helper name stays generated when body differs" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE HelperShadow ----------------------
+        \\Range(x) == 42
+        \\Use == Range(1)
+        \\================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module(std.testing.allocator, module);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.native_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "runtime.function_range(") == null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "try op_0(context") != null,
+    );
+}
+
+test "generated CASE expressions work inside function literals" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedCase ----------------------
+        \\VARIABLE pc
+        \\ProcSet == {"Router"} \cup {1}
+        \\Init == pc = [self \in ProcSet |->
+        \\    CASE self = "Router" -> "ROUTER"
+        \\      [] self \in {1} -> "TXN"]
+        \\Next == UNCHANGED pc
+        \\==================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Init", "Next" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expectEqual(@as(usize, 0), result.unsupported.len);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "case_value_") != null,
+    );
+}
+
+test "selected type invariant emits integer range type facts" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE TypeFacts ----------------------
+        \\VARIABLE x, y
+        \\TypeOK == /\ x \in 0..2
+        \\          /\ y \in -1..1
+        \\Init == TypeOK
+        \\Next == UNCHANGED <<x, y>>
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_options(
+        std.testing.allocator,
+        module,
+        .{
+            .extra_roots = &.{ "Init", "Next", "TypeOK" },
+            .type_invariants = &.{"TypeOK"},
+        },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        ".{ .variable_index = 0, .min_int = 0, .max_int = 2 }",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        ".{ .variable_index = 1, .min_int = -1, .max_int = 1 }",
+    ) != null);
 }

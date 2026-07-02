@@ -39,6 +39,11 @@ pub const CallContext = struct {
 pub const OperatorFn = *const fn (*CallContext, []const Value) Error!Value;
 pub const OperatorBoolFn = *const fn (*CallContext, []const Value) Error!bool;
 
+pub const PathKey = union(enum) {
+    value: Value,
+    field: []const u8,
+};
+
 pub const QuantifierKind = enum {
     exists,
     forall,
@@ -183,6 +188,34 @@ pub fn primed_variable_except_update_equal_bool(
     );
 }
 
+pub fn primed_variable_except_update_path_equal_bool(
+    context: *CallContext,
+    operator_args: []const Value,
+    index: u32,
+    path: []const PathKey,
+    updater: OperatorFn,
+) Error!bool {
+    var current_pool: *const ValuePool = context.eval_pool;
+    const current = try resolve_current_variable(
+        context,
+        index,
+        &current_pool,
+    );
+    var next_pool: *const ValuePool = context.eval_pool;
+    const next = try resolve_primed_variable(context, index, &next_pool);
+    return try equal_except_update_path_keys(
+        context,
+        operator_args,
+        next,
+        next_pool,
+        current,
+        current_pool,
+        path,
+        0,
+        updater,
+    );
+}
+
 pub fn primed_variable_double_except_update_equal_bool(
     context: *CallContext,
     operator_args: []const Value,
@@ -201,6 +234,39 @@ pub fn primed_variable_double_except_update_equal_bool(
     var next_pool: *const ValuePool = context.eval_pool;
     const next = try resolve_primed_variable(context, index, &next_pool);
     return try equal_double_except_update_path(
+        context,
+        operator_args,
+        next,
+        next_pool,
+        current,
+        current_pool,
+        path_a,
+        0,
+        updater_a,
+        path_b,
+        0,
+        updater_b,
+    );
+}
+
+pub fn primed_variable_double_except_update_path_equal_bool(
+    context: *CallContext,
+    operator_args: []const Value,
+    index: u32,
+    path_a: []const PathKey,
+    updater_a: OperatorFn,
+    path_b: []const PathKey,
+    updater_b: OperatorFn,
+) Error!bool {
+    var current_pool: *const ValuePool = context.eval_pool;
+    const current = try resolve_current_variable(
+        context,
+        index,
+        &current_pool,
+    );
+    var next_pool: *const ValuePool = context.eval_pool;
+    const next = try resolve_primed_variable(context, index, &next_pool);
+    return try equal_double_except_update_path_keys(
         context,
         operator_args,
         next,
@@ -246,6 +312,11 @@ pub fn unchanged_variable(
     if (index >= current.values.len or index >= next.values.len) {
         return Error.TypeError;
     }
+    if (index < 64 and
+        (next.changed_mask & (@as(u64, 1) << @intCast(index))) == 0)
+    {
+        return true;
+    }
     return Value.eql_cross_pool(
         current.values[index],
         current.value_pool(index, context.state_pool),
@@ -263,6 +334,11 @@ pub fn unchanged_variables(
     for (indices) |index| {
         if (index >= current.values.len or index >= next.values.len) {
             return Error.TypeError;
+        }
+        if (index < 64 and
+            (next.changed_mask & (@as(u64, 1) << @intCast(index))) == 0)
+        {
+            continue;
         }
         if (!Value.eql_cross_pool(
             current.values[index],
@@ -763,7 +839,16 @@ fn member_cross_pool(
 ) Error!bool {
     const materialized = try materialize_iterable(context, set_value);
     if (materialized != .set_v) return Error.TypeError;
-    for (materialized.set_v.items(context.eval_pool)) |item| {
+    const items = materialized.set_v.items(context.eval_pool);
+    if (dense_set_contains_probe(
+        items,
+        context.eval_pool,
+        value,
+        value_pool,
+    )) |contains| {
+        return contains;
+    }
+    for (items) |item| {
         if (Value.eql_cross_pool(
             item,
             context.eval_pool,
@@ -783,7 +868,16 @@ fn set_member_cross_pool(
     if (!set_value.is_set_like()) return Error.TypeError;
     switch (set_value) {
         .set_v => |set_value_items| {
-            for (set_value_items.items(set_pool)) |item| {
+            const items = set_value_items.items(set_pool);
+            if (dense_set_contains_probe(
+                items,
+                set_pool,
+                element,
+                element_pool,
+            )) |contains| {
+                return contains;
+            }
+            for (items) |item| {
                 if (Value.eql_cross_pool(
                     item,
                     set_pool,
@@ -835,6 +929,7 @@ fn equal_except_update_path(
             if (current_function.len != next_function.len) return false;
             const current_keys = current_function.domain.items(current_pool);
             const current_entries = current_function.entries(current_pool);
+            var matched = false;
             for (current_keys, current_entries) |current_key, current_entry| {
                 const next_entry = function_lookup_cross_pool(
                     next_function,
@@ -848,6 +943,7 @@ fn equal_except_update_path(
                     key,
                     context.eval_pool,
                 )) {
+                    matched = true;
                     if (!try equal_except_update_path(
                         context,
                         operator_args,
@@ -866,6 +962,7 @@ fn equal_except_update_path(
                     current_pool,
                 )) return false;
             }
+            if (!matched) return false;
             return true;
         },
         .tuple_v => |current_tuple| {
@@ -905,6 +1002,7 @@ fn equal_except_update_path(
             if (current_record.len != next_record.len) return false;
             const key_name = key.string_v.slice(context.eval_pool);
             const current_fields = current_record.fields(current_pool);
+            var matched = false;
             var field_index: u32 = 0;
             while (field_index < current_record.len) : (field_index += 1) {
                 const field_name = current_fields[field_index * 2].string_v;
@@ -914,6 +1012,7 @@ fn equal_except_update_path(
                     field_name.slice(current_pool),
                 ) orelse return false;
                 if (std.mem.eql(u8, field_name.slice(current_pool), key_name)) {
+                    matched = true;
                     if (!try equal_except_update_path(
                         context,
                         operator_args,
@@ -932,6 +1031,7 @@ fn equal_except_update_path(
                     current_pool,
                 )) return false;
             }
+            if (!matched) return false;
             return true;
         },
         else => return Error.TypeError,
@@ -1000,6 +1100,8 @@ fn equal_double_except_update_path(
             if (current_function.len != next_function.len) return false;
             const current_keys = current_function.domain.items(current_pool);
             const current_entries = current_function.entries(current_pool);
+            var matched_a = path_index_a == null;
+            var matched_b = path_index_b == null;
             for (current_keys, current_entries) |current_key, current_entry| {
                 const next_entry = function_lookup_cross_pool(
                     next_function,
@@ -1013,7 +1115,10 @@ fn equal_double_except_update_path(
                         current_pool,
                         path_a[index_a],
                         context.eval_pool,
-                    )) index_a + 1 else null
+                    )) blk: {
+                        matched_a = true;
+                        break :blk index_a + 1;
+                    } else null
                 else
                     null;
                 const child_b = if (path_index_b) |index_b|
@@ -1022,7 +1127,10 @@ fn equal_double_except_update_path(
                         current_pool,
                         path_b[index_b],
                         context.eval_pool,
-                    )) index_b + 1 else null
+                    )) blk: {
+                        matched_b = true;
+                        break :blk index_b + 1;
+                    } else null
                 else
                     null;
                 if (child_a != null or child_b != null) {
@@ -1047,6 +1155,7 @@ fn equal_double_except_update_path(
                     current_pool,
                 )) return false;
             }
+            if (!matched_a or !matched_b) return false;
             return true;
         },
         .tuple_v => |current_tuple| {
@@ -1055,23 +1164,25 @@ fn equal_double_except_update_path(
             if (current_tuple.len != next_tuple.len) return false;
             const current_items = current_tuple.items(current_pool);
             const next_items = next_tuple.items(next_pool);
+            var matched_a = path_index_a == null;
+            var matched_b = path_index_b == null;
             for (current_items, next_items, 0..) |current_item, next_item, item_index| {
                 const item_number: i64 = @intCast(item_index + 1);
                 const child_a = if (path_index_a) |index_a| blk: {
                     const raw_index = path_a[index_a].as_int() orelse
                         return Error.TypeError;
-                    break :blk if (raw_index == item_number)
-                        index_a + 1
-                    else
-                        null;
+                    break :blk if (raw_index == item_number) matched: {
+                        matched_a = true;
+                        break :matched index_a + 1;
+                    } else null;
                 } else null;
                 const child_b = if (path_index_b) |index_b| blk: {
                     const raw_index = path_b[index_b].as_int() orelse
                         return Error.TypeError;
-                    break :blk if (raw_index == item_number)
-                        index_b + 1
-                    else
-                        null;
+                    break :blk if (raw_index == item_number) matched: {
+                        matched_b = true;
+                        break :matched index_b + 1;
+                    } else null;
                 } else null;
                 if (child_a != null or child_b != null) {
                     if (!try equal_double_except_update_path(
@@ -1095,6 +1206,7 @@ fn equal_double_except_update_path(
                     current_pool,
                 )) return false;
             }
+            if (!matched_a or !matched_b) return false;
             return true;
         },
         .record_v => |current_record| {
@@ -1102,6 +1214,8 @@ fn equal_double_except_update_path(
             const next_record = next.record_v;
             if (current_record.len != next_record.len) return false;
             const current_fields = current_record.fields(current_pool);
+            var matched_a = path_index_a == null;
+            var matched_b = path_index_b == null;
             var field_index: u32 = 0;
             while (field_index < current_record.len) : (field_index += 1) {
                 const field_name = current_fields[field_index * 2].string_v;
@@ -1117,7 +1231,10 @@ fn equal_double_except_update_path(
                         u8,
                         field_name_bytes,
                         path_a[index_a].string_v.slice(context.eval_pool),
-                    )) index_a + 1 else null;
+                    )) matched: {
+                        matched_a = true;
+                        break :matched index_a + 1;
+                    } else null;
                 } else null;
                 const child_b = if (path_index_b) |index_b| blk: {
                     if (path_b[index_b] != .string_v) return Error.TypeError;
@@ -1125,7 +1242,10 @@ fn equal_double_except_update_path(
                         u8,
                         field_name_bytes,
                         path_b[index_b].string_v.slice(context.eval_pool),
-                    )) index_b + 1 else null;
+                    )) matched: {
+                        matched_b = true;
+                        break :matched index_b + 1;
+                    } else null;
                 } else null;
                 if (child_a != null or child_b != null) {
                     if (!try equal_double_except_update_path(
@@ -1149,10 +1269,426 @@ fn equal_double_except_update_path(
                     current_pool,
                 )) return false;
             }
+            if (!matched_a or !matched_b) return false;
             return true;
         },
         else => return Error.TypeError,
     }
+}
+
+fn equal_except_update_path_keys(
+    context: *CallContext,
+    operator_args: []const Value,
+    next: Value,
+    next_pool: *const ValuePool,
+    current: Value,
+    current_pool: *const ValuePool,
+    path: []const PathKey,
+    path_index: usize,
+    updater: OperatorFn,
+) Error!bool {
+    std.debug.assert(path_index <= path.len);
+
+    if (path_index == path.len) {
+        const replacement = try call_bound(
+            context,
+            operator_args,
+            &.{current},
+            updater,
+        );
+        return Value.eql_cross_pool(
+            next,
+            next_pool,
+            replacement,
+            context.eval_pool,
+        );
+    }
+
+    const key = path[path_index];
+    switch (current) {
+        .function_v => |current_function| {
+            if (next != .function_v) return false;
+            const next_function = next.function_v;
+            if (current_function.len != next_function.len) return false;
+            const current_keys = current_function.domain.items(current_pool);
+            const current_entries = current_function.entries(current_pool);
+            var matched = false;
+            for (current_keys, current_entries) |current_key, current_entry| {
+                const next_entry = function_lookup_cross_pool(
+                    next_function,
+                    next_pool,
+                    current_key,
+                    current_pool,
+                ) orelse return false;
+                if (path_key_matches_value(key, current_key, current_pool, context.eval_pool)) {
+                    matched = true;
+                    if (!try equal_except_update_path_keys(
+                        context,
+                        operator_args,
+                        next_entry,
+                        next_pool,
+                        current_entry,
+                        current_pool,
+                        path,
+                        path_index + 1,
+                        updater,
+                    )) return false;
+                } else if (!Value.eql_cross_pool(
+                    next_entry,
+                    next_pool,
+                    current_entry,
+                    current_pool,
+                )) return false;
+            }
+            if (!matched) return false;
+            return true;
+        },
+        .tuple_v => |current_tuple| {
+            if (next != .tuple_v) return false;
+            const next_tuple = next.tuple_v;
+            if (current_tuple.len != next_tuple.len) return false;
+            const raw_index = path_key_int(key) orelse return Error.TypeError;
+            if (raw_index < 1 or raw_index > current_tuple.len) return false;
+            const update_index: usize = @intCast(raw_index - 1);
+            const current_items = current_tuple.items(current_pool);
+            const next_items = next_tuple.items(next_pool);
+            for (current_items, next_items, 0..) |current_item, next_item, item_index| {
+                if (item_index == update_index) {
+                    if (!try equal_except_update_path_keys(
+                        context,
+                        operator_args,
+                        next_item,
+                        next_pool,
+                        current_item,
+                        current_pool,
+                        path,
+                        path_index + 1,
+                        updater,
+                    )) return false;
+                } else if (!Value.eql_cross_pool(
+                    next_item,
+                    next_pool,
+                    current_item,
+                    current_pool,
+                )) return false;
+            }
+            return true;
+        },
+        .record_v => |current_record| {
+            if (next != .record_v) return false;
+            const next_record = next.record_v;
+            if (current_record.len != next_record.len) return false;
+            const key_name = path_key_field(key, context.eval_pool) orelse
+                return Error.TypeError;
+            const current_fields = current_record.fields(current_pool);
+            var matched = false;
+            var field_index: u32 = 0;
+            while (field_index < current_record.len) : (field_index += 1) {
+                const field_name = current_fields[field_index * 2].string_v;
+                const field_name_bytes = field_name.slice(current_pool);
+                const current_field = current_fields[field_index * 2 + 1];
+                const next_field = next_record.lookup(
+                    next_pool,
+                    field_name_bytes,
+                ) orelse return false;
+                if (std.mem.eql(u8, field_name_bytes, key_name)) {
+                    matched = true;
+                    if (!try equal_except_update_path_keys(
+                        context,
+                        operator_args,
+                        next_field,
+                        next_pool,
+                        current_field,
+                        current_pool,
+                        path,
+                        path_index + 1,
+                        updater,
+                    )) return false;
+                } else if (!Value.eql_cross_pool(
+                    next_field,
+                    next_pool,
+                    current_field,
+                    current_pool,
+                )) return false;
+            }
+            if (!matched) return false;
+            return true;
+        },
+        else => return Error.TypeError,
+    }
+}
+
+fn equal_double_except_update_path_keys(
+    context: *CallContext,
+    operator_args: []const Value,
+    next: Value,
+    next_pool: *const ValuePool,
+    current: Value,
+    current_pool: *const ValuePool,
+    path_a: []const PathKey,
+    path_index_a: ?usize,
+    updater_a: OperatorFn,
+    path_b: []const PathKey,
+    path_index_b: ?usize,
+    updater_b: OperatorFn,
+) Error!bool {
+    const active_a = path_index_a != null;
+    const active_b = path_index_b != null;
+    if (!active_a and !active_b) {
+        return Value.eql_cross_pool(next, next_pool, current, current_pool);
+    }
+
+    if (path_index_a) |index_a| {
+        std.debug.assert(index_a <= path_a.len);
+        if (index_a == path_a.len) {
+            if (active_b) return Error.NotImplemented;
+            const replacement = try call_bound(
+                context,
+                operator_args,
+                &.{current},
+                updater_a,
+            );
+            return Value.eql_cross_pool(
+                next,
+                next_pool,
+                replacement,
+                context.eval_pool,
+            );
+        }
+    }
+    if (path_index_b) |index_b| {
+        std.debug.assert(index_b <= path_b.len);
+        if (index_b == path_b.len) {
+            if (active_a) return Error.NotImplemented;
+            const replacement = try call_bound(
+                context,
+                operator_args,
+                &.{current},
+                updater_b,
+            );
+            return Value.eql_cross_pool(
+                next,
+                next_pool,
+                replacement,
+                context.eval_pool,
+            );
+        }
+    }
+
+    switch (current) {
+        .function_v => |current_function| {
+            if (next != .function_v) return false;
+            const next_function = next.function_v;
+            if (current_function.len != next_function.len) return false;
+            const current_keys = current_function.domain.items(current_pool);
+            const current_entries = current_function.entries(current_pool);
+            var matched_a = path_index_a == null;
+            var matched_b = path_index_b == null;
+            for (current_keys, current_entries) |current_key, current_entry| {
+                const next_entry = function_lookup_cross_pool(
+                    next_function,
+                    next_pool,
+                    current_key,
+                    current_pool,
+                ) orelse return false;
+                const child_a = if (path_index_a) |index_a|
+                    if (path_key_matches_value(
+                        path_a[index_a],
+                        current_key,
+                        current_pool,
+                        context.eval_pool,
+                    )) blk: {
+                        matched_a = true;
+                        break :blk index_a + 1;
+                    } else null
+                else
+                    null;
+                const child_b = if (path_index_b) |index_b|
+                    if (path_key_matches_value(
+                        path_b[index_b],
+                        current_key,
+                        current_pool,
+                        context.eval_pool,
+                    )) blk: {
+                        matched_b = true;
+                        break :blk index_b + 1;
+                    } else null
+                else
+                    null;
+                if (child_a != null or child_b != null) {
+                    if (!try equal_double_except_update_path_keys(
+                        context,
+                        operator_args,
+                        next_entry,
+                        next_pool,
+                        current_entry,
+                        current_pool,
+                        path_a,
+                        child_a,
+                        updater_a,
+                        path_b,
+                        child_b,
+                        updater_b,
+                    )) return false;
+                } else if (!Value.eql_cross_pool(
+                    next_entry,
+                    next_pool,
+                    current_entry,
+                    current_pool,
+                )) return false;
+            }
+            if (!matched_a or !matched_b) return false;
+            return true;
+        },
+        .tuple_v => |current_tuple| {
+            if (next != .tuple_v) return false;
+            const next_tuple = next.tuple_v;
+            if (current_tuple.len != next_tuple.len) return false;
+            const current_items = current_tuple.items(current_pool);
+            const next_items = next_tuple.items(next_pool);
+            var matched_a = path_index_a == null;
+            var matched_b = path_index_b == null;
+            for (current_items, next_items, 0..) |current_item, next_item, item_index| {
+                const item_number: i64 = @intCast(item_index + 1);
+                const child_a = if (path_index_a) |index_a| blk: {
+                    const raw_index = path_key_int(path_a[index_a]) orelse
+                        return Error.TypeError;
+                    break :blk if (raw_index == item_number) matched: {
+                        matched_a = true;
+                        break :matched index_a + 1;
+                    } else null;
+                } else null;
+                const child_b = if (path_index_b) |index_b| blk: {
+                    const raw_index = path_key_int(path_b[index_b]) orelse
+                        return Error.TypeError;
+                    break :blk if (raw_index == item_number) matched: {
+                        matched_b = true;
+                        break :matched index_b + 1;
+                    } else null;
+                } else null;
+                if (child_a != null or child_b != null) {
+                    if (!try equal_double_except_update_path_keys(
+                        context,
+                        operator_args,
+                        next_item,
+                        next_pool,
+                        current_item,
+                        current_pool,
+                        path_a,
+                        child_a,
+                        updater_a,
+                        path_b,
+                        child_b,
+                        updater_b,
+                    )) return false;
+                } else if (!Value.eql_cross_pool(
+                    next_item,
+                    next_pool,
+                    current_item,
+                    current_pool,
+                )) return false;
+            }
+            if (!matched_a or !matched_b) return false;
+            return true;
+        },
+        .record_v => |current_record| {
+            if (next != .record_v) return false;
+            const next_record = next.record_v;
+            if (current_record.len != next_record.len) return false;
+            const current_fields = current_record.fields(current_pool);
+            var matched_a = path_index_a == null;
+            var matched_b = path_index_b == null;
+            var field_index: u32 = 0;
+            while (field_index < current_record.len) : (field_index += 1) {
+                const field_name = current_fields[field_index * 2].string_v;
+                const field_name_bytes = field_name.slice(current_pool);
+                const current_field = current_fields[field_index * 2 + 1];
+                const next_field = next_record.lookup(
+                    next_pool,
+                    field_name_bytes,
+                ) orelse return false;
+                const child_a = if (path_index_a) |index_a| blk: {
+                    const key_name = path_key_field(
+                        path_a[index_a],
+                        context.eval_pool,
+                    ) orelse return Error.TypeError;
+                    break :blk if (std.mem.eql(u8, field_name_bytes, key_name)) matched: {
+                        matched_a = true;
+                        break :matched index_a + 1;
+                    } else null;
+                } else null;
+                const child_b = if (path_index_b) |index_b| blk: {
+                    const key_name = path_key_field(
+                        path_b[index_b],
+                        context.eval_pool,
+                    ) orelse return Error.TypeError;
+                    break :blk if (std.mem.eql(u8, field_name_bytes, key_name)) matched: {
+                        matched_b = true;
+                        break :matched index_b + 1;
+                    } else null;
+                } else null;
+                if (child_a != null or child_b != null) {
+                    if (!try equal_double_except_update_path_keys(
+                        context,
+                        operator_args,
+                        next_field,
+                        next_pool,
+                        current_field,
+                        current_pool,
+                        path_a,
+                        child_a,
+                        updater_a,
+                        path_b,
+                        child_b,
+                        updater_b,
+                    )) return false;
+                } else if (!Value.eql_cross_pool(
+                    next_field,
+                    next_pool,
+                    current_field,
+                    current_pool,
+                )) return false;
+            }
+            if (!matched_a or !matched_b) return false;
+            return true;
+        },
+        else => return Error.TypeError,
+    }
+}
+
+fn path_key_matches_value(
+    key: PathKey,
+    value: Value,
+    value_pool: *const ValuePool,
+    key_pool: *const ValuePool,
+) bool {
+    return switch (key) {
+        .value => |key_value| cross_pool_equal(
+            value,
+            value_pool,
+            key_value,
+            key_pool,
+        ),
+        .field => |field_name| value == .string_v and
+            std.mem.eql(u8, value.string_v.slice(value_pool), field_name),
+    };
+}
+
+fn path_key_int(key: PathKey) ?i64 {
+    return switch (key) {
+        .value => |value| value.as_int(),
+        .field => null,
+    };
+}
+
+fn path_key_field(key: PathKey, pool: *const ValuePool) ?[]const u8 {
+    return switch (key) {
+        .value => |value| if (value == .string_v)
+            value.string_v.slice(pool)
+        else
+            null,
+        .field => |field_name| field_name,
+    };
 }
 
 fn function_lookup_cross_pool(
@@ -1163,8 +1699,17 @@ fn function_lookup_cross_pool(
 ) ?Value {
     const keys = function.domain.items(function_pool);
     const entries = function.entries(function_pool);
+    if (function_dense_entry_probe(
+        keys,
+        entries,
+        function_pool,
+        key,
+        key_pool,
+    )) |entry| {
+        return entry;
+    }
     for (keys, entries) |candidate, entry| {
-        if (Value.eql_cross_pool(
+        if (cross_pool_equal(
             candidate,
             function_pool,
             key,
@@ -1273,6 +1818,15 @@ fn apply_cross_pool(
             const domain_values =
                 function_value.domain.items(function_pool);
             const entries = function_value.entries(function_pool);
+            if (function_dense_entry_probe(
+                domain_values,
+                entries,
+                function_pool,
+                key,
+                key_pool,
+            )) |entry| {
+                break :blk entry;
+            }
             for (domain_values, entries) |candidate, entry| {
                 if (cross_pool_equal(
                     candidate,
@@ -1302,12 +1856,95 @@ fn apply_cross_pool(
     };
 }
 
+fn function_dense_entry_probe(
+    keys: []const Value,
+    entries: []const Value,
+    function_pool: *const ValuePool,
+    key: Value,
+    key_pool: *const ValuePool,
+) ?Value {
+    std.debug.assert(keys.len == entries.len);
+    if (keys.len == 0) return null;
+    const index = switch (key) {
+        .int_v => |key_int| blk: {
+            if (keys[0] != .int_v) return null;
+            const delta = std.math.sub(i64, key_int, keys[0].int_v) catch
+                return null;
+            if (delta < 0) return null;
+            break :blk @as(u64, @intCast(delta));
+        },
+        .model_v => |key_model| blk: {
+            if (keys[0] != .model_v or key_model < keys[0].model_v) {
+                return null;
+            }
+            break :blk @as(u64, key_model - keys[0].model_v);
+        },
+        else => return null,
+    };
+    if (index >= keys.len) return null;
+    const index_u: usize = @intCast(index);
+    if (!cross_pool_equal(keys[index_u], function_pool, key, key_pool)) {
+        return null;
+    }
+    return entries[index_u];
+}
+
+fn dense_set_contains_probe(
+    items: []const Value,
+    item_pool: *const ValuePool,
+    value: Value,
+    value_pool: *const ValuePool,
+) ?bool {
+    if (items.len == 0) return false;
+    const index = switch (value) {
+        .int_v => |value_int| blk: {
+            if (items[0] != .int_v) return null;
+            const delta = std.math.sub(i64, value_int, items[0].int_v) catch
+                return null;
+            if (delta < 0) return null;
+            break :blk @as(u64, @intCast(delta));
+        },
+        .model_v => |value_model| blk: {
+            if (items[0] != .model_v) return null;
+            if (value_model < items[0].model_v) return null;
+            break :blk @as(u64, value_model - items[0].model_v);
+        },
+        else => return null,
+    };
+    if (index >= items.len) return null;
+    const index_u: usize = @intCast(index);
+    if (!cross_pool_equal(items[index_u], item_pool, value, value_pool)) {
+        return null;
+    }
+    return true;
+}
+
 fn cross_pool_equal(
     left: Value,
     left_pool: *const ValuePool,
     right: Value,
     right_pool: *const ValuePool,
 ) bool {
+    if (left.tag() != right.tag()) return false;
+    switch (left) {
+        .bool_v => return left.bool_v == right.bool_v,
+        .int_v => return left.int_v == right.int_v,
+        .model_v => return left.model_v == right.model_v,
+        .string_v => {
+            if (left_pool == right_pool and
+                left.string_v.offset == right.string_v.offset and
+                left.string_v.len == right.string_v.len)
+            {
+                return true;
+            }
+            return std.mem.eql(
+                u8,
+                left.string_v.slice(left_pool),
+                right.string_v.slice(right_pool),
+            );
+        },
+        else => {},
+    }
     return Value.eql_cross_pool(left, left_pool, right, right_pool);
 }
 
@@ -1344,6 +1981,27 @@ pub fn record(context: *CallContext, fields: []const Value) Error!Value {
     } };
 }
 
+pub fn record_static(
+    context: *CallContext,
+    field_names: []const []const u8,
+    field_values: []const Value,
+) Error!Value {
+    if (field_names.len != field_values.len) return Error.TypeError;
+    const values = try context.eval_pool.alloc_values(
+        @intCast(field_names.len * 2),
+    );
+    for (field_names, field_values, 0..) |field_name, field_value, index| {
+        values[index * 2] = .{
+            .string_v = try context.eval_pool.push_string(field_name),
+        };
+        values[index * 2 + 1] = field_value;
+    }
+    return .{ .record_v = .{
+        .offset = value_offset(context.eval_pool, values.ptr),
+        .len = @intCast(field_names.len),
+    } };
+}
+
 pub fn set(context: *CallContext, items: []const Value) Error!Value {
     const source_offset = pool_slice_offset(context.eval_pool, items);
     const values = try context.eval_pool.alloc_values(
@@ -1364,6 +2022,44 @@ pub fn set(context: *CallContext, items: []const Value) Error!Value {
         }
         if (!duplicate) {
             values[count] = candidate;
+            count += 1;
+        }
+    }
+    return .{ .set_v = .{
+        .offset = value_offset(context.eval_pool, values.ptr),
+        .len = count,
+    } };
+}
+
+fn set_cross_pool(
+    context: *CallContext,
+    items: []const Value,
+    item_pool: *const ValuePool,
+) Error!Value {
+    if (item_pool == context.eval_pool) return set(context, items);
+
+    const values = try context.eval_pool.alloc_values(
+        @intCast(items.len),
+    );
+    var count: u32 = 0;
+    for (items) |candidate| {
+        var duplicate = false;
+        for (values[0..count]) |existing| {
+            if (Value.eql_cross_pool(
+                existing,
+                context.eval_pool,
+                candidate,
+                item_pool,
+            )) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            values[count] = try candidate.clone(
+                item_pool,
+                context.eval_pool,
+            );
             count += 1;
         }
     }
@@ -1705,6 +2401,49 @@ pub fn sequence_append(
     } };
 }
 
+pub fn sequence_subseq(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 3) return Error.TypeError;
+    const lo = args[1].as_int() orelse return Error.TypeError;
+    const hi = args[2].as_int() orelse return Error.TypeError;
+    if (lo < 1) return Error.IndexOutOfBounds;
+    if (hi < lo) {
+        return tuple(context, &.{});
+    }
+
+    const result_len_i64 = hi - lo + 1;
+    if (result_len_i64 > std.math.maxInt(u32)) return Error.OutOfMemory;
+    const result_len: u32 = @intCast(result_len_i64);
+    return switch (args[0]) {
+        .function_v => |function| {
+            if (hi > function.len) return Error.IndexOutOfBounds;
+            const result = try context.eval_pool.alloc_values(result_len);
+            const result_offset = value_offset(context.eval_pool, result.ptr);
+            for (result, 0..) |*slot, index| {
+                const source_index: usize = @intCast(lo - 1 + @as(i64, @intCast(index)));
+                slot.* = context.eval_pool.values[function.offset + source_index];
+            }
+            return .{ .tuple_v = .{
+                .offset = result_offset,
+                .len = result_len,
+            } };
+        },
+        .tuple_v => |tuple_value| {
+            if (hi > tuple_value.len) return Error.IndexOutOfBounds;
+            const source = tuple_value.items(context.eval_pool);
+            const result = try context.eval_pool.alloc_values(result_len);
+            @memcpy(result, source[@intCast(lo - 1)..@intCast(hi)]);
+            return .{ .tuple_v = .{
+                .offset = value_offset(context.eval_pool, result.ptr),
+                .len = result_len,
+            } };
+        },
+        else => Error.TypeError,
+    };
+}
+
 pub fn sequence_concat(
     context: *CallContext,
     left: Value,
@@ -1895,11 +2634,7 @@ fn function_range_cross_pool(
         .tuple_v => |tuple_value| tuple_value.items(source_pool),
         else => return Error.TypeError,
     };
-    const entries = try context.eval_pool.alloc_values(@intCast(source.len));
-    for (source, entries) |entry, *destination| {
-        destination.* = try entry.clone(source_pool, context.eval_pool);
-    }
-    return set(context, entries);
+    return set_cross_pool(context, source, source_pool);
 }
 
 pub fn variable_path_function_range(
@@ -1952,6 +2687,36 @@ pub fn sequence_index(
     for (source, 0..) |item, index| {
         if (item.eql(args[1], context.eval_pool)) {
             return .{ .int_v = @as(i64, @intCast(index)) + 1 };
+        }
+    }
+    return Error.EmptyChoose;
+}
+
+pub fn sequence_index_order_bool(
+    context: *CallContext,
+    args: []const Value,
+    inclusive: bool,
+) Error!bool {
+    if (args.len != 3) return Error.TypeError;
+    const source = switch (args[0]) {
+        .function_v => |function| function.entries(context.eval_pool),
+        .tuple_v => |tuple_value| tuple_value.items(context.eval_pool),
+        else => return Error.TypeError,
+    };
+    var left_index: ?usize = null;
+    var right_index: ?usize = null;
+    for (source, 0..) |item, index| {
+        if (left_index == null and item.eql(args[1], context.eval_pool)) {
+            left_index = index;
+        }
+        if (right_index == null and item.eql(args[2], context.eval_pool)) {
+            right_index = index;
+        }
+        if (left_index != null and right_index != null) {
+            return if (inclusive)
+                left_index.? <= right_index.?
+            else
+                left_index.? < right_index.?;
         }
     }
     return Error.EmptyChoose;
@@ -2450,7 +3215,7 @@ pub fn quantify_at(
     }
     var materialized: [16]Value = undefined;
     for (domains, 0..) |domain_value, index| {
-        materialized[index] = try materialize_iterable(
+        materialized[index] = try iterable_for_iteration(
             context,
             domain_value,
         );
@@ -2482,7 +3247,7 @@ pub fn quantify_at_bool(
     }
     var materialized: [16]Value = undefined;
     for (domains, 0..) |domain_value, index| {
-        materialized[index] = try materialize_iterable(
+        materialized[index] = try iterable_for_iteration(
             context,
             domain_value,
         );
@@ -2791,7 +3556,7 @@ pub fn filter_at(
             predicate,
         );
     }
-    const iterable = try materialize_iterable(context, domain_value);
+    const iterable = try iterable_for_iteration(context, domain_value);
     const count = try iterable_count(iterable);
     const accepted = try context.eval_pool.alloc_values(count);
     const accepted_offset = value_offset(
@@ -2947,7 +3712,7 @@ pub fn map_set(
     domain_value: Value,
     mapper: OperatorFn,
 ) Error!Value {
-    const iterable = try materialize_iterable(context, domain_value);
+    const iterable = try iterable_for_iteration(context, domain_value);
     const count = try iterable_count(iterable);
     const mapped = try context.eval_pool.alloc_values(count);
     const mapped_offset = value_offset(context.eval_pool, mapped.ptr);
@@ -2955,6 +3720,7 @@ pub fn map_set(
     var index: u32 = 0;
     while (index < count) : (index += 1) {
         const candidate = try iterable_value(context, iterable, index);
+        const result_snapshot = context.eval_pool.snapshot();
         const result = try call_bound(
             context,
             operator_args,
@@ -2972,6 +3738,8 @@ pub fn map_set(
         if (!duplicate) {
             mapped_values[mapped_count] = result;
             mapped_count += 1;
+        } else {
+            context.eval_pool.restore(result_snapshot);
         }
     }
     return .{ .set_v = .{
@@ -2986,7 +3754,7 @@ pub fn function_map(
     domain_value: Value,
     mapper: OperatorFn,
 ) Error!Value {
-    const iterable = try materialize_iterable(context, domain_value);
+    const iterable = try iterable_for_iteration(context, domain_value);
     const count = try iterable_count(iterable);
     const keys = try context.eval_pool.alloc_values(count);
     const keys_offset = value_offset(context.eval_pool, keys.ptr);
@@ -3051,7 +3819,7 @@ pub fn choose(
     predicate: OperatorFn,
     source_identity: u32,
 ) Error!Value {
-    const iterable = try materialize_iterable(context, domain_value);
+    const iterable = try iterable_for_iteration(context, domain_value);
     const count = try iterable_count(iterable);
     var index: u32 = 0;
     while (index < count) : (index += 1) {
@@ -3505,6 +4273,18 @@ fn call_bound_bool(
         context,
         combined[0 .. operator_args.len + bound.len],
     );
+}
+
+fn iterable_for_iteration(
+    context: *CallContext,
+    value: Value,
+) Error!Value {
+    return switch (value) {
+        .set_v,
+        .range_v,
+        => value,
+        else => materialize_iterable(context, value),
+    };
 }
 
 pub fn materialize_iterable(
@@ -4029,6 +4809,32 @@ test "generated finite values use only the value pool" {
         .max_seq_len = 5,
     };
 
+    var current_values = [_]Value{ .{ .int_v = 1 }, .{ .int_v = 2 } };
+    var next_values = [_]Value{ .{ .int_v = 1 }, .{ .int_v = 2 } };
+    var current_state = State{
+        .level = 0,
+        .pred = 0,
+        .changed_mask = 0,
+        .borrowed_mask = 0,
+        .borrowed_pool = null,
+        .values = current_values[0..],
+    };
+    var next_state = State{
+        .level = 1,
+        .pred = 0,
+        .changed_mask = 0,
+        .borrowed_mask = 0,
+        .borrowed_pool = null,
+        .values = next_values[0..],
+    };
+    context.state = &current_state;
+    context.next_state = &next_state;
+    try std.testing.expect(try unchanged_variables(&context, &.{ 0, 1 }));
+    next_state.changed_mask = @as(u64, 1) << 1;
+    try std.testing.expect(try unchanged_variable(&context, 1));
+    context.state = null;
+    context.next_state = null;
+
     const finite_set = try set(
         &context,
         &.{ .{ .int_v = 1 }, .{ .int_v = 2 }, .{ .int_v = 1 } },
@@ -4045,6 +4851,96 @@ test "generated finite values use only the value pool" {
         )).bool_v,
     );
 
+    var source_arena = try Arena.init(1024 * 1024);
+    defer source_arena.deinit();
+    var source_pool = try ValuePool.init(&source_arena, 256, 256);
+    var source_generated_cache = [_]?Value{};
+    var source_context = CallContext{
+        .eval_pool = &source_pool,
+        .state_pool = &source_pool,
+        .state = null,
+        .next_state = null,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &source_generated_cache,
+        .generated_cache_pool = &source_pool,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 5,
+    };
+    const duplicate_a = try tuple(&source_context, &.{.{ .int_v = 9 }});
+    const duplicate_b = try tuple(&source_context, &.{.{ .int_v = 9 }});
+    const source_values = try source_pool.alloc_values(2);
+    source_values[0] = duplicate_a;
+    source_values[1] = duplicate_b;
+    const before_range_values = pool.value_count;
+    const cross_pool_range = try set_cross_pool(
+        &context,
+        source_values,
+        &source_pool,
+    );
+    try std.testing.expectEqual(@as(u32, 1), cross_pool_range.set_v.len);
+    try std.testing.expectEqual(
+        before_range_values + 3,
+        pool.value_count,
+    );
+
+    const unsorted_int_items = [_]Value{
+        .{ .int_v = 5 },
+        .{ .int_v = 1 },
+    };
+    const unsorted_int_offset = try source_pool.push_values(
+        &unsorted_int_items,
+    );
+    const unsorted_int_set = Value{ .set_v = .{
+        .offset = unsorted_int_offset,
+        .len = unsorted_int_items.len,
+    } };
+    try std.testing.expect(try set_member_cross_pool(
+        unsorted_int_set,
+        &source_pool,
+        .{ .int_v = 1 },
+        &pool,
+    ));
+    try std.testing.expect(!try set_member_cross_pool(
+        unsorted_int_set,
+        &source_pool,
+        .{ .int_v = 4 },
+        &pool,
+    ));
+
+    const before_mapped_values = pool.value_count;
+    const filtered_range = try filter_at(
+        &context,
+        &.{},
+        try range(.{ .int_v = 1 }, .{ .int_v = 3 }),
+        always_true_predicate,
+        0,
+    );
+    try std.testing.expectEqual(@as(u32, 3), filtered_range.set_v.len);
+    try std.testing.expectEqual(
+        before_mapped_values + 3,
+        pool.value_count,
+    );
+
+    const before_duplicate_map_values = pool.value_count;
+    const mapped_duplicates = try map_set(
+        &context,
+        &.{},
+        try range(.{ .int_v = 1 }, .{ .int_v = 3 }),
+        duplicate_tuple_mapper,
+    );
+    try std.testing.expectEqual(@as(u32, 1), mapped_duplicates.set_v.len);
+    // Three output slots and one accepted tuple payload. The range is not
+    // materialized, and duplicate tuple payloads are restored.
+    try std.testing.expectEqual(
+        before_duplicate_map_values + 4,
+        pool.value_count,
+    );
+
     const finite_record = try record(
         &context,
         &.{
@@ -4052,9 +4948,19 @@ test "generated finite values use only the value pool" {
             .{ .int_v = 7 },
         },
     );
+    const static_record = try record_static(
+        &context,
+        &.{"field"},
+        &.{.{ .int_v = 7 }},
+    );
+    try std.testing.expect(static_record.eql(finite_record, &pool));
     try std.testing.expectEqual(
         @as(i64, 7),
         (try field(&context, finite_record, "field")).int_v,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 7),
+        (try field(&context, static_record, "field")).int_v,
     );
 
     const left_sequence = try tuple(
@@ -4115,6 +5021,22 @@ test "generated finite values use only the value pool" {
         @as(i64, 9),
         (try field(&context, overridden_record, "field")).int_v,
     );
+}
+
+fn always_true_predicate(
+    _: *CallContext,
+    args: []const Value,
+) Error!Value {
+    std.debug.assert(args.len == 1);
+    return .{ .bool_v = true };
+}
+
+fn duplicate_tuple_mapper(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    std.debug.assert(args.len == 1);
+    return tuple(context, &.{.{ .int_v = 9 }});
 }
 
 fn test_native_call(

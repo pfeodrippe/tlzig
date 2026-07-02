@@ -33,6 +33,8 @@ const Options = struct {
     include_one_core: bool = false,
     auto_only: bool = false,
     tlzig_only: bool = false,
+    write_tlzig_baseline: bool = false,
+    generated_expressions: bool = false,
 };
 
 const specs = [_]Spec{
@@ -218,6 +220,7 @@ const specs = [_]Spec{
         .one_core_default = false,
         .max_states = 500_000,
         .state_values_per_state = 180,
+        .compare_generated = false,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -225,12 +228,10 @@ const specs = [_]Spec{
         .label = "SingleLog MDBLinearizability",
         .tla = "vendor/MDBTLA/SingleLog/MDBLinearizability.tla",
         .cfg = "vendor/MDBTLA/SingleLog/MDBLinearizability.cfg",
-        .default_enabled = false,
         .one_core_default = false,
         .max_states = 5_000_000,
         .state_values_per_state = 180,
         .compare_generated = false,
-        .compare_distinct = false,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -240,10 +241,9 @@ const specs = [_]Spec{
         .cfg = "vendor/MDBTLA/SingleShardTxn/ShardTxn.cfg",
         .default_enabled = false,
         .one_core_default = false,
-        .max_states = 5_000_000,
+        .max_states = 6_000_000,
         .state_values_per_state = 220,
         .compare_generated = false,
-        .compare_distinct = false,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -303,7 +303,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     const allocator = std.heap.page_allocator;
     const options = parse_options(init) catch {
         std.debug.print(
-            "usage: benchmark [--include-long] [--include-one-core] [--auto-only] [--tlzig-only] [--filter TEXT|TEXT]\n",
+            "usage: benchmark [--include-long] [--include-one-core] [--auto-only] [--tlzig-only] [--write-tlzig-baseline] [--generated-expressions] [--filter TEXT|TEXT]\n",
             .{},
         );
         std.process.exit(2);
@@ -342,6 +342,8 @@ pub fn main(init: std.process.Init.Minimal) void {
                 (options.include_one_core or spec.one_core_default),
             options.label_suffix,
             options.tlzig_only,
+            options.write_tlzig_baseline,
+            options.generated_expressions,
         ) catch |err| {
             failures += 1;
             std.debug.print("{s:40} ERROR {any}\n", .{ spec.tla, err });
@@ -370,6 +372,10 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
             options.label_suffix = args.next() orelse return error.InvalidArgs;
         } else if (std.mem.eql(u8, arg, "--tlzig-only")) {
             options.tlzig_only = true;
+        } else if (std.mem.eql(u8, arg, "--write-tlzig-baseline")) {
+            options.write_tlzig_baseline = true;
+        } else if (std.mem.eql(u8, arg, "--generated-expressions")) {
+            options.generated_expressions = true;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.InvalidArgs;
         } else if (options.filter == null) {
@@ -402,17 +408,33 @@ fn run_comparison(
     run_one_core: bool,
     label_suffix: []const u8,
     tlzig_only: bool,
+    write_baseline: bool,
+    use_generated_expressions: bool,
 ) !void {
     const cpu_count: u16 = @intCast(@min(
         std.Thread.getCpuCount() catch 1,
         std.math.maxInt(u16),
     ));
     const tlzig_one: ?RunResult = if (run_one_core)
-        try run_tlzig_internal(allocator, io, spec, 1, true)
+        try run_tlzig_internal(
+            allocator,
+            io,
+            spec,
+            1,
+            true,
+            use_generated_expressions,
+        )
     else
         null;
     defer if (tlzig_one) |result| result.deinit(allocator);
-    const tlzig_auto = try run_tlzig_internal(allocator, io, spec, cpu_count, true);
+    const tlzig_auto = try run_tlzig_internal(
+        allocator,
+        io,
+        spec,
+        cpu_count,
+        true,
+        use_generated_expressions,
+    );
     defer tlzig_auto.deinit(allocator);
     const spec_java_cp = spec.java_classpath orelse java_cp;
     const tlc_one: ?RunResult = if (run_one_core and !tlzig_only)
@@ -481,6 +503,17 @@ fn run_comparison(
     }
 
     if (tlzig_only) {
+        if (write_baseline) {
+            if (generated_model.generated_count > 0) {
+                std.debug.print(
+                    "--write-tlzig-baseline requires the interpreted benchmark binary\n",
+                    .{},
+                );
+                return error.InvalidArgs;
+            }
+            try write_tlzig_baseline(allocator, spec, tlzig_auto);
+            return;
+        }
         try compare_tlzig_baseline(allocator, spec, tlzig_auto);
         return;
     }
@@ -575,12 +608,20 @@ fn compare_tlzig_baseline(
     actual: RunResult,
 ) !void {
     const baseline = try read_tlzig_baseline(allocator, spec);
-    const require_baseline_distinct = !spec.expected_violation or
-        (baseline.outcome == .completed and actual.outcome == .completed);
+    const generated_model_active = generated_model.generated_count > 0;
+    const compare_generated =
+        spec.compare_generated or
+        (generated_model_active and
+            baseline.outcome == .completed and
+            actual.outcome == .completed);
+    const compare_distinct =
+        spec.compare_distinct or
+        (generated_model_active and
+            baseline.outcome == .completed and
+            actual.outcome == .completed);
     const mismatch = baseline.outcome != actual.outcome or
-        (spec.compare_generated and baseline.generated != actual.generated) or
-        ((spec.compare_distinct or require_baseline_distinct) and
-            baseline.distinct != actual.distinct);
+        (compare_generated and baseline.generated != actual.generated) or
+        (compare_distinct and baseline.distinct != actual.distinct);
     if (!mismatch) return;
 
     std.debug.print(
@@ -679,6 +720,7 @@ fn run_tlzig_internal(
     spec: Spec,
     worker_count: u16,
     use_generated: bool,
+    use_generated_expressions: bool,
 ) !RunResult {
     const start = std.Io.Clock.Timestamp.now(io, .real);
 
@@ -725,19 +767,25 @@ fn run_tlzig_internal(
             @as(u64, spec.max_states) * spec.state_values_per_state,
             1_000_000,
         ),
-        132_000_000,
+        192_000_000,
     ));
     const state_string_cap = cap_u32(@min(
         @max(@as(u64, spec.max_states) * 4, 500_000),
         8_000_000,
     ));
 
+    const generated_model_matches =
+        use_generated and generated_matches(module.name, cfg);
     const generated: []const generated_runtime.Operator =
-        if (use_generated and generated_matches(module.name, cfg))
+        if (generated_model_matches)
             &generated_model.operators
         else
             &.{};
-    const generated_expressions = &.{};
+    const generated_expressions: []const generated_runtime.Expression =
+        if (generated_model_matches and use_generated_expressions)
+            &generated_model.expressions
+        else
+            &.{};
     var ch = checker.Checker.init_generated_with_successor_limit(
         &arena,
         module,

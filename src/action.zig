@@ -1288,10 +1288,8 @@ pub const ActionExecutor = struct {
         context: Context,
     ) bool {
         if (generated.arg_names.len == 0) return true;
-        for (generated.arg_names, 0..) |name, index| {
-            const required = generated.arg_required.len == 0 or
-                generated.arg_required[index];
-            if (required and context.lookup(name) == null) return false;
+        for (generated.arg_names) |name| {
+            if (context.lookup(name) == null) return false;
         }
         return true;
     }

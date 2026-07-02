@@ -465,6 +465,8 @@ pub const Checker = struct {
     eval_pool_base: ValuePool.Snapshot,
     check_deadlock: bool,
     diagnostics: bool,
+    progress_interval_states: u64,
+    next_progress_distinct: u64,
     worker_count: u16,
     max_states: u32,
     max_successors: u32,
@@ -891,6 +893,8 @@ pub const Checker = struct {
             .eval_pool_base = eval_pool_base,
             .check_deadlock = cfg.check_deadlock,
             .diagnostics = true,
+            .progress_interval_states = 0,
+            .next_progress_distinct = 0,
             .worker_count = worker_count,
             .max_states = max_states,
             .max_successors = max_successors,
@@ -919,6 +923,11 @@ pub const Checker = struct {
 
     pub fn set_diagnostics(self: *Checker, enabled: bool) void {
         self.diagnostics = enabled;
+    }
+
+    pub fn set_progress_interval(self: *Checker, interval_states: u64) void {
+        self.progress_interval_states = interval_states;
+        self.next_progress_distinct = interval_states;
     }
 
     pub fn check(self: *Checker) !Result {
@@ -1235,8 +1244,11 @@ pub const Checker = struct {
                     return Error.InvariantViolated;
                 }
             }
-            if (is_new and !self.queue.enqueue(state_idx)) {
-                return Error.StateSpaceExhausted;
+            if (is_new) {
+                if (!self.queue.enqueue(state_idx)) {
+                    return Error.StateSpaceExhausted;
+                }
+                self.maybe_report_progress();
             }
             if (deduplicate_successor(
                 out_states.items[0..kept_count],
@@ -1354,6 +1366,7 @@ pub const Checker = struct {
                 if (!self.queue.enqueue(state_idx)) {
                     return Error.StateSpaceExhausted;
                 }
+                self.maybe_report_progress();
             }
             if (deduplicate_successor(
                 out_states.items[0..kept_count],
@@ -1399,6 +1412,9 @@ pub const Checker = struct {
                     const child = self.state_store.get(idx);
                     if (!try self.check_safety_properties(parent, child)) {
                         std.debug.print("PropertyViolated on transition {d}->{d}\n", .{ pidx, idx });
+                        if (self.diagnostics) {
+                            self.print_trace(idx);
+                        }
                         return Error.PropertyViolated;
                     }
                 }
@@ -1419,6 +1435,28 @@ pub const Checker = struct {
             return true;
         }
         return false;
+    }
+
+    fn maybe_report_progress(self: *Checker) void {
+        if (self.progress_interval_states == 0) return;
+        if (self.distinct < self.next_progress_distinct) return;
+        while (self.next_progress_distinct <= self.distinct) {
+            self.next_progress_distinct += self.progress_interval_states;
+        }
+        std.debug.print(
+            "Progress generated={d} distinct={d} queue={d} values={d}/{d} strings={d}/{d} graph_edges={d}/{d}\n",
+            .{
+                self.generated,
+                self.distinct,
+                self.queue.len(),
+                self.state_store.values_pool.value_count,
+                self.state_store.values_pool.value_cap,
+                self.state_store.values_pool.string_count,
+                self.state_store.values_pool.string_cap,
+                self.succ_count,
+                self.succ_cap,
+            },
+        );
     }
 
     fn clone_candidate_state(
@@ -1972,6 +2010,49 @@ pub const Checker = struct {
         var stack = try allocator.alloc(u32, scc_count);
         defer allocator.free(stack);
         var stack_len: u32 = 0;
+
+        const scc_edge_count = scc_succ_offsets[scc_count];
+        var pred_counts = try allocator.alloc(u32, scc_count);
+        defer allocator.free(pred_counts);
+        @memset(pred_counts, 0);
+        for (0..scc_count) |from_usize| {
+            const from: u32 = @intCast(from_usize);
+            const begin = scc_succ_offsets[from];
+            const end = scc_succ_offsets[from + 1];
+            for (scc_succ_edges[begin..end]) |succ| {
+                assert(succ < scc_count);
+                pred_counts[succ] += 1;
+            }
+        }
+
+        var pred_offsets = try allocator.alloc(u32, scc_count + 1);
+        defer allocator.free(pred_offsets);
+        var pred_total: u32 = 0;
+        for (pred_counts, 0..) |count, index| {
+            pred_offsets[index] = pred_total;
+            pred_total += count;
+        }
+        assert(pred_total == scc_edge_count);
+        pred_offsets[scc_count] = pred_total;
+
+        var pred_edges = try allocator.alloc(u32, pred_total);
+        defer allocator.free(pred_edges);
+        var pred_fill = try allocator.alloc(u32, scc_count);
+        defer allocator.free(pred_fill);
+        @memcpy(pred_fill, pred_offsets[0..scc_count]);
+        for (0..scc_count) |from_usize| {
+            const from: u32 = @intCast(from_usize);
+            const begin = scc_succ_offsets[from];
+            const end = scc_succ_offsets[from + 1];
+            for (scc_succ_edges[begin..end]) |succ| {
+                pred_edges[pred_fill[succ]] = from;
+                pred_fill[succ] += 1;
+            }
+        }
+        for (0..scc_count) |index| {
+            assert(pred_fill[index] == pred_offsets[index + 1]);
+        }
+
         for (fair_sccs, 0..) |fair, id| {
             if (fair) {
                 scc_can_reach_fair[id] = true;
@@ -1982,20 +2063,14 @@ pub const Checker = struct {
         while (stack_len > 0) {
             stack_len -= 1;
             const cur = stack[stack_len];
-            for (0..scc_count) |pred_id| {
-                const pred: u32 = @intCast(pred_id);
+            const pred_begin = pred_offsets[cur];
+            const pred_end = pred_offsets[cur + 1];
+            for (pred_edges[pred_begin..pred_end]) |pred| {
                 if (scc_can_reach_fair[pred]) continue;
-                const begin = scc_succ_offsets[pred];
-                const end = scc_succ_offsets[pred + 1];
-                for (scc_succ_edges[begin..end]) |succ| {
-                    if (succ == cur) {
-                        scc_can_reach_fair[pred] = true;
-                        assert(stack_len < scc_count);
-                        stack[stack_len] = pred;
-                        stack_len += 1;
-                        break;
-                    }
-                }
+                scc_can_reach_fair[pred] = true;
+                assert(stack_len < scc_count);
+                stack[stack_len] = pred;
+                stack_len += 1;
             }
         }
         for (scc_ids, 0..) |scc_id, i| {

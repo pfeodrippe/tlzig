@@ -71,6 +71,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(bench);
 
     const run_bench = b.addRunArtifact(bench);
+    run_bench.has_side_effects = true;
     run_bench.step.dependOn(b.getInstallStep());
     const tlc_test_class = b.addSystemCommand(&.{
         "mkdir",
@@ -101,11 +102,19 @@ pub fn build(b: *std.Build) void {
         "benchmark-include-long",
         "Include opt-in long benchmark specs and generated benchmark rows",
     ) orelse false;
+    const benchmark_generated_expressions = b.option(
+        bool,
+        "benchmark-generated-expressions",
+        "Enable generated expression AOT benchmark path",
+    ) orelse true;
     if (benchmark_filter) |filter| {
         run_bench.addArg(filter);
     }
     if (benchmark_include_long) {
         run_bench.addArg("--include-long");
+    }
+    if (benchmark_generated_expressions) {
+        run_bench.addArg("--generated-expressions");
     }
     const benchmark_step = b.step("benchmark", "Benchmark tlzig vs Java TLC");
     benchmark_step.dependOn(&run_bench.step);
@@ -121,23 +130,20 @@ pub fn build(b: *std.Build) void {
                 .name = "benchmark_mdbtla_mcm_snapshot_aot",
                 .model_path = "generated_models/mdbtla_mcm_snapshot_invariant.zig",
                 .filter = "MultiShardTxn MCM/snapshot-invariant",
-                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_mcm_rc_local_aot",
                 .model_path = "generated_models/mdbtla_mcm_rc_local_invariant.zig",
                 .filter = "MultiShardTxn MCM/rc-local-invariant",
-                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_storage_aot",
                 .model_path = "generated_models/mdbtla_storage.zig",
                 .filter = "MultiShardTxn Storage",
-                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_storage_exhaustive_aot",
-                .model_path = "generated_models/mdbtla_storage.zig",
+                .model_path = "generated_models/mdbtla_storage_exhaustive.zig",
                 .filter = "MultiShardTxn Storage exhaustive",
                 .default_enabled = false,
             },
@@ -145,7 +151,6 @@ pub fn build(b: *std.Build) void {
                 .name = "benchmark_mdbtla_rc_no_prepare_aot",
                 .model_path = "generated_models/mdbtla_rc_no_prepare_block.zig",
                 .filter = "MultiShardTxn RC/no-prepare-block",
-                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_no_prepare_exhaustive_aot",
@@ -157,7 +162,6 @@ pub fn build(b: *std.Build) void {
                 .name = "benchmark_mdbtla_rc_no_prepare_ww_aot",
                 .model_path = "generated_models/mdbtla_rc_no_prepare_block_or_ww.zig",
                 .filter = "MultiShardTxn RC/no-prepare-block-or-ww",
-                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_no_prepare_ww_exhaustive_aot",
@@ -169,7 +173,6 @@ pub fn build(b: *std.Build) void {
                 .name = "benchmark_mdbtla_rc_snapshot_aot",
                 .model_path = "generated_models/mdbtla_rc_snapshot.zig",
                 .filter = "MultiShardTxn RC/snapshot",
-                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_snapshot_exhaustive_aot",
@@ -181,13 +184,32 @@ pub fn build(b: *std.Build) void {
                 .name = "benchmark_mdbtla_rc_with_prepare_aot",
                 .model_path = "generated_models/mdbtla_rc_with_prepare_block.zig",
                 .filter = "MultiShardTxn RC/with-prepare-block",
-                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_with_prepare_exhaustive_aot",
                 .model_path = "generated_models/mdbtla_rc_with_prepare_block_exhaustive.zig",
                 .filter = "MultiShardTxn RC/with-prepare-block exhaustive",
                 .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_mdbtla_single_shard_txn_small_aot",
+                .model_path = "generated_models/mdbtla_single_shard_txn_small.zig",
+                .filter = "SingleShardTxn ShardTxn/small",
+            },
+            .{
+                .name = "benchmark_mdbtla_single_shard_txn_small_no_sym_aot",
+                .model_path = "generated_models/mdbtla_single_shard_txn_small_no_sym.zig",
+                .filter = "SingleShardTxn ShardTxn/small no-sym",
+            },
+            .{
+                .name = "benchmark_mdbtla_single_shard_txn_small_safety_aot",
+                .model_path = "generated_models/mdbtla_single_shard_txn_small_safety.zig",
+                .filter = "SingleShardTxn ShardTxn/small safety",
+            },
+            .{
+                .name = "benchmark_mdbtla_single_shard_txn_small_safety_no_sym_aot",
+                .model_path = "generated_models/mdbtla_single_shard_txn_small_safety_no_sym.zig",
+                .filter = "SingleShardTxn ShardTxn/small safety no-sym",
             },
             .{
                 .name = "benchmark_mdbtla_singlelog_mcmdbprops_aot",
@@ -214,6 +236,7 @@ pub fn build(b: *std.Build) void {
                 generated_benchmark.name,
                 generated_benchmark.model_path,
                 generated_benchmark.filter,
+                benchmark_generated_expressions,
             );
             run_generated_benchmark.step.dependOn(
                 previous_generated_benchmark,
@@ -254,6 +277,7 @@ fn addGeneratedBenchmark(
     name: []const u8,
     generated_model_path: []const u8,
     filter: []const u8,
+    generated_expressions: bool,
 ) *std.Build.Step.Run {
     const generated_model_module = b.createModule(.{
         .root_source_file = b.path(generated_model_path),
@@ -273,8 +297,12 @@ fn addGeneratedBenchmark(
     bench.root_module.addImport("tlzig", tlzig_module);
     bench.root_module.addImport("generated_model", generated_model_module);
     const run_bench = b.addRunArtifact(bench);
+    run_bench.has_side_effects = true;
     run_bench.addArg(filter);
     run_bench.addArgs(&.{ "--label-suffix", " [AOT]", "--tlzig-only", "--auto-only" });
+    if (generated_expressions) {
+        run_bench.addArg("--generated-expressions");
+    }
     return run_bench;
 }
 
@@ -288,7 +316,17 @@ fn generatedBenchmarkMatches(
     const filter = optional_filter orelse return include_long or default_enabled;
     const exact_label_match = std.mem.eql(u8, label, filter);
     if (!include_long and !default_enabled and !exact_label_match) return false;
+    const label_contains_filter =
+        std.mem.indexOf(u8, label, filter) != null and
+        !detailedLabelPrefixMatch(label, filter);
     return exact_label_match or
-        std.mem.indexOf(u8, label, filter) != null or
+        label_contains_filter or
         std.mem.indexOf(u8, generated_model_path, filter) != null;
+}
+
+fn detailedLabelPrefixMatch(label: []const u8, filter: []const u8) bool {
+    if (filter.len == 0 or label.len <= filter.len) return false;
+    if (!std.mem.startsWith(u8, label, filter)) return false;
+    if (label[filter.len] != ' ') return false;
+    return std.mem.indexOfScalar(u8, filter, '/') != null;
 }

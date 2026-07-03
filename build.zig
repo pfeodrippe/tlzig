@@ -116,6 +116,9 @@ pub fn build(b: *std.Build) void {
     if (benchmark_generated_expressions) {
         run_bench.addArg("--generated-expressions");
     }
+    if (generated_model_path == null) {
+        run_bench.addArg("--skip-prefer-generated");
+    }
     const benchmark_step = b.step("benchmark", "Benchmark tlzig vs Java TLC");
     benchmark_step.dependOn(&run_bench.step);
     if (generated_model_path == null) {
@@ -192,6 +195,12 @@ pub fn build(b: *std.Build) void {
                 .default_enabled = false,
             },
             .{
+                .name = "benchmark_mdbtla_single_shard_txn_full_aot",
+                .model_path = "generated_models/mdbtla_single_shard_txn_full.zig",
+                .filter = "SingleShardTxn ShardTxn",
+                .default_enabled = false,
+            },
+            .{
                 .name = "benchmark_mdbtla_single_shard_txn_small_aot",
                 .model_path = "generated_models/mdbtla_single_shard_txn_small.zig",
                 .filter = "SingleShardTxn ShardTxn/small",
@@ -216,6 +225,11 @@ pub fn build(b: *std.Build) void {
                 .model_path = "generated_models/mdbtla_singlelog_mcmdbprops.zig",
                 .filter = "SingleLog MCMDBProps",
                 .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_mdbtla_singlelog_mdblinearizability_aot",
+                .model_path = "generated_models/mdbtla_singlelog_mdblinearizability.zig",
+                .filter = "SingleLog MDBLinearizability",
             },
         };
         for (generated_benchmarks) |generated_benchmark| {
@@ -299,7 +313,7 @@ fn addGeneratedBenchmark(
     const run_bench = b.addRunArtifact(bench);
     run_bench.has_side_effects = true;
     run_bench.addArg(filter);
-    run_bench.addArgs(&.{ "--label-suffix", " [AOT]", "--tlzig-only", "--auto-only" });
+    run_bench.addArgs(&.{ "--label-suffix", " [AOT]", "--auto-only" });
     if (generated_expressions) {
         run_bench.addArg("--generated-expressions");
     }

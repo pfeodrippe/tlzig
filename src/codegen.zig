@@ -1174,7 +1174,7 @@ fn emit_boolean_expr(
                     }
                 }
             }
-            if (variable_application_index(module, application)) |variable| {
+            if (variable_application_index_scoped(module, application, params)) |variable| {
                 try emit_variable_path_call(
                     output,
                     allocator,
@@ -1729,7 +1729,7 @@ fn emit_expr(
             );
         },
         .field => |field| {
-            if (sequence_head_field_path(module, expr)) |field_path| {
+            if (sequence_head_field_path_scoped(module, expr, params)) |field_path| {
                 try emit_field_path_call(
                     output,
                     allocator,
@@ -1743,7 +1743,7 @@ fn emit_expr(
                 );
                 return;
             }
-            if (direct_field_path(module, expr)) |field_path| {
+            if (direct_field_path_scoped(module, expr, params)) |field_path| {
                 try emit_field_path_call(
                     output,
                     allocator,
@@ -2227,7 +2227,7 @@ fn emit_expr(
         },
         .unary => |unary| {
             if (unary.op == .domain) {
-                if (direct_field_path(module, unary.operand)) |field_path| {
+                if (direct_field_path_scoped(module, unary.operand, params)) |field_path| {
                     try emit_field_path_call(
                         output,
                         allocator,
@@ -2242,9 +2242,10 @@ fn emit_expr(
                     return;
                 }
                 if (unary.operand.* == .apply) {
-                    if (variable_application_index(
+                    if (variable_application_index_scoped(
                         module,
                         unary.operand.apply,
+                        params,
                     )) |variable| {
                         try emit_variable_path_call(
                             output,
@@ -2489,9 +2490,10 @@ fn emit_expr(
                     application.args.len == 1 and
                     application.args[0].* == .apply)
                 {
-                    if (variable_application_index(
+                    if (variable_application_index_scoped(
                         module,
                         application.args[0].apply,
+                        params,
                     )) |variable| {
                         try emit_variable_path_call(
                             output,
@@ -2509,7 +2511,7 @@ fn emit_expr(
                     if (std.mem.eql(u8, native_name, "function_range") and
                         application.args.len == 1)
                     {
-                        if (direct_field_path(module, application.args[0])) |field_path| {
+                        if (direct_field_path_scoped(module, application.args[0], params)) |field_path| {
                             try emit_field_path_call(
                                 output,
                                 allocator,
@@ -2524,9 +2526,10 @@ fn emit_expr(
                             return;
                         }
                         if (application.args[0].* == .apply) {
-                            if (variable_application_index(
+                            if (variable_application_index_scoped(
                                 module,
                                 application.args[0].apply,
+                                params,
                             )) |variable| {
                                 try emit_variable_path_call(
                                     output,
@@ -2566,9 +2569,41 @@ fn emit_expr(
                 try append(output, allocator, ")");
                 return;
             }
-            if (variable_application_index(
+            if (is_reduce_sequence_call(module, application)) {
+                try append(
+                    output,
+                    allocator,
+                    "try runtime.reduce_sequence(context, args, ",
+                );
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    application.args[1],
+                    params,
+                );
+                try append(output, allocator, ", ");
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    application.args[2],
+                    params,
+                );
+                const helper = try helper_name(
+                    allocator,
+                    expression_identity(module, application.args[0]),
+                );
+                defer allocator.free(helper);
+                try append(output, allocator, ", ");
+                try append(output, allocator, helper);
+                try append(output, allocator, ")");
+                return;
+            }
+            if (variable_application_index_scoped(
                 module,
                 application,
+                params,
             )) |variable| {
                 const prefix = try std.fmt.allocPrint(
                     allocator,
@@ -2783,17 +2818,35 @@ fn operator_supported(
     definition: ast.Definition,
     depth: u32,
 ) bool {
+    var active: [64][]const u8 = undefined;
+    return operator_supported_active(module, definition, depth, &active, 0);
+}
+
+fn operator_supported_active(
+    module: ast.Module,
+    definition: ast.Definition,
+    depth: u32,
+    active: *[64][]const u8,
+    active_len: usize,
+) bool {
+    for (active[0..active_len]) |name| {
+        if (std.mem.eql(u8, name, definition.name)) return true;
+    }
     if (depth > 64 or
         definition.is_function or
         definition_kind_shallow(module, definition) != .generated)
     {
         return false;
     }
-    return expr_supported(
+    if (active_len == active.len) return false;
+    active[active_len] = definition.name;
+    return expr_supported_active(
         module,
         definition.body,
         definition.params,
         depth,
+        active,
+        active_len + 1,
     );
 }
 
@@ -2850,19 +2903,24 @@ fn expr_supported(
     params: []const []const u8,
     depth: u32,
 ) bool {
-    return expr_supported_impl(
+    var active: [64][]const u8 = undefined;
+    return expr_supported_active(
         module,
         expr,
         params,
         depth,
+        &active,
+        0,
     );
 }
 
-fn expr_supported_impl(
+fn expr_supported_active(
     module: ast.Module,
     expr: *const ast.Expr,
     params: []const []const u8,
     depth: u32,
+    active: *[64][]const u8,
+    active_len: usize,
 ) bool {
     return switch (expr.*) {
         .bool_literal, .int_literal, .string_literal => true,
@@ -2873,6 +2931,8 @@ fn expr_supported_impl(
                 module,
                 name,
                 depth,
+                active,
+                active_len,
             ),
         .primed => |name| variable_index(module, name) != null or blk: {
             const resolved_name = resolved_definition_name(
@@ -2884,78 +2944,102 @@ fn expr_supported_impl(
                 resolved_name,
             ) orelse break :blk false;
             const supported = definition.params.len == 0 and
-                operator_supported(module, definition, depth + 1);
+                operator_supported_active(
+                    module,
+                    definition,
+                    depth + 1,
+                    active,
+                    active_len,
+                );
             break :blk supported;
         },
-        .primed_expr => |operand| expr_supported(
+        .primed_expr => |operand| expr_supported_active(
             module,
             operand,
             params,
             depth,
+            active,
+            active_len,
         ),
         .unchanged => |names| variable_names_supported(module, names),
         .unchanged_expr => |unchanged_expr| unchanged_tuple_supported(module, unchanged_expr),
-        .tuple, .set_enum => |items| expressions_supported(
+        .tuple, .set_enum => |items| expressions_supported_active(
             module,
             items,
             params,
             depth,
+            active,
+            active_len,
         ),
         .record => |fields| blk: {
             for (fields) |field| {
-                if (!expr_supported(
+                if (!expr_supported_active(
                     module,
                     field.value,
                     params,
                     depth,
+                    active,
+                    active_len,
                 )) break :blk false;
             }
             break :blk true;
         },
-        .set_binary => |set_binary| expr_supported(
+        .set_binary => |set_binary| expr_supported_active(
             module,
             set_binary.left,
             params,
             depth,
+            active,
+            active_len,
         ) and
-            expr_supported(
+            expr_supported_active(
                 module,
                 set_binary.right,
                 params,
                 depth,
+                active,
+                active_len,
             ),
-        .function_literal => |function_literal| bound_expression_supported(
+        .function_literal => |function_literal| bound_expression_supported_active(
             module,
             function_literal.vars,
             function_literal.body,
             params,
             depth,
+            active,
+            active_len,
         ),
-        .quantifier => |quantifier| bound_expression_supported(
+        .quantifier => |quantifier| bound_expression_supported_active(
             module,
             quantifier.vars,
             quantifier.body,
             params,
             depth,
+            active,
+            active_len,
         ),
         .set_filter => |filter_value| filter_value.vars.len == 1 and
-            bound_expression_supported(
+            bound_expression_supported_active(
                 module,
                 filter_value.vars,
                 filter_value.pred,
                 params,
                 depth,
+                active,
+                active_len,
             ),
         .set_map => |map_value| map_value.vars.len == 1 and
-            bound_expression_supported(
+            bound_expression_supported_active(
                 module,
                 map_value.vars,
                 map_value.value,
                 params,
                 depth,
+                active,
+                active_len,
             ),
         .choose => |choose_value| choose_value.domain != null and
-            bound_expression_supported(
+            bound_expression_supported_active(
                 module,
                 &.{.{
                     .name = choose_value.var_name,
@@ -2964,104 +3048,128 @@ fn expr_supported_impl(
                 choose_value.body,
                 params,
                 depth,
+                active,
+                active_len,
             ),
-        .let_in => |let_value| let_supported(
+        .let_in => |let_value| let_supported_active(
             module,
             let_value,
             params,
             depth,
+            active,
+            active_len,
         ),
         .except => |except_value| blk: {
-            if (!expr_supported(
+            if (!expr_supported_active(
                 module,
                 except_value.func,
                 params,
                 depth,
+                active,
+                active_len,
             )) break :blk false;
             for (except_value.steps) |step| {
-                if (step == .index and !expr_supported(
+                if (step == .index and !expr_supported_active(
                     module,
                     step.index,
                     params,
                     depth,
+                    active,
+                    active_len,
                 )) break :blk false;
             }
             if (params.len >= 64) break :blk false;
             var extended: [64][]const u8 = undefined;
             @memcpy(extended[0..params.len], params);
             extended[params.len] = "$at";
-            break :blk expr_supported(
+            break :blk expr_supported_active(
                 module,
                 except_value.value,
                 extended[0 .. params.len + 1],
                 depth,
+                active,
+                active_len,
             );
         },
         .at => params.len > 0 and
             std.mem.eql(u8, params[params.len - 1], "$at"),
-        .set_of_functions => |function_set| expr_supported(
+        .set_of_functions => |function_set| expr_supported_active(
             module,
             function_set.domain,
             params,
             depth,
-        ) and expr_supported(
+            active,
+            active_len,
+        ) and expr_supported_active(
             module,
             function_set.codomain,
             params,
             depth,
+            active,
+            active_len,
         ),
         .record_set => |record_set| blk: {
             for (record_set.fields) |field| {
-                if (!expr_supported(
+                if (!expr_supported_active(
                     module,
                     field.domain,
                     params,
                     depth,
+                    active,
+                    active_len,
                 )) break :blk false;
             }
             break :blk true;
         },
-        .field => |field| expr_supported(
+        .field => |field| expr_supported_active(
             module,
             field.expr,
             params,
             depth,
+            active,
+            active_len,
         ),
         .unary => |unary| switch (unary.op) {
-            .not, .neg, .subset, .union_all, .domain => expr_supported(
+            .not, .neg, .subset, .union_all, .domain => expr_supported_active(
                 module,
                 unary.operand,
                 params,
                 depth,
+                active,
+                active_len,
             ),
             else => false,
         },
         .binary => |binary| binary_supported(binary.op) and
-            expr_supported(module, binary.left, params, depth) and
-            expr_supported(module, binary.right, params, depth),
-        .if_then_else => |conditional| expr_supported(module, conditional.cond, params, depth) and
-            expr_supported(
+            expr_supported_active(module, binary.left, params, depth, active, active_len) and
+            expr_supported_active(module, binary.right, params, depth, active, active_len),
+        .if_then_else => |conditional| expr_supported_active(module, conditional.cond, params, depth, active, active_len) and
+            expr_supported_active(
                 module,
                 conditional.then_branch,
                 params,
                 depth,
+                active,
+                active_len,
             ) and
-            expr_supported(
+            expr_supported_active(
                 module,
                 conditional.else_branch,
                 params,
                 depth,
+                active,
+                active_len,
             ),
         .case_expr => |case_value| blk: {
             for (case_value.arms) |arm| {
-                if (!expr_supported(module, arm.cond, params, depth) or
-                    !expr_supported(module, arm.value, params, depth))
+                if (!expr_supported_active(module, arm.cond, params, depth, active, active_len) or
+                    !expr_supported_active(module, arm.value, params, depth, active, active_len))
                 {
                     break :blk false;
                 }
             }
             if (case_value.otherwise) |otherwise| {
-                break :blk expr_supported(module, otherwise, params, depth);
+                break :blk expr_supported_active(module, otherwise, params, depth, active, active_len);
             }
             break :blk true;
         },
@@ -3078,11 +3186,13 @@ fn expr_supported_impl(
                 const lambda = application.args[1].*.lambda;
                 if (lambda.params.len != 1 or
                     params.len + 1 > 64 or
-                    !expr_supported(
+                    !expr_supported_active(
                         module,
                         application.args[0],
                         params,
                         depth,
+                        active,
+                        active_len,
                     ))
                 {
                     break :blk false;
@@ -3090,22 +3200,64 @@ fn expr_supported_impl(
                 var extended: [64][]const u8 = undefined;
                 @memcpy(extended[0..params.len], params);
                 extended[params.len] = lambda.params[0];
-                break :blk expr_supported(
+                break :blk expr_supported_active(
                     module,
                     lambda.body,
                     extended[0 .. params.len + 1],
                     depth,
+                    active,
+                    active_len,
+                );
+            }
+            if (is_reduce_sequence_call(module, application)) {
+                const lambda = application.args[0].*.lambda;
+                if (lambda.params.len != 2 or
+                    params.len + lambda.params.len > 64 or
+                    !expr_supported_active(
+                        module,
+                        application.args[1],
+                        params,
+                        depth,
+                        active,
+                        active_len,
+                    ) or
+                    !expr_supported_active(
+                        module,
+                        application.args[2],
+                        params,
+                        depth,
+                        active,
+                        active_len,
+                    ))
+                {
+                    break :blk false;
+                }
+                var extended: [64][]const u8 = undefined;
+                @memcpy(extended[0..params.len], params);
+                @memcpy(
+                    extended[params.len..][0..lambda.params.len],
+                    lambda.params,
+                );
+                break :blk expr_supported_active(
+                    module,
+                    lambda.body,
+                    extended[0 .. params.len + lambda.params.len],
+                    depth,
+                    active,
+                    active_len,
                 );
             }
             if (application.func.* == .ident and
                 direct_native_name(module, application.func.ident) != null)
             {
                 for (application.args) |argument| {
-                    if (!expr_supported(
+                    if (!expr_supported_active(
                         module,
                         argument,
                         params,
                         depth,
+                        active,
+                        active_len,
                     )) break :blk false;
                 }
                 break :blk true;
@@ -3118,18 +3270,22 @@ fn expr_supported_impl(
             else
                 null;
             if (target_name == null) {
-                if (!expr_supported(
+                if (!expr_supported_active(
                     module,
                     application.func,
                     params,
                     depth,
+                    active,
+                    active_len,
                 )) break :blk false;
                 for (application.args) |argument| {
-                    if (!expr_supported(
+                    if (!expr_supported_active(
                         module,
                         argument,
                         params,
                         depth,
+                        active,
+                        active_len,
                     )) break :blk false;
                 }
                 break :blk true;
@@ -3140,31 +3296,47 @@ fn expr_supported_impl(
             ) orelse break :blk false;
             if (target.params.len != application.args.len) {
                 if (target.params.len != 0 or
-                    !operator_supported(module, target, depth + 1))
+                    !operator_supported_active(
+                        module,
+                        target,
+                        depth + 1,
+                        active,
+                        active_len,
+                    ))
                 {
                     break :blk false;
                 }
                 for (application.args) |argument| {
-                    if (!expr_supported(
+                    if (!expr_supported_active(
                         module,
                         argument,
                         params,
                         depth,
+                        active,
+                        active_len,
                     )) break :blk false;
                 }
                 break :blk true;
             }
-            if (!operator_supported(module, target, depth + 1) and
+            if (!operator_supported_active(
+                module,
+                target,
+                depth + 1,
+                active,
+                active_len,
+            ) and
                 !native_operator(target.name))
             {
                 break :blk false;
             }
             for (application.args) |argument| {
-                if (!expr_supported(
+                if (!expr_supported_active(
                     module,
                     argument,
                     params,
                     depth,
+                    active,
+                    active_len,
                 )) break :blk false;
             }
             break :blk true;
@@ -3177,6 +3349,8 @@ fn definition_value_supported(
     module: ast.Module,
     name: []const u8,
     depth: u32,
+    active: *[64][]const u8,
+    active_len: usize,
 ) bool {
     if (configured_constant_name(module, name) != null) return true;
     if (builtin_value_runtime_name(name) != null) return true;
@@ -3185,7 +3359,13 @@ fn definition_value_supported(
     if (builtin_value_runtime_name(resolved_name) != null) return true;
     const definition = find_definition(module, resolved_name) orelse
         return false;
-    return operator_supported(module, definition, depth + 1);
+    return operator_supported_active(
+        module,
+        definition,
+        depth + 1,
+        active,
+        active_len,
+    );
 }
 
 fn bound_expression_supported(
@@ -3195,6 +3375,27 @@ fn bound_expression_supported(
     params: []const []const u8,
     depth: u32,
 ) bool {
+    var active: [64][]const u8 = undefined;
+    return bound_expression_supported_active(
+        module,
+        vars,
+        body,
+        params,
+        depth,
+        &active,
+        0,
+    );
+}
+
+fn bound_expression_supported_active(
+    module: ast.Module,
+    vars: []const ast.BoundVar,
+    body: *const ast.Expr,
+    params: []const []const u8,
+    depth: u32,
+    active: *[64][]const u8,
+    active_len: usize,
+) bool {
     if (vars.len == 0 or params.len + vars.len > 64) return false;
     for (vars) |bound| {
         for (vars) |other| {
@@ -3203,11 +3404,13 @@ fn bound_expression_supported(
                 other.name,
             )) return false;
         }
-        if (!expr_supported(
+        if (!expr_supported_active(
             module,
             bound.domain,
             params,
             depth,
+            active,
+            active_len,
         )) return false;
     }
     var extended: [64][]const u8 = undefined;
@@ -3215,11 +3418,13 @@ fn bound_expression_supported(
     for (vars, 0..) |bound, index| {
         extended[params.len + index] = bound.name;
     }
-    return expr_supported(
+    return expr_supported_active(
         module,
         body,
         extended[0 .. params.len + vars.len],
         depth,
+        active,
+        active_len,
     );
 }
 
@@ -3531,6 +3736,55 @@ fn emit_helpers(
                 );
                 return;
             }
+            if (is_reduce_sequence_call(module, application)) {
+                const lambda_expr = application.args[0];
+                const lambda = lambda_expr.*.lambda;
+                var extended: [64][]const u8 = undefined;
+                @memcpy(extended[0..params.len], params);
+                @memcpy(
+                    extended[params.len..][0..lambda.params.len],
+                    lambda.params,
+                );
+                const helper = try helper_name(
+                    allocator,
+                    expression_identity(module, lambda_expr),
+                );
+                defer allocator.free(helper);
+                try emit_named_helper(
+                    output,
+                    allocator,
+                    module,
+                    helper,
+                    lambda.body,
+                    extended[0 .. params.len + lambda.params.len],
+                    emitted_helpers,
+                );
+                try emit_helpers(
+                    output,
+                    allocator,
+                    module,
+                    lambda.body,
+                    extended[0 .. params.len + lambda.params.len],
+                    emitted_helpers,
+                );
+                try emit_helpers(
+                    output,
+                    allocator,
+                    module,
+                    application.args[1],
+                    params,
+                    emitted_helpers,
+                );
+                try emit_helpers(
+                    output,
+                    allocator,
+                    module,
+                    application.args[2],
+                    params,
+                    emitted_helpers,
+                );
+                return;
+            }
             try emit_helpers(
                 output,
                 allocator,
@@ -3674,6 +3928,25 @@ fn let_supported(
     params: []const []const u8,
     depth: u32,
 ) bool {
+    var active: [64][]const u8 = undefined;
+    return let_supported_active(
+        module,
+        let_value,
+        params,
+        depth,
+        &active,
+        0,
+    );
+}
+
+fn let_supported_active(
+    module: ast.Module,
+    let_value: *const ast.LetIn,
+    params: []const []const u8,
+    depth: u32,
+    active: *[64][]const u8,
+    active_len: usize,
+) bool {
     if (params.len + let_value.defs.len > 64) return false;
     var extended: [64][]const u8 = undefined;
     @memcpy(extended[0..params.len], params);
@@ -3692,19 +3965,23 @@ fn let_supported(
             definition_params[params.len + index ..][0..definition.params.len],
             definition.params,
         );
-        if (!expr_supported(
+        if (!expr_supported_active(
             module,
             definition.body,
             definition_params[0 .. params.len + index + definition.params.len],
             depth,
+            active,
+            active_len,
         )) return false;
         extended[params.len + index] = definition.name;
     }
-    return expr_supported(
+    return expr_supported_active(
         module,
         let_value.body,
         extended[0 .. params.len + let_value.defs.len],
         depth,
+        active,
+        active_len,
     );
 }
 
@@ -3719,6 +3996,44 @@ fn is_select_sequence_call(application: *const ast.Apply) bool {
     const unqualified = standard_native_unqualified_name(name) orelse
         return false;
     return std.mem.eql(u8, unqualified, "SelectSeq");
+}
+
+fn is_reduce_sequence_call(
+    module: ast.Module,
+    application: *const ast.Apply,
+) bool {
+    if (application.func.* != .ident or
+        application.args.len != 3 or
+        application.args[0].* != .lambda)
+    {
+        return false;
+    }
+    const resolved = resolved_definition_name(
+        module,
+        application.func.ident,
+    ) orelse application.func.ident;
+    const definition = find_definition(module, resolved) orelse return false;
+    return reduce_sequence_helper_definition(definition);
+}
+
+fn reduce_sequence_helper_definition(definition: ast.Definition) bool {
+    if (definition.params.len != 3 or definition.body.* != .apply) {
+        return false;
+    }
+    const application = definition.body.apply;
+    if (application.func.* != .ident or application.args.len != 3) {
+        return false;
+    }
+    if (!std.mem.eql(
+        u8,
+        operator_unqualified_name(application.func.ident),
+        "FoldFunction",
+    )) {
+        return false;
+    }
+    return expr_is_identifier(application.args[0], definition.params[0]) and
+        expr_is_identifier(application.args[1], definition.params[2]) and
+        expr_is_identifier(application.args[2], definition.params[1]);
 }
 
 fn is_sequence_index_call(application: *const ast.Apply) bool {
@@ -4745,12 +5060,33 @@ fn expressions_supported(
     params: []const []const u8,
     depth: u32,
 ) bool {
+    var active: [64][]const u8 = undefined;
+    return expressions_supported_active(
+        module,
+        expressions,
+        params,
+        depth,
+        &active,
+        0,
+    );
+}
+
+fn expressions_supported_active(
+    module: ast.Module,
+    expressions: []const *ast.Expr,
+    params: []const []const u8,
+    depth: u32,
+    active: *[64][]const u8,
+    active_len: usize,
+) bool {
     for (expressions) |expression| {
-        if (!expr_supported(
+        if (!expr_supported_active(
             module,
             expression,
             params,
             depth,
+            active,
+            active_len,
         )) return false;
     }
     return true;
@@ -5121,6 +5457,7 @@ fn mark_reachable_expr(
                     return;
                 }
                 if (is_select_sequence_call(application) or
+                    is_reduce_sequence_call(module, application) or
                     direct_native_name(module, name) != null or
                     is_native_override(name))
                 {
@@ -5136,7 +5473,9 @@ fn mark_reachable_expr(
                         application.func,
                     );
                 }
-            } else if (!is_select_sequence_call(application)) {
+            } else if (!is_select_sequence_call(application) and
+                !is_reduce_sequence_call(module, application))
+            {
                 mark_reachable_expr(
                     module,
                     reachable,
@@ -5336,6 +5675,7 @@ fn collect_generated_expressions(
             const native_call = application.func.* == .ident and
                 is_native_override(application.func.*.ident);
             if (!is_select_sequence_call(application) and
+                !is_reduce_sequence_call(module, application) and
                 !native_call and
                 !resolved_call)
             {
@@ -6148,6 +6488,24 @@ fn variable_application_index(
     };
 }
 
+fn application_root_ident(application: *const ast.Apply) ?[]const u8 {
+    return switch (application.func.*) {
+        .ident => |name| name,
+        .apply => |parent| application_root_ident(parent),
+        else => null,
+    };
+}
+
+fn variable_application_index_scoped(
+    module: ast.Module,
+    application: *const ast.Apply,
+    params: []const []const u8,
+) ?u32 {
+    const root = application_root_ident(application) orelse return null;
+    if (param_index(params, root) != null) return null;
+    return variable_application_index(module, application);
+}
+
 fn emit_field_path_comparison(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -6163,25 +6521,19 @@ fn emit_field_path_comparison(
         params,
     )) return true;
 
-    const left_is_field_path = binary.left.* == .field and
-        binary.left.field.expr.* == .apply and
-        variable_application_index(module, binary.left.field.expr.apply) != null and
-        binary.right.* != .field;
-    const right_is_field_path = binary.right.* == .field and
-        binary.right.field.expr.* == .apply and
-        variable_application_index(module, binary.right.field.expr.apply) != null and
-        binary.left.* != .field;
-    if (!left_is_field_path and !right_is_field_path) return false;
-
-    const field_expr = if (left_is_field_path)
-        binary.left.field
+    const left_path = if (binary.right.* != .field)
+        direct_field_path_scoped(module, binary.left, params)
     else
-        binary.right.field;
-    const other = if (left_is_field_path) binary.right else binary.left;
-    const variable = variable_application_index(
-        module,
-        field_expr.expr.apply,
-    ).?;
+        null;
+    const right_path = if (binary.left.* != .field)
+        direct_field_path_scoped(module, binary.right, params)
+    else
+        null;
+    if (left_path == null and right_path == null) return false;
+
+    const field_path = left_path orelse right_path.?;
+    const field_expr = if (left_path != null) binary.left.field else binary.right.field;
+    const other = if (left_path != null) binary.right else binary.left;
     const function_name = if (binary.op == .eq)
         "variable_path_field_equal_bool"
     else
@@ -6189,7 +6541,7 @@ fn emit_field_path_comparison(
     const prefix = try std.fmt.allocPrint(
         allocator,
         "try runtime.{s}(context, {d}, &[_]Value{{",
-        .{ function_name, variable },
+        .{ function_name, field_path.variable },
     );
     defer allocator.free(prefix);
     try append(output, allocator, prefix);
@@ -6197,7 +6549,7 @@ fn emit_field_path_comparison(
         output,
         allocator,
         module,
-        field_expr.expr.apply,
+        field_path.application,
         params,
     );
     const middle = try std.fmt.allocPrint(
@@ -6219,7 +6571,7 @@ fn emit_field_path_boolean(
     expr: *const ast.Expr,
     params: []const []const u8,
 ) error{OutOfMemory}!bool {
-    if (sequence_head_field_path(module, expr)) |field_path| {
+    if (sequence_head_field_path_scoped(module, expr, params)) |field_path| {
         try emit_field_path_call(
             output,
             allocator,
@@ -6233,7 +6585,7 @@ fn emit_field_path_boolean(
         );
         return true;
     }
-    if (direct_field_path(module, expr)) |field_path| {
+    if (direct_field_path_scoped(module, expr, params)) |field_path| {
         try emit_field_path_call(
             output,
             allocator,
@@ -6258,8 +6610,12 @@ fn emit_field_path_membership(
     params: []const []const u8,
 ) error{OutOfMemory}!bool {
     if (binary.right.* == .field) return false;
-    const sequence_path = sequence_head_field_path(module, binary.left);
-    const direct_path = direct_field_path(module, binary.left);
+    const sequence_path = sequence_head_field_path_scoped(
+        module,
+        binary.left,
+        params,
+    );
+    const direct_path = direct_field_path_scoped(module, binary.left, params);
     const field_path = sequence_path orelse direct_path orelse return false;
     const function_name = if (sequence_path != null)
         "variable_path_sequence_head_field_member_bool"
@@ -6340,8 +6696,8 @@ fn emit_sequence_head_field_path_comparison(
     binary: *const ast.Binary,
     params: []const []const u8,
 ) error{OutOfMemory}!bool {
-    const left = sequence_head_field_path(module, binary.left);
-    const right = sequence_head_field_path(module, binary.right);
+    const left = sequence_head_field_path_scoped(module, binary.left, params);
+    const right = sequence_head_field_path_scoped(module, binary.right, params);
     if (left == null and right == null) return false;
     if (left != null and right != null) return false;
     const field_path = left orelse right.?;
@@ -6453,6 +6809,26 @@ fn direct_field_path(
     };
 }
 
+fn direct_field_path_scoped(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    params: []const []const u8,
+) ?SequenceHeadFieldPath {
+    if (expr.* != .field) return null;
+    const field_value = expr.field;
+    if (field_value.expr.* != .apply) return null;
+    const variable = variable_application_index_scoped(
+        module,
+        field_value.expr.apply,
+        params,
+    ) orelse return null;
+    return .{
+        .variable = variable,
+        .application = field_value.expr.apply,
+        .field_name = field_value.name,
+    };
+}
+
 fn sequence_head_field_path(
     module: ast.Module,
     expr: *const ast.Expr,
@@ -6479,6 +6855,34 @@ fn sequence_head_field_path(
     };
 }
 
+fn sequence_head_field_path_scoped(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    params: []const []const u8,
+) ?SequenceHeadFieldPath {
+    if (expr.* != .field) return null;
+    const field_value = expr.field;
+    if (field_value.expr.* != .apply) return null;
+    const head = field_value.expr.apply;
+    if (head.func.* != .ident or
+        !std.mem.eql(u8, head.func.ident, "Head") or
+        head.args.len != 1 or
+        head.args[0].* != .apply)
+    {
+        return null;
+    }
+    const variable = variable_application_index_scoped(
+        module,
+        head.args[0].apply,
+        params,
+    ) orelse return null;
+    return .{
+        .variable = variable,
+        .application = head.args[0].apply,
+        .field_name = field_value.name,
+    };
+}
+
 fn emit_variable_path_comparison(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -6487,7 +6891,11 @@ fn emit_variable_path_comparison(
     params: []const []const u8,
 ) error{OutOfMemory}!bool {
     if (binary.left.* == .apply and binary.right.* != .apply) {
-        if (variable_application_index(module, binary.left.apply)) |index| {
+        if (variable_application_index_scoped(
+            module,
+            binary.left.apply,
+            params,
+        )) |index| {
             return try emit_one_sided_path_comparison(
                 output,
                 allocator,
@@ -6501,7 +6909,11 @@ fn emit_variable_path_comparison(
         }
     }
     if (binary.right.* == .apply and binary.left.* != .apply) {
-        if (variable_application_index(module, binary.right.apply)) |index| {
+        if (variable_application_index_scoped(
+            module,
+            binary.right.apply,
+            params,
+        )) |index| {
             return try emit_one_sided_path_comparison(
                 output,
                 allocator,
@@ -6525,9 +6937,10 @@ fn emit_variable_path_membership(
     params: []const []const u8,
 ) error{OutOfMemory}!bool {
     if (binary.right.* != .apply) return false;
-    const variable = variable_application_index(
+    const variable = variable_application_index_scoped(
         module,
         binary.right.apply,
+        params,
     ) orelse return false;
     const function_name = if (binary.op == .in)
         "variable_path_member_bool"
@@ -6561,8 +6974,10 @@ fn emit_variable_path_int_comparison(
     params: []const []const u8,
 ) error{OutOfMemory}!bool {
     const compare_op = compare_op_literal(binary.op) orelse return false;
-    if (direct_field_path(module, binary.left)) |field_path| {
-        if (direct_field_path(module, binary.right) != null) return false;
+    if (direct_field_path_scoped(module, binary.left, params)) |field_path| {
+        if (direct_field_path_scoped(module, binary.right, params) != null) {
+            return false;
+        }
         try emit_field_path_int_compare_call(
             output,
             allocator,
@@ -6575,7 +6990,7 @@ fn emit_variable_path_int_comparison(
         );
         return true;
     }
-    if (direct_field_path(module, binary.right)) |field_path| {
+    if (direct_field_path_scoped(module, binary.right, params)) |field_path| {
         try emit_field_path_int_compare_call(
             output,
             allocator,
@@ -6589,9 +7004,17 @@ fn emit_variable_path_int_comparison(
         return true;
     }
     if (binary.left.* == .apply) {
-        if (variable_application_index(module, binary.left.apply)) |variable| {
+        if (variable_application_index_scoped(
+            module,
+            binary.left.apply,
+            params,
+        )) |variable| {
             if (binary.right.* == .apply and
-                variable_application_index(module, binary.right.apply) != null)
+                variable_application_index_scoped(
+                    module,
+                    binary.right.apply,
+                    params,
+                ) != null)
             {
                 return false;
             }
@@ -6610,7 +7033,11 @@ fn emit_variable_path_int_comparison(
         }
     }
     if (binary.right.* == .apply) {
-        if (variable_application_index(module, binary.right.apply)) |variable| {
+        if (variable_application_index_scoped(
+            module,
+            binary.right.apply,
+            params,
+        )) |variable| {
             try emit_variable_path_int_compare_call(
                 output,
                 allocator,
@@ -7345,6 +7772,78 @@ test "configuration replacements remove shadowed fallbacks" {
         u8,
         result.source,
         "pub const config_replacements_hash: u64 = 0x",
+    ) != null);
+}
+
+test "operator formals shadow state variables in generated paths" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedFormalShadow ----------------------
+        \\VARIABLE x
+        \\Read(x) == x[1]
+        \\Use == Read([i \in 1..1 |-> 1])
+        \\=========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Read", "Use" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "pub fn op_0(context: *runtime.CallContext, args: []const Value) Error!Value {\n    std.debug.assert(args.len == 1);\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "try runtime.variable_path(context, 0",
+    ) == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "try runtime.call(context, args[0]",
+    ) != null);
+}
+
+test "self-recursive operators are generated without fallbacks" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedRecursion ----------------------
+        \\Recur(n) == IF n = 0 THEN 0 ELSE Recur(n - 1)
+        \\Use == Recur(2)
+        \\=========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Recur", "Use" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expectEqual(@as(usize, 0), result.unsupported.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "try op_0(context, &[_]Value{",
     ) != null);
 }
 

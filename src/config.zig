@@ -34,6 +34,7 @@ pub const Config = struct {
     action_constraints: []const []const u8,
     symmetry_name: ?[]const u8 = null,
     check_deadlock: bool,
+    strict_constants: bool = false,
 
     pub fn empty() Config {
         return Config{
@@ -47,6 +48,7 @@ pub const Config = struct {
             .action_constraints = &[_][]const u8{},
             .symmetry_name = null,
             .check_deadlock = true,
+            .strict_constants = false,
         };
     }
 
@@ -65,6 +67,7 @@ pub const Config = struct {
             .action_constraints = &[_][]const u8{},
             .symmetry_name = null,
             .check_deadlock = true,
+            .strict_constants = false,
         };
     }
 
@@ -93,6 +96,7 @@ pub const Config = struct {
             .action_constraints = &[_][]const u8{},
             .symmetry_name = null,
             .check_deadlock = true,
+            .strict_constants = false,
         };
     }
 };
@@ -375,6 +379,7 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
         ),
         .symmetry_name = cfg.symmetry_name,
         .check_deadlock = cfg.check_deadlock,
+        .strict_constants = true,
     };
 }
 

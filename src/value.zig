@@ -128,11 +128,10 @@ pub const RecordSet = extern struct {
         if (elem != .record_v) return false;
         const r = elem.record_v;
         if (r.len != self.len) return false;
-        const rfs = r.fields(pool);
         var i: u32 = 0;
         while (i < self.len) : (i += 1) {
-            if (!rfs[i * 2].string_v.eql(self.field_name(pool, i), pool)) return false;
-            const val = rfs[i * 2 + 1];
+            const expected_name = self.field_name(pool, i).slice(pool);
+            const val = r.lookup(pool, expected_name) orelse return false;
             if (!self.field_domain(pool, i).member(pool, val)) return false;
         }
         return true;
@@ -144,8 +143,20 @@ pub const RecordSet = extern struct {
         if (self.len != other.len) return false;
         var i: u32 = 0;
         while (i < self.len) : (i += 1) {
-            if (!self.field_name(pool, i).eql(other.field_name(pool, i), pool)) return false;
-            if (!self.field_domain(pool, i).eql(other.field_domain(pool, i), pool)) return false;
+            const expected_name = self.field_name(pool, i).slice(pool);
+            var matched = false;
+            var j: u32 = 0;
+            while (j < other.len) : (j += 1) {
+                if (!std.mem.eql(u8, expected_name, other.field_name(pool, j).slice(pool))) {
+                    continue;
+                }
+                matched = true;
+                if (!self.field_domain(pool, i).eql(other.field_domain(pool, j), pool)) {
+                    return false;
+                }
+                break;
+            }
+            if (!matched) return false;
         }
         return true;
     }
@@ -397,7 +408,40 @@ pub const Value = union(ValueTag) {
         right: Value,
         right_pool: *const ValuePool,
     ) bool {
-        if (left.tag() != right.tag()) return false;
+        const tags_equal = left.tag() == right.tag();
+        if (!tags_equal) {
+            if (left == .function_v and right == .tuple_v) {
+                return function_equals_tuple_cross_pool(
+                    left.function_v,
+                    left_pool,
+                    right.tuple_v,
+                    right_pool,
+                );
+            }
+            if (left == .tuple_v and right == .function_v) {
+                return function_equals_tuple_cross_pool(
+                    right.function_v,
+                    right_pool,
+                    left.tuple_v,
+                    left_pool,
+                );
+            }
+            if (left == .range_v and right == .set_v) {
+                return range_equals_set_cross_pool(
+                    left.range_v,
+                    right.set_v,
+                    right_pool,
+                );
+            }
+            if (left == .set_v and right == .range_v) {
+                return range_equals_set_cross_pool(
+                    right.range_v,
+                    left.set_v,
+                    left_pool,
+                );
+            }
+            return false;
+        }
         if (left_pool == right_pool and
             left != .lambda_v and
             same_repr(left, right))
@@ -522,17 +566,24 @@ pub const Value = union(ValueTag) {
                 if (set_v.len != right_set.len) break :blk false;
                 var index: u32 = 0;
                 while (index < set_v.len) : (index += 1) {
-                    if (!eql_cross_pool(
-                        .{ .string_v = set_v.field_name(left_pool, index) },
-                        left_pool,
-                        .{ .string_v = right_set.field_name(right_pool, index) },
-                        right_pool,
-                    ) or !eql_cross_pool(
-                        set_v.field_domain(left_pool, index),
-                        left_pool,
-                        right_set.field_domain(right_pool, index),
-                        right_pool,
-                    )) break :blk false;
+                    const left_name =
+                        set_v.field_name(left_pool, index).slice(left_pool);
+                    var matched = false;
+                    var right_index: u32 = 0;
+                    while (right_index < right_set.len) : (right_index += 1) {
+                        const right_name =
+                            right_set.field_name(right_pool, right_index).slice(right_pool);
+                        if (!std.mem.eql(u8, left_name, right_name)) continue;
+                        matched = true;
+                        if (!eql_cross_pool(
+                            set_v.field_domain(left_pool, index),
+                            left_pool,
+                            right_set.field_domain(right_pool, right_index),
+                            right_pool,
+                        )) break :blk false;
+                        break;
+                    }
+                    if (!matched) break :blk false;
                 }
                 break :blk true;
             },
@@ -793,10 +844,46 @@ fn function_equals_tuple(function: Function, tuple: Tuple, pool: *const ValuePoo
     return true;
 }
 
+fn function_equals_tuple_cross_pool(
+    function: Function,
+    function_pool: *const ValuePool,
+    tuple: Tuple,
+    tuple_pool: *const ValuePool,
+) bool {
+    if (function.len != tuple.len or function.domain.len != function.len) return false;
+    const tuple_items = tuple.items(tuple_pool);
+    var i: u32 = 0;
+    while (i < function.len) : (i += 1) {
+        const function_item = function.apply(
+            function_pool,
+            Value{ .int_v = @as(i64, @intCast(i)) + 1 },
+        ) orelse return false;
+        if (!Value.eql_cross_pool(
+            function_item,
+            function_pool,
+            tuple_items[i],
+            tuple_pool,
+        )) return false;
+    }
+    return true;
+}
+
 fn range_equals_set(r: Range, s: Set, pool: *const ValuePool) bool {
     const items = s.items(pool);
     if (items.len != @as(u64, @intCast(r.hi - r.lo + 1))) return false;
     for (items, 0..) |it, i| {
+        const expected = r.lo + @as(i64, @intCast(i));
+        if (it.as_int() != expected) return false;
+    }
+    return true;
+}
+
+fn range_equals_set_cross_pool(r: Range, s: Set, pool: *const ValuePool) bool {
+    if (r.hi < r.lo) return s.len == 0;
+    const length_i128 = @as(i128, r.hi) - @as(i128, r.lo) + 1;
+    if (length_i128 < 0 or length_i128 > std.math.maxInt(u32)) return false;
+    if (s.len != @as(u32, @intCast(length_i128))) return false;
+    for (s.items(pool), 0..) |it, i| {
         const expected = r.lo + @as(i64, @intCast(i));
         if (it.as_int() != expected) return false;
     }
@@ -993,12 +1080,18 @@ pub const Function = extern struct {
     pub fn eql(self: Function, other: Function, pool: *const ValuePool) bool {
         assert(self.offset + self.len <= pool.value_count);
         assert(other.offset + other.len <= pool.value_count);
-        if (!self.domain.eql(other.domain, pool)) return false;
-        const a = self.entries(pool);
-        const b = other.entries(pool);
-        if (a.len != b.len) return false;
-        for (a, b) |x, y| {
-            if (!x.eql(y, pool)) return false;
+        if (self.len != other.len) return false;
+        const other_keys = other.domain.items(pool);
+        const other_entries = other.entries(pool);
+        for (self.domain.items(pool), self.entries(pool)) |left_key, left_entry| {
+            var found = false;
+            for (other_keys, other_entries) |right_key, right_entry| {
+                if (!left_key.eql(right_key, pool)) continue;
+                found = true;
+                if (!left_entry.eql(right_entry, pool)) return false;
+                break;
+            }
+            if (!found) return false;
         }
         return true;
     }

@@ -19,6 +19,15 @@ fn make_test_arena() !Arena {
     return try Arena.init(1 * 1024 * 1024);
 }
 
+fn test_value_offset(pool: *const ValuePool, values: []const Value) u32 {
+    const base = @intFromPtr(pool.values.ptr);
+    const addr = @intFromPtr(values.ptr);
+    std.debug.assert(addr >= base);
+    const bytes = addr - base;
+    std.debug.assert(bytes % @sizeOf(Value) == 0);
+    return @intCast(bytes / @sizeOf(Value));
+}
+
 test "arena alloc and reset" {
     var arena = try make_test_arena();
     defer arena.deinit();
@@ -69,6 +78,78 @@ test "equal tuple and function sequences have equal fingerprints" {
     try std.testing.expectEqual(
         fingerprint.hash_value(&pool, tuple, fingerprint.hash_init()),
         fingerprint.hash_value(&pool, function, fingerprint.hash_init()),
+    );
+}
+
+test "record equality and fingerprints ignore field order" {
+    var arena = try make_test_arena();
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 32, 32);
+    const a = try pool.push_string("a");
+    const b = try pool.push_string("b");
+
+    const left_fields = try pool.alloc_values(4);
+    const left_offset = test_value_offset(&pool, left_fields);
+    left_fields[0] = .{ .string_v = a };
+    left_fields[1] = .{ .int_v = 1 };
+    left_fields[2] = .{ .string_v = b };
+    left_fields[3] = .{ .int_v = 2 };
+    const left = Value{ .record_v = .{ .offset = left_offset, .len = 2 } };
+
+    const right_fields = try pool.alloc_values(4);
+    const right_offset = test_value_offset(&pool, right_fields);
+    right_fields[0] = .{ .string_v = b };
+    right_fields[1] = .{ .int_v = 2 };
+    right_fields[2] = .{ .string_v = a };
+    right_fields[3] = .{ .int_v = 1 };
+    const right = Value{ .record_v = .{ .offset = right_offset, .len = 2 } };
+
+    try std.testing.expect(left.eql(right, &pool));
+    try std.testing.expect(Value.eql_cross_pool(left, &pool, right, &pool));
+    try std.testing.expectEqual(
+        fingerprint.hash_value(&pool, left, fingerprint.hash_init()),
+        fingerprint.hash_value(&pool, right, fingerprint.hash_init()),
+    );
+}
+
+test "function equality ignores domain storage order" {
+    var arena = try make_test_arena();
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 64, 32);
+
+    const left_keys = try pool.alloc_values(2);
+    const left_keys_offset = test_value_offset(&pool, left_keys);
+    left_keys[0] = .{ .int_v = 1 };
+    left_keys[1] = .{ .int_v = 2 };
+    const left_values = try pool.alloc_values(2);
+    const left_values_offset = test_value_offset(&pool, left_values);
+    left_values[0] = .{ .int_v = 10 };
+    left_values[1] = .{ .int_v = 20 };
+    const left = Value{ .function_v = .{
+        .domain = .{ .offset = left_keys_offset, .len = 2 },
+        .offset = left_values_offset,
+        .len = 2,
+    } };
+
+    const right_keys = try pool.alloc_values(2);
+    const right_keys_offset = test_value_offset(&pool, right_keys);
+    right_keys[0] = .{ .int_v = 2 };
+    right_keys[1] = .{ .int_v = 1 };
+    const right_values = try pool.alloc_values(2);
+    const right_values_offset = test_value_offset(&pool, right_values);
+    right_values[0] = .{ .int_v = 20 };
+    right_values[1] = .{ .int_v = 10 };
+    const right = Value{ .function_v = .{
+        .domain = .{ .offset = right_keys_offset, .len = 2 },
+        .offset = right_values_offset,
+        .len = 2,
+    } };
+
+    try std.testing.expect(left.eql(right, &pool));
+    try std.testing.expect(Value.eql_cross_pool(left, &pool, right, &pool));
+    try std.testing.expectEqual(
+        fingerprint.hash_value(&pool, left, fingerprint.hash_init()),
+        fingerprint.hash_value(&pool, right, fingerprint.hash_init()),
     );
 }
 

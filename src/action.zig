@@ -577,7 +577,13 @@ pub const ActionCompiler = struct {
         var steps = std.ArrayList(ActionStep).empty;
         defer steps.deinit(std.heap.page_allocator);
         try self.collect_steps(expr, &steps, false);
-        return CompiledNext{ .steps = try self.dup_slice(ActionStep, steps.items) };
+        const compiled = CompiledNext{
+            .steps = try self.dup_slice(ActionStep, steps.items),
+        };
+        if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null) {
+            dump_action_steps("NEXT", compiled.steps, 0);
+        }
+        return compiled;
     }
 
     fn is_constant_replacement(self: ActionCompiler, name: []const u8) bool {
@@ -640,11 +646,11 @@ pub const ActionCompiler = struct {
         switch (expr.*) {
             .binary => |b| {
                 if (b.op == .eq and b.left.* == .ident) {
-                    const name = b.left.ident;
+                    const name = self.evaluator.resolve_alias(b.left.ident);
                     if (self.evaluator.find_variable(name) != null) return true;
                 }
                 if (b.op == .in and b.left.* == .ident) {
-                    const name = b.left.ident;
+                    const name = self.evaluator.resolve_alias(b.left.ident);
                     if (self.evaluator.find_variable(name) != null) return true;
                 }
                 return false;
@@ -729,14 +735,14 @@ pub const ActionCompiler = struct {
                 }
                 if (b.op == .eq) {
                     if (!is_init and b.left.* == .primed) {
-                        const name = b.left.*.primed;
+                        const name = self.evaluator.resolve_alias(b.left.*.primed);
                         const index = self.evaluator.find_variable(name) orelse
                             return Error.UndefinedSymbol;
                         try steps.append(std.heap.page_allocator, ActionStep{ .assign_prime = .{ .var_name = name, .var_index = index, .expr = try self.compile_expr(b.right), .is_membership = false } });
                         return;
                     }
                     if (is_init and b.left.* == .ident) {
-                        const name = b.left.*.ident;
+                        const name = self.evaluator.resolve_alias(b.left.*.ident);
                         const index = self.evaluator.find_variable(name) orelse
                             return Error.UndefinedSymbol;
                         try steps.append(std.heap.page_allocator, ActionStep{ .assign_var = .{ .var_name = name, .var_index = index, .expr = try self.compile_expr(b.right), .is_membership = false } });
@@ -745,14 +751,14 @@ pub const ActionCompiler = struct {
                 }
                 if (b.op == .in) {
                     if (is_init and b.left.* == .ident) {
-                        const name = b.left.*.ident;
+                        const name = self.evaluator.resolve_alias(b.left.*.ident);
                         const index = self.evaluator.find_variable(name) orelse
                             return Error.UndefinedSymbol;
                         try steps.append(std.heap.page_allocator, ActionStep{ .assign_var = .{ .var_name = name, .var_index = index, .expr = try self.compile_expr(b.right), .is_membership = true } });
                         return;
                     }
                     if (!is_init and b.left.* == .primed) {
-                        const name = b.left.*.primed;
+                        const name = self.evaluator.resolve_alias(b.left.*.primed);
                         const index = self.evaluator.find_variable(name) orelse
                             return Error.UndefinedSymbol;
                         try steps.append(std.heap.page_allocator, ActionStep{ .assign_prime = .{ .var_name = name, .var_index = index, .expr = try self.compile_expr(b.right), .is_membership = true } });
@@ -1046,16 +1052,17 @@ pub const ActionCompiler = struct {
             },
             .unchanged => |vars| {
                 for (vars) |v| {
-                    if (self.evaluator.find_variable(v)) |index| {
+                    const resolved = self.evaluator.resolve_alias(v);
+                    if (self.evaluator.find_variable(resolved)) |index| {
                         try steps.append(std.heap.page_allocator, ActionStep{ .unchanged = .{
-                            .var_name = v,
+                            .var_name = resolved,
                             .var_index = index,
                         } });
                     } else if (self.evaluator.find_definition(v)) |def| {
                         if (def.params.len == 0 and def.body.* == .tuple) {
                             for (def.body.*.tuple) |it| {
                                 if (it.* != .ident) return Error.TypeError;
-                                const name = it.*.ident;
+                                const name = self.evaluator.resolve_alias(it.*.ident);
                                 const index = self.evaluator.find_variable(name) orelse
                                     return Error.UndefinedSymbol;
                                 try steps.append(std.heap.page_allocator, ActionStep{ .unchanged = .{
@@ -1149,6 +1156,78 @@ pub const ActionCompiler = struct {
         return copy;
     }
 };
+
+fn dump_action_steps(label: []const u8, steps: []const ActionStep, depth: u32) void {
+    for (steps) |step| {
+        var indent: u32 = 0;
+        while (indent < depth) : (indent += 1) {
+            std.debug.print("  ", .{});
+        }
+        switch (step) {
+            .assign_var => |assign| std.debug.print(
+                "{s}: assign {s}\n",
+                .{ label, assign.var_name },
+            ),
+            .assign_prime => |assign| std.debug.print(
+                "{s}: assign' {s}\n",
+                .{ label, assign.var_name },
+            ),
+            .condition => std.debug.print("{s}: condition\n", .{label}),
+            .mark_action => |marker| std.debug.print(
+                "{s}: mark {s}\n",
+                .{ label, marker.name },
+            ),
+            .choose => |choose| {
+                std.debug.print("{s}: choose {s}\n", .{ label, choose.var_name });
+                dump_action_steps(label, choose.body_steps, depth + 1);
+            },
+            .branch => |branch| {
+                std.debug.print("{s}: branch options={d}\n", .{
+                    label,
+                    branch.options.len,
+                });
+                for (branch.options) |option| {
+                    dump_action_steps(label, option, depth + 1);
+                }
+            },
+            .if_branch => |branch| {
+                std.debug.print("{s}: if\n", .{label});
+                dump_action_steps(label, branch.then_steps, depth + 1);
+                dump_action_steps(label, branch.else_steps, depth + 1);
+            },
+            .case_branch => |branch| {
+                std.debug.print("{s}: case arms={d}\n", .{
+                    label,
+                    branch.arms.len,
+                });
+                for (branch.arms) |arm| {
+                    dump_action_steps(label, arm.steps, depth + 1);
+                }
+                if (branch.otherwise_steps) |otherwise| {
+                    dump_action_steps(label, otherwise, depth + 1);
+                }
+            },
+            .call => |call| {
+                std.debug.print("{s}: call {s}\n", .{ label, call.def.name });
+                dump_action_steps(label, call.body_steps, depth + 1);
+            },
+            .compose => |compose| {
+                std.debug.print("{s}: compose left\n", .{label});
+                dump_action_steps(label, compose.left_steps, depth + 1);
+                std.debug.print("{s}: compose right\n", .{label});
+                dump_action_steps(label, compose.right_steps, depth + 1);
+            },
+            .let_bind => |binding| std.debug.print(
+                "{s}: let {s}\n",
+                .{ label, binding.name },
+            ),
+            .unchanged => |unchanged| std.debug.print(
+                "{s}: unchanged {s}\n",
+                .{ label, unchanged.var_name },
+            ),
+        }
+    }
+}
 
 fn flatten_conjunction(
     expr: *ast.Expr,

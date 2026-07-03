@@ -2053,6 +2053,53 @@ test "FALSE operator substitution does not suppress other Next branches" {
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
 }
 
+test "operator formals shadow state variables in action RHS applications" {
+    const source =
+        \\---------------------- MODULE TestFormalShadowState ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x, y
+        \\Init == /\ x = [i \in 1..1 |-> 0]
+        \\        /\ y = 0
+        \\Read(x) == x[1]
+        \\Next == /\ x' = [i \in 1..1 |-> 1]
+        \\        /\ y' = Read(x')
+        \\TypeOK == y = x[1]
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = null,
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{"TypeOK"},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
 test "EXCEPT indexes nested records by string key" {
     const source =
         \\---------------------- MODULE TestRecordExcept ----------------------

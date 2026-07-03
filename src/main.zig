@@ -353,6 +353,13 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     };
 
+    if (std.process.Environ.getPosix(init.environ, "TLZIG_DUMP_STATES")) |dump_path| {
+        ch.dump_states(dump_path) catch |err| {
+            std.debug.print("failed to dump states: {any}\n", .{err});
+            std.process.exit(1);
+        };
+    }
+
     _ = std.c.printf("generated=%llu distinct=%llu\n", result.generated, result.distinct);
 }
 

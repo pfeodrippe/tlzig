@@ -23,6 +23,7 @@ const Spec = struct {
     expected_violation: bool = false,
     compare_generated: bool = true,
     compare_distinct: bool = true,
+    prefer_generated: bool = false,
     java_classpath: ?[]const u8 = null,
 };
 
@@ -33,6 +34,7 @@ const Options = struct {
     include_one_core: bool = false,
     auto_only: bool = false,
     tlzig_only: bool = false,
+    skip_prefer_generated: bool = false,
     write_tlzig_baseline: bool = false,
     generated_expressions: bool = false,
 };
@@ -75,6 +77,7 @@ const specs = [_]Spec{
         .cfg = "vendor/MDBTLA/MultiShardTxn/ClientCentricTests.cfg",
         .max_states = 2_000,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -86,6 +89,7 @@ const specs = [_]Spec{
         .expected_violation = true,
         .compare_generated = false,
         .compare_distinct = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -96,6 +100,7 @@ const specs = [_]Spec{
         .max_states = 20_000,
         .compare_generated = false,
         .compare_distinct = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -106,6 +111,7 @@ const specs = [_]Spec{
         .max_states = 100_000,
         .compare_generated = false,
         .compare_distinct = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -117,6 +123,7 @@ const specs = [_]Spec{
         .one_core_default = false,
         .max_states = 5_000_000,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -128,6 +135,7 @@ const specs = [_]Spec{
         .state_values_per_state = 120,
         .compare_generated = false,
         .compare_distinct = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -139,6 +147,7 @@ const specs = [_]Spec{
         .state_values_per_state = 120,
         .compare_generated = false,
         .compare_distinct = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -150,6 +159,7 @@ const specs = [_]Spec{
         .state_values_per_state = 300,
         .compare_generated = false,
         .compare_distinct = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -161,6 +171,7 @@ const specs = [_]Spec{
         .state_values_per_state = 120,
         .compare_generated = false,
         .compare_distinct = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -173,6 +184,7 @@ const specs = [_]Spec{
         .max_states = 30_000_000,
         .state_values_per_state = 120,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -185,6 +197,7 @@ const specs = [_]Spec{
         .max_states = 30_000_000,
         .state_values_per_state = 120,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -194,9 +207,10 @@ const specs = [_]Spec{
         .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_snapshot_exhaustive.cfg",
         .default_enabled = false,
         .one_core_default = false,
-        .max_states = 30_000_000,
+        .max_states = 80_000_000,
         .state_values_per_state = 300,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -209,6 +223,7 @@ const specs = [_]Spec{
         .max_states = 30_000_000,
         .state_values_per_state = 120,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -221,6 +236,7 @@ const specs = [_]Spec{
         .max_states = 500_000,
         .state_values_per_state = 180,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -232,6 +248,7 @@ const specs = [_]Spec{
         .max_states = 5_000_000,
         .state_values_per_state = 180,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -244,6 +261,7 @@ const specs = [_]Spec{
         .max_states = 6_000_000,
         .state_values_per_state = 220,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -255,6 +273,7 @@ const specs = [_]Spec{
         .max_states = 500_000,
         .state_values_per_state = 220,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -267,6 +286,7 @@ const specs = [_]Spec{
         .max_states = 500_000,
         .state_values_per_state = 220,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -278,6 +298,7 @@ const specs = [_]Spec{
         .max_states = 500_000,
         .state_values_per_state = 220,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -290,6 +311,7 @@ const specs = [_]Spec{
         .max_states = 500_000,
         .state_values_per_state = 220,
         .compare_generated = false,
+        .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
     },
@@ -303,7 +325,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     const allocator = std.heap.page_allocator;
     const options = parse_options(init) catch {
         std.debug.print(
-            "usage: benchmark [--include-long] [--include-one-core] [--auto-only] [--tlzig-only] [--write-tlzig-baseline] [--generated-expressions] [--filter TEXT|TEXT]\n",
+            "usage: benchmark [--include-long] [--include-one-core] [--auto-only] [--tlzig-only] [--skip-prefer-generated] [--write-tlzig-baseline] [--generated-expressions] [--filter TEXT|TEXT]\n",
             .{},
         );
         std.process.exit(2);
@@ -328,6 +350,9 @@ pub fn main(init: std.process.Init.Minimal) void {
         const explicit_match = filter_matches(spec, options.filter);
         const exact_label_match = filter_label_matches(spec, options.filter);
         if (options.filter != null and !explicit_match) continue;
+        if (options.skip_prefer_generated and spec.prefer_generated) {
+            continue;
+        }
         if (!options.include_long and !spec.default_enabled and
             (options.filter == null or !exact_label_match))
         {
@@ -372,6 +397,8 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
             options.label_suffix = args.next() orelse return error.InvalidArgs;
         } else if (std.mem.eql(u8, arg, "--tlzig-only")) {
             options.tlzig_only = true;
+        } else if (std.mem.eql(u8, arg, "--skip-prefer-generated")) {
+            options.skip_prefer_generated = true;
         } else if (std.mem.eql(u8, arg, "--write-tlzig-baseline")) {
             options.write_tlzig_baseline = true;
         } else if (std.mem.eql(u8, arg, "--generated-expressions")) {
@@ -575,7 +602,9 @@ fn run_comparison(
         return error.StateMismatch;
     }
 
-    try write_tlzig_baseline(allocator, spec, tlzig_auto);
+    if (generated_model.generated_count == 0) {
+        try write_tlzig_baseline(allocator, spec, tlzig_auto);
+    }
 }
 
 const RunResult = struct {

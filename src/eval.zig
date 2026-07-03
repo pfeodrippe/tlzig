@@ -42,6 +42,30 @@ pub const Context = struct {
         return try binding.value.clone(source_pool, eval_pool);
     }
 
+    pub fn lookup_local_value(
+        self: Context,
+        name: []const u8,
+        eval_pool: *ValuePool,
+    ) Error!?Value {
+        var binding = self.head;
+        while (binding) |current| : (binding = current.parent) {
+            if (current.variable_index != null) continue;
+            if (!name_eql(current.name, name)) continue;
+            const source_pool = current.value_pool orelse return current.value;
+            return try current.value.clone(source_pool, eval_pool);
+        }
+        return null;
+    }
+
+    pub fn has_local_binding(self: Context, name: []const u8) bool {
+        var binding = self.head;
+        while (binding) |current| : (binding = current.parent) {
+            if (current.variable_index != null) continue;
+            if (name_eql(current.name, name)) return true;
+        }
+        return false;
+    }
+
     pub fn lookup_values(
         self: Context,
         names: []const []const u8,
@@ -716,6 +740,11 @@ pub const Evaluator = struct {
             .int_literal => |i| return Value{ .int_v = i },
             .string_literal => |s| return Value{ .string_v = try eval_pool.push_string(s) },
             .ident => |name| {
+                if (try ctx.lookup_local_value(name, eval_pool)) |v| return v;
+                const aliased = self.resolve_alias(name);
+                if (!std.mem.eql(u8, aliased, name)) {
+                    if (try ctx.lookup_local_value(aliased, eval_pool)) |v| return v;
+                }
                 if (s0) |st| {
                     if (self.find_variable(name)) |idx| {
                         return try st.values[idx].clone(
@@ -723,10 +752,21 @@ pub const Evaluator = struct {
                             eval_pool,
                         );
                     }
+                    if (!std.mem.eql(u8, aliased, name)) {
+                        if (self.find_variable(aliased)) |idx| {
+                            return try st.values[idx].clone(
+                                st.value_pool(idx, state_pool),
+                                eval_pool,
+                            );
+                        }
+                    }
+                } else {
+                    if (try ctx.lookup_value(name, eval_pool)) |v| return v;
+                    if (!std.mem.eql(u8, aliased, name)) {
+                        if (try ctx.lookup_value(aliased, eval_pool)) |v| return v;
+                    }
                 }
-                if (try ctx.lookup_value(name, eval_pool)) |v| return v;
                 if (self.find_constant(name)) |v| return try v.clone(state_pool, eval_pool);
-                const aliased = self.resolve_alias(name);
                 if (self.override_registry.find_value(aliased)) |func| {
                     return try func(self.override_registry.ctx, eval_pool);
                 }
@@ -813,30 +853,30 @@ pub const Evaluator = struct {
                 return self.fail(Error.UndefinedSymbol, "ident", name);
             },
             .primed => |name| {
+                const aliased = self.resolve_alias(name);
+                if (try ctx.lookup_value(aliased, eval_pool)) |v| return v;
                 if (try ctx.lookup_value(name, eval_pool)) |v| return v;
                 const ns = self.next_state;
                 if (ns) |nst| {
-                    if (self.find_variable(name)) |idx| {
+                    if (self.find_variable(aliased)) |idx| {
                         return try nst.values[idx].clone(
                             nst.value_pool(idx, state_pool),
                             eval_pool,
                         );
                     }
-                    const aliased = self.resolve_alias(name);
                     if (self.find_definition(aliased)) |def| {
                         if (def.params.len != 0) return Error.TypeError;
                         return try self.eval_expr(def.body, ctx, ns, eval_pool, state_pool);
                     }
                 }
                 if (s0) |st| {
-                    if (self.find_variable(name)) |idx| {
+                    if (self.find_variable(aliased)) |idx| {
                         return try st.values[idx].clone(
                             st.value_pool(idx, state_pool),
                             eval_pool,
                         );
                     }
                 }
-                const aliased = self.resolve_alias(name);
                 if (self.find_definition(aliased)) |def| {
                     if (def.params.len != 0) return Error.TypeError;
                     if (ns) |next| {
@@ -2561,7 +2601,7 @@ pub const Evaluator = struct {
                 &root_name,
                 &groups,
                 &group_count,
-            )) {
+            ) and !ctx.has_local_binding(root_name)) {
                 if (self.find_variable(root_name)) |variable_index| {
                     assert(variable_index < state_v.values.len);
                     var current = state_v.values[variable_index];
@@ -2653,7 +2693,7 @@ pub const Evaluator = struct {
             {
                 return try self.eval_fold_function_on_set(ap, ctx, s0, eval_pool, state_pool);
             }
-            if (try ctx.lookup_value(name, eval_pool)) |local_function| {
+            if (try ctx.lookup_local_value(name, eval_pool)) |local_function| {
                 const values = try eval_pool.alloc_values(
                     @intCast(ap.args.len),
                 );
@@ -3296,6 +3336,7 @@ pub const Evaluator = struct {
             &groups,
             &group_count,
         )) return null;
+        if (ctx.has_local_binding(root_name)) return null;
         const variable_index = self.find_variable(root_name) orelse
             return null;
         assert(variable_index < state_v.values.len);

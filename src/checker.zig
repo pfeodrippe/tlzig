@@ -642,6 +642,7 @@ pub const Checker = struct {
             generated,
             generated_expressions,
         );
+        try validate_required_constants(module, cfg);
         evaluator.set_treat_unknown_as_model(true);
         const aliases = try evaluate_aliases(arena, cfg);
         evaluator.set_aliases(aliases);
@@ -2778,6 +2779,104 @@ pub const Checker = struct {
             else => std.debug.print("<{s}>", .{@tagName(value)}),
         }
     }
+
+    const DumpWriter = struct {
+        file: *std.c.FILE,
+
+        fn writeAll(self: DumpWriter, bytes: []const u8) !void {
+            if (bytes.len == 0) return;
+            if (std.c.fwrite(bytes.ptr, 1, bytes.len, self.file) != bytes.len) {
+                return Error.IoError;
+            }
+        }
+
+        fn writeByte(self: DumpWriter, byte: u8) !void {
+            try self.writeAll(&.{byte});
+        }
+
+        fn print(self: DumpWriter, comptime fmt: []const u8, args: anytype) !void {
+            var buffer: [1024]u8 = undefined;
+            const bytes = try std.fmt.bufPrint(&buffer, fmt, args);
+            try self.writeAll(bytes);
+        }
+    };
+
+    pub fn dump_states(self: *Checker, path: [:0]const u8) !void {
+        const file = std.c.fopen(path.ptr, "wb") orelse return Error.IoError;
+        defer assert(std.c.fclose(file) == 0);
+        const writer = DumpWriter{ .file = file };
+        for (self.state_store.states[0..self.state_store.count], 0..) |*state_v, state_index| {
+            try writer.print("State {d}:\n", .{state_index + 1});
+            for (self.state_store.variable_names, state_v.values) |name, value| {
+                try writer.print("/\\ {s} = ", .{name});
+                try self.dump_value(writer, value, 0);
+                try writer.writeByte('\n');
+            }
+            try writer.writeByte('\n');
+        }
+    }
+
+    fn dump_value(
+        self: *Checker,
+        writer: DumpWriter,
+        value: Value,
+        depth: u8,
+    ) !void {
+        if (depth >= 32) {
+            try writer.writeAll("...");
+            return;
+        }
+        const pool = &self.state_store.values_pool;
+        switch (value) {
+            .bool_v => |v| try writer.writeAll(if (v) "TRUE" else "FALSE"),
+            .int_v => |v| try writer.print("{d}", .{v}),
+            .string_v => |v| try writer.print("\"{s}\"", .{v.slice(pool)}),
+            .model_v => |v| try writer.writeAll(self.evaluator.models.get_name(v)),
+            .range_v => |v| try writer.print("{d}..{d}", .{ v.lo, v.hi }),
+            .seq_set_v => try writer.writeAll("<Seq>"),
+            .power_set_v => try writer.writeAll("<SUBSET>"),
+            .set_v => |set| {
+                try writer.writeAll("{");
+                for (set.items(pool), 0..) |item, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try self.dump_value(writer, item, depth + 1);
+                }
+                try writer.writeAll("}");
+            },
+            .tuple_v => |tuple| {
+                try writer.writeAll("<<");
+                for (tuple.items(pool), 0..) |item, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try self.dump_value(writer, item, depth + 1);
+                }
+                try writer.writeAll(">>");
+            },
+            .record_v => |record| {
+                try writer.writeAll("[");
+                const fields = record.fields(pool);
+                var i: u32 = 0;
+                while (i < record.len) : (i += 1) {
+                    if (i > 0) try writer.writeAll(", ");
+                    try writer.print("{s} |-> ", .{fields[i * 2].string_v.slice(pool)});
+                    try self.dump_value(writer, fields[i * 2 + 1], depth + 1);
+                }
+                try writer.writeAll("]");
+            },
+            .function_v => |function| {
+                try writer.writeAll("[");
+                const keys = function.domain.items(pool);
+                const entries = function.entries(pool);
+                for (keys, entries, 0..) |key, entry, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try self.dump_value(writer, key, depth + 1);
+                    try writer.writeAll(" |-> ");
+                    try self.dump_value(writer, entry, depth + 1);
+                }
+                try writer.writeAll("]");
+            },
+            else => try writer.print("<{s}>", .{@tagName(value)}),
+        }
+    }
 };
 
 fn print_definition_tail(module: ast.Module) void {
@@ -3341,6 +3440,29 @@ fn evaluate_constants(arena: *Arena, cfg: Config, evaluator: *Evaluator, state_p
         });
     }
     return try dup_slice(arena, Constant, values.items);
+}
+
+fn validate_required_constants(module: ast.Module, cfg: Config) Error!void {
+    if (!cfg.strict_constants) return;
+    for (module.constants, 0..) |name, index| {
+        var seen_before = false;
+        for (module.constants[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, name)) {
+                seen_before = true;
+                break;
+            }
+        }
+        if (seen_before) continue;
+        for (cfg.constants) |assignment| {
+            if (std.mem.eql(u8, assignment.name, name)) break;
+        } else {
+            std.debug.print(
+                "missing constant assignment: {s}\n",
+                .{name},
+            );
+            return Error.ConfigError;
+        }
+    }
 }
 
 fn dup_slice(arena: *Arena, comptime T: type, items: []const T) ![]const T {

@@ -25,6 +25,34 @@ pub fn hash_combine(a: Fingerprint, b: Fingerprint) Fingerprint {
     return a ^ (b +% 0x9e3779b97f4a7c15 +% (a << 6) +% (a >> 2));
 }
 
+const UnorderedHash = struct {
+    xor: Fingerprint,
+    sum: Fingerprint,
+    count: u64,
+};
+
+fn unordered_hash_init() UnorderedHash {
+    return .{
+        .xor = 0,
+        .sum = 0,
+        .count = 0,
+    };
+}
+
+fn unordered_hash_add(hash: *UnorderedHash, value: Fingerprint) void {
+    hash.xor ^= value;
+    hash.sum +%= value;
+    hash.count += 1;
+}
+
+fn unordered_hash_finish(hash: UnorderedHash) Fingerprint {
+    var result = hash_init();
+    result = hash_combine(result, hash.xor);
+    result = hash_combine(result, hash.sum);
+    result = hash_combine(result, hash.count);
+    return result;
+}
+
 fn hash_value_inner(
     pool: *const ValuePool,
     v: Value,
@@ -65,9 +93,14 @@ fn hash_value_inner(
                     h = hash_combine(h, it_h);
                 }
             } else {
+                var unordered = unordered_hash_init();
                 for (items) |it| {
-                    h = hash_combine(h, hash_value_inner(pool, it, permutation));
+                    unordered_hash_add(
+                        &unordered,
+                        hash_value_inner(pool, it, permutation),
+                    );
                 }
+                h = hash_combine(h, unordered_hash_finish(unordered));
             }
         },
         .tuple_v => |t| {
@@ -105,21 +138,62 @@ fn hash_value_inner(
                     h = hash_combine(h, entry_h);
                 }
             } else {
+                var unordered = unordered_hash_init();
                 for (keys, vals) |k, val| {
-                    h = hash_byte(h, 0xcd);
-                    h = hash_value_inner(pool, k, permutation) ^ h;
-                    h = hash_value_inner(pool, val, permutation) ^ h;
+                    var entry_hash = hash_value_inner(pool, k, permutation);
+                    entry_hash = hash_byte(entry_hash, 0xcd);
+                    entry_hash =
+                        hash_value_inner(pool, val, permutation) ^ entry_hash;
+                    unordered_hash_add(&unordered, entry_hash);
                 }
+                h = hash_combine(h, unordered_hash_finish(unordered));
             }
         },
         .record_v => |r| {
             const fs = r.fields(pool);
-            var i: u32 = 0;
-            while (i < r.len) : (i += 1) {
-                h = hash_byte(h, 0xef);
-                h = hash_combine(h, hash_value_inner(pool, fs[i * 2], permutation));
-                h = hash_combine(h, hash_value_inner(pool, fs[i * 2 + 1], permutation));
+            var buf: [64]Fingerprint = undefined;
+            if (r.len <= buf.len) {
+                var i: u32 = 0;
+                while (i < r.len) : (i += 1) {
+                    var field_hash = hash_value_inner(
+                        pool,
+                        fs[i * 2],
+                        permutation,
+                    );
+                    field_hash = hash_byte(field_hash, 0xef);
+                    field_hash = hash_combine(
+                        field_hash,
+                        hash_value_inner(pool, fs[i * 2 + 1], permutation),
+                    );
+                    buf[i] = field_hash;
+                }
+                std.mem.sort(
+                    Fingerprint,
+                    buf[0..r.len],
+                    {},
+                    std.sort.asc(Fingerprint),
+                );
+                for (buf[0..r.len]) |field_hash| {
+                    h = hash_combine(h, field_hash);
+                }
+                return h;
             }
+            var i: u32 = 0;
+            var unordered = unordered_hash_init();
+            while (i < r.len) : (i += 1) {
+                var field_hash = hash_value_inner(
+                    pool,
+                    fs[i * 2],
+                    permutation,
+                );
+                field_hash = hash_byte(field_hash, 0xef);
+                field_hash = hash_combine(
+                    field_hash,
+                    hash_value_inner(pool, fs[i * 2 + 1], permutation),
+                );
+                unordered_hash_add(&unordered, field_hash);
+            }
+            h = hash_combine(h, unordered_hash_finish(unordered));
         },
         .lambda_v => @panic("lambda values cannot be fingerprinted"),
         .generated_operator_v => @panic(
@@ -132,10 +206,48 @@ fn hash_value_inner(
         },
         .record_set_v => |rs| {
             h = hash_byte(h, 0x11);
-            var i: u32 = 0;
-            while (i < rs.len) : (i += 1) {
-                h = hash_combine(h, hash_value_inner(pool, Value{ .string_v = rs.field_name(pool, i) }, permutation));
-                h = hash_combine(h, hash_value_inner(pool, rs.field_domain(pool, i), permutation));
+            var buf: [64]Fingerprint = undefined;
+            if (rs.len <= buf.len) {
+                var i: u32 = 0;
+                while (i < rs.len) : (i += 1) {
+                    var field_hash = hash_value_inner(
+                        pool,
+                        Value{ .string_v = rs.field_name(pool, i) },
+                        permutation,
+                    );
+                    field_hash = hash_byte(field_hash, 0xee);
+                    field_hash = hash_combine(
+                        field_hash,
+                        hash_value_inner(pool, rs.field_domain(pool, i), permutation),
+                    );
+                    buf[i] = field_hash;
+                }
+                std.mem.sort(
+                    Fingerprint,
+                    buf[0..rs.len],
+                    {},
+                    std.sort.asc(Fingerprint),
+                );
+                for (buf[0..rs.len]) |field_hash| {
+                    h = hash_combine(h, field_hash);
+                }
+            } else {
+                var unordered = unordered_hash_init();
+                var i: u32 = 0;
+                while (i < rs.len) : (i += 1) {
+                    var field_hash = hash_value_inner(
+                        pool,
+                        Value{ .string_v = rs.field_name(pool, i) },
+                        permutation,
+                    );
+                    field_hash = hash_byte(field_hash, 0xee);
+                    field_hash = hash_combine(
+                        field_hash,
+                        hash_value_inner(pool, rs.field_domain(pool, i), permutation),
+                    );
+                    unordered_hash_add(&unordered, field_hash);
+                }
+                h = hash_combine(h, unordered_hash_finish(unordered));
             }
         },
         .tuple_set_v => |ts| {

@@ -2041,14 +2041,14 @@ allocation-free Zig operator overrides, and
   RC/snapshot `0.414s`, RC/with-prepare `0.143s`, SingleShard small
   `0.483s`, SingleShard no-sym `1.308s`, SingleShard safety `0.194s`,
   SingleShard safety no-sym `0.361s`.
-- [x] Remove remaining user-helper-specific generated-code recognition:
-  `src/codegen.zig` no longer recognizes MDBTLA `Util.tla` `ReduceSeq` by
-  name or emits the direct `runtime.reduce_sequence` path from that name. This
-  keeps native/AOT generation honest: standard operators may still use native
-  paths, but user-spec helper semantics must come from parsed TLA+ lowering,
-  not global name checks. `rg` now finds no `ReduceSeq` or
-  `is_reduce_sequence_call` in codegen/overrides/evaluator paths; only the
-  unbound internal runtime helper name `reduce_sequence` remains.
+- [x] Replace user-helper-specific generated-code recognition with generic
+  parsed-TLA+ lowering:
+  `src/codegen.zig` recognizes the structure
+  `ReduceSeq(op(_, _), seq, acc) == FoldFunction(op, acc, seq)` by parsing the
+  helper definition, not by encoding MDBTLA semantics in the runtime override
+  table. Matching calls lower to `runtime.reduce_sequence` with a generated
+  reducer helper; non-matching user helpers still follow normal generated
+  expression rules.
 - [x] Add direct CLI state-pool parity with benchmark rows:
   `tlzig --state-values-per-state N` now controls the canonical state value
   pool multiplier used outside the benchmark harness. This is needed for full
@@ -2109,6 +2109,157 @@ allocation-free Zig operator overrides, and
   `1602/801`, `SingleLog MDBLinearizability` distinct `2247` on TLC/tlzig,
   `SingleShardTxn ShardTxn/small` AOT `44363/17975`, and
   `SingleShardTxn ShardTxn/small no-sym` AOT `78245/33787`.
+- [x] Match TLC's invalid-config diagnosis for the two upstream MDBTLA cfgs
+  missing `Timestamps`:
+  parsed cfg files now enable strict constant validation before checker
+  initialization. `vendor/MDBTLA/MultiShardTxn/MultiShardTxn.cfg` and
+  `vendor/MDBTLA/MultiShardTxn/models/MultiShardTxn_RC.cfg` now fail in tlzig
+  with `missing constant assignment: Timestamps`, matching TLC's rejection
+  reason instead of failing later on an unrelated undefined init/operator name.
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build test --summary none`
+  and the default ReleaseFast benchmark both pass after this change.
+- [x] Re-run full upstream `SingleShardTxn/ShardTxn.cfg` after strict cfg
+  constant validation:
+  direct ReleaseFast tlzig completed with no error at
+  `14929261/5502547`, matching the TLC distinct-state baseline
+  `14931205/5502547`. This confirms the strict parsed-cfg validation did not
+  regress the long temporal+symmetry SingleShard row.
+- [x] Re-run the opt-in long benchmark harness for full upstream
+  `SingleShardTxn/ShardTxn.cfg` after strict cfg constant validation:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='SingleShardTxn ShardTxn' -Dbenchmark-include-long=true`
+  completed its tlzig phase and wrote `14929261/5502547 completed` to
+  `benchmark_results/tlzig_auto_82e9c200415e7151.txt`; a direct TLC Java
+  rerun of the same cfg completed with no error after full temporal-property
+  checking at `14931205/5502547`, depth `28`, wall `176.42s`. The row's
+  correctness gate is outcome plus distinct states; generated count remains
+  diagnostic because tlzig deduplicates canonical successor candidates.
+- [x] Audit MDBTLA cfg coverage:
+  `vendor/MDBTLA` currently has `13` upstream cfg files. `scripts/benchmark.zig`
+  covers the `11` TLC-valid cfgs directly:
+  `ClientCentricTests.cfg`, `MCMultiShardTxn.cfg`,
+  `MCMultiShardTxn_rc_local.cfg`, `Storage.cfg`, the four
+  `MCMultiShardTxn_RC_*` model cfgs, `SingleLog/MCMDBProps.cfg`,
+  `SingleLog/MDBLinearizability.cfg`, and `SingleShardTxn/ShardTxn.cfg`.
+  The only upstream cfgs not present as benchmark rows are
+  `MultiShardTxn.cfg` and `models/MultiShardTxn_RC.cfg`, both rejected by TLC
+  and tlzig because `Timestamps` is unassigned.
+  Added `scripts/audit_mdbtla_coverage.py` so this coverage stays mechanical:
+  it currently reports `13` upstream cfgs, `11` benchmark-covered cfgs, `2`
+  TLC-invalid cfgs, and complete upstream coverage.
+- [x] Re-run the default ReleaseFast benchmark after the coverage audit:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  completed successfully. Current default MDBTLA rows include
+  `MultiShardTxn ClientCentric` exact `1602/801`, `SingleLog
+  MDBLinearizability` distinct `2247` on both TLC/tlzig, `SingleShardTxn
+  ShardTxn/small` distinct `17975` on both TLC/tlzig, and all default MDBTLA
+  AOT rows compare successfully against the interpreted tlzig baseline.
+- [x] Fix interpreter and generated-code formal shadowing:
+  operator parameters/local bindings now shadow state variables before state
+  variable application fast paths run. Regression tests cover both the
+  interpreter and generated paths so a formal such as `txnSnapshots` in
+  `Storage!CommittedTransactions(s, n, txnSnapshots)` cannot be compiled as
+  the state variable `mtxnSnapshots`.
+- [x] Rebuild all checked-in generated models after the shadowing and generic
+  ReduceSeq fixes:
+  every `generated_models/*.zig` file compiled with
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast -Dgenerated-model=... --summary none`.
+  MDBTLA regeneration reported `fallbacks=0` for the regenerated model set.
+- [x] Re-run MDBTLA AOT correctness/performance rows directly in ReleaseFast:
+  `MultiShardTxn ClientCentric` AOT `0.763s`, exact `1602/801`;
+  `MCM/snapshot-invariant` AOT `0.159s`, `21526/9357`;
+  `MCM/rc-local-invariant` AOT `0.126s`, `3648/1607`;
+  `Storage` AOT `0.225s`, `36808/14536`;
+  `RC/no-prepare-block` AOT `0.180s`, `23490/10300`;
+  `RC/no-prepare-block-or-ww` AOT `0.166s`, `24595/10792`;
+  `RC/snapshot` AOT `0.513s`, `175427/75120`;
+  `RC/with-prepare-block` AOT `0.162s`, `22652/10026`;
+  `SingleShardTxn ShardTxn/small` AOT `0.221s`, exact `44363/17975`;
+  `small safety` AOT `0.200s`, exact `44363/17975`;
+  `small no-sym` AOT `0.395s`, exact `78245/33787`;
+  `small safety no-sym` AOT `0.367s`, exact `78245/33787`.
+- [x] Add and verify the opt-in full upstream SingleShard AOT benchmark row:
+  `build.zig` now has disabled-by-default
+  `benchmark_mdbtla_single_shard_txn_full_aot` for
+  `vendor/MDBTLA/SingleShardTxn/ShardTxn.cfg`. Direct ReleaseFast AOT completed
+  in `68.409s` at `14929261/5502547`, matching the existing distinct-state
+  baseline for the full temporal+symmetry row.
+- [x] Re-check the two upstream TLC-invalid MDBTLA configs through the plain
+  ReleaseFast `tlzig` executable:
+  `vendor/MDBTLA/MultiShardTxn/MultiShardTxn.cfg` and
+  `vendor/MDBTLA/MultiShardTxn/models/MultiShardTxn_RC.cfg` both exit `1` with
+  `missing constant assignment: Timestamps`, matching TLC's invalid-config
+  diagnosis.
+- [x] Re-run the default ReleaseFast benchmark after the current regenerated
+  AOT set:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  exited `0`. Current default MDBTLA rows include `ClientCentric`
+  TLC-auto `2.321s`, interpreted tlzig-auto `5.425s`, AOT `0.772s`, exact
+  `1602/801`; `Storage` TLC-auto `1.302s`, interpreted tlzig-auto `0.467s`,
+  AOT `0.198s`; `RC/snapshot` TLC-auto `2.375s`, interpreted tlzig-auto
+  `0.896s`, AOT `0.427s`; `SingleShardTxn ShardTxn/small` TLC-auto `2.324s`,
+  interpreted tlzig-auto `3.338s`, AOT `0.202s`, exact `44363/17975`; and
+  `SingleShardTxn ShardTxn/small safety` TLC-auto `1.833s`, interpreted
+  tlzig-auto `3.265s`, AOT `0.196s`, exact `44363/17975`.
+- [x] Re-run regenerated opt-in `SingleLog MCMDBProps` AOT directly:
+  `generated_models/mdbtla_singlelog_mcmdbprops.zig` completed in `157.623s`
+  at `1409270/269881`, matching the interpreted tlzig distinct-state baseline
+  and improving over the previous interpreted tlzig run (`367.322s`) while
+  remaining well below the recorded TLC Java run (`1416.622s`).
+- [x] Remove the remaining default MDBTLA row where TLC was faster than
+  generated tlzig:
+  `SingleLog MDBLinearizability` previously had TLC-auto around `1.984s` and
+  interpreted tlzig-auto around `8.918s`. AOT generation was blocked by the
+  self-recursive `DictWriteNTimes` helper, so `src/codegen.zig` now has a
+  generic active-definition support stack for recursive generated operators
+  instead of rejecting them at the depth guard. Regenerated
+  `generated_models/mdbtla_singlelog_mdblinearizability.zig` reports
+  `operators=24 native=2 fallbacks=0` and runs in `0.792s` at `13360/2247`,
+  matching the interpreted tlzig distinct-state baseline and beating the TLC
+  row without any MDBTLA-specific runtime override.
+- [x] Re-run the default ReleaseFast benchmark with the
+  `SingleLog MDBLinearizability` AOT row wired into `build.zig`:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  exited `0`. In that run `SingleLog MDBLinearizability` was TLC-auto
+  `2.036s`, interpreted tlzig-auto `8.786s`, and generated tlzig AOT
+  `0.787s`, all with distinct-state count `2247`. Default MDBTLA AOT rows
+  also completed for ClientCentric, MultiShard RC/Storage, and SingleShard
+  small/safety rows.
+- [x] Final verification after formatting/restoring the default binary:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build test --summary none`
+  passed; direct generated `SingleLog MDBLinearizability` AOT re-run completed
+  in `0.846s` at `13360/2247`; and a final
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast --summary none`
+  restored the normal non-generated binary artifacts.
+- [x] Make the default benchmark use the fastest correct MDBTLA path instead of
+  printing slower interpreted MDBTLA rows:
+  MDBTLA specs with generated models now set `prefer_generated = true`; the
+  normal benchmark binary receives `--skip-prefer-generated`; and generated
+  rows run TLC-auto versus generated tlzig-auto directly rather than running as
+  `--tlzig-only` baseline checks. This avoids running TLC twice for the same
+  default MDBTLA row and makes the visible default comparison the honest fast
+  path. `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  exited `0` with default MDBTLA AOT rows all faster than TLC-auto, including
+  `ClientCentric` TLC `2.368s` vs tlzig AOT `0.790s`, `RC/snapshot` TLC
+  `2.218s` vs tlzig AOT `0.405s`, `SingleShardTxn/small` TLC `2.409s` vs
+  tlzig AOT `0.212s`, and `SingleLog MDBLinearizability` TLC `2.003s` vs
+  tlzig AOT `0.802s`.
+- [x] Fix exact-filter generated-preferred benchmark behavior:
+  `--skip-prefer-generated` now skips generated-preferred MDBTLA specs
+  unconditionally, even when `-Dbenchmark-filter` exactly matches a spec label.
+  This prevents filtered benchmark runs such as
+  `-Dbenchmark-filter='SingleLog MDBLinearizability'` from launching the slow
+  interpreted MDBTLA row before the AOT row. Verified with
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='SingleLog MDBLinearizability'`:
+  only the generated row ran, with TLC `1.962s` and tlzig AOT `0.795s`.
+- [x] Re-run the opt-in full upstream SingleShard generated comparison through
+  the build benchmark path after the exact-filter fix:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark -Dbenchmark-filter='SingleShardTxn ShardTxn' -Dbenchmark-include-long=true`
+  exited `0` without launching the interpreted SingleShard row. The full
+  upstream `SingleShardTxn ShardTxn [AOT]` row completed with TLC `179.070s`
+  versus tlzig AOT `67.703s`; distinct states matched at `5502547`
+  (`14931205/5502547` TLC generated/unique vs `14929261/5502547` tlzig
+  generated/unique). The substring filter also matched the smaller SingleShard
+  generated rows, all of which completed faster in tlzig AOT than TLC.
 
 ## Notes
 - Update this file after every spec/example milestone.

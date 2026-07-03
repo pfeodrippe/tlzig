@@ -353,12 +353,11 @@ Target: **100% of TLC-valid, non-TLAPS configurations must pass.**
       `0.703s/0.104s`, `1.53x/1.52x`.
   - Generated benchmark rows now print with ` [AOT]` label suffix so generic
     and strict native rows are not visually conflated.
-  - 2026-06-29 benchmark semantic cleanup:
-    generated ` [AOT]` rows now run `--tlzig-only --auto-only`, so Java TLC is
-    not run a second time for the same spec. The generic row runs TLC and
-    interpreted tlzig, then writes a tlzig-auto baseline only after the normal
-    TLC comparison passes. The AOT row reads that baseline and compares the
-    generated tlzig result against it.
+  - 2026-06-29 benchmark semantic cleanup, superseded by later AOT wiring:
+    generated ` [AOT]` rows initially ran as tlzig-only baseline checks. The
+    current benchmark skips generated-preferred interpreted MDBTLA rows and
+    runs TLC directly against generated tlzig AOT, with one-worker checks
+    enabled for small/default rows that need first-error count comparison.
   - 2026-06-29 default ReleaseFast benchmark check after regenerated models,
     `record_static(...)`, generated-runtime `UNCHANGED` changed-mask checks,
     and stricter AOT-vs-tlzig baseline comparison: all default AOT rows run
@@ -1497,16 +1496,17 @@ allocation-free Zig operator overrides, and
     disabled because the deadlock-stopping row is traversal/order dependent.
   - Default benchmark keeps generated-count-only rows runnable by comparing
     distinct state count and outcome where documented above.
-- [x] Remove duplicate Java TLC work from generated/AOT benchmark rows:
-  generated benchmark executables now run with `--tlzig-only --auto-only`.
-  The normal benchmark row is the TLC-vs-interpreter correctness baseline; the
-  generated row is the tlzig AOT measurement for the same spec/config.
+- [x] Remove duplicate interpreted MDBTLA work from generated/AOT benchmark rows:
+  default interpreted benchmark rows skip generated-preferred MDBTLA specs, and
+  generated benchmark executables run TLC directly against generated tlzig AOT
+  for the same spec/config. Rows no longer force `--auto-only`; small/default
+  rows may run one-worker checks when the row needs first-error count parity.
 - [x] Tighten AOT benchmark correctness gates:
-  AOT rows now compare against the same-run interpreted tlzig-auto baseline.
-  Rows match outcome unconditionally, and match generated/distinct state counts
-  only when the benchmark row enables those comparisons. This avoids rejecting
-  valid parallel deadlock rows where `compare_distinct = false` because the
-  first deadlock can be reached after different traversal counts.
+  AOT rows match TLC outcome unconditionally. Completed rows keep exact
+  distinct-state checks. Expected first-error rows now use explicit
+  `distinct_tolerance` values for one-worker TLC/tlzig comparisons instead of
+  hiding the check with `compare_distinct = false`, because the first
+  deadlock/invariant can be reached after different traversal counts.
 - [x] Add a stable Storage full-search benchmark row:
   `benchmark_configs/MDBTLA/MultiShardTxn/Storage_exhaustive.cfg` keeps the
   upstream Storage constants and symmetry but sets `CHECK_DEADLOCK FALSE`, so
@@ -1568,9 +1568,9 @@ allocation-free Zig operator overrides, and
   baseline files used by generated/AOT rows, so Zig build caching can otherwise
   replay stdout without refreshing the baseline files.
 - [x] Fix AOT baseline comparison for non-exact deadlock rows:
-  `scripts/benchmark.zig` no longer forces distinct-state equality when a row
-  explicitly has `compare_distinct = false`. Fresh ReleaseFast checks after the
-  fix:
+  `scripts/benchmark.zig` now models first-error rows explicitly with
+  `expected_violation` plus bounded `distinct_tolerance`. Fresh ReleaseFast
+  checks at the time of the fix:
   - `MultiShardTxn Storage`: TLC-auto `1.358s`, interpreted tlzig-auto
     `0.459s`, AOT tlzig-auto `0.276s`; outcome matched, distinct comparison
     disabled for this deadlock-order-dependent row.
@@ -2260,6 +2260,96 @@ allocation-free Zig operator overrides, and
   (`14931205/5502547` TLC generated/unique vs `14929261/5502547` tlzig
   generated/unique). The substring filter also matched the smaller SingleShard
   generated rows, all of which completed faster in tlzig AOT than TLC.
+- [x] Replace hidden MDBTLA `compare_distinct = false` waivers with explicit
+  first-error correctness bounds:
+  Storage is now marked as an expected deadlock row and all default
+  MultiShardTxn first-error rows require the same TLC/tlzig outcome plus a
+  one-worker distinct-state delta within `16` or `32` states. This records the
+  real limitation: TLC and tlzig stop on the first deadlock/invariant violation
+  in traversal-order-dependent places, so exact stopped counts are not a
+  semantic equality proof. The default generated MultiShardTxn sweep now runs
+  one-worker checks for rows that need them and passed with visible counts:
+  `ClientCentric` exact `1602/801`; `Storage` exact distinct `13370`;
+  `MCM/snapshot-invariant` `10776` TLC vs `10768` tlzig; `MCM/rc-local`
+  `1476` vs `1468`; `RC/no-prepare-block` `10652` vs `10636`;
+  `RC/no-prepare-block-or-ww` `10636` vs `10632`; `RC/snapshot` `84708` vs
+  `84692`; and `RC/with-prepare-block` `10652` vs `10636`.
+- [x] Re-run the default ReleaseFast benchmark after replacing the hidden
+  distinct-count waivers:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark`
+  exited `0`. Default MDBTLA AOT rows were all faster than TLC-auto:
+  `ClientCentric` `2.360s` TLC vs `0.761s` tlzig, exact `801` distinct;
+  `Storage` `1.437s` vs `0.206s`, exact one-worker distinct `13370`;
+  `RC/snapshot` `2.403s` vs `0.362s`, first-error one-worker distinct
+  `84708` vs `84692`; `SingleShardTxn/small` `2.318s` vs `0.208s`, exact
+  `17975` distinct; `SingleShardTxn/small no-sym` `2.674s` vs `0.379s`,
+  exact `33787` distinct; and `SingleLog MDBLinearizability` `1.941s` vs
+  `0.794s`, exact `2247` distinct.
+- [x] Verification after the benchmark policy fix:
+  `python3 scripts/audit_mdbtla_coverage.py`,
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build test --summary none`,
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast --summary none`,
+  and `git diff --check` all passed. Runtime overrides were audited with `rg`;
+  MDBTLA-specific names appear in benchmark/test/generated files but not in
+  `src/overrides.zig`, whose entries are built-ins/modules only.
+- [x] Re-run the full upstream MDBTLA ReleaseFast AOT/TLC comparison set after
+  the generic action/generated-expression changes:
+  `python3 scripts/audit_mdbtla_coverage.py` reports `13` upstream cfg files,
+  `11` benchmark-covered TLC-valid cfgs, and `2` TLC-invalid cfgs. The two
+  invalid upstream cfgs (`MultiShardTxn.cfg` and `models/MultiShardTxn_RC.cfg`)
+  still fail in tlzig with `missing constant assignment: Timestamps`. Default
+  MDBTLA rows pass the benchmark harness; first-error rows require same outcome
+  plus bounded one-worker distinct deltas because TLC/tlzig can stop at
+  different first counterexamples. Completed/full rows have exact distinct-state
+  parity:
+  `Storage exhaustive` TLC `35.981s` vs tlzig `16.989s`, exact `1078623`
+  distinct; `RC/no-prepare-block exhaustive` TLC `172.084s` vs tlzig
+  `166.338s`, exact `17057584`; `RC/no-prepare-block-or-ww exhaustive` TLC
+  `191.966s` vs tlzig `180.775s`, exact `18764120`;
+  `RC/with-prepare-block exhaustive` TLC `155.452s` vs tlzig `153.345s`,
+  exact `15738792`; `RC/snapshot exhaustive` TLC `677.225s` vs tlzig
+  `675.583s`, exact `67629092`; upstream `SingleLog MCMDBProps` TLC
+  `1434.504s` vs tlzig `157.265s`, exact `269881`; and upstream
+  `SingleShardTxn ShardTxn` TLC `181.348s` vs tlzig `67.052s`, exact
+  `5502547`. The printed TLC/tlzig generated counts are not currently a
+  like-for-like correctness metric: TLC prints non-distinct successor attempts,
+  while tlzig prints committed candidate states. Add a TLC-compatible attempted
+  successor counter before requiring exact generated-count parity in the
+  benchmark harness.
+- [x] Add a comparable generated-attempt counter:
+  `Checker.generated`/benchmark output now report TLC-style non-distinct
+  generated states: initial states plus raw next-state candidates before
+  constraints/fingerprinting/successor-edge deduplication. The previous
+  post-filter counter is kept as `committed_generated` for internal profiling.
+  This made full upstream rows strict where TLC reports the same attempt
+  semantics: `SingleShardTxn ShardTxn [AOT]` is now exactly
+  `14931205/5502547` on both TLC and tlzig, and `SingleLog MCMDBProps [AOT]`
+  is exactly `3101918/269881` on both. MultiShard first-error rows still use
+  outcome plus bounded distinct deltas because the first counterexample can be
+  reached at a different traversal point.
+- [ ] Improve the narrowest remaining MDBTLA performance win without
+  spec-specific runtime overrides:
+  latest `RC/snapshot exhaustive [AOT]` paired run has exact count parity
+  (`405005930/67629092` on both TLC and tlzig), but tlzig AOT was slower in
+  that run (`689.630s` vs TLC-auto `637.733s`). Generic improvements made
+  since then: generated models now emit `constant_at` instead of name-based
+  constant lookups; no-graph runs skip unused edge-action-mask writes; and
+  full MDBTLA exhaustive benchmark caps were tightened to just above observed
+  completed distinct counts to reduce tlzig preallocation. Direct tlzig-only
+  `RC/snapshot exhaustive` with the tightened `68M` cap completed with exact
+  counts in `670.22s`, still slower than the latest TLC timing and therefore
+  still the primary perf target. Disabling generated expressions was worse
+  (`>776s`, interrupted), so expression AOT remains enabled.
+- [x] Final gate after the full upstream MDBTLA sweep:
+  `python3 scripts/audit_mdbtla_coverage.py`,
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build test --summary none`,
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast --summary none`,
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark --summary none`,
+  and `git diff --check` all passed. Default MDBTLA AOT rows remained faster
+  than TLC-auto, including `ClientCentric` `2.348s` TLC vs `0.775s` tlzig,
+  `Storage` `1.487s` vs `0.228s`, `RC/snapshot` `2.332s` vs `0.361s`,
+  `SingleShardTxn/small` `2.554s` vs `0.200s`, and
+  `SingleLog MDBLinearizability` `1.992s` vs `0.798s`.
 
 ## Notes
 - Update this file after every spec/example milestone.

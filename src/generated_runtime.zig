@@ -64,6 +64,7 @@ pub const Expression = struct {
     identity: u32,
     arg_names: []const []const u8,
     arg_required: []const bool = &.{},
+    uses_primed: bool = true,
     function: OperatorFn,
     boolean_function: ?OperatorBoolFn = null,
 };

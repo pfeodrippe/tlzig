@@ -719,16 +719,36 @@ pub const ActionCompiler = struct {
                 }
                 if (b.op == .or_op) {
                     if (self.is_action_expr(b.left) or self.is_action_expr(b.right)) {
+                        var operands: [256]*ast.Expr = undefined;
+                        var operand_count: usize = 0;
+                        flatten_action_disjunction(
+                            self,
+                            expr,
+                            &operands,
+                            &operand_count,
+                        );
                         var options = std.ArrayList([]const ActionStep).empty;
                         defer options.deinit(std.heap.page_allocator);
-                        var left_steps = std.ArrayList(ActionStep).empty;
-                        defer left_steps.deinit(std.heap.page_allocator);
-                        try self.collect_steps(b.left, &left_steps, is_init);
-                        try options.append(std.heap.page_allocator, try self.dup_slice(ActionStep, left_steps.items));
-                        var right_steps = std.ArrayList(ActionStep).empty;
-                        defer right_steps.deinit(std.heap.page_allocator);
-                        try self.collect_steps(b.right, &right_steps, is_init);
-                        try options.append(std.heap.page_allocator, try self.dup_slice(ActionStep, right_steps.items));
+                        try options.ensureTotalCapacity(
+                            std.heap.page_allocator,
+                            operand_count,
+                        );
+                        for (operands[0..operand_count]) |operand| {
+                            var option_steps = std.ArrayList(ActionStep).empty;
+                            defer option_steps.deinit(std.heap.page_allocator);
+                            try self.collect_steps(
+                                operand,
+                                &option_steps,
+                                is_init,
+                            );
+                            try options.append(
+                                std.heap.page_allocator,
+                                try self.dup_slice(
+                                    ActionStep,
+                                    option_steps.items,
+                                ),
+                            );
+                        }
                         try steps.append(std.heap.page_allocator, ActionStep{ .branch = .{ .options = try self.dup_slice([]const ActionStep, options.items) } });
                         return;
                     }
@@ -1244,6 +1264,35 @@ fn flatten_conjunction(
     count.* += 1;
 }
 
+fn flatten_action_disjunction(
+    compiler: ActionCompiler,
+    expr: *ast.Expr,
+    operands: *[256]*ast.Expr,
+    count: *usize,
+) void {
+    if (expr.* == .binary and
+        expr.binary.op == .or_op and
+        compiler.is_action_expr(expr))
+    {
+        flatten_action_disjunction(
+            compiler,
+            expr.binary.left,
+            operands,
+            count,
+        );
+        flatten_action_disjunction(
+            compiler,
+            expr.binary.right,
+            operands,
+            count,
+        );
+        return;
+    }
+    assert(count.* < operands.len);
+    operands[count.*] = expr;
+    count.* += 1;
+}
+
 fn mark_required_let_bindings(
     let_value: *const ast.LetIn,
     definition_index: usize,
@@ -1314,16 +1363,14 @@ pub const ActionExecutor = struct {
         state: ?*StateStore.State,
     ) !Value {
         if (compiled.generated) |generated| generated: {
-            if (!generated_args_available(generated, context)) {
-                break :generated;
-            }
-            return self.evaluator.eval_generated_expression(
+            if (try self.evaluator.eval_generated_expression_if_args_available(
                 generated,
                 context,
                 state,
                 self.eval_pool,
                 &self.source_state_store.values_pool,
-            );
+            )) |result| return result;
+            break :generated;
         }
         return self.evaluator.eval_expr(
             compiled.expr,
@@ -1341,16 +1388,14 @@ pub const ActionExecutor = struct {
         state: ?*StateStore.State,
     ) !bool {
         if (compiled.generated) |generated| generated: {
-            if (!generated_args_available(generated, context)) {
-                break :generated;
-            }
-            return self.evaluator.eval_generated_expression_bool(
+            if (try self.evaluator.eval_generated_expression_bool_if_args_available(
                 generated,
                 context,
                 state,
                 self.eval_pool,
                 &self.source_state_store.values_pool,
-            );
+            )) |result| return result;
+            break :generated;
         }
         const result = try self.evaluator.eval_expr(
             compiled.expr,
@@ -1360,17 +1405,6 @@ pub const ActionExecutor = struct {
             &self.source_state_store.values_pool,
         );
         return result.is_truthy();
-    }
-
-    fn generated_args_available(
-        generated: generated_runtime.Expression,
-        context: Context,
-    ) bool {
-        if (generated.arg_names.len == 0) return true;
-        for (generated.arg_names) |name| {
-            if (context.lookup(name) == null) return false;
-        }
-        return true;
     }
 
     fn execute_steps(
@@ -1389,20 +1423,14 @@ pub const ActionExecutor = struct {
         assert(self.candidate_store.values_pool.value_count <=
             self.candidate_store.values_pool.value_cap);
         var current_steps = steps;
+        var current_cont = continuation;
         var current_ctx = ctx;
         while (true) {
             if (current_steps.len == 0) {
-                if (continuation) |next| {
-                    try self.execute_steps(
-                        next.steps,
-                        next.next,
-                        current_ctx,
-                        s0,
-                        out_states,
-                        is_init,
-                        action_mask,
-                    );
-                    return;
+                if (current_cont) |next| {
+                    current_steps = next.steps;
+                    current_cont = next.next;
+                    continue;
                 }
                 try self.commit_state(
                     current_ctx,
@@ -1433,7 +1461,7 @@ pub const ActionExecutor = struct {
                                 it,
                                 .changed,
                             );
-                            try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init, action_mask);
+                            try self.execute_steps(rest, current_cont, new_ctx, s0, out_states, is_init, action_mask);
                             self.eval_pool.restore(snap);
                             self.evaluator.restore_context_pool(context_snap);
                         }
@@ -1466,7 +1494,7 @@ pub const ActionExecutor = struct {
                                 it,
                                 .changed,
                             );
-                            try self.execute_steps(rest, continuation, new_ctx, s0, out_states, is_init, action_mask);
+                            try self.execute_steps(rest, current_cont, new_ctx, s0, out_states, is_init, action_mask);
                             self.eval_pool.restore(snap);
                             self.evaluator.restore_context_pool(context_snap);
                         }
@@ -1499,7 +1527,7 @@ pub const ActionExecutor = struct {
                         if (additional_mask == 0) break :mask_update;
                         try self.execute_steps(
                             rest,
-                            continuation,
+                            current_cont,
                             current_ctx,
                             s0,
                             out_states,
@@ -1516,9 +1544,25 @@ pub const ActionExecutor = struct {
                     const mat = try self.evaluator.materialize_set(set_v, current_ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                     if (mat != .set_v) return Error.TypeError;
                     const items = mat.set_v.items(self.eval_pool);
-                    const next = Continuation{ .steps = rest, .next = continuation };
+                    if (items.len == 0) return;
                     const snap = self.eval_pool.snapshot();
                     const context_snap = self.evaluator.context_snapshot();
+                    if (rest.len == 0 and current_cont == null) {
+                        for (items[0 .. items.len - 1]) |it| {
+                            const new_ctx = try self.evaluator.extend_context(current_ctx, c.var_name, it);
+                            try self.execute_steps(c.body_steps, null, new_ctx, s0, out_states, is_init, action_mask);
+                            self.eval_pool.restore(snap);
+                            self.evaluator.restore_context_pool(context_snap);
+                        }
+                        current_ctx = try self.evaluator.extend_context(
+                            current_ctx,
+                            c.var_name,
+                            items[items.len - 1],
+                        );
+                        current_steps = c.body_steps;
+                        continue;
+                    }
+                    const next = Continuation{ .steps = rest, .next = current_cont };
                     for (items) |it| {
                         const new_ctx = try self.evaluator.extend_context(current_ctx, c.var_name, it);
                         try self.execute_steps(c.body_steps, &next, new_ctx, s0, out_states, is_init, action_mask);
@@ -1548,8 +1592,9 @@ pub const ActionExecutor = struct {
                 },
                 .call => |c| {
                     if (c.def.params.len != c.args.len) return Error.TypeError;
+                    if (c.args.len > 32) return Error.NotImplemented;
                     const context_snap = self.evaluator.context_snapshot();
-                    const values = try self.eval_pool.alloc_values(@intCast(c.args.len));
+                    var values: [32]Value = undefined;
                     for (c.args, 0..) |arg, i| {
                         values[i] = try self.eval_compiled_expr(
                             arg,
@@ -1561,7 +1606,12 @@ pub const ActionExecutor = struct {
                     for (c.def.params, 0..) |p, i| {
                         call_ctx = try self.evaluator.extend_context(call_ctx, p, values[i]);
                     }
-                    const next = Continuation{ .steps = rest, .next = continuation };
+                    if (rest.len == 0 and current_cont == null) {
+                        current_ctx = call_ctx;
+                        current_steps = c.body_steps;
+                        continue;
+                    }
+                    const next = Continuation{ .steps = rest, .next = current_cont };
                     const snap = self.eval_pool.snapshot();
                     try self.execute_steps(c.body_steps, &next, call_ctx, s0, out_states, is_init, action_mask);
                     self.eval_pool.restore(snap);
@@ -1585,7 +1635,7 @@ pub const ActionExecutor = struct {
                     self.evaluator.restore_context_pool(left_context_snapshot);
                     const next = Continuation{
                         .steps = rest,
-                        .next = continuation,
+                        .next = current_cont,
                     };
                     const snapshot = self.eval_pool.snapshot();
                     const context_snapshot = self.evaluator.context_snapshot();
@@ -1621,7 +1671,19 @@ pub const ActionExecutor = struct {
                     return;
                 },
                 .branch => |b| {
-                    const next = Continuation{ .steps = rest, .next = continuation };
+                    if (b.options.len == 0) return;
+                    if (rest.len == 0 and current_cont == null) {
+                        const snap = self.eval_pool.snapshot();
+                        const context_snap = self.evaluator.context_snapshot();
+                        for (b.options[0 .. b.options.len - 1]) |opt| {
+                            try self.execute_steps(opt, null, current_ctx, s0, out_states, is_init, action_mask);
+                            self.eval_pool.restore(snap);
+                            self.evaluator.restore_context_pool(context_snap);
+                        }
+                        current_steps = b.options[b.options.len - 1];
+                        continue;
+                    }
+                    const next = Continuation{ .steps = rest, .next = current_cont };
                     const snap = self.eval_pool.snapshot();
                     const context_snap = self.evaluator.context_snapshot();
                     for (b.options) |opt| {
@@ -1637,7 +1699,11 @@ pub const ActionExecutor = struct {
                         current_ctx,
                         s0,
                     )) ib.then_steps else ib.else_steps;
-                    const next = Continuation{ .steps = rest, .next = continuation };
+                    if (rest.len == 0 and current_cont == null) {
+                        current_steps = taken;
+                        continue;
+                    }
+                    const next = Continuation{ .steps = rest, .next = current_cont };
                     const snap = self.eval_pool.snapshot();
                     const context_snap = self.evaluator.context_snapshot();
                     try self.execute_steps(taken, &next, current_ctx, s0, out_states, is_init, action_mask);
@@ -1646,7 +1712,9 @@ pub const ActionExecutor = struct {
                     return;
                 },
                 .case_branch => |case| {
-                    const next = Continuation{ .steps = rest, .next = continuation };
+                    const next = Continuation{ .steps = rest, .next = current_cont };
+                    const next_ptr: ?*const Continuation = if (rest.len == 0 and
+                        current_cont == null) null else &next;
                     const snap = self.eval_pool.snapshot();
                     const context_snap = self.evaluator.context_snapshot();
                     for (case.arms) |arm| {
@@ -1659,13 +1727,13 @@ pub const ActionExecutor = struct {
                             self.evaluator.restore_context_pool(context_snap);
                             continue;
                         }
-                        try self.execute_steps(arm.steps, &next, current_ctx, s0, out_states, is_init, action_mask);
+                        try self.execute_steps(arm.steps, next_ptr, current_ctx, s0, out_states, is_init, action_mask);
                         self.eval_pool.restore(snap);
                         self.evaluator.restore_context_pool(context_snap);
                         return;
                     }
                     if (case.otherwise_steps) |otherwise| {
-                        try self.execute_steps(otherwise, &next, current_ctx, s0, out_states, is_init, action_mask);
+                        try self.execute_steps(otherwise, next_ptr, current_ctx, s0, out_states, is_init, action_mask);
                         self.eval_pool.restore(snap);
                         self.evaluator.restore_context_pool(context_snap);
                     }
@@ -1838,9 +1906,40 @@ pub const ActionExecutor = struct {
         for (new_state.values, 0..) |*destination, variable_index| {
             if (assignments[variable_index]) |assigned| {
                 if (assigned.assignment == .changed) {
-                    new_state.changed_mask |= @as(u64, 1) << @intCast(variable_index);
                     const source_pool = assigned.value_pool orelse
                         self.eval_pool;
+                    const no_change_check_worthwhile = switch (assigned.value) {
+                        .bool_v,
+                        .int_v,
+                        .model_v,
+                        .range_v,
+                        => false,
+                        else => true,
+                    };
+                    if (no_change_check_worthwhile) {
+                        if (s0) |parent| no_change: {
+                            const parent_pool = parent.value_pool(
+                                @intCast(variable_index),
+                                &self.source_state_store.values_pool,
+                            );
+                            if (!Value.eql_cross_pool(
+                                assigned.value,
+                                source_pool,
+                                parent.values[variable_index],
+                                parent_pool,
+                            )) break :no_change;
+                            destination.* = parent.values[variable_index];
+                            if (parent_pool != &self.candidate_store.values_pool) {
+                                new_state.borrowed_mask |=
+                                    @as(u64, 1) << @intCast(variable_index);
+                                assert(new_state.borrowed_pool == null or
+                                    new_state.borrowed_pool == parent_pool);
+                                new_state.borrowed_pool = parent_pool;
+                            }
+                            continue;
+                        }
+                    }
+                    new_state.changed_mask |= @as(u64, 1) << @intCast(variable_index);
                     destination.* = try assigned.value.clone(
                         source_pool,
                         &self.candidate_store.values_pool,

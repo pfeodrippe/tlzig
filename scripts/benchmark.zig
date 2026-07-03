@@ -21,6 +21,7 @@ const Spec = struct {
     max_int: i64 = 1000,
     state_values_per_state: u32 = 60,
     expected_violation: bool = false,
+    distinct_tolerance: u64 = 0,
     compare_generated: bool = true,
     compare_distinct: bool = true,
     prefer_generated: bool = false,
@@ -87,8 +88,8 @@ const specs = [_]Spec{
         .cfg = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.cfg",
         .max_states = 100_000,
         .expected_violation = true,
+        .distinct_tolerance = 16,
         .compare_generated = false,
-        .compare_distinct = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
@@ -98,8 +99,9 @@ const specs = [_]Spec{
         .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
         .cfg = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn_rc_local.cfg",
         .max_states = 20_000,
+        .expected_violation = true,
+        .distinct_tolerance = 16,
         .compare_generated = false,
-        .compare_distinct = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
@@ -109,8 +111,8 @@ const specs = [_]Spec{
         .tla = "vendor/MDBTLA/MultiShardTxn/Storage.tla",
         .cfg = "vendor/MDBTLA/MultiShardTxn/Storage.cfg",
         .max_states = 100_000,
+        .expected_violation = true,
         .compare_generated = false,
-        .compare_distinct = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
@@ -121,7 +123,7 @@ const specs = [_]Spec{
         .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/Storage_exhaustive.cfg",
         .default_enabled = false,
         .one_core_default = false,
-        .max_states = 5_000_000,
+        .max_states = 1_200_000,
         .compare_generated = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -133,8 +135,9 @@ const specs = [_]Spec{
         .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block.cfg",
         .max_states = 20_000,
         .state_values_per_state = 120,
+        .expected_violation = true,
+        .distinct_tolerance = 32,
         .compare_generated = false,
-        .compare_distinct = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
@@ -145,8 +148,9 @@ const specs = [_]Spec{
         .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_or_ww.cfg",
         .max_states = 20_000,
         .state_values_per_state = 120,
+        .expected_violation = true,
+        .distinct_tolerance = 32,
         .compare_generated = false,
-        .compare_distinct = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
@@ -157,8 +161,9 @@ const specs = [_]Spec{
         .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_snapshot.cfg",
         .max_states = 100_000,
         .state_values_per_state = 300,
+        .expected_violation = true,
+        .distinct_tolerance = 32,
         .compare_generated = false,
-        .compare_distinct = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
@@ -169,8 +174,9 @@ const specs = [_]Spec{
         .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_with_prepare_block.cfg",
         .max_states = 20_000,
         .state_values_per_state = 120,
+        .expected_violation = true,
+        .distinct_tolerance = 32,
         .compare_generated = false,
-        .compare_distinct = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
@@ -181,7 +187,7 @@ const specs = [_]Spec{
         .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_exhaustive.cfg",
         .default_enabled = false,
         .one_core_default = false,
-        .max_states = 30_000_000,
+        .max_states = 18_000_000,
         .state_values_per_state = 120,
         .compare_generated = false,
         .prefer_generated = true,
@@ -194,7 +200,7 @@ const specs = [_]Spec{
         .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_or_ww_exhaustive.cfg",
         .default_enabled = false,
         .one_core_default = false,
-        .max_states = 30_000_000,
+        .max_states = 20_000_000,
         .state_values_per_state = 120,
         .compare_generated = false,
         .prefer_generated = true,
@@ -207,7 +213,7 @@ const specs = [_]Spec{
         .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_snapshot_exhaustive.cfg",
         .default_enabled = false,
         .one_core_default = false,
-        .max_states = 80_000_000,
+        .max_states = 68_000_000,
         .state_values_per_state = 300,
         .compare_generated = false,
         .prefer_generated = true,
@@ -220,7 +226,7 @@ const specs = [_]Spec{
         .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_with_prepare_block_exhaustive.cfg",
         .default_enabled = false,
         .one_core_default = false,
-        .max_states = 30_000_000,
+        .max_states = 17_000_000,
         .state_values_per_state = 120,
         .compare_generated = false,
         .prefer_generated = true,
@@ -550,11 +556,17 @@ fn run_comparison(
             tlc_one.?.outcome != tlc_auto.?.outcome
     else
         false;
+    const expected_distinct_mismatch = spec.compare_distinct and
+        run_one_core and
+        !distinct_within_tolerance(
+            tlc_one.?.distinct,
+            tlzig_one.?.distinct,
+            spec.distinct_tolerance,
+        );
     const mismatch = one_core_mismatch or
         tlc_auto.?.outcome != tlzig_auto.outcome or
         (if (spec.expected_violation)
-            spec.compare_distinct and run_one_core and
-                tlc_one.?.distinct != tlzig_one.?.distinct
+            expected_distinct_mismatch
         else
             (spec.compare_generated and
                 ((run_one_core and
@@ -605,6 +617,18 @@ fn run_comparison(
     if (generated_model.generated_count == 0) {
         try write_tlzig_baseline(allocator, spec, tlzig_auto);
     }
+}
+
+fn distinct_within_tolerance(
+    expected: u64,
+    actual: u64,
+    tolerance: u64,
+) bool {
+    const delta = if (expected >= actual)
+        expected - actual
+    else
+        actual - expected;
+    return delta <= tolerance;
 }
 
 const RunResult = struct {
@@ -840,14 +864,18 @@ fn run_tlzig_internal(
     const result = ch.check() catch |err| {
         const elapsed = elapsed_ms(io, start);
         const distinct = ch.distinct;
-        const output = try std.fmt.allocPrint(allocator, "generated={d} distinct={d} error={any}", .{ ch.generated, distinct, err });
+        const output = try std.fmt.allocPrint(
+            allocator,
+            "generated={d} distinct={d} error={any}",
+            .{ ch.successor_attempts, distinct, err },
+        );
         if (err == error.InvariantViolated or
             err == error.PropertyViolated or
             err == error.Deadlock)
         {
             return RunResult{
                 .elapsed_ms = elapsed,
-                .generated = ch.generated,
+                .generated = ch.successor_attempts,
                 .distinct = distinct,
                 .outcome = if (err == error.Deadlock)
                     .deadlock

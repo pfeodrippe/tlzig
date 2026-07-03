@@ -130,7 +130,10 @@ fn parallel_worker(
             .compose_states = &worker.compose_states,
             .composition_generated = &worker.composition_generated,
             .fairness_markers = checker.fairness_markers,
-            .edge_action_masks = worker.prepared_edge_masks,
+            .edge_action_masks = if (checker.graph_enabled)
+                worker.prepared_edge_masks
+            else
+                null,
         };
         const generation_error: ?Error = blk: {
             executor.execute_next(
@@ -161,13 +164,14 @@ fn parallel_worker(
             if (checker.diagnostics) {
                 std.debug.print(
                     "Deadlock generated={d} distinct={d}\n",
-                    .{ checker.generated, checker.distinct },
+                    .{ checker.successor_attempts, checker.distinct },
                 );
                 checker.print_trace(state_idx);
             }
             parallel.failure = Error.Deadlock;
         } else if (parallel.failure == null) {
-            checker.generated += worker.composition_generated;
+            checker.successor_attempts += worker.prepared_generated;
+            checker.committed_generated += worker.composition_generated;
             if (checker.graph_enabled) {
                 checker.succ_offsets[state_idx] = checker.succ_count;
             }
@@ -470,7 +474,8 @@ pub const Checker = struct {
     worker_count: u16,
     max_states: u32,
     max_successors: u32,
-    generated: u64,
+    successor_attempts: u64,
+    committed_generated: u64,
     distinct: u64,
     // Transition graph for liveness/property checking.
     succ_offsets: []u32,
@@ -899,7 +904,8 @@ pub const Checker = struct {
             .worker_count = worker_count,
             .max_states = max_states,
             .max_successors = max_successors,
-            .generated = 0,
+            .successor_attempts = 0,
+            .committed_generated = 0,
             .distinct = 0,
             .succ_offsets = succ_offsets,
             .succ_counts = succ_counts,
@@ -936,6 +942,7 @@ pub const Checker = struct {
             assert(self.next_spec == null);
             return Result{
                 .generated = 0,
+                .committed_generated = 0,
                 .distinct = 0,
                 .error_state = null,
             };
@@ -955,12 +962,13 @@ pub const Checker = struct {
             .compose_states = &compose_states,
             .composition_generated = &composition_generated,
             .fairness_markers = self.fairness_markers,
-            .edge_action_masks = edge_masks,
+            .edge_action_masks = if (self.graph_enabled) edge_masks else null,
         };
 
         self.candidate_store.reset(self.candidate_pool_base);
         self.eval_pool.restore(self.eval_pool_base);
         try executor.execute_init(self.init_spec.?, &out_states);
+        self.successor_attempts += out_states.items.len;
         try self.process_generated(
             null,
             &out_states,
@@ -988,12 +996,13 @@ pub const Checker = struct {
                     });
                     return err;
                 };
-                self.generated += composition_generated;
+                self.successor_attempts += out_states.items.len;
+                self.committed_generated += composition_generated;
                 if (self.check_deadlock and out_states.items.len == 0) {
                     if (self.diagnostics) {
                         std.debug.print(
                             "Deadlock generated={d} distinct={d}\n",
-                            .{ self.generated, self.distinct },
+                            .{ self.successor_attempts, self.distinct },
                         );
                         self.print_trace(idx);
                     }
@@ -1019,7 +1028,8 @@ pub const Checker = struct {
         }
 
         return Result{
-            .generated = self.generated,
+            .generated = self.successor_attempts,
+            .committed_generated = self.committed_generated,
             .distinct = self.distinct,
             .error_state = null,
         };
@@ -1119,10 +1129,13 @@ pub const Checker = struct {
             bool,
             self.max_successors,
         );
-        worker.prepared_edge_masks = try worker.candidate_arena.alloc(
-            u64,
-            self.max_successors,
-        );
+        worker.prepared_edge_masks = if (self.graph_enabled)
+            try worker.candidate_arena.alloc(
+                u64,
+                self.max_successors,
+            )
+        else
+            &.{};
         worker.prepared_generated = 0;
         worker.composition_generated = 0;
         worker.source_snapshot = self.state_store;
@@ -1143,7 +1156,9 @@ pub const Checker = struct {
         assert(!self.symmetry_hash_cache.enabled);
         assert(out_states.items.len <= prepared_fingerprints.len);
         assert(out_states.items.len <= prepared_invariants.len);
-        assert(out_states.items.len <= prepared_edge_masks.len);
+        if (self.graph_enabled) {
+            assert(out_states.items.len <= prepared_edge_masks.len);
+        }
         var kept_count: u32 = 0;
         var action_parent = try self.clone_parent_for_action_constraints(
             parent_idx,
@@ -1181,9 +1196,11 @@ pub const Checker = struct {
             out_states.items[kept_count] = candidate_index;
             prepared_fingerprints[kept_count] = candidate_fingerprint;
             prepared_invariants[kept_count] = true;
-            prepared_edge_masks[kept_count] = prepared_edge_masks[
-                @intCast(candidate_index)
-            ];
+            if (self.graph_enabled) {
+                prepared_edge_masks[kept_count] = prepared_edge_masks[
+                    @intCast(candidate_index)
+                ];
+            }
             kept_count += 1;
         }
         out_states.shrink(kept_count);
@@ -1202,7 +1219,9 @@ pub const Checker = struct {
     ) !void {
         assert(out_states.items.len <= prepared_fingerprints.len);
         assert(out_states.items.len <= prepared_invariants.len);
-        assert(out_states.items.len <= prepared_edge_masks.len);
+        if (self.graph_enabled) {
+            assert(out_states.items.len <= prepared_edge_masks.len);
+        }
         var kept_count: u32 = 0;
         for (out_states.items, 0..) |*candidate_index, prepared_index| {
             const candidate = candidate_store.get(candidate_index.*);
@@ -1239,7 +1258,7 @@ pub const Checker = struct {
                 if (!invariants_hold) {
                     std.debug.print(
                         "InvariantViolated generated={d} distinct={d}\n",
-                        .{ self.generated, self.distinct },
+                        .{ self.successor_attempts, self.distinct },
                     );
                     self.print_trace(state_idx);
                     return Error.InvariantViolated;
@@ -1251,16 +1270,23 @@ pub const Checker = struct {
                 }
                 self.maybe_report_progress();
             }
-            if (deduplicate_successor(
+            if (self.graph_enabled) {
+                if (deduplicate_successor(
+                    out_states.items[0..kept_count],
+                    prepared_edge_masks[0..kept_count],
+                    state_idx,
+                    prepared_edge_masks[prepared_index],
+                )) continue;
+            } else if (deduplicate_successor_plain(
                 out_states.items[0..kept_count],
-                prepared_edge_masks[0..kept_count],
                 state_idx,
-                prepared_edge_masks[prepared_index],
             )) continue;
-            self.generated += 1;
+            self.committed_generated += 1;
             candidate_index.* = state_idx;
             out_states.items[kept_count] = state_idx;
-            prepared_edge_masks[kept_count] = prepared_edge_masks[prepared_index];
+            if (self.graph_enabled) {
+                prepared_edge_masks[kept_count] = prepared_edge_masks[prepared_index];
+            }
             kept_count += 1;
         }
         out_states.shrink(kept_count);
@@ -1359,7 +1385,10 @@ pub const Checker = struct {
                 true;
             self.eval_pool.restore(snap);
             if (!invariants_hold) {
-                std.debug.print("InvariantViolated generated={d} distinct={d}\n", .{ self.generated, self.distinct });
+                std.debug.print("InvariantViolated generated={d} distinct={d}\n", .{
+                    self.successor_attempts,
+                    self.distinct,
+                });
                 self.print_trace(state_idx);
                 return Error.InvariantViolated;
             }
@@ -1369,16 +1398,23 @@ pub const Checker = struct {
                 }
                 self.maybe_report_progress();
             }
-            if (deduplicate_successor(
+            if (self.graph_enabled) {
+                if (deduplicate_successor(
+                    out_states.items[0..kept_count],
+                    edge_masks[0..kept_count],
+                    state_idx,
+                    edge_masks[@intCast(candidate_index)],
+                )) continue;
+            } else if (deduplicate_successor_plain(
                 out_states.items[0..kept_count],
-                edge_masks[0..kept_count],
                 state_idx,
-                edge_masks[@intCast(candidate_index)],
             )) continue;
-            self.generated += 1;
+            self.committed_generated += 1;
             idx.* = state_idx;
             out_states.items[kept_count] = state_idx;
-            edge_masks[kept_count] = edge_masks[@intCast(candidate_index)];
+            if (self.graph_enabled) {
+                edge_masks[kept_count] = edge_masks[@intCast(candidate_index)];
+            }
             kept_count += 1;
         }
         out_states.shrink(kept_count);
@@ -1393,8 +1429,8 @@ pub const Checker = struct {
     ) !void {
         if (parent_idx) |pidx| {
             const count: u32 = @intCast(out_states.items.len);
-            assert(edge_masks.len >= count);
             if (self.graph_enabled) {
+                assert(edge_masks.len >= count);
                 if (self.succ_count + count > self.succ_cap) {
                     return Error.OutOfMemory;
                 }
@@ -1438,6 +1474,16 @@ pub const Checker = struct {
         return false;
     }
 
+    fn deduplicate_successor_plain(
+        states: []const u32,
+        state_idx: u32,
+    ) bool {
+        for (states) |existing| {
+            if (existing == state_idx) return true;
+        }
+        return false;
+    }
+
     fn maybe_report_progress(self: *Checker) void {
         if (self.progress_interval_states == 0) return;
         if (self.distinct < self.next_progress_distinct) return;
@@ -1447,7 +1493,7 @@ pub const Checker = struct {
         std.debug.print(
             "Progress generated={d} distinct={d} queue={d} values={d}/{d} strings={d}/{d} graph_edges={d}/{d}\n",
             .{
-                self.generated,
+                self.successor_attempts,
                 self.distinct,
                 self.queue.len(),
                 self.state_store.values_pool.value_count,
@@ -2665,7 +2711,7 @@ pub const Checker = struct {
                 std.debug.print("Invariant false: {s}\n", .{self.invariant_names[i]});
                 try self.print_first_false_conjunct(inv, st);
                 std.debug.print("InvariantViolated generated={d} distinct={d}\n", .{
-                    self.generated,
+                    self.successor_attempts,
                     self.distinct,
                 });
                 self.print_trace(state_idx);
@@ -2926,7 +2972,14 @@ fn contains_enabled(expr: *ast.Expr) bool {
 }
 
 pub const Result = struct {
+    // TLC-compatible non-distinct generated-state count:
+    // initial states plus raw next-state candidates before constraints,
+    // fingerprinting, and successor-edge deduplication.
     generated: u64,
+    // Internal committed graph edges after constraints and per-parent
+    // successor deduplication. This is useful for tlzig profiling, not TLC
+    // result comparison.
+    committed_generated: u64,
     distinct: u64,
     error_state: ?u32,
 };

@@ -73,9 +73,49 @@ pub const Context = struct {
         values: []Value,
         eval_pool: *ValuePool,
     ) Error!void {
+        const found_all = try self.lookup_values_internal(
+            names,
+            required,
+            values,
+            eval_pool,
+            false,
+        );
+        assert(found_all);
+    }
+
+    pub fn lookup_all_values(
+        self: Context,
+        names: []const []const u8,
+        values: []Value,
+        eval_pool: *ValuePool,
+    ) Error!bool {
+        return self.lookup_values_internal(
+            names,
+            &.{},
+            values,
+            eval_pool,
+            true,
+        );
+    }
+
+    fn lookup_values_internal(
+        self: Context,
+        names: []const []const u8,
+        required: []const bool,
+        values: []Value,
+        eval_pool: *ValuePool,
+        require_all: bool,
+    ) Error!bool {
         assert(names.len == values.len);
         assert(required.len == 0 or required.len == names.len);
         assert(names.len <= 32);
+        if (require_all and try self.lookup_values_stack_top(
+            names,
+            values,
+            eval_pool,
+        )) {
+            return true;
+        }
         var found: [32]bool = @splat(false);
         var found_count: usize = 0;
         var binding = self.head;
@@ -94,17 +134,46 @@ pub const Context = struct {
                 } else {
                     values[index] = current.value;
                 }
-                if (found_count == names.len) return;
+                if (found_count == names.len) return true;
                 break;
             }
         }
         for (names, 0..) |_, index| {
             if (found[index]) continue;
+            if (require_all) return false;
             if (required.len == 0 or required[index]) {
                 return Error.UndefinedSymbol;
             }
             values[index] = Value{ .bool_v = false };
         }
+        return true;
+    }
+
+    fn lookup_values_stack_top(
+        self: Context,
+        names: []const []const u8,
+        values: []Value,
+        eval_pool: *ValuePool,
+    ) Error!bool {
+        if (names.len == 0) return true;
+        if (names.len > self.len) return false;
+        var binding = self.head;
+        var index = names.len;
+        while (index > 0) {
+            index -= 1;
+            const current = binding orelse return false;
+            if (!name_eql(current.name, names[index])) return false;
+            if (current.value_pool) |source_pool| {
+                values[index] = try current.value.clone(
+                    source_pool,
+                    eval_pool,
+                );
+            } else {
+                values[index] = current.value;
+            }
+            binding = current.parent;
+        }
+        return true;
     }
 
     fn lookup_binding(self: Context, name: []const u8) ?*const ContextBinding {
@@ -492,6 +561,7 @@ pub const Evaluator = struct {
                 current_state,
                 eval_pool,
                 state_pool,
+                true,
             );
         }
         const definition = self.find_definition(resolved) orelse
@@ -545,8 +615,37 @@ pub const Evaluator = struct {
             current_state,
             eval_pool,
             state_pool,
+            expression.uses_primed,
         );
         return result;
+    }
+
+    pub fn eval_generated_expression_if_args_available(
+        self: Evaluator,
+        expression: generated_runtime.Expression,
+        context: Context,
+        current_state: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!?Value {
+        if (expression.arg_names.len > 32) return Error.NotImplemented;
+        var args: [32]Value = undefined;
+        if (!try context.lookup_all_values(
+            expression.arg_names,
+            args[0..expression.arg_names.len],
+            eval_pool,
+        )) {
+            return null;
+        }
+        return try self.call_generated(
+            expression.function,
+            args[0..expression.arg_names.len],
+            context,
+            current_state,
+            eval_pool,
+            state_pool,
+            expression.uses_primed,
+        );
     }
 
     pub fn eval_generated_expression_bool(
@@ -587,6 +686,45 @@ pub const Evaluator = struct {
             current_state,
             eval_pool,
             state_pool,
+            expression.uses_primed,
+        );
+    }
+
+    pub fn eval_generated_expression_bool_if_args_available(
+        self: Evaluator,
+        expression: generated_runtime.Expression,
+        context: Context,
+        current_state: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!?bool {
+        const boolean_function = expression.boolean_function orelse {
+            const result = try self.eval_generated_expression_if_args_available(
+                expression,
+                context,
+                current_state,
+                eval_pool,
+                state_pool,
+            ) orelse return null;
+            return result.is_truthy();
+        };
+        if (expression.arg_names.len > 32) return Error.NotImplemented;
+        var args: [32]Value = undefined;
+        if (!try context.lookup_all_values(
+            expression.arg_names,
+            args[0..expression.arg_names.len],
+            eval_pool,
+        )) {
+            return null;
+        }
+        return try self.call_generated_bool(
+            boolean_function,
+            args[0..expression.arg_names.len],
+            context,
+            current_state,
+            eval_pool,
+            state_pool,
+            expression.uses_primed,
         );
     }
 
@@ -808,6 +946,7 @@ pub const Evaluator = struct {
                         s0,
                         eval_pool,
                         state_pool,
+                        true,
                     );
                 }
                 if (self.find_definition(aliased)) |def| {
@@ -2760,6 +2899,7 @@ pub const Evaluator = struct {
                     s0,
                     eval_pool,
                     state_pool,
+                    true,
                 ) catch |err| {
                     if (err == Error.TypeError) {
                         return self.fail(
@@ -2923,11 +3063,14 @@ pub const Evaluator = struct {
         current_state: ?*StateStore.State,
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
+        uses_primed: bool,
     ) Error!Value {
         var partial_values: [64]?Value = undefined;
         var partial_value_pools: [64]?*const ValuePool = undefined;
         assert(self.module.variables.len <= partial_values.len);
-        const partial_value_slice = if (evaluator_context.state_head == null)
+        const skip_partial_values = !uses_primed and current_state != null;
+        const partial_value_slice = if (skip_partial_values or
+            evaluator_context.state_head == null)
             partial_values[0..0]
         else blk: {
             @memset(partial_values[0..self.module.variables.len], null);
@@ -2943,7 +3086,8 @@ pub const Evaluator = struct {
             }
             break :blk partial_values[0..self.module.variables.len];
         };
-        const partial_pool_slice = if (evaluator_context.state_head == null)
+        const partial_pool_slice = if (skip_partial_values or
+            evaluator_context.state_head == null)
             partial_value_pools[0..0]
         else
             partial_value_pools[0..self.module.variables.len];
@@ -2974,11 +3118,14 @@ pub const Evaluator = struct {
         current_state: ?*StateStore.State,
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
+        uses_primed: bool,
     ) Error!bool {
         var partial_values: [64]?Value = undefined;
         var partial_value_pools: [64]?*const ValuePool = undefined;
         assert(self.module.variables.len <= partial_values.len);
-        const partial_value_slice = if (evaluator_context.state_head == null)
+        const skip_partial_values = !uses_primed and current_state != null;
+        const partial_value_slice = if (skip_partial_values or
+            evaluator_context.state_head == null)
             partial_values[0..0]
         else blk: {
             @memset(partial_values[0..self.module.variables.len], null);
@@ -2994,7 +3141,8 @@ pub const Evaluator = struct {
             }
             break :blk partial_values[0..self.module.variables.len];
         };
-        const partial_pool_slice = if (evaluator_context.state_head == null)
+        const partial_pool_slice = if (skip_partial_values or
+            evaluator_context.state_head == null)
             partial_value_pools[0..0]
         else
             partial_value_pools[0..self.module.variables.len];
@@ -3188,6 +3336,7 @@ pub const Evaluator = struct {
                 s0,
                 eval_pool,
                 state_pool,
+                true,
             );
         }
         if (args.len == 0) return func;

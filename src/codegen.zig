@@ -31,6 +31,7 @@ const GeneratedExpressionMeta = struct {
     params: [32][]const u8,
     param_count: u8,
     identity: u32,
+    uses_primed: bool,
 
     fn param_slice(self: *const GeneratedExpressionMeta) []const []const u8 {
         return self.params[0..self.param_count];
@@ -364,14 +365,14 @@ pub fn emit_module_with_options(
         ))
             try std.fmt.allocPrint(
                 allocator,
-                "}}, .function = expr_{d}, .boolean_function = expr_{d}_bool }},\n",
-                .{ entry.identity, entry.identity },
+                "}}, .uses_primed = {}, .function = expr_{d}, .boolean_function = expr_{d}_bool }},\n",
+                .{ entry.uses_primed, entry.identity, entry.identity },
             )
         else
             try std.fmt.allocPrint(
                 allocator,
-                "}}, .function = expr_{d} }},\n",
-                .{entry.identity},
+                "}}, .uses_primed = {}, .function = expr_{d} }},\n",
+                .{ entry.uses_primed, entry.identity },
             );
         defer allocator.free(expression_suffix);
         try append(&output, allocator, expression_suffix);
@@ -1606,19 +1607,29 @@ fn emit_expr(
                 )
             else if (resolved_config_symbol(module, name)) |symbol|
                 switch (symbol) {
-                    .constant => |constant_name| try std.fmt.allocPrint(
-                        allocator,
-                        "try runtime.constant(context, \"{f}\")",
-                        .{std.zig.fmtString(constant_name)},
-                    ),
-                    .name => |resolved_name| if (constant_index(
+                    .constant => |constant_name| if (constant_index(
                         module,
-                        resolved_name,
-                    ) != null)
+                        constant_name,
+                    )) |index|
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "try runtime.constant_at(context, {d})",
+                            .{index},
+                        )
+                    else
                         try std.fmt.allocPrint(
                             allocator,
                             "try runtime.constant(context, \"{f}\")",
-                            .{std.zig.fmtString(resolved_name)},
+                            .{std.zig.fmtString(constant_name)},
+                        ),
+                    .name => |resolved_name| if (constant_index(
+                        module,
+                        resolved_name,
+                    )) |index|
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "try runtime.constant_at(context, {d})",
+                            .{index},
                         )
                     else if (builtin_value_runtime_name(resolved_name)) |runtime_name|
                         try std.fmt.allocPrint(
@@ -1645,11 +1656,11 @@ fn emit_expr(
                             );
                     } else unreachable,
                 }
-            else if (constant_index(module, name)) |_|
+            else if (constant_index(module, name)) |index|
                 try std.fmt.allocPrint(
                     allocator,
-                    "try runtime.constant(context, \"{f}\")",
-                    .{std.zig.fmtString(name)},
+                    "try runtime.constant_at(context, {d})",
+                    .{index},
                 )
             else if (builtin_value_runtime_name(name)) |runtime_name|
                 try std.fmt.allocPrint(
@@ -2463,11 +2474,18 @@ fn emit_expr(
                     module,
                     application.func.*.ident,
                 )) |constant_name| {
-                    const text = try std.fmt.allocPrint(
-                        allocator,
-                        "try runtime.constant(context, \"{f}\")",
-                        .{std.zig.fmtString(constant_name)},
-                    );
+                    const text = if (constant_index(module, constant_name)) |index|
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "try runtime.constant_at(context, {d})",
+                            .{index},
+                        )
+                    else
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "try runtime.constant(context, \"{f}\")",
+                            .{std.zig.fmtString(constant_name)},
+                        );
                     defer allocator.free(text);
                     try append(output, allocator, text);
                     return;
@@ -5347,6 +5365,337 @@ pub fn expression_references_identifier(
     return expr_references_identifier(expr, name);
 }
 
+fn expression_uses_primed(module: ast.Module, expr: *const ast.Expr) bool {
+    var active: [64][]const u8 = undefined;
+    return expression_uses_primed_active(module, expr, &active, 0);
+}
+
+fn expression_uses_primed_active(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    active: *[64][]const u8,
+    active_len: usize,
+) bool {
+    return switch (expr.*) {
+        .primed,
+        .primed_expr,
+        .unchanged,
+        .unchanged_expr,
+        .box_action,
+        => true,
+        .ident => |name| definition_uses_primed_active(
+            module,
+            name,
+            active,
+            active_len,
+        ),
+        .binary => |binary| expression_uses_primed_active(
+            module,
+            binary.left,
+            active,
+            active_len,
+        ) or expression_uses_primed_active(
+            module,
+            binary.right,
+            active,
+            active_len,
+        ),
+        .unary => |unary| expression_uses_primed_active(
+            module,
+            unary.operand,
+            active,
+            active_len,
+        ),
+        .quantifier => |quantifier| blk: {
+            for (quantifier.vars) |bound| {
+                if (expression_uses_primed_active(
+                    module,
+                    bound.domain,
+                    active,
+                    active_len,
+                )) break :blk true;
+            }
+            break :blk expression_uses_primed_active(
+                module,
+                quantifier.body,
+                active,
+                active_len,
+            );
+        },
+        .choose => |choose_value| (if (choose_value.domain) |domain|
+            expression_uses_primed_active(module, domain, active, active_len)
+        else
+            false) or expression_uses_primed_active(
+            module,
+            choose_value.body,
+            active,
+            active_len,
+        ),
+        .if_then_else => |conditional| expression_uses_primed_active(
+            module,
+            conditional.cond,
+            active,
+            active_len,
+        ) or expression_uses_primed_active(
+            module,
+            conditional.then_branch,
+            active,
+            active_len,
+        ) or expression_uses_primed_active(
+            module,
+            conditional.else_branch,
+            active,
+            active_len,
+        ),
+        .apply => |application| blk: {
+            if (application.func.* == .ident and
+                definition_uses_primed_active(
+                    module,
+                    application.func.*.ident,
+                    active,
+                    active_len,
+                ))
+            {
+                break :blk true;
+            }
+            if (application.func.* != .ident and
+                expression_uses_primed_active(
+                    module,
+                    application.func,
+                    active,
+                    active_len,
+                ))
+            {
+                break :blk true;
+            }
+            for (application.args) |argument| {
+                if (expression_uses_primed_active(
+                    module,
+                    argument,
+                    active,
+                    active_len,
+                )) break :blk true;
+            }
+            break :blk false;
+        },
+        .field => |field_value| expression_uses_primed_active(
+            module,
+            field_value.expr,
+            active,
+            active_len,
+        ),
+        .tuple, .set_enum => |items| blk: {
+            for (items) |item| {
+                if (expression_uses_primed_active(
+                    module,
+                    item,
+                    active,
+                    active_len,
+                )) break :blk true;
+            }
+            break :blk false;
+        },
+        .record => |fields| blk: {
+            for (fields) |field_value| {
+                if (expression_uses_primed_active(
+                    module,
+                    field_value.value,
+                    active,
+                    active_len,
+                )) break :blk true;
+            }
+            break :blk false;
+        },
+        .set_filter => |filter_value| blk: {
+            for (filter_value.vars) |bound| {
+                if (expression_uses_primed_active(
+                    module,
+                    bound.domain,
+                    active,
+                    active_len,
+                )) break :blk true;
+            }
+            break :blk expression_uses_primed_active(
+                module,
+                filter_value.pred,
+                active,
+                active_len,
+            );
+        },
+        .set_map => |map_value| blk: {
+            for (map_value.vars) |bound| {
+                if (expression_uses_primed_active(
+                    module,
+                    bound.domain,
+                    active,
+                    active_len,
+                )) break :blk true;
+            }
+            break :blk expression_uses_primed_active(
+                module,
+                map_value.value,
+                active,
+                active_len,
+            );
+        },
+        .set_binary => |set_binary| expression_uses_primed_active(
+            module,
+            set_binary.left,
+            active,
+            active_len,
+        ) or expression_uses_primed_active(
+            module,
+            set_binary.right,
+            active,
+            active_len,
+        ),
+        .set_of_functions => |function_set| expression_uses_primed_active(
+            module,
+            function_set.domain,
+            active,
+            active_len,
+        ) or expression_uses_primed_active(
+            module,
+            function_set.codomain,
+            active,
+            active_len,
+        ),
+        .function_literal => |function_literal| blk: {
+            for (function_literal.vars) |bound| {
+                if (expression_uses_primed_active(
+                    module,
+                    bound.domain,
+                    active,
+                    active_len,
+                )) break :blk true;
+            }
+            break :blk expression_uses_primed_active(
+                module,
+                function_literal.body,
+                active,
+                active_len,
+            );
+        },
+        .record_set => |record_set_value| blk: {
+            for (record_set_value.fields) |field_value| {
+                if (expression_uses_primed_active(
+                    module,
+                    field_value.domain,
+                    active,
+                    active_len,
+                )) break :blk true;
+            }
+            break :blk false;
+        },
+        .except => |except_value| blk: {
+            if (expression_uses_primed_active(
+                module,
+                except_value.func,
+                active,
+                active_len,
+            )) break :blk true;
+            for (except_value.steps) |step| {
+                if (step == .index and expression_uses_primed_active(
+                    module,
+                    step.index,
+                    active,
+                    active_len,
+                )) break :blk true;
+            }
+            break :blk expression_uses_primed_active(
+                module,
+                except_value.value,
+                active,
+                active_len,
+            );
+        },
+        .let_in => |let_value| blk: {
+            for (let_value.defs) |definition| {
+                if (expression_uses_primed_active(
+                    module,
+                    definition.body,
+                    active,
+                    active_len,
+                )) break :blk true;
+                if (definition.function_domain) |domain| {
+                    if (expression_uses_primed_active(
+                        module,
+                        domain,
+                        active,
+                        active_len,
+                    )) break :blk true;
+                }
+            }
+            break :blk expression_uses_primed_active(
+                module,
+                let_value.body,
+                active,
+                active_len,
+            );
+        },
+        .case_expr => |case_value| blk: {
+            for (case_value.arms) |arm| {
+                if (expression_uses_primed_active(
+                    module,
+                    arm.cond,
+                    active,
+                    active_len,
+                ) or expression_uses_primed_active(
+                    module,
+                    arm.value,
+                    active,
+                    active_len,
+                )) break :blk true;
+            }
+            if (case_value.otherwise) |otherwise| {
+                if (expression_uses_primed_active(
+                    module,
+                    otherwise,
+                    active,
+                    active_len,
+                )) break :blk true;
+            }
+            break :blk false;
+        },
+        .lambda => |lambda_value| expression_uses_primed_active(
+            module,
+            lambda_value.body,
+            active,
+            active_len,
+        ),
+        .bool_literal,
+        .int_literal,
+        .string_literal,
+        .at,
+        => false,
+    };
+}
+
+fn definition_uses_primed_active(
+    module: ast.Module,
+    name: []const u8,
+    active: *[64][]const u8,
+    active_len: usize,
+) bool {
+    if (is_native_override(name)) return false;
+    const resolved = resolved_definition_name(module, name) orelse return false;
+    for (active[0..active_len]) |active_name| {
+        if (std.mem.eql(u8, active_name, resolved)) return false;
+    }
+    const definition = find_definition(module, resolved) orelse return false;
+    if (active_len == active.len) return true;
+    active[active_len] = resolved;
+    return expression_uses_primed_active(
+        module,
+        definition.body,
+        active,
+        active_len + 1,
+    ) or if (definition.function_domain) |domain|
+        expression_uses_primed_active(module, domain, active, active_len + 1)
+    else
+        false;
+}
+
 fn compute_reachable(
     allocator: std.mem.Allocator,
     module: ast.Module,
@@ -5618,6 +5967,7 @@ fn collect_generated_expressions(
             .params = params_copy,
             .param_count = @intCast(params.len),
             .identity = @intCast(identity.*),
+            .uses_primed = expression_uses_primed(module, expr),
         });
     }
     switch (expr.*) {

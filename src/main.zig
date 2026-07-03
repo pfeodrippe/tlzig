@@ -349,7 +349,10 @@ pub fn main(init: std.process.Init.Minimal) void {
                 },
             );
         }
-        std.debug.print(" -- generated={d} distinct={d}\n", .{ ch.generated, ch.distinct });
+        std.debug.print(" -- generated={d} distinct={d}\n", .{
+            ch.successor_attempts,
+            ch.distinct,
+        });
         std.process.exit(1);
     };
 

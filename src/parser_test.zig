@@ -368,7 +368,7 @@ test "instance substitutions rewrite primed variables in both copies" {
     const loader = ModuleLoader.init(&arena, &search_paths);
     const module = try loader.load("vendor/tlaplus-examples/specifications/DieHard/MCDieHardest.tla");
     const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
-    const compiler = action.ActionCompiler.init(&arena, evaluator);
+    const compiler = try action.ActionCompiler.init(&arena, evaluator);
     const d1 = evaluator.find_definition("D1!Next") orelse return error.UndefinedSymbol;
     const d2 = evaluator.find_definition("D2!Next") orelse return error.UndefinedSymbol;
     const d1_next = try compiler.compile_next(d1.body);
@@ -416,7 +416,7 @@ test "compile real btree init as assignments" {
     const loader = ModuleLoader.init(&arena, &search_paths);
     const module = try loader.load("vendor/tlaplus-examples/specifications/btree/btree.tla");
     var evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
-    const compiler = action.ActionCompiler.init(&arena, evaluator);
+    const compiler = try action.ActionCompiler.init(&arena, evaluator);
     const init_def = evaluator.find_definition("Init") orelse return error.UndefinedSymbol;
     const compiled = try compiler.compile_init(init_def.body);
     try std.testing.expect(compiled.steps.len >= 12);
@@ -445,7 +445,7 @@ test "action if false branch commits done state" {
     var p = parser.Parser.init(&arena, source);
     const module = try p.parse_module();
     var evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
-    const compiler = action.ActionCompiler.init(&arena, evaluator);
+    const compiler = try action.ActionCompiler.init(&arena, evaluator);
     const next_def = evaluator.find_definition("Next").?;
     const compiled = try compiler.compile_next(next_def.body);
 
@@ -462,7 +462,7 @@ test "action if false branch commits done state" {
     defer eval_arena.deinit();
     var eval_pool = try value.ValuePool.init(&eval_arena, 1024, 1024);
     const executor = action.ActionExecutor{
-        .evaluator = evaluator,
+        .evaluator = &evaluator,
         .source_state_store = &store,
         .candidate_store = &store,
         .eval_pool = &eval_pool,
@@ -493,7 +493,7 @@ test "multi-variable existential action expands every binding" {
     var p = parser.Parser.init(&arena, source);
     const module = try p.parse_module();
     const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
-    const compiler = action.ActionCompiler.init(&arena, evaluator);
+    const compiler = try action.ActionCompiler.init(&arena, evaluator);
     const next_def = evaluator.find_definition("Next").?;
     const compiled = try compiler.compile_next(next_def.body);
     try std.testing.expectEqual(@as(usize, 1), compiled.steps.len);
@@ -510,7 +510,7 @@ test "multi-variable existential action expands every binding" {
     defer eval_arena.deinit();
     var eval_pool = try value.ValuePool.init(&eval_arena, 1024, 64);
     const executor = action.ActionExecutor{
-        .evaluator = evaluator,
+        .evaluator = &evaluator,
         .source_state_store = &store,
         .candidate_store = &store,
         .eval_pool = &eval_pool,
@@ -545,7 +545,7 @@ test "parameterized LET operator remains in action scope" {
     var p = parser.Parser.init(&arena, source);
     const module = try p.parse_module();
     const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
-    const compiler = action.ActionCompiler.init(&arena, evaluator);
+    const compiler = try action.ActionCompiler.init(&arena, evaluator);
     const next_def = evaluator.find_definition("Next").?;
     const compiled = try compiler.compile_next(next_def.body);
 
@@ -556,7 +556,7 @@ test "parameterized LET operator remains in action scope" {
     defer eval_arena.deinit();
     var eval_pool = try value.ValuePool.init(&eval_arena, 256, 64);
     const executor = action.ActionExecutor{
-        .evaluator = evaluator,
+        .evaluator = &evaluator,
         .source_state_store = &store,
         .candidate_store = &store,
         .eval_pool = &eval_pool,
@@ -582,7 +582,7 @@ test "CASE action executes first matching branch" {
     var p = parser.Parser.init(&arena, source);
     const module = try p.parse_module();
     const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
-    const compiler = action.ActionCompiler.init(&arena, evaluator);
+    const compiler = try action.ActionCompiler.init(&arena, evaluator);
     const next_def = evaluator.find_definition("Next").?;
     const compiled = try compiler.compile_next(next_def.body);
 
@@ -593,7 +593,7 @@ test "CASE action executes first matching branch" {
     defer eval_arena.deinit();
     var eval_pool = try value.ValuePool.init(&eval_arena, 256, 64);
     const executor = action.ActionExecutor{
-        .evaluator = evaluator,
+        .evaluator = &evaluator,
         .source_state_store = &store,
         .candidate_store = &store,
         .eval_pool = &eval_pool,

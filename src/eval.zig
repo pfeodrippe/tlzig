@@ -464,20 +464,20 @@ pub const Evaluator = struct {
         return copy;
     }
 
-    pub fn reset_context_pool(self: Evaluator) void {
+    pub fn reset_context_pool(self: *const Evaluator) void {
         self.context_pool.reset();
     }
 
-    pub fn context_snapshot(self: Evaluator) u32 {
+    pub fn context_snapshot(self: *const Evaluator) u32 {
         return self.context_pool.snapshot();
     }
 
-    pub fn restore_context_pool(self: Evaluator, saved_count: u32) void {
+    pub fn restore_context_pool(self: *const Evaluator, saved_count: u32) void {
         self.context_pool.restore(saved_count);
     }
 
     pub fn extend_context(
-        self: Evaluator,
+        self: *const Evaluator,
         context: Context,
         name: []const u8,
         value_v: Value,
@@ -493,7 +493,7 @@ pub const Evaluator = struct {
     }
 
     pub fn extend_state_context(
-        self: Evaluator,
+        self: *const Evaluator,
         context: Context,
         name: []const u8,
         variable_index: u32,
@@ -511,7 +511,7 @@ pub const Evaluator = struct {
     }
 
     pub fn extend_state_context_from_pool(
-        self: Evaluator,
+        self: *const Evaluator,
         context: Context,
         name: []const u8,
         variable_index: u32,
@@ -533,7 +533,7 @@ pub const Evaluator = struct {
     }
 
     pub fn context_assignment(
-        self: Evaluator,
+        self: *const Evaluator,
         context: Context,
         name: []const u8,
     ) AssignmentKind {
@@ -545,7 +545,7 @@ pub const Evaluator = struct {
     }
 
     pub fn eval_named_zero(
-        self: Evaluator,
+        self: *const Evaluator,
         name: []const u8,
         context: Context,
         current_state: ?*StateStore.State,
@@ -577,18 +577,18 @@ pub const Evaluator = struct {
     }
 
     pub fn find_generated_expression(
-        self: Evaluator,
+        self: *const Evaluator,
         identity: u32,
     ) ?generated_runtime.Expression {
         return self.override_registry.find_generated_expression(identity);
     }
 
-    pub fn generated_expression_count(self: Evaluator) usize {
+    pub fn generated_expression_count(self: *const Evaluator) usize {
         return self.override_registry.generated_expressions.len;
     }
 
     pub fn eval_generated_expression(
-        self: Evaluator,
+        self: *const Evaluator,
         expression: generated_runtime.Expression,
         context: Context,
         current_state: ?*StateStore.State,
@@ -602,12 +602,14 @@ pub const Evaluator = struct {
             return Error.TypeError;
         }
         var args: [32]Value = undefined;
-        try context.lookup_values(
-            expression.arg_names,
-            expression.arg_required,
-            args[0..expression.arg_names.len],
-            eval_pool,
-        );
+        if (expression.arg_names.len > 0) {
+            try context.lookup_values(
+                expression.arg_names,
+                expression.arg_required,
+                args[0..expression.arg_names.len],
+                eval_pool,
+            );
+        }
         const result = try self.call_generated(
             expression.function,
             args[0..expression.arg_names.len],
@@ -621,7 +623,7 @@ pub const Evaluator = struct {
     }
 
     pub fn eval_generated_expression_if_args_available(
-        self: Evaluator,
+        self: *const Evaluator,
         expression: generated_runtime.Expression,
         context: Context,
         current_state: ?*StateStore.State,
@@ -630,7 +632,7 @@ pub const Evaluator = struct {
     ) Error!?Value {
         if (expression.arg_names.len > 32) return Error.NotImplemented;
         var args: [32]Value = undefined;
-        if (!try context.lookup_all_values(
+        if (expression.arg_names.len > 0 and !try context.lookup_all_values(
             expression.arg_names,
             args[0..expression.arg_names.len],
             eval_pool,
@@ -649,7 +651,7 @@ pub const Evaluator = struct {
     }
 
     pub fn eval_generated_expression_bool(
-        self: Evaluator,
+        self: *const Evaluator,
         expression: generated_runtime.Expression,
         context: Context,
         current_state: ?*StateStore.State,
@@ -673,12 +675,14 @@ pub const Evaluator = struct {
             return Error.TypeError;
         }
         var args: [32]Value = undefined;
-        try context.lookup_values(
-            expression.arg_names,
-            expression.arg_required,
-            args[0..expression.arg_names.len],
-            eval_pool,
-        );
+        if (expression.arg_names.len > 0) {
+            try context.lookup_values(
+                expression.arg_names,
+                expression.arg_required,
+                args[0..expression.arg_names.len],
+                eval_pool,
+            );
+        }
         return try self.call_generated_bool(
             boolean_function,
             args[0..expression.arg_names.len],
@@ -691,7 +695,7 @@ pub const Evaluator = struct {
     }
 
     pub fn eval_generated_expression_bool_if_args_available(
-        self: Evaluator,
+        self: *const Evaluator,
         expression: generated_runtime.Expression,
         context: Context,
         current_state: ?*StateStore.State,
@@ -710,7 +714,7 @@ pub const Evaluator = struct {
         };
         if (expression.arg_names.len > 32) return Error.NotImplemented;
         var args: [32]Value = undefined;
-        if (!try context.lookup_all_values(
+        if (expression.arg_names.len > 0 and !try context.lookup_all_values(
             expression.arg_names,
             args[0..expression.arg_names.len],
             eval_pool,
@@ -729,7 +733,7 @@ pub const Evaluator = struct {
     }
 
     pub fn make_generated_expression_operator(
-        self: Evaluator,
+        self: *const Evaluator,
         expression: generated_runtime.Expression,
         arity: u16,
         context: Context,
@@ -797,13 +801,13 @@ pub const Evaluator = struct {
 
     /// Record error context and return the error. Always use this in hot paths
     /// so the top-level handler can print what went wrong.
-    pub fn fail(self: Evaluator, err: Error, context: []const u8, detail: []const u8) Error {
+    pub fn fail(self: *const Evaluator, err: Error, context: []const u8, detail: []const u8) Error {
         self.err_ctx.context = context;
         self.err_ctx.detail = detail;
         return err;
     }
 
-    pub fn resolve_alias(self: Evaluator, name: []const u8) []const u8 {
+    pub fn resolve_alias(self: *const Evaluator, name: []const u8) []const u8 {
         for (self.aliases) |a| {
             if (name_eql(name, a.from)) return a.to;
         }
@@ -811,7 +815,7 @@ pub const Evaluator = struct {
     }
 
     fn is_module_operator(
-        self: Evaluator,
+        self: *const Evaluator,
         name: []const u8,
         module_name: []const u8,
         operator_name: []const u8,
@@ -826,7 +830,7 @@ pub const Evaluator = struct {
             std.mem.eql(u8, name[bang + 1 ..], operator_name);
     }
 
-    pub fn find_constant(self: Evaluator, name: []const u8) ?Value {
+    pub fn find_constant(self: *const Evaluator, name: []const u8) ?Value {
         for (self.constants) |c| {
             if (name_eql(c.name, name)) return c.value;
         }
@@ -834,7 +838,7 @@ pub const Evaluator = struct {
     }
 
     pub fn eval_expr(
-        self: Evaluator,
+        self: *const Evaluator,
         expr: *ast.Expr,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -866,7 +870,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_expr_inner(
-        self: Evaluator,
+        self: *const Evaluator,
         expr: *ast.Expr,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -1214,7 +1218,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_binary(
-        self: Evaluator,
+        self: *const Evaluator,
         b: *ast.Binary,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -1385,7 +1389,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_binary_operand(
-        self: Evaluator,
+        self: *const Evaluator,
         binary: *ast.Binary,
         operand: *ast.Expr,
         side: []const u8,
@@ -1413,7 +1417,7 @@ pub const Evaluator = struct {
     }
 
     fn sequence_member(
-        self: Evaluator,
+        self: *const Evaluator,
         sequence: Value,
         element_set_expr: *ast.Expr,
         ctx: Context,
@@ -1455,7 +1459,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_unary(
-        self: Evaluator,
+        self: *const Evaluator,
         u: *ast.Unary,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -1527,7 +1531,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_set_filter(
-        self: Evaluator,
+        self: *const Evaluator,
         sf: *ast.SetFilter,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -1575,7 +1579,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_function_set_filter(
-        self: Evaluator,
+        self: *const Evaluator,
         sf: *ast.SetFilter,
         bv: ast.BoundVar,
         ctx: Context,
@@ -1718,7 +1722,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_pointwise_function_set_filter(
-        self: Evaluator,
+        self: *const Evaluator,
         sf: *ast.SetFilter,
         bv: ast.BoundVar,
         domain: Value,
@@ -1867,7 +1871,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_set_filter_tuples(
-        self: Evaluator,
+        self: *const Evaluator,
         sf: *ast.SetFilter,
         var_idx: usize,
         ctx: Context,
@@ -1915,7 +1919,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_sorted_sequence_filter(
-        self: Evaluator,
+        self: *const Evaluator,
         sf: *ast.SetFilter,
         bv: ast.BoundVar,
         ctx: Context,
@@ -1958,7 +1962,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_set_map(
-        self: Evaluator,
+        self: *const Evaluator,
         sm: *ast.SetMap,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -2001,7 +2005,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_set_map_vars(
-        self: Evaluator,
+        self: *const Evaluator,
         sm: *ast.SetMap,
         var_idx: usize,
         domains: []const Value,
@@ -2033,7 +2037,7 @@ pub const Evaluator = struct {
     /// Evaluate an expression and return a materialized `set_v`, expanding
     /// symbolic sets such as ranges and record sets on demand.
     pub fn eval_set_materialized(
-        self: Evaluator,
+        self: *const Evaluator,
         expr: *ast.Expr,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -2048,7 +2052,7 @@ pub const Evaluator = struct {
     /// Materialize a set-like value into an enumerated `set_v`.  Symbolic
     /// sets are expanded on demand; already-materialized sets pass through.
     pub fn materialize_set(
-        self: Evaluator,
+        self: *const Evaluator,
         set: Value,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -2293,7 +2297,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_record_set(
-        self: Evaluator,
+        self: *const Evaluator,
         rs: *ast.RecordSet,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -2347,7 +2351,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_set_of_functions(
-        self: Evaluator,
+        self: *const Evaluator,
         sf: *ast.SetOfFunctions,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -2401,7 +2405,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_set_binary(
-        self: Evaluator,
+        self: *const Evaluator,
         sb: *ast.SetBinary,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -2469,7 +2473,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_function_literal(
-        self: Evaluator,
+        self: *const Evaluator,
         fl: *ast.FunctionLiteral,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -2544,7 +2548,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_sequence_field_projection(
-        self: Evaluator,
+        self: *const Evaluator,
         fl: *ast.FunctionLiteral,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -2639,7 +2643,7 @@ pub const Evaluator = struct {
         } };
     }
 
-    fn cartesian_product(self: Evaluator, eval_pool: *ValuePool, sets: []const Value) error{ OutOfMemory, TypeError }![]Value {
+    fn cartesian_product(self: *const Evaluator, eval_pool: *ValuePool, sets: []const Value) error{ OutOfMemory, TypeError }![]Value {
         _ = self;
         if (sets.len == 0) {
             const empty = try eval_pool.alloc_values(0);
@@ -2688,7 +2692,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_apply(
-        self: Evaluator,
+        self: *const Evaluator,
         ap: *ast.Apply,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -2988,7 +2992,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_primed_definition(
-        self: Evaluator,
+        self: *const Evaluator,
         def: ast.Definition,
         ctx: Context,
         current: *StateStore.State,
@@ -3042,7 +3046,7 @@ pub const Evaluator = struct {
                 ),
             };
         }
-        var primed_evaluator = self;
+        var primed_evaluator = self.*;
         primed_evaluator.constants =
             constant_scratch[0..self.constants.len];
         primed_evaluator.next_state = &partial_next;
@@ -3056,7 +3060,7 @@ pub const Evaluator = struct {
     }
 
     fn call_generated(
-        self: Evaluator,
+        self: *const Evaluator,
         function: generated_runtime.OperatorFn,
         args: []const Value,
         evaluator_context: Context,
@@ -3065,29 +3069,28 @@ pub const Evaluator = struct {
         state_pool: *ValuePool,
         uses_primed: bool,
     ) Error!Value {
-        var partial_values: [64]?Value = undefined;
+        var partial_values: [64]Value = undefined;
         var partial_value_pools: [64]?*const ValuePool = undefined;
         assert(self.module.variables.len <= partial_values.len);
         const skip_partial_values = !uses_primed and current_state != null;
-        const partial_value_slice = if (skip_partial_values or
-            evaluator_context.state_head == null)
-            partial_values[0..0]
-        else blk: {
-            @memset(partial_values[0..self.module.variables.len], null);
-            @memset(partial_value_pools[0..self.module.variables.len], null);
+        var partial_mask: u64 = 0;
+        if (!skip_partial_values and evaluator_context.state_head != null) {
             var binding = evaluator_context.state_head;
             while (binding) |current| : (binding = current.state_parent) {
                 const index = current.variable_index.?;
                 assert(index < self.module.variables.len);
-                if (partial_values[index] == null) {
-                    partial_values[index] = current.value;
-                    partial_value_pools[index] = current.value_pool;
-                }
+                const bit = @as(u64, 1) << @intCast(index);
+                if (partial_mask & bit != 0) continue;
+                partial_mask |= bit;
+                partial_values[index] = current.value;
+                partial_value_pools[index] = current.value_pool;
             }
-            break :blk partial_values[0..self.module.variables.len];
-        };
-        const partial_pool_slice = if (skip_partial_values or
-            evaluator_context.state_head == null)
+        }
+        const partial_value_slice = if (partial_mask == 0)
+            partial_values[0..0]
+        else
+            partial_values[0..self.module.variables.len];
+        const partial_pool_slice = if (partial_mask == 0)
             partial_value_pools[0..0]
         else
             partial_value_pools[0..self.module.variables.len];
@@ -3096,6 +3099,7 @@ pub const Evaluator = struct {
             .state_pool = state_pool,
             .state = current_state,
             .next_state = self.next_state,
+            .partial_mask = partial_mask,
             .partial_values = partial_value_slice,
             .partial_value_pools = partial_pool_slice,
             .read_primed = false,
@@ -3111,7 +3115,7 @@ pub const Evaluator = struct {
     }
 
     fn call_generated_bool(
-        self: Evaluator,
+        self: *const Evaluator,
         function: generated_runtime.OperatorBoolFn,
         args: []const Value,
         evaluator_context: Context,
@@ -3120,29 +3124,28 @@ pub const Evaluator = struct {
         state_pool: *ValuePool,
         uses_primed: bool,
     ) Error!bool {
-        var partial_values: [64]?Value = undefined;
+        var partial_values: [64]Value = undefined;
         var partial_value_pools: [64]?*const ValuePool = undefined;
         assert(self.module.variables.len <= partial_values.len);
         const skip_partial_values = !uses_primed and current_state != null;
-        const partial_value_slice = if (skip_partial_values or
-            evaluator_context.state_head == null)
-            partial_values[0..0]
-        else blk: {
-            @memset(partial_values[0..self.module.variables.len], null);
-            @memset(partial_value_pools[0..self.module.variables.len], null);
+        var partial_mask: u64 = 0;
+        if (!skip_partial_values and evaluator_context.state_head != null) {
             var binding = evaluator_context.state_head;
             while (binding) |current| : (binding = current.state_parent) {
                 const index = current.variable_index.?;
                 assert(index < self.module.variables.len);
-                if (partial_values[index] == null) {
-                    partial_values[index] = current.value;
-                    partial_value_pools[index] = current.value_pool;
-                }
+                const bit = @as(u64, 1) << @intCast(index);
+                if (partial_mask & bit != 0) continue;
+                partial_mask |= bit;
+                partial_values[index] = current.value;
+                partial_value_pools[index] = current.value_pool;
             }
-            break :blk partial_values[0..self.module.variables.len];
-        };
-        const partial_pool_slice = if (skip_partial_values or
-            evaluator_context.state_head == null)
+        }
+        const partial_value_slice = if (partial_mask == 0)
+            partial_values[0..0]
+        else
+            partial_values[0..self.module.variables.len];
+        const partial_pool_slice = if (partial_mask == 0)
             partial_value_pools[0..0]
         else
             partial_value_pools[0..self.module.variables.len];
@@ -3151,6 +3154,7 @@ pub const Evaluator = struct {
             .state_pool = state_pool,
             .state = current_state,
             .next_state = self.next_state,
+            .partial_mask = partial_mask,
             .partial_values = partial_value_slice,
             .partial_value_pools = partial_pool_slice,
             .read_primed = false,
@@ -3166,7 +3170,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_sequence_fold(
-        self: Evaluator,
+        self: *const Evaluator,
         operator_expr: *ast.Expr,
         accumulator_expr: *ast.Expr,
         sequence_expr: *ast.Expr,
@@ -3234,7 +3238,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_fold_function_on_set(
-        self: Evaluator,
+        self: *const Evaluator,
         ap: *ast.Apply,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -3257,7 +3261,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_select_seq(
-        self: Evaluator,
+        self: *const Evaluator,
         ap: *ast.Apply,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -3309,7 +3313,7 @@ pub const Evaluator = struct {
         return Value{ .tuple_v = .{ .offset = result_offset, .len = selected } };
     }
 
-    fn apply_values(self: Evaluator, func: Value, args: []const Value, eval_pool: *ValuePool, state_pool: *ValuePool, s0: ?*StateStore.State) Error!Value {
+    fn apply_values(self: *const Evaluator, func: Value, args: []const Value, eval_pool: *ValuePool, state_pool: *ValuePool, s0: ?*StateStore.State) Error!Value {
         if (func == .generated_operator_v) {
             const operator_value = func.generated_operator_v;
             if (args.len != operator_value.arity) {
@@ -3359,7 +3363,7 @@ pub const Evaluator = struct {
     }
 
     fn make_recursive_function(
-        self: Evaluator,
+        self: *const Evaluator,
         def: ast.Definition,
         ctx: Context,
         eval_pool: *ValuePool,
@@ -3387,7 +3391,7 @@ pub const Evaluator = struct {
         return func_val;
     }
 
-    fn apply_value(self: Evaluator, func: Value, arg: Value, eval_pool: *ValuePool, state_pool: *ValuePool, s0: ?*StateStore.State) Error!Value {
+    fn apply_value(self: *const Evaluator, func: Value, arg: Value, eval_pool: *ValuePool, state_pool: *ValuePool, s0: ?*StateStore.State) Error!Value {
         switch (func) {
             .function_v => |f| return f.apply(eval_pool, arg) orelse self.fail(Error.IndexOutOfBounds, "apply function", @tagName(arg)),
             .tuple_v => |t| {
@@ -3423,7 +3427,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_field(
-        self: Evaluator,
+        self: *const Evaluator,
         f: *ast.Field,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -3436,7 +3440,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_quantifier(
-        self: Evaluator,
+        self: *const Evaluator,
         q: *ast.Quantifier,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -3456,7 +3460,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_state_function_quantifier(
-        self: Evaluator,
+        self: *const Evaluator,
         q: *ast.Quantifier,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -3545,7 +3549,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_state_quantifier_combinations(
-        self: Evaluator,
+        self: *const Evaluator,
         domains: []const Value,
         depth: usize,
         assignments: *[8]Value,
@@ -3598,7 +3602,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_quantifier_vars(
-        self: Evaluator,
+        self: *const Evaluator,
         q: *ast.Quantifier,
         idx: u32,
         ctx: Context,
@@ -3643,7 +3647,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_filtered_power_set_quantifier(
-        self: Evaluator,
+        self: *const Evaluator,
         q: *ast.Quantifier,
         idx: u32,
         quantified_var: ast.BoundVar,
@@ -3741,7 +3745,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_let_in(
-        self: Evaluator,
+        self: *const Evaluator,
         l: *ast.LetIn,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -3762,7 +3766,7 @@ pub const Evaluator = struct {
     }
 
     fn make_lambda(
-        self: Evaluator,
+        self: *const Evaluator,
         def: ast.Definition,
         ctx: Context,
         eval_pool: *ValuePool,
@@ -3782,7 +3786,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_case_expr(
-        self: Evaluator,
+        self: *const Evaluator,
         c: *ast.CaseExpr,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -3802,7 +3806,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_choose(
-        self: Evaluator,
+        self: *const Evaluator,
         c: *ast.Choose,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -3853,7 +3857,7 @@ pub const Evaluator = struct {
     }
 
     fn eval_except(
-        self: Evaluator,
+        self: *const Evaluator,
         e: *ast.Except,
         ctx: Context,
         s0: ?*StateStore.State,
@@ -3883,7 +3887,7 @@ pub const Evaluator = struct {
     }
 
     fn except_steps_cross_pool(
-        self: Evaluator,
+        self: *const Evaluator,
         original: Value,
         original_pool: *const ValuePool,
         steps: []const ast.AccessStep,
@@ -4080,7 +4084,7 @@ pub const Evaluator = struct {
     }
 
     fn except_cross_pool_child(
-        self: Evaluator,
+        self: *const Evaluator,
         old_value: Value,
         original_pool: *const ValuePool,
         steps: []const ast.AccessStep,
@@ -4123,7 +4127,7 @@ pub const Evaluator = struct {
     }
 
     fn except_cross_pool_record(
-        self: Evaluator,
+        self: *const Evaluator,
         record: value.Record,
         original_pool: *const ValuePool,
         field: []const u8,
@@ -4190,7 +4194,7 @@ pub const Evaluator = struct {
     }
 
     fn except_steps(
-        self: Evaluator,
+        self: *const Evaluator,
         original: Value,
         steps: []const ast.AccessStep,
         idx: u32,
@@ -4221,7 +4225,7 @@ pub const Evaluator = struct {
         }
     }
 
-    fn except_lookup_index(self: Evaluator, original: Value, key: Value, eval_pool: *ValuePool) Error!Value {
+    fn except_lookup_index(self: *const Evaluator, original: Value, key: Value, eval_pool: *ValuePool) Error!Value {
         switch (original) {
             .function_v => |f| return f.apply(eval_pool, key) orelse self.fail(Error.IndexOutOfBounds, "except lookup function", @tagName(key)),
             .tuple_v => |t| {
@@ -4258,7 +4262,7 @@ pub const Evaluator = struct {
         }
     }
 
-    fn except_update_index(self: Evaluator, original: Value, key: Value, new_value: Value, eval_pool: *ValuePool) Error!Value {
+    fn except_update_index(self: *const Evaluator, original: Value, key: Value, new_value: Value, eval_pool: *ValuePool) Error!Value {
         switch (original) {
             .function_v => |f| {
                 const entries = f.entries(eval_pool);
@@ -4310,7 +4314,7 @@ pub const Evaluator = struct {
         }
     }
 
-    fn except_lookup_field(self: Evaluator, original: Value, field: []const u8, eval_pool: *ValuePool) Error!Value {
+    fn except_lookup_field(self: *const Evaluator, original: Value, field: []const u8, eval_pool: *ValuePool) Error!Value {
         if (original != .record_v) {
             return self.fail(
                 Error.TypeError,
@@ -4321,7 +4325,7 @@ pub const Evaluator = struct {
         return original.record_v.lookup(eval_pool, field) orelse Error.UndefinedSymbol;
     }
 
-    fn except_update_field(self: Evaluator, original: Value, field: []const u8, new_value: Value, eval_pool: *ValuePool) Error!Value {
+    fn except_update_field(self: *const Evaluator, original: Value, field: []const u8, new_value: Value, eval_pool: *ValuePool) Error!Value {
         if (original != .record_v) {
             return self.fail(
                 Error.TypeError,
@@ -4343,21 +4347,21 @@ pub const Evaluator = struct {
         return Value{ .record_v = make_record(eval_pool, dest) };
     }
 
-    pub fn find_variable(self: Evaluator, name: []const u8) ?u32 {
+    pub fn find_variable(self: *const Evaluator, name: []const u8) ?u32 {
         for (self.module.variables, 0..) |variable, index| {
             if (name_eql(variable, name)) return @intCast(index);
         }
         return null;
     }
 
-    pub fn find_definition(self: Evaluator, name: []const u8) ?ast.Definition {
+    pub fn find_definition(self: *const Evaluator, name: []const u8) ?ast.Definition {
         for (self.module.definitions) |definition| {
             if (name_eql(definition.name, name)) return definition;
         }
         return null;
     }
 
-    pub fn find_subexpression(self: Evaluator, name: []const u8) ?*ast.Expr {
+    pub fn find_subexpression(self: *const Evaluator, name: []const u8) ?*ast.Expr {
         const bang = std.mem.lastIndexOfScalar(u8, name, '!') orelse return null;
         if (bang == 0 or bang + 1 >= name.len) return null;
         const selector = std.fmt.parseInt(usize, name[bang + 1 ..], 10) catch return null;
@@ -4931,7 +4935,7 @@ fn collect_application_groups(
 }
 
 fn apply_cross_pool(
-    evaluator: Evaluator,
+    evaluator: *const Evaluator,
     function: Value,
     function_pool: *const ValuePool,
     key: Value,
@@ -5008,7 +5012,7 @@ fn cross_pool_eql(
 /// its elements.  Used for membership tests (`x \in S`).  Returns null when the
 /// expression is not a recognized symbolic-set pattern.
 fn eval_symbolic_set(
-    self: Evaluator,
+    self: *const Evaluator,
     expr: *ast.Expr,
     ctx: Context,
     s0: ?*StateStore.State,
@@ -5290,7 +5294,7 @@ fn make_union_value(eval_pool: *ValuePool, set: Value) Error!Value {
 }
 
 fn eval_symbolic_seq_map(
-    self: Evaluator,
+    self: *const Evaluator,
     sm: *ast.SetMap,
     ctx: Context,
     s0: ?*StateStore.State,

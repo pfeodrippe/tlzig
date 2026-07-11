@@ -313,7 +313,12 @@ fn addGeneratedBenchmark(
     const run_bench = b.addRunArtifact(bench);
     run_bench.has_side_effects = true;
     run_bench.addArg(filter);
-    run_bench.addArgs(&.{ "--label-suffix", " [AOT]" });
+    run_bench.addArgs(&.{
+        "--label-suffix",
+        " [AOT]",
+        "--tlzig-only",
+        "--auto-only",
+    });
     if (generated_expressions) {
         run_bench.addArg("--generated-expressions");
     }

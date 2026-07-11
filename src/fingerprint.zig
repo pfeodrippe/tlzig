@@ -28,6 +28,8 @@ pub fn hash_combine(a: Fingerprint, b: Fingerprint) Fingerprint {
 const UnorderedHash = struct {
     xor: Fingerprint,
     sum: Fingerprint,
+    sum_square: Fingerprint,
+    product: Fingerprint,
     count: u64,
 };
 
@@ -35,13 +37,25 @@ fn unordered_hash_init() UnorderedHash {
     return .{
         .xor = 0,
         .sum = 0,
+        .sum_square = 0,
+        .product = 1,
         .count = 0,
     };
 }
 
+fn unordered_hash_mix(value: Fingerprint) Fingerprint {
+    var mixed = value +% 0x9e3779b97f4a7c15;
+    mixed = (mixed ^ (mixed >> 30)) *% 0xbf58476d1ce4e5b9;
+    mixed = (mixed ^ (mixed >> 27)) *% 0x94d049bb133111eb;
+    return mixed ^ (mixed >> 31);
+}
+
 fn unordered_hash_add(hash: *UnorderedHash, value: Fingerprint) void {
-    hash.xor ^= value;
-    hash.sum +%= value;
+    const mixed = unordered_hash_mix(value);
+    hash.xor ^= std.math.rotl(Fingerprint, mixed, @as(u6, @truncate(mixed)));
+    hash.sum +%= mixed;
+    hash.sum_square +%= mixed *% mixed;
+    hash.product *%= mixed | 1;
     hash.count += 1;
 }
 
@@ -49,6 +63,8 @@ fn unordered_hash_finish(hash: UnorderedHash) Fingerprint {
     var result = hash_init();
     result = hash_combine(result, hash.xor);
     result = hash_combine(result, hash.sum);
+    result = hash_combine(result, hash.sum_square);
+    result = hash_combine(result, hash.product);
     result = hash_combine(result, hash.count);
     return result;
 }
@@ -82,26 +98,14 @@ fn hash_value_inner(
             h = hash_bytes(h, s.slice(pool));
         },
         .set_v => |s| {
-            const items = s.items(pool);
-            var buf: [64]Fingerprint = undefined;
-            if (items.len <= buf.len) {
-                for (items, 0..) |it, i| {
-                    buf[i] = hash_value_inner(pool, it, permutation);
-                }
-                std.mem.sort(Fingerprint, buf[0..items.len], {}, std.sort.asc(Fingerprint));
-                for (buf[0..items.len]) |it_h| {
-                    h = hash_combine(h, it_h);
-                }
-            } else {
-                var unordered = unordered_hash_init();
-                for (items) |it| {
-                    unordered_hash_add(
-                        &unordered,
-                        hash_value_inner(pool, it, permutation),
-                    );
-                }
-                h = hash_combine(h, unordered_hash_finish(unordered));
+            var unordered = unordered_hash_init();
+            for (s.items(pool)) |it| {
+                unordered_hash_add(
+                    &unordered,
+                    hash_value_inner(pool, it, permutation),
+                );
             }
+            h = hash_combine(h, unordered_hash_finish(unordered));
         },
         .tuple_v => |t| {
             const items = t.items(pool);
@@ -125,59 +129,17 @@ fn hash_value_inner(
             }
             const keys = f.domain.items(pool);
             const vals = f.entries(pool);
-            var buf: [64]Fingerprint = undefined;
-            if (keys.len <= buf.len) {
-                for (keys, vals, 0..) |k, val, i| {
-                    var kh = hash_value_inner(pool, k, permutation);
-                    kh = hash_byte(kh, 0xcd);
-                    kh = hash_value_inner(pool, val, permutation) ^ kh;
-                    buf[i] = kh;
-                }
-                std.mem.sort(Fingerprint, buf[0..keys.len], {}, std.sort.asc(Fingerprint));
-                for (buf[0..keys.len]) |entry_h| {
-                    h = hash_combine(h, entry_h);
-                }
-            } else {
-                var unordered = unordered_hash_init();
-                for (keys, vals) |k, val| {
-                    var entry_hash = hash_value_inner(pool, k, permutation);
-                    entry_hash = hash_byte(entry_hash, 0xcd);
-                    entry_hash =
-                        hash_value_inner(pool, val, permutation) ^ entry_hash;
-                    unordered_hash_add(&unordered, entry_hash);
-                }
-                h = hash_combine(h, unordered_hash_finish(unordered));
+            var unordered = unordered_hash_init();
+            for (keys, vals) |k, val| {
+                var entry_hash = hash_value_inner(pool, k, permutation);
+                entry_hash = hash_byte(entry_hash, 0xcd);
+                entry_hash = hash_value_inner(pool, val, permutation) ^ entry_hash;
+                unordered_hash_add(&unordered, entry_hash);
             }
+            h = hash_combine(h, unordered_hash_finish(unordered));
         },
         .record_v => |r| {
             const fs = r.fields(pool);
-            var buf: [64]Fingerprint = undefined;
-            if (r.len <= buf.len) {
-                var i: u32 = 0;
-                while (i < r.len) : (i += 1) {
-                    var field_hash = hash_value_inner(
-                        pool,
-                        fs[i * 2],
-                        permutation,
-                    );
-                    field_hash = hash_byte(field_hash, 0xef);
-                    field_hash = hash_combine(
-                        field_hash,
-                        hash_value_inner(pool, fs[i * 2 + 1], permutation),
-                    );
-                    buf[i] = field_hash;
-                }
-                std.mem.sort(
-                    Fingerprint,
-                    buf[0..r.len],
-                    {},
-                    std.sort.asc(Fingerprint),
-                );
-                for (buf[0..r.len]) |field_hash| {
-                    h = hash_combine(h, field_hash);
-                }
-                return h;
-            }
             var i: u32 = 0;
             var unordered = unordered_hash_init();
             while (i < r.len) : (i += 1) {
@@ -206,49 +168,22 @@ fn hash_value_inner(
         },
         .record_set_v => |rs| {
             h = hash_byte(h, 0x11);
-            var buf: [64]Fingerprint = undefined;
-            if (rs.len <= buf.len) {
-                var i: u32 = 0;
-                while (i < rs.len) : (i += 1) {
-                    var field_hash = hash_value_inner(
-                        pool,
-                        Value{ .string_v = rs.field_name(pool, i) },
-                        permutation,
-                    );
-                    field_hash = hash_byte(field_hash, 0xee);
-                    field_hash = hash_combine(
-                        field_hash,
-                        hash_value_inner(pool, rs.field_domain(pool, i), permutation),
-                    );
-                    buf[i] = field_hash;
-                }
-                std.mem.sort(
-                    Fingerprint,
-                    buf[0..rs.len],
-                    {},
-                    std.sort.asc(Fingerprint),
+            var unordered = unordered_hash_init();
+            var i: u32 = 0;
+            while (i < rs.len) : (i += 1) {
+                var field_hash = hash_value_inner(
+                    pool,
+                    Value{ .string_v = rs.field_name(pool, i) },
+                    permutation,
                 );
-                for (buf[0..rs.len]) |field_hash| {
-                    h = hash_combine(h, field_hash);
-                }
-            } else {
-                var unordered = unordered_hash_init();
-                var i: u32 = 0;
-                while (i < rs.len) : (i += 1) {
-                    var field_hash = hash_value_inner(
-                        pool,
-                        Value{ .string_v = rs.field_name(pool, i) },
-                        permutation,
-                    );
-                    field_hash = hash_byte(field_hash, 0xee);
-                    field_hash = hash_combine(
-                        field_hash,
-                        hash_value_inner(pool, rs.field_domain(pool, i), permutation),
-                    );
-                    unordered_hash_add(&unordered, field_hash);
-                }
-                h = hash_combine(h, unordered_hash_finish(unordered));
+                field_hash = hash_byte(field_hash, 0xee);
+                field_hash = hash_combine(
+                    field_hash,
+                    hash_value_inner(pool, rs.field_domain(pool, i), permutation),
+                );
+                unordered_hash_add(&unordered, field_hash);
             }
+            h = hash_combine(h, unordered_hash_finish(unordered));
         },
         .tuple_set_v => |ts| {
             h = hash_byte(h, 0x12);
@@ -311,6 +246,68 @@ fn is_sequence_function(pool: *const ValuePool, function: @import("value.zig").F
 
 pub fn hash_value(pool: *const ValuePool, v: Value, fp: Fingerprint) Fingerprint {
     return hash_combine(fp, hash_value_inner(pool, v, null));
+}
+
+pub fn hash_value_unseeded(
+    pool: *const ValuePool,
+    value: Value,
+) Fingerprint {
+    return hash_value_inner(pool, value, null);
+}
+
+pub fn state_component_from_value_hash(
+    value_hash: Fingerprint,
+    variable_index: u32,
+) Fingerprint {
+    const indexed = hash_combine(
+        value_hash,
+        @as(Fingerprint, variable_index) *% 0x9e3779b97f4a7c15,
+    );
+    return unordered_hash_mix(indexed);
+}
+
+pub fn hash_state_indexed(
+    default_pool: *const ValuePool,
+    state: anytype,
+) Fingerprint {
+    var hash = hash_init();
+    for (state.values, 0..) |value, variable_index| {
+        hash +%= state_component_from_value_hash(
+            hash_value_unseeded(
+                state.value_pool(@intCast(variable_index), default_pool),
+                value,
+            ),
+            @intCast(variable_index),
+        );
+    }
+    return hash;
+}
+
+pub fn replace_state_value(
+    state_hash: Fingerprint,
+    variable_index: u32,
+    old_pool: *const ValuePool,
+    old_value: Value,
+    new_pool: *const ValuePool,
+    new_value: Value,
+) Fingerprint {
+    return replace_state_value_hashes(
+        state_hash,
+        variable_index,
+        hash_value_unseeded(old_pool, old_value),
+        hash_value_unseeded(new_pool, new_value),
+    );
+}
+
+pub fn replace_state_value_hashes(
+    state_hash: Fingerprint,
+    variable_index: u32,
+    old_value_hash: Fingerprint,
+    new_value_hash: Fingerprint,
+) Fingerprint {
+    return state_hash -%
+        state_component_from_value_hash(old_value_hash, variable_index) +%
+        state_component_from_value_hash(new_value_hash, variable_index);
 }
 
 pub fn hash_value_permuted(

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Arena = @import("arena.zig").Arena;
 const ast = @import("ast.zig");
@@ -34,12 +35,14 @@ const WorkerContext = struct {
     eval_pool_base: ValuePool.Snapshot,
     out_states: StateBuffer,
     compose_states: StateBuffer,
+    new_states: StateBuffer,
     prepared_fingerprints: []fingerprint.Fingerprint,
-    prepared_invariants: []bool,
     prepared_edge_masks: []u64,
     prepared_generated: u64,
     composition_generated: u64,
     source_snapshot: StateStore,
+    canonical_hash_cache: SymmetryHashCache,
+    candidate_hash_cache: SymmetryHashCache,
 
     fn deinit(self: *WorkerContext) void {
         self.eval_arena.deinit();
@@ -50,6 +53,10 @@ const WorkerContext = struct {
 const ParallelState = struct {
     checker: *Checker,
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    commit_mutex: CommitMutex = if (builtin.os.tag == .macos)
+        .{}
+    else
+        std.c.PTHREAD_MUTEX_INITIALIZER,
     condition: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
     active: u32 = 0,
     current_level: u32 = 0,
@@ -57,12 +64,33 @@ const ParallelState = struct {
     failure: ?Error = null,
 };
 
+const CommitMutex = if (builtin.os.tag == .macos)
+    std.c.os_unfair_lock
+else
+    std.c.pthread_mutex_t;
+
 fn parallel_lock(parallel: *ParallelState) void {
     assert(std.c.pthread_mutex_lock(&parallel.mutex) == .SUCCESS);
 }
 
 fn parallel_unlock(parallel: *ParallelState) void {
     assert(std.c.pthread_mutex_unlock(&parallel.mutex) == .SUCCESS);
+}
+
+fn parallel_commit_lock(parallel: *ParallelState) void {
+    if (comptime builtin.os.tag == .macos) {
+        std.c.os_unfair_lock_lock(&parallel.commit_mutex);
+    } else {
+        assert(std.c.pthread_mutex_lock(&parallel.commit_mutex) == .SUCCESS);
+    }
+}
+
+fn parallel_commit_unlock(parallel: *ParallelState) void {
+    if (comptime builtin.os.tag == .macos) {
+        std.c.os_unfair_lock_unlock(&parallel.commit_mutex);
+    } else {
+        assert(std.c.pthread_mutex_unlock(&parallel.commit_mutex) == .SUCCESS);
+    }
 }
 
 fn parallel_wait(parallel: *ParallelState) void {
@@ -118,12 +146,13 @@ fn parallel_worker(
         parallel_unlock(parallel);
 
         worker.candidate_store.reset(worker.candidate_pool_base);
+        worker.candidate_hash_cache.advance_generation();
         worker.eval_pool.restore(worker.eval_pool_base);
         worker.out_states.clear();
         worker.prepared_generated = 0;
         worker.composition_generated = 0;
         var executor = ActionExecutor{
-            .evaluator = worker.evaluator,
+            .evaluator = &worker.evaluator,
             .source_state_store = &worker.source_snapshot,
             .candidate_store = &worker.candidate_store,
             .eval_pool = &worker.eval_pool,
@@ -149,16 +178,83 @@ fn parallel_worker(
                 &worker.candidate_evaluator,
                 &worker.eval_pool,
                 worker.prepared_fingerprints,
-                worker.prepared_invariants,
                 worker.prepared_edge_masks,
+                &worker.canonical_hash_cache,
+                &worker.candidate_hash_cache,
             ) catch |err| break :blk err;
             break :blk null;
         };
 
+        worker.new_states.clear();
+        if (!checker.graph_enabled and
+            checker.invariants.len == 0 and
+            checker.safety_properties.len == 0)
+        {
+            parallel_lock(parallel);
+            var commit_error: ?Error = generation_error orelse
+                parallel.failure;
+            parallel_unlock(parallel);
+            if (commit_error == null and checker.check_deadlock and
+                worker.prepared_generated == 0)
+            {
+                if (checker.diagnostics) {
+                    std.debug.print(
+                        "Deadlock generated={d} distinct={d}\n",
+                        .{ checker.successor_attempts, checker.distinct },
+                    );
+                    checker.print_trace(state_idx);
+                }
+                commit_error = Error.Deadlock;
+            }
+
+            var committed_generated: u64 = 0;
+            if (commit_error == null) {
+                committed_generated = checker.process_prepared_ungraphed_parallel(
+                    parallel,
+                    state_idx,
+                    &worker.out_states,
+                    &worker.new_states,
+                    &worker.candidate_store,
+                    worker.prepared_fingerprints,
+                    &worker.candidate_hash_cache,
+                ) catch |err| blk: {
+                    commit_error = err;
+                    break :blk 0;
+                };
+            }
+
+            parallel_lock(parallel);
+            if (commit_error) |err| {
+                parallel.failure = err;
+            } else {
+                checker.successor_attempts += worker.prepared_generated;
+                checker.committed_generated += worker.composition_generated +
+                    committed_generated;
+                for (worker.new_states.items) |new_state_idx| {
+                    if (!checker.queue.enqueue(new_state_idx)) {
+                        parallel.failure = Error.StateSpaceExhausted;
+                        break;
+                    }
+                }
+            }
+            assert(parallel.active > 0);
+            parallel.active -= 1;
+            if (parallel.failure != null or
+                (checker.queue.is_empty() and parallel.active == 0))
+            {
+                parallel.done = true;
+            }
+            parallel_broadcast(parallel);
+            parallel_unlock(parallel);
+            continue;
+        }
+
+        parallel_commit_lock(parallel);
         parallel_lock(parallel);
-        if (generation_error) |err| {
-            parallel.failure = err;
-        } else if (checker.check_deadlock and
+        var commit_error: ?Error = generation_error;
+        if (commit_error == null) commit_error = parallel.failure;
+        parallel_unlock(parallel);
+        if (commit_error == null and checker.check_deadlock and
             worker.prepared_generated == 0)
         {
             if (checker.diagnostics) {
@@ -168,8 +264,8 @@ fn parallel_worker(
                 );
                 checker.print_trace(state_idx);
             }
-            parallel.failure = Error.Deadlock;
-        } else if (parallel.failure == null) {
+            commit_error = Error.Deadlock;
+        } else if (commit_error == null) {
             checker.successor_attempts += worker.prepared_generated;
             checker.committed_generated += worker.composition_generated;
             if (checker.graph_enabled) {
@@ -179,21 +275,46 @@ fn parallel_worker(
                 state_idx,
                 worker.out_states.items.len > 0,
             ) catch |err| {
-                parallel.failure = err;
+                commit_error = err;
             };
-            if (parallel.failure == null) {
+            if (commit_error == null) {
                 checker.process_prepared_generated(
                     state_idx,
                     &worker.out_states,
+                    &worker.new_states,
                     &worker.candidate_store,
-                    &worker.evaluator,
-                    &worker.eval_pool,
                     worker.prepared_fingerprints,
-                    worker.prepared_invariants,
                     worker.prepared_edge_masks,
+                    &worker.candidate_hash_cache,
                 ) catch |err| {
-                    parallel.failure = err;
+                    commit_error = err;
                 };
+            }
+        }
+
+        // Canonical publication is serialized, but invariant evaluation is
+        // read-only and may proceed in parallel. New states are not queued
+        // until every invariant has passed.
+        parallel_commit_unlock(parallel);
+        if (commit_error == null) {
+            checker.check_new_state_invariants(
+                &worker.evaluator,
+                &worker.eval_pool,
+                &worker.new_states,
+            ) catch |err| {
+                commit_error = err;
+            };
+        }
+
+        parallel_lock(parallel);
+        if (commit_error) |err| {
+            parallel.failure = err;
+        } else {
+            for (worker.new_states.items) |new_state_idx| {
+                if (!checker.queue.enqueue(new_state_idx)) {
+                    parallel.failure = Error.StateSpaceExhausted;
+                    break;
+                }
             }
         }
         assert(parallel.active > 0);
@@ -221,13 +342,16 @@ pub const FairnessBinding = action.FairnessBinding;
 const SymmetryHashCache = struct {
     const Entry = struct {
         value: Value = .{ .bool_v = false },
+        pool_ptr: usize = 0,
         permutation_ptr: usize = 0,
         hash: fingerprint.Fingerprint = 0,
+        generation: u32 = 0,
         occupied: bool = false,
     };
 
     entries: []Entry,
     enabled: bool,
+    generation: u32,
 
     fn init(arena: *Arena, enabled: bool) !SymmetryHashCache {
         const entries = try arena.alloc(
@@ -235,7 +359,16 @@ const SymmetryHashCache = struct {
             if (enabled) 32_768 else 1,
         );
         @memset(entries, .{});
-        return .{ .entries = entries, .enabled = enabled };
+        return .{ .entries = entries, .enabled = enabled, .generation = 1 };
+    }
+
+    fn advance_generation(self: *SymmetryHashCache) void {
+        if (!self.enabled) return;
+        self.generation +%= 1;
+        if (self.generation == 0) {
+            @memset(self.entries, .{});
+            self.generation = 1;
+        }
     }
 
     fn hash_value(
@@ -248,13 +381,15 @@ const SymmetryHashCache = struct {
             @intFromPtr(mapping.ptr)
         else
             0;
+        const pool_ptr = @intFromPtr(pool);
         const identity = value_identity(value_v);
         const slot: usize = @intCast(
             (identity ^ (permutation_ptr *% 0x9e3779b97f4a7c15)) &
                 (self.entries.len - 1),
         );
         const entry = &self.entries[slot];
-        if (entry.occupied and
+        if (entry.occupied and entry.generation == self.generation and
+            entry.pool_ptr == pool_ptr and
             entry.permutation_ptr == permutation_ptr and
             std.meta.eql(entry.value, value_v))
         {
@@ -267,8 +402,10 @@ const SymmetryHashCache = struct {
         );
         entry.* = .{
             .value = value_v,
+            .pool_ptr = pool_ptr,
             .permutation_ptr = permutation_ptr,
             .hash = hash,
+            .generation = self.generation,
             .occupied = true,
         };
         return hash;
@@ -332,18 +469,7 @@ fn symmetry_fingerprint(
 ) fingerprint.Fingerprint {
     const values = state_v.values;
     if (permutations.len == 0) {
-        var hash = fingerprint.hash_init();
-        for (values, 0..) |value_v, variable_index| {
-            hash = fingerprint.hash_value(
-                state_v.value_pool(
-                    @intCast(variable_index),
-                    default_pool,
-                ),
-                value_v,
-                hash,
-            );
-        }
-        return hash;
+        return fingerprint.hash_state_indexed(default_pool, state_v);
     }
     assert(values.len <= 64);
 
@@ -428,8 +554,13 @@ const CanonicalValueEntry = struct {
     hash: fingerprint.Fingerprint = 0,
     value: Value = .{ .bool_v = false },
     variable_index: u16 = 0,
-    occupied: bool = false,
+    value_count: u32 = 0,
+    string_count: u32 = 0,
 };
+
+fn effective_canonical_hash(hash: fingerprint.Fingerprint) fingerprint.Fingerprint {
+    return if (hash == 0) 0xdeadbeef else hash;
+}
 
 fn canonical_value_capacity(max_states: u32) u32 {
     const target = @min(
@@ -451,8 +582,10 @@ pub const Checker = struct {
     candidate_pool_base: ValuePool.Snapshot,
     queue: StateQueue,
     fp_set: FpSet,
+    state_fingerprints: []fingerprint.Fingerprint,
     symmetry_hash_cache: SymmetryHashCache,
     canonical_value_entries: []CanonicalValueEntry,
+    canonical_value_count: u32,
     evaluator: Evaluator,
     init_spec: ?action.CompiledInit,
     next_spec: ?action.CompiledNext,
@@ -654,7 +787,7 @@ pub const Checker = struct {
         const constants = try evaluate_constants(arena, cfg, &evaluator, &state_store.values_pool);
         evaluator.set_constants(constants);
         evaluator.set_treat_unknown_as_model(false);
-        const compiler = ActionCompiler.init(arena, evaluator);
+        const compiler = try ActionCompiler.init(arena, evaluator);
 
         const eval_arena = try arena.alloc_object(Arena);
         eval_arena.* = try Arena.init(eval_arena_bytes);
@@ -694,6 +827,10 @@ pub const Checker = struct {
             &eval_pool,
             &state_store.values_pool,
         );
+        const state_fingerprints = if (symmetry_permutations.len == 0)
+            try arena.alloc(fingerprint.Fingerprint, max_states)
+        else
+            try arena.alloc(fingerprint.Fingerprint, 0);
         const eval_pool_base = eval_pool.snapshot();
 
         const candidate_arena = try arena.alloc_object(Arena);
@@ -881,8 +1018,10 @@ pub const Checker = struct {
             .candidate_pool_base = candidate_pool_base,
             .queue = queue,
             .fp_set = fp_set,
+            .state_fingerprints = state_fingerprints,
             .symmetry_hash_cache = symmetry_hash_cache,
             .canonical_value_entries = canonical_value_entries,
+            .canonical_value_count = 0,
             .evaluator = evaluator,
             .init_spec = compiled_init,
             .next_spec = compiled_next,
@@ -955,7 +1094,7 @@ pub const Checker = struct {
         var composition_generated: u64 = 0;
 
         var executor = ActionExecutor{
-            .evaluator = self.evaluator,
+            .evaluator = &self.evaluator,
             .source_state_store = &self.state_store,
             .candidate_store = &self.candidate_store,
             .eval_pool = &self.eval_pool,
@@ -966,6 +1105,7 @@ pub const Checker = struct {
         };
 
         self.candidate_store.reset(self.candidate_pool_base);
+        self.symmetry_hash_cache.advance_generation();
         self.eval_pool.restore(self.eval_pool_base);
         try executor.execute_init(self.init_spec.?, &out_states);
         self.successor_attempts += out_states.items.len;
@@ -987,6 +1127,7 @@ pub const Checker = struct {
                     self.succ_offsets[idx] = self.succ_count;
                 }
                 self.candidate_store.reset(self.candidate_pool_base);
+                self.symmetry_hash_cache.advance_generation();
                 self.eval_pool.restore(self.eval_pool_base);
                 composition_generated = 0;
                 executor.execute_next(self.next_spec.?, idx, &out_states) catch |err| {
@@ -1060,6 +1201,9 @@ pub const Checker = struct {
         defer {
             assert(std.c.pthread_cond_destroy(&parallel.condition) == .SUCCESS);
             assert(std.c.pthread_mutex_destroy(&parallel.mutex) == .SUCCESS);
+            if (comptime builtin.os.tag != .macos) {
+                assert(std.c.pthread_mutex_destroy(&parallel.commit_mutex) == .SUCCESS);
+            }
         }
         if (self.queue.peek()) |idx| {
             parallel.current_level = self.state_store.get(idx).level;
@@ -1093,6 +1237,14 @@ pub const Checker = struct {
             65_536,
         );
         worker.eval_pool_base = worker.eval_pool.snapshot();
+        worker.canonical_hash_cache = try SymmetryHashCache.init(
+            &worker.eval_arena,
+            true,
+        );
+        worker.candidate_hash_cache = try SymmetryHashCache.init(
+            &worker.eval_arena,
+            true,
+        );
 
         worker.candidate_arena = try Arena.init(16 * 1024 * 1024);
         errdefer worker.candidate_arena.deinit();
@@ -1121,12 +1273,12 @@ pub const Checker = struct {
             &worker.candidate_arena,
             self.max_successors,
         );
-        worker.prepared_fingerprints = try worker.candidate_arena.alloc(
-            fingerprint.Fingerprint,
+        worker.new_states = try StateBuffer.init(
+            &worker.candidate_arena,
             self.max_successors,
         );
-        worker.prepared_invariants = try worker.candidate_arena.alloc(
-            bool,
+        worker.prepared_fingerprints = try worker.candidate_arena.alloc(
+            fingerprint.Fingerprint,
             self.max_successors,
         );
         worker.prepared_edge_masks = if (self.graph_enabled)
@@ -1149,13 +1301,13 @@ pub const Checker = struct {
         candidate_evaluator: *Evaluator,
         eval_pool: *ValuePool,
         prepared_fingerprints: []fingerprint.Fingerprint,
-        prepared_invariants: []bool,
         prepared_edge_masks: []u64,
+        canonical_hash_cache: *SymmetryHashCache,
+        candidate_hash_cache: *SymmetryHashCache,
     ) !void {
         assert(self.worker_count > 1);
         assert(!self.symmetry_hash_cache.enabled);
         assert(out_states.items.len <= prepared_fingerprints.len);
-        assert(out_states.items.len <= prepared_invariants.len);
         if (self.graph_enabled) {
             assert(out_states.items.len <= prepared_edge_masks.len);
         }
@@ -1186,16 +1338,15 @@ pub const Checker = struct {
                     eval_pool,
                 )) continue;
             }
-            const candidate_fingerprint = symmetry_fingerprint(
-                &candidate_store.values_pool,
-                &self.state_store.values_pool,
-                &self.symmetry_hash_cache,
+            const candidate_fp = self.candidate_fingerprint(
+                parent_idx,
+                candidate_store,
                 candidate,
-                self.symmetry_permutations,
+                canonical_hash_cache,
+                candidate_hash_cache,
             );
             out_states.items[kept_count] = candidate_index;
-            prepared_fingerprints[kept_count] = candidate_fingerprint;
-            prepared_invariants[kept_count] = true;
+            prepared_fingerprints[kept_count] = candidate_fp;
             if (self.graph_enabled) {
                 prepared_edge_masks[kept_count] = prepared_edge_masks[
                     @intCast(candidate_index)
@@ -1210,18 +1361,17 @@ pub const Checker = struct {
         self: *Checker,
         parent_idx: u32,
         out_states: *StateBuffer,
+        new_states: *StateBuffer,
         candidate_store: *StateStore,
-        evaluator: *Evaluator,
-        eval_pool: *ValuePool,
         prepared_fingerprints: []const fingerprint.Fingerprint,
-        prepared_invariants: []const bool,
         prepared_edge_masks: []u64,
+        candidate_hash_cache: *SymmetryHashCache,
     ) !void {
         assert(out_states.items.len <= prepared_fingerprints.len);
-        assert(out_states.items.len <= prepared_invariants.len);
         if (self.graph_enabled) {
             assert(out_states.items.len <= prepared_edge_masks.len);
         }
+        assert(new_states.items.len == 0);
         var kept_count: u32 = 0;
         for (out_states.items, 0..) |*candidate_index, prepared_index| {
             const candidate = candidate_store.get(candidate_index.*);
@@ -1233,7 +1383,11 @@ pub const Checker = struct {
                     candidate,
                     candidate_store,
                     parent_idx,
+                    candidate_hash_cache,
                 );
+                if (self.state_fingerprints.len > 0) {
+                    self.state_fingerprints[permanent_idx] = state_fingerprint;
+                }
                 assert(self.fp_set.put_with_index(
                     state_fingerprint,
                     permanent_idx,
@@ -1248,26 +1402,7 @@ pub const Checker = struct {
                 }
             }
             if (is_new) {
-                const invariant_snapshot = eval_pool.snapshot();
-                const invariants_hold = try self.check_invariants_with(
-                    evaluator,
-                    eval_pool,
-                    self.state_store.get(state_idx),
-                );
-                eval_pool.restore(invariant_snapshot);
-                if (!invariants_hold) {
-                    std.debug.print(
-                        "InvariantViolated generated={d} distinct={d}\n",
-                        .{ self.successor_attempts, self.distinct },
-                    );
-                    self.print_trace(state_idx);
-                    return Error.InvariantViolated;
-                }
-            }
-            if (is_new) {
-                if (!self.queue.enqueue(state_idx)) {
-                    return Error.StateSpaceExhausted;
-                }
+                try new_states.append(state_idx);
                 self.maybe_report_progress();
             }
             if (self.graph_enabled) {
@@ -1291,6 +1426,131 @@ pub const Checker = struct {
         }
         out_states.shrink(kept_count);
         try self.record_successors(parent_idx, out_states, prepared_edge_masks);
+    }
+
+    fn process_prepared_ungraphed_parallel(
+        self: *Checker,
+        parallel: *ParallelState,
+        parent_idx: u32,
+        out_states: *StateBuffer,
+        new_states: *StateBuffer,
+        candidate_store: *StateStore,
+        prepared_fingerprints: []const fingerprint.Fingerprint,
+        candidate_hash_cache: *SymmetryHashCache,
+    ) !u64 {
+        assert(!self.graph_enabled);
+        assert(self.invariants.len == 0);
+        assert(self.safety_properties.len == 0);
+        assert(out_states.items.len <= prepared_fingerprints.len);
+        assert(new_states.items.len == 0);
+
+        var kept_count: u32 = 0;
+        for (out_states.items, 0..) |*candidate_index, prepared_index| {
+            const candidate = candidate_store.get(candidate_index.*);
+            const state_fingerprint = prepared_fingerprints[prepared_index];
+            var canonical = self.fp_set.find(state_fingerprint);
+            var is_new = false;
+            if (canonical == null) {
+                assert(candidate.values.len <= 64);
+                var canonical_values: [64]Value = undefined;
+                for (candidate.values, 0..) |source, variable_index| {
+                    const changed = candidate.changed_mask &
+                        (@as(u64, 1) << @intCast(variable_index)) != 0;
+                    canonical_values[variable_index] = if (changed)
+                        self.intern_canonical_value_parallel(
+                            parallel,
+                            source,
+                            &candidate_store.values_pool,
+                            @intCast(variable_index),
+                            candidate_hash_cache,
+                        ) catch |err| return err
+                    else
+                        self.state_store.get(parent_idx).values[variable_index];
+                }
+
+                parallel_commit_lock(parallel);
+                canonical = self.fp_set.find(state_fingerprint);
+                if (canonical == null) {
+                    const permanent_idx = self.store_prepared_candidate_state(
+                        candidate,
+                        canonical_values[0..candidate.values.len],
+                    ) catch |err| {
+                        parallel_commit_unlock(parallel);
+                        return err;
+                    };
+                    if (self.state_fingerprints.len > 0) {
+                        self.state_fingerprints[permanent_idx] =
+                            state_fingerprint;
+                    }
+                    assert(self.fp_set.put_with_index(
+                        state_fingerprint,
+                        permanent_idx,
+                    ) == null);
+                    self.distinct += 1;
+                    assert(self.distinct <= self.max_states_limit);
+                    self.maybe_report_progress();
+                    canonical = permanent_idx;
+                    is_new = true;
+                }
+                parallel_commit_unlock(parallel);
+            }
+
+            const state_idx = canonical.?;
+            if (is_new) try new_states.append(state_idx);
+            if (deduplicate_successor_plain(
+                out_states.items[0..kept_count],
+                state_idx,
+            )) continue;
+            candidate_index.* = state_idx;
+            out_states.items[kept_count] = state_idx;
+            kept_count += 1;
+        }
+        out_states.shrink(kept_count);
+        return kept_count;
+    }
+
+    fn store_prepared_candidate_state(
+        self: *Checker,
+        candidate: *const StateStore.State,
+        canonical_values: []const Value,
+    ) !u32 {
+        assert(candidate.values.len == canonical_values.len);
+        const state_idx = try self.state_store.alloc_state();
+        const state = self.state_store.get(state_idx);
+        state.level = candidate.level;
+        state.pred = candidate.pred;
+        state.changed_mask = candidate.changed_mask;
+        state.borrowed_mask = 0;
+        state.borrowed_pool = null;
+        @memcpy(state.values, canonical_values);
+        return state_idx;
+    }
+
+    fn check_new_state_invariants(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        new_states: *const StateBuffer,
+    ) !void {
+        for (new_states.items) |state_idx| {
+            const invariant_snapshot = eval_pool.snapshot();
+            const invariants_hold = self.check_invariants_with(
+                evaluator,
+                eval_pool,
+                self.state_store.get(state_idx),
+            ) catch |err| {
+                eval_pool.restore(invariant_snapshot);
+                return err;
+            };
+            eval_pool.restore(invariant_snapshot);
+            if (invariants_hold) continue;
+            std.debug.print(
+                "InvariantViolated generated={d} distinct={d}\n",
+                .{ self.successor_attempts, self.distinct },
+            );
+            self.print_trace(state_idx);
+            return Error.InvariantViolated;
+        }
     }
 
     fn process_generated(
@@ -1348,12 +1608,12 @@ pub const Checker = struct {
                 idx.* = std.math.maxInt(u32);
                 continue;
             }
-            const fp = symmetry_fingerprint(
-                &candidate_store.values_pool,
-                &self.state_store.values_pool,
-                &self.symmetry_hash_cache,
+            const fp = self.candidate_fingerprint(
+                parent_idx,
+                candidate_store,
                 candidate,
-                self.symmetry_permutations,
+                &self.symmetry_hash_cache,
+                &self.symmetry_hash_cache,
             );
             const canonical = self.fp_set.find(fp);
             const is_new = canonical == null;
@@ -1362,7 +1622,11 @@ pub const Checker = struct {
                     candidate,
                     candidate_store,
                     parent_idx,
+                    &self.symmetry_hash_cache,
                 );
+                if (self.state_fingerprints.len > 0) {
+                    self.state_fingerprints[permanent_idx] = fp;
+                }
                 assert(self.fp_set.put_with_index(fp, permanent_idx) == null);
                 break :blk permanent_idx;
             };
@@ -1419,6 +1683,69 @@ pub const Checker = struct {
         }
         out_states.shrink(kept_count);
         try self.record_successors(parent_idx, out_states, edge_masks);
+    }
+
+    fn candidate_fingerprint(
+        self: *Checker,
+        parent_idx: ?u32,
+        candidate_store: *StateStore,
+        candidate: *const StateStore.State,
+        canonical_hash_cache: *SymmetryHashCache,
+        candidate_hash_cache: *SymmetryHashCache,
+    ) fingerprint.Fingerprint {
+        if (self.symmetry_permutations.len > 0 or parent_idx == null) {
+            return symmetry_fingerprint(
+                &candidate_store.values_pool,
+                &self.state_store.values_pool,
+                &self.symmetry_hash_cache,
+                candidate,
+                self.symmetry_permutations,
+            );
+        }
+
+        const parent_index = parent_idx.?;
+        assert(parent_index < self.state_store.count);
+        assert(parent_index < self.state_fingerprints.len);
+        const parent = self.state_store.get(parent_index);
+        var hash = self.state_fingerprints[parent_index];
+        var changed = candidate.changed_mask;
+        while (changed != 0) {
+            const variable_index: u32 = @intCast(@ctz(changed));
+            changed &= changed - 1;
+            assert(variable_index < parent.values.len);
+            assert(variable_index < candidate.values.len);
+            const parent_pool = parent.value_pool(
+                variable_index,
+                &self.state_store.values_pool,
+            );
+            const candidate_pool = candidate.value_pool(
+                variable_index,
+                &candidate_store.values_pool,
+            );
+            const old_value_hash = if (parent_pool ==
+                &self.state_store.values_pool)
+                canonical_hash_cache.hash_value(
+                    parent_pool,
+                    parent.values[variable_index],
+                    null,
+                )
+            else
+                fingerprint.hash_value_unseeded(
+                    parent_pool,
+                    parent.values[variable_index],
+                );
+            hash = fingerprint.replace_state_value_hashes(
+                hash,
+                variable_index,
+                old_value_hash,
+                candidate_hash_cache.hash_value(
+                    candidate_pool,
+                    candidate.values[variable_index],
+                    null,
+                ),
+            );
+        }
+        return hash;
     }
 
     fn record_successors(
@@ -1491,7 +1818,7 @@ pub const Checker = struct {
             self.next_progress_distinct += self.progress_interval_states;
         }
         std.debug.print(
-            "Progress generated={d} distinct={d} queue={d} values={d}/{d} strings={d}/{d} graph_edges={d}/{d}\n",
+            "Progress generated={d} distinct={d} queue={d} values={d}/{d} strings={d}/{d} canonical={d}/{d} graph_edges={d}/{d}\n",
             .{
                 self.successor_attempts,
                 self.distinct,
@@ -1500,6 +1827,8 @@ pub const Checker = struct {
                 self.state_store.values_pool.value_cap,
                 self.state_store.values_pool.string_count,
                 self.state_store.values_pool.string_cap,
+                self.canonical_value_count,
+                self.canonical_value_entries.len,
                 self.succ_count,
                 self.succ_cap,
             },
@@ -1511,6 +1840,7 @@ pub const Checker = struct {
         candidate: *StateStore.State,
         candidate_store: *StateStore,
         parent_idx: ?u32,
+        candidate_hash_cache: *SymmetryHashCache,
     ) !u32 {
         const state_idx = try self.state_store.alloc_state();
         const state = self.state_store.get(state_idx);
@@ -1528,6 +1858,7 @@ pub const Checker = struct {
                     source,
                     &candidate_store.values_pool,
                     @intCast(variable_index),
+                    candidate_hash_cache,
                 );
                 assert(Value.eql_cross_pool(
                     source,
@@ -1547,8 +1878,10 @@ pub const Checker = struct {
         source: Value,
         source_pool: *const ValuePool,
         variable_index: u16,
+        source_hash_cache: *SymmetryHashCache,
     ) !Value {
-        if (self.canonical_value_entries.len == 0) {
+        const capacity = self.canonical_value_entries.len;
+        if (capacity == 0) {
             return source.clone(
                 source_pool,
                 &self.state_store.values_pool,
@@ -1564,33 +1897,45 @@ pub const Checker = struct {
             },
             else => {},
         }
-        assert(self.canonical_value_entries.len > 0);
-        assert(std.math.isPowerOfTwo(self.canonical_value_entries.len));
-        const hash = fingerprint.hash_value(
+        assert(capacity > 0);
+        assert(std.math.isPowerOfTwo(capacity));
+        const hash = source_hash_cache.hash_value(
             source_pool,
             source,
-            fingerprint.hash_init(),
+            null,
         );
-        const mixed_hash = fingerprint.hash_combine(hash, variable_index);
-        const mask = self.canonical_value_entries.len - 1;
+        const published_hash = effective_canonical_hash(hash);
+        const mixed_hash = fingerprint.hash_combine(published_hash, variable_index);
+        const mask = capacity - 1;
         var slot: usize = @intCast(mixed_hash & mask);
         var probes: usize = 0;
-        while (probes < self.canonical_value_entries.len) : (probes += 1) {
+        while (probes < capacity) : (probes += 1) {
             const entry = &self.canonical_value_entries[slot];
-            if (!entry.occupied) {
+            const entry_hash = @atomicLoad(
+                fingerprint.Fingerprint,
+                &entry.hash,
+                .acquire,
+            );
+            if (entry_hash == 0) {
                 const canonical = try source.clone(
                     source_pool,
                     &self.state_store.values_pool,
                 );
-                entry.* = .{
-                    .hash = hash,
-                    .value = canonical,
-                    .variable_index = variable_index,
-                    .occupied = true,
-                };
+                entry.value = canonical;
+                entry.variable_index = variable_index;
+                entry.value_count = self.state_store.values_pool.value_count;
+                entry.string_count = self.state_store.values_pool.string_count;
+                self.canonical_value_count += 1;
+                assert(self.canonical_value_count <= capacity);
+                @atomicStore(
+                    fingerprint.Fingerprint,
+                    &entry.hash,
+                    published_hash,
+                    .release,
+                );
                 return canonical;
             }
-            if (entry.hash == hash and
+            if (entry_hash == published_hash and
                 entry.variable_index == variable_index and
                 Value.eql_cross_pool(
                     source,
@@ -1606,6 +1951,97 @@ pub const Checker = struct {
         return source.clone(
             source_pool,
             &self.state_store.values_pool,
+        );
+    }
+
+    fn canonical_pool_at(
+        self: *const Checker,
+        entry: *const CanonicalValueEntry,
+    ) ValuePool {
+        const pool = &self.state_store.values_pool;
+        assert(entry.value_count <= pool.value_cap);
+        assert(entry.string_count <= pool.string_cap);
+        return .{
+            .arena = pool.arena,
+            .values = pool.values,
+            .strings = pool.strings,
+            .value_count = entry.value_count,
+            .string_count = entry.string_count,
+            .value_cap = pool.value_cap,
+            .string_cap = pool.string_cap,
+            .growable = false,
+        };
+    }
+
+    fn find_canonical_value(
+        self: *const Checker,
+        source: Value,
+        source_pool: *const ValuePool,
+        variable_index: u16,
+        hash: fingerprint.Fingerprint,
+    ) ?Value {
+        const capacity = self.canonical_value_entries.len;
+        assert(capacity > 0);
+        assert(std.math.isPowerOfTwo(capacity));
+        const published_hash = effective_canonical_hash(hash);
+        const mixed_hash = fingerprint.hash_combine(published_hash, variable_index);
+        const mask = capacity - 1;
+        var slot: usize = @intCast(mixed_hash & mask);
+        var probes: usize = 0;
+        while (probes < capacity) : (probes += 1) {
+            const entry = &self.canonical_value_entries[slot];
+            const entry_hash = @atomicLoad(
+                fingerprint.Fingerprint,
+                &entry.hash,
+                .acquire,
+            );
+            if (entry_hash == 0) return null;
+            if (entry_hash == published_hash and
+                entry.variable_index == variable_index)
+            {
+                var canonical_pool = self.canonical_pool_at(entry);
+                if (Value.eql_cross_pool(
+                    source,
+                    source_pool,
+                    entry.value,
+                    &canonical_pool,
+                )) return entry.value;
+            }
+            slot = (slot + 1) & mask;
+        }
+        return null;
+    }
+
+    fn intern_canonical_value_parallel(
+        self: *Checker,
+        parallel: *ParallelState,
+        source: Value,
+        source_pool: *const ValuePool,
+        variable_index: u16,
+        source_hash_cache: *SymmetryHashCache,
+    ) !Value {
+        switch (source) {
+            .bool_v, .int_v, .model_v, .range_v => return source,
+            else => {},
+        }
+
+        if (self.canonical_value_entries.len > 0 and source != .string_v) {
+            const hash = source_hash_cache.hash_value(source_pool, source, null);
+            if (self.find_canonical_value(
+                source,
+                source_pool,
+                variable_index,
+                hash,
+            )) |canonical| return canonical;
+        }
+
+        parallel_commit_lock(parallel);
+        defer parallel_commit_unlock(parallel);
+        return self.intern_canonical_value(
+            source,
+            source_pool,
+            variable_index,
+            source_hash_cache,
         );
     }
 

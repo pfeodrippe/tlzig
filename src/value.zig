@@ -671,8 +671,21 @@ pub const Value = union(ValueTag) {
         assert(source.string_count <= source.string_cap);
         assert(target.value_count <= target.value_cap);
         assert(target.string_count <= target.string_cap);
-        try target.ensure_value_capacity(self.clone_value_count(source));
-        return self.clone_assume_capacity(source, target);
+        if (!target.growable) {
+            return self.clone_assume_capacity(source, target);
+        }
+
+        const snapshot = target.snapshot();
+        target.growable = false;
+        const cloned = self.clone_assume_capacity(source, target) catch |err| {
+            target.growable = true;
+            target.restore(snapshot);
+            if (err != error.OutOfMemory) return err;
+            try target.ensure_value_capacity(self.clone_value_count(source));
+            return self.clone_assume_capacity(source, target);
+        };
+        target.growable = true;
+        return cloned;
     }
 
     fn clone_assume_capacity(
@@ -1024,9 +1037,7 @@ pub const Set = extern struct {
         const src_items = self.items(source);
         const dest = try target.alloc_values(@intCast(src_items.len));
         assert(dest.len == src_items.len);
-        for (src_items, 0..) |it, i| {
-            dest[i] = try it.clone_assume_capacity(source, target);
-        }
+        try clone_values_assume_capacity(src_items, source, target, dest);
         const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
         assert(offset + dest.len <= target.value_cap);
         return Set{ .offset = offset, .len = @intCast(src_items.len) };
@@ -1102,9 +1113,7 @@ pub const Function = extern struct {
         const vals = self.entries(source);
         const dest = try target.alloc_values(@intCast(vals.len));
         assert(dest.len == vals.len);
-        for (vals, 0..) |v, i| {
-            dest[i] = try v.clone_assume_capacity(source, target);
-        }
+        try clone_values_assume_capacity(vals, source, target, dest);
         const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
         assert(offset + dest.len <= target.value_cap);
         return Function{
@@ -1139,9 +1148,7 @@ pub const Tuple = extern struct {
         const src_items = self.items(source);
         const dest = try target.alloc_values(@intCast(src_items.len));
         assert(dest.len == src_items.len);
-        for (src_items, 0..) |it, i| {
-            dest[i] = try it.clone_assume_capacity(source, target);
-        }
+        try clone_values_assume_capacity(src_items, source, target, dest);
         const offset: u32 = @intCast((@intFromPtr(dest.ptr) - @intFromPtr(target.values.ptr)) / @sizeOf(Value));
         assert(offset + dest.len <= target.value_cap);
         return Tuple{ .offset = offset, .len = @intCast(src_items.len) };
@@ -1236,6 +1243,35 @@ fn clone_slice_value_count(values: []const Value, source: *const ValuePool) u64 
     var count: u64 = values.len;
     for (values) |v| count += v.clone_value_count(source);
     return count;
+}
+
+fn values_are_pool_independent(values: []const Value) bool {
+    if (values.len == 0) return true;
+    switch (values[0]) {
+        .bool_v, .int_v, .model_v, .range_v => {},
+        else => return false,
+    }
+    for (values[1..]) |value_v| switch (value_v) {
+        .bool_v, .int_v, .model_v, .range_v => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn clone_values_assume_capacity(
+    source_values: []const Value,
+    source: *const ValuePool,
+    target: *ValuePool,
+    target_values: []Value,
+) error{ OutOfMemory, NotImplemented }!void {
+    assert(source_values.len == target_values.len);
+    if (values_are_pool_independent(source_values)) {
+        @memcpy(target_values, source_values);
+        return;
+    }
+    for (source_values, target_values) |source_value, *target_value| {
+        target_value.* = try source_value.clone_assume_capacity(source, target);
+    }
 }
 
 pub const ModelTable = struct {

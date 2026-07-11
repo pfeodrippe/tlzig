@@ -4,15 +4,15 @@ const Arena = @import("arena.zig").Arena;
 const Fingerprint = @import("fingerprint.zig").Fingerprint;
 
 pub const FpSet = struct {
-    slots: []?Fingerprint,
+    slots: []Fingerprint,
     indices: []u32,
     cap: u32,
     count: u32,
 
     pub fn init(arena: *Arena, capacity: u32) !FpSet {
         assert(capacity > 0);
-        const slots = try arena.alloc(?Fingerprint, capacity);
-        @memset(slots, null);
+        const slots = try arena.alloc(Fingerprint, capacity);
+        @memset(slots, 0);
         const indices = try arena.alloc(u32, capacity);
         @memset(indices, 0);
         return FpSet{
@@ -38,14 +38,19 @@ pub const FpSet = struct {
         var idx: u32 = @intCast(effective % self.cap);
         var i: u32 = 0;
         while (i < self.cap) : (i += 1) {
-            const slot = &self.slots[idx];
-            if (slot.* == null) {
-                slot.* = effective;
+            const slot = @atomicLoad(Fingerprint, &self.slots[idx], .acquire);
+            if (slot == 0) {
                 self.indices[idx] = state_index;
+                @atomicStore(
+                    Fingerprint,
+                    &self.slots[idx],
+                    effective,
+                    .release,
+                );
                 self.count += 1;
                 return null;
             }
-            if (slot.*.? == effective) {
+            if (slot == effective) {
                 return self.indices[idx];
             }
             idx = (idx + 1) % self.cap;
@@ -59,14 +64,13 @@ pub const FpSet = struct {
 
     pub fn find(self: FpSet, fp: Fingerprint) ?u32 {
         assert(self.cap > 0);
-        assert(self.count <= self.cap);
         const effective = if (fp == 0) 0xdeadbeef else fp;
         var idx: u32 = @intCast(effective % self.cap);
         var i: u32 = 0;
         while (i < self.cap) : (i += 1) {
-            const slot = self.slots[idx];
-            if (slot == null) return null;
-            if (slot.? == effective) {
+            const slot = @atomicLoad(Fingerprint, &self.slots[idx], .acquire);
+            if (slot == 0) return null;
+            if (slot == effective) {
                 assert(self.indices[idx] < self.cap);
                 return self.indices[idx];
             }

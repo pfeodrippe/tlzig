@@ -7,6 +7,7 @@ const ValuePool = value.ValuePool;
 const fingerprint = @import("fingerprint.zig");
 const fp_set = @import("fp_set.zig");
 const StateQueue = @import("queue.zig").StateQueue;
+const StateStore = @import("state.zig").StateStore;
 
 comptime {
     _ = @import("codegen.zig");
@@ -51,6 +52,50 @@ test "fingerprint stable" {
     const fp1 = fingerprint.hash_value(&pool, v, fingerprint.hash_init());
     const fp2 = fingerprint.hash_value(&pool, v, fingerprint.hash_init());
     try std.testing.expectEqual(fp1, fp2);
+}
+
+test "incremental state fingerprint matches full recomputation" {
+    var arena = try make_test_arena();
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 16, 16);
+
+    var old_values = [_]Value{
+        .{ .int_v = 7 },
+        .{ .bool_v = false },
+        .{ .int_v = 11 },
+    };
+    var new_values = old_values;
+    new_values[1] = .{ .bool_v = true };
+    const old_state = StateStore.State{
+        .level = 0,
+        .pred = 0,
+        .changed_mask = 0,
+        .borrowed_mask = 0,
+        .borrowed_pool = null,
+        .values = &old_values,
+    };
+    const new_state = StateStore.State{
+        .level = 1,
+        .pred = 0,
+        .changed_mask = 1 << 1,
+        .borrowed_mask = 0,
+        .borrowed_pool = null,
+        .values = &new_values,
+    };
+
+    const old_hash = fingerprint.hash_state_indexed(&pool, &old_state);
+    const incremental = fingerprint.replace_state_value(
+        old_hash,
+        1,
+        &pool,
+        old_values[1],
+        &pool,
+        new_values[1],
+    );
+    try std.testing.expectEqual(
+        fingerprint.hash_state_indexed(&pool, &new_state),
+        incremental,
+    );
 }
 
 test "equal tuple and function sequences have equal fingerprints" {

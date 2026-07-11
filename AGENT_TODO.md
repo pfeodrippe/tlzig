@@ -2133,6 +2133,121 @@ allocation-free Zig operator overrides, and
   checking at `14931205/5502547`, depth `28`, wall `176.42s`. The row's
   correctness gate is outcome plus distinct states; generated count remains
   diagnostic because tlzig deduplicates canonical successor candidates.
+- [x] Re-run MDBTLA coverage audit after the latest generated-model restore:
+  `python3 scripts/audit_mdbtla_coverage.py` reports `13` upstream cfgs, `11`
+  benchmark-covered TLC-valid cfgs, and `2` TLC-invalid cfgs. The invalid cfgs
+  are still exactly `vendor/MDBTLA/MultiShardTxn/MultiShardTxn.cfg` and
+  `vendor/MDBTLA/MultiShardTxn/models/MultiShardTxn_RC.cfg`, both missing the
+  required `Timestamps` constant.
+- [x] Regenerate and audit all stored generated models after reverting stale
+  string-literal experiments. Every generated model in `generated_models/`
+  currently reports `fallback_count = 0`; scans find no emitted
+  `runtime.native(...)`, no emitted `runtime.native_binary(...)`, and no stale
+  `string_literals`/`string_at`/`string_static` symbols. The only
+  `runtime.native` string left is the fail-closed fallback emitter in
+  `src/codegen.zig`.
+- [x] Re-run the default ReleaseFast benchmark after regeneration:
+  `tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build -Doptimize=ReleaseFast benchmark --summary none`
+  completed successfully. Current default MDBTLA AOT rows are all faster than
+  the paired TLC-auto runs. Completed rows keep exact distinct parity; early
+  invariant/deadlock rows compare outcome plus documented distinct tolerance
+  because first-error frontier counts are traversal-order dependent. Fresh
+  2026-07-03 default AOT rows:
+  `ClientCentric` TLC-auto `2.373s`, tlzig `0.775s`, distinct `801/801`;
+  `MCM/snapshot-invariant` `1.677s` vs `0.164s`, early-stop distinct
+  `10776/10768`; `MCM/rc-local-invariant` `1.386s` vs `0.118s`,
+  early-stop distinct `1476/1468`; `Storage` `1.397s` vs `0.217s`, distinct
+  `13370/13370`; `RC/no-prepare-block` `1.582s` vs `0.171s`;
+  `RC/no-prepare-block-or-ww` `1.682s` vs `0.163s`; `RC/snapshot` `2.361s`
+  vs `0.445s`, distinct `84708/84692` on the early-stop row;
+  `RC/with-prepare-block` `1.597s` vs `0.166s`; `SingleShard` representative
+  AOT rows are exact and range from `0.195s` to `0.376s` vs TLC-auto
+  `1.885s` to `2.830s`; `SingleLog MDBLinearizability` is exact at
+  `21748/2247` and `0.799s` vs TLC-auto `2.049s`.
+- [x] Re-run long MultiShardTxn exhaustive rows against TLC Java and strict AOT
+  tlzig in ReleaseFast/all-core mode:
+  - `Storage exhaustive`: TLC-auto `31.472s`, tlzig-AOT-auto `17.438s`,
+    distinct `1078623/1078623`.
+  - `RC/no-prepare-block exhaustive`: TLC-auto `171.040s`,
+    tlzig-AOT-auto `165.433s`, distinct `17057584/17057584`.
+  - `RC/no-prepare-block-or-ww exhaustive`: TLC-auto `190.499s`,
+    tlzig-AOT-auto `185.755s`, distinct `18764120/18764120`.
+  - `RC/with-prepare-block exhaustive`: TLC-auto `155.066s`,
+    tlzig-AOT-auto `154.119s`, exact `89960594/15738792`.
+  - `RC/snapshot exhaustive`: TLC-auto `669.976s`, tlzig-AOT-auto `679.912s`,
+    exact `405005930/67629092`.
+  This closes the correctness/count-parity target for the MultiShard exhaustive
+  rows but leaves `RC/snapshot exhaustive` as the current performance blocker
+  because tlzig is about `1.5%` slower than TLC on the paired run.
+- [x] Reject recent generic performance experiments that did not survive full
+  ReleaseFast validation:
+  - action-executor final-branch tail continuation improved a 3M capped probe
+    but regressed full `RC/snapshot exhaustive` to TLC-auto `673.338s` versus
+    tlzig-AOT-auto `680.431s`; reverted.
+  - removing the recursive `Value.clone()` pre-count reserve failed the existing
+    deep cross-pool clone capacity test and was reverted.
+  - lowering snapshot exhaustive `--state-values-per-state` and forcing fewer
+    workers (`12` or `8`) both worsened capped ReleaseFast runs; keep auto/all
+    cores for paired benchmark comparisons.
+- [ ] Fix the remaining MDBTLA performance blocker without user-spec runtime
+  semantics: `MultiShardTxn RC/snapshot exhaustive [AOT]` is correct and exact,
+  but currently slower than TLC Java. Latest sample points to generic
+  `Value.eql_cross_pool`, `Value.clone_value_count`, generated runtime path
+  resolution, and action/eval dispatch. Candidate-store borrowing from the
+  evaluator pool must not be merged naively because evaluator snapshots/restores
+  can invalidate borrowed successor values; any fix needs a generic typed/native
+  commit path with tests for candidate lifetimes, invariants, symmetry hashing,
+  and parallel workers.
+  2026-07-10 measured progress: the current generic implementation completed
+  the full ReleaseFast/all-core exhaustive run at exactly
+  `405005930/67629092` in `560.73s`, versus the recorded paired TLC-auto
+  `669.976s` and prior tlzig-AOT-auto `679.912s`. This is a real `1.21x`
+  improvement over prior tlzig and `1.19x` over TLC, but it does **not** meet
+  the requested `2x` over TLC (`<=334.988s`), so this item remains open.
+  Peak resident size reported by `/usr/bin/time -lp` was `25,484,083,200`
+  bytes; aggregate system time remained high at `515.69s`, with `72,440,544`
+  involuntary context switches. The next architectural target remains
+  concurrent canonical publication/native action frames, not model-specific
+  shortcuts.
+- [x] Add and validate generic hot-path improvements used by the 2026-07-10
+  exhaustive result:
+  - incremental non-symmetry state fingerprints update only variables in the
+    candidate changed mask, with a regression test against full recomputation;
+  - commutative set/function/record hashing no longer sorts temporary hash
+    arrays;
+  - each worker caches stable canonical component hashes separately from
+    generation-scoped candidate hashes; cache keys include pool identity and a
+    generation epoch, so recycled candidate offsets cannot return stale data;
+  - candidate hashing and canonical-value interning reuse the same recursive
+    component hash;
+  - fixed-capacity fingerprint slots use an acquire/release `u64` publication
+    representation instead of 16-byte optional `u64` slots, halving the
+    fingerprint table from about `2.18GB` to `1.09GB` at the 68M-state limit;
+  - successor commit copies the contiguous parent top-level value array and
+    applies only linked changed assignments with a `u64` shadow mask instead
+    of clearing a 64-entry assignment array and scanning every variable;
+  - invariant evaluation for newly published states runs outside the canonical
+    insertion mutex, while queue publication still waits for all invariants to
+    pass;
+  - homogeneous inline bool/int/model/range collections use bulk copies, and
+    growable cross-pool cloning first attempts the preallocated no-growth path
+    before doing an exact reserve/retry.
+- [x] Reject and revert ReleaseFast experiments that did not improve the 3M
+  snapshot cap: generated context-layout caching (`19.99s`), required-only
+  generated capture lookup (`17.76s` after the accepted cache work), hash-table
+  multiply-high indexing (`18.95s`), duplicate-only lock-free preclassification
+  (`17.52-17.62s`), bounded commit-mutex spinning (`18.08s`), skipping deep
+  no-op equality (`17.95s`), larger canonical hash caches (`17.76s`), deeper
+  contiguous context-frame scans (`17.78s`), cross-variable canonical sharing
+  (instruction-neutral), and `-Dcpu=native` (`17.90s`). Keep the accepted
+  compact-table/candidate-cache cap at approximately `17.33s`; the same-machine
+  pre-work control was `22.38s` (`1.29x` cap improvement).
+- [x] Re-run post-change correctness gates on 2026-07-10:
+  `zig build test` exits `0`; the default ReleaseFast benchmark exits `0`;
+  `scripts/audit_mdbtla_coverage.py` reports `13` upstream cfgs, `11`
+  TLC-valid benchmark-covered cfgs, and `2` TLC-invalid cfgs; generated models
+  contain no `runtime.native`/`runtime.native_binary` calls and all generated
+  `fallback_count` declarations remain `0`.
 - [x] Audit MDBTLA cfg coverage:
   `vendor/MDBTLA` currently has `13` upstream cfg files. `scripts/benchmark.zig`
   covers the `11` TLC-valid cfgs directly:
@@ -2350,6 +2465,58 @@ allocation-free Zig operator overrides, and
   `Storage` `1.487s` vs `0.228s`, `RC/snapshot` `2.332s` vs `0.361s`,
   `SingleShardTxn/small` `2.554s` vs `0.200s`, and
   `SingleLog MDBLinearizability` `1.992s` vs `0.798s`.
+
+- [x] Complete the 2026-07-10 post-optimization MDBTLA correctness and
+  ReleaseFast performance sweep without spec-specific runtime semantics.
+  `scripts/audit_mdbtla_coverage.py` still classifies all `13` upstream cfgs:
+  `11` TLC-valid cfgs are benchmark-covered and the remaining `2` are invalid
+  in both TLC/tlzig because `Timestamps` is unassigned. The default benchmark
+  passes all `37/37` build/run steps, including invariant, temporal, symmetry,
+  interpreted, and strict AOT paths. Completed long rows retain exact distinct
+  counts:
+  - `Storage exhaustive`: `1,078,623`, tlzig `13.22s` versus TLC `35.981s`
+    (`2.72x`).
+  - `RC/no-prepare-block exhaustive`: `17,057,584`, tlzig `86.18s` versus TLC
+    `172.084s` (`2.00x`).
+  - `RC/no-prepare-block-or-ww exhaustive`: `18,764,120`, tlzig `91.94s`
+    versus TLC `191.966s` (`2.09x`).
+  - `RC/with-prepare-block exhaustive`: `15,738,792`, tlzig `75.65s` versus
+    TLC `155.452s` (`2.05x`).
+  - `RC/snapshot exhaustive`: exact `405,005,930/67,629,092`, tlzig `360.86s`
+    versus TLC `669.976s` (`1.86x`). This is also `1.20x` faster than the
+    previous accepted tlzig `432.26s` run and `1.88x` faster than the original
+    `679.912s` tlzig baseline. Retired instructions fell from `68.20T` to
+    `63.56T`; maximum RSS was `26,015,973,376` bytes.
+  - upstream `SingleLog MCMDBProps`: exact `3,101,918/269,881`, tlzig `80.93s`
+    versus TLC `1,434.504s` (`17.7x`).
+  - upstream `SingleShardTxn ShardTxn`: exact `14,931,205/5,502,547`, tlzig
+    `17.94s` versus TLC `181.348s` (`10.1x`).
+- [x] Add the generic hot-path work responsible for the latest long-run gains:
+  evaluator/action receivers no longer copy large structs; generated partial
+  state setup uses a sparse `u64` mask; Darwin commit serialization uses
+  `os_unfair_lock`; ungraphed no-invariant workers preclassify fingerprints and
+  publish duplicates concurrently; canonical component entries are immutable
+  release-published values with acquire readers and per-entry pool bounds; and
+  changed components are resolved before the short final state-publication
+  lock. Generated action binding names are interned once during action-plan
+  compilation, retaining textual fallback while avoiding repeated matching
+  work. The 3M snapshot cap improved from the prior accepted `13.42-13.49s` to
+  `10.75-10.86s`. Canonical occupancy is measured and asserted: the full
+  snapshot used about `600k/2,097,152` entries at 60M distinct states, so the
+  table is not saturating.
+- [x] Reject and remove post-publication experiments that failed ReleaseFast
+  wall-time validation: 64-bit generated-name hashes (`11.49-11.67s`), an
+  explicit local context chain (`11.06-11.33s`), pointer-only duplicate lookup
+  passes (`12.13-12.29s`), state-binding skip scans (`11.08-11.17s`), same-pool
+  recursive clone identity (`10.94-11.08s` despite fewer instructions), and a
+  structure-of-arrays canonical table (`11.36-12.31s`). None remain in the hot
+  path.
+- [x] Stop duplicate Java execution for generated benchmark rows. The baseline
+  benchmark owns TLC/interpreted comparison; generated AOT rows now run with
+  `--tlzig-only --auto-only` and compare against the stored tlzig baseline.
+  Completed rows retain exact configured generated/distinct checks; configured
+  first-error rows compare the violation/deadlock outcome because all-core
+  traversal can reach the same error at a different nondeterministic frontier.
 
 ## Notes
 - Update this file after every spec/example milestone.

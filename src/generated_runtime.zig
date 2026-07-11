@@ -24,7 +24,8 @@ pub const CallContext = struct {
     state_pool: *ValuePool,
     state: ?*State,
     next_state: ?*State,
-    partial_values: []const ?Value,
+    partial_mask: u64,
+    partial_values: []const Value,
     partial_value_pools: []const ?*const ValuePool,
     read_primed: bool,
     constants: []const NamedValue,
@@ -95,14 +96,14 @@ fn resolve_current_variable(
 ) Error!Value {
     source_pool.* = context.eval_pool;
     const current = context.state orelse {
-        if (index < context.partial_values.len) {
-            if (context.partial_values[index]) |value| {
-                if (index < context.partial_value_pools.len) {
-                    source_pool.* = context.partial_value_pools[index] orelse
-                        context.eval_pool;
-                }
-                return value;
+        if (index < context.partial_values.len and
+            context.partial_mask & (@as(u64, 1) << @intCast(index)) != 0)
+        {
+            if (index < context.partial_value_pools.len) {
+                source_pool.* = context.partial_value_pools[index] orelse
+                    context.eval_pool;
             }
+            return context.partial_values[index];
         }
         return Error.TypeError;
     };
@@ -123,14 +124,14 @@ fn resolve_primed_variable(
     source_pool: **const ValuePool,
 ) Error!Value {
     source_pool.* = context.eval_pool;
-    if (index < context.partial_values.len) {
-        if (context.partial_values[index]) |value| {
-            if (index < context.partial_value_pools.len) {
-                source_pool.* = context.partial_value_pools[index] orelse
-                    context.eval_pool;
-            }
-            return value;
+    if (index < context.partial_values.len and
+        context.partial_mask & (@as(u64, 1) << @intCast(index)) != 0)
+    {
+        if (index < context.partial_value_pools.len) {
+            source_pool.* = context.partial_value_pools[index] orelse
+                context.eval_pool;
         }
+        return context.partial_values[index];
     }
     if (context.next_state) |next| {
         if (index >= next.values.len) return Error.TypeError;
@@ -1747,9 +1748,9 @@ fn resolve_path(
 
     if (context.read_primed) {
         if (index < context.partial_values.len and
-            context.partial_values[index] != null)
+            context.partial_mask & (@as(u64, 1) << @intCast(index)) != 0)
         {
-            value = context.partial_values[index].?;
+            value = context.partial_values[index];
             if (index < context.partial_value_pools.len) {
                 source_pool.* = context.partial_value_pools[index] orelse
                     context.eval_pool;
@@ -4798,6 +4799,7 @@ test "generated finite values use only the value pool" {
         .state_pool = &pool,
         .state = null,
         .next_state = null,
+        .partial_mask = 0,
         .partial_values = &.{},
         .partial_value_pools = &.{},
         .read_primed = false,
@@ -4861,6 +4863,7 @@ test "generated finite values use only the value pool" {
         .state_pool = &source_pool,
         .state = null,
         .next_state = null,
+        .partial_mask = 0,
         .partial_values = &.{},
         .partial_value_pools = &.{},
         .read_primed = false,

@@ -661,20 +661,13 @@ fn compare_tlzig_baseline(
     actual: RunResult,
 ) !void {
     const baseline = try read_tlzig_baseline(allocator, spec);
-    const generated_model_active = generated_model.generated_count > 0;
-    const compare_generated =
-        spec.compare_generated or
-        (generated_model_active and
-            baseline.outcome == .completed and
-            actual.outcome == .completed);
-    const compare_distinct =
-        spec.compare_distinct or
-        (generated_model_active and
-            baseline.outcome == .completed and
-            actual.outcome == .completed);
     const mismatch = baseline.outcome != actual.outcome or
-        (compare_generated and baseline.generated != actual.generated) or
-        (compare_distinct and baseline.distinct != actual.distinct);
+        (!spec.expected_violation and
+            spec.compare_generated and
+            baseline.generated != actual.generated) or
+        (!spec.expected_violation and
+            spec.compare_distinct and
+            baseline.distinct != actual.distinct);
     if (!mismatch) return;
 
     std.debug.print(

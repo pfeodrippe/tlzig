@@ -9,6 +9,17 @@ const overrides = tlzig.overrides;
 const generated_runtime = tlzig.generated_runtime;
 const generated_model = @import("generated_model");
 
+comptime {
+    if (!@hasDecl(generated_model, "abi_version")) {
+        @compileError("generated model is stale; regenerate it with tlzig --emit-zig");
+    }
+    if (generated_model.abi_version !=
+        generated_runtime.generated_model_abi_version)
+    {
+        @compileError("generated model ABI mismatch; regenerate it with tlzig --emit-zig");
+    }
+}
+
 const Spec = struct {
     label: ?[]const u8 = null,
     tla: []const u8,
@@ -667,7 +678,11 @@ fn compare_tlzig_baseline(
             baseline.generated != actual.generated) or
         (!spec.expected_violation and
             spec.compare_distinct and
-            baseline.distinct != actual.distinct);
+            !distinct_within_tolerance(
+                baseline.distinct,
+                actual.distinct,
+                spec.distinct_tolerance,
+            ));
     if (!mismatch) return;
 
     std.debug.print(
@@ -852,7 +867,7 @@ fn run_tlzig_internal(
         return error.CheckFailed;
     };
     defer ch.deinit();
-    ch.set_diagnostics(false);
+    ch.set_diagnostics(std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null);
 
     const result = ch.check() catch |err| {
         const elapsed = elapsed_ms(io, start);
@@ -885,6 +900,11 @@ fn run_tlzig_internal(
             );
         }
         std.debug.print("\n", .{});
+        if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            if (@errorReturnTrace()) |trace| {
+                std.debug.dumpErrorReturnTrace(trace);
+            }
+        }
         return error.CheckFailed;
     };
 

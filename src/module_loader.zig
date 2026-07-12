@@ -224,7 +224,47 @@ pub const ModuleLoader = struct {
             const ns_total = parent.namespace_instances.len + child.namespace_instances.len;
             const merged_ns = try self.arena.alloc(ast.NamespaceInstance, ns_total);
             @memcpy(merged_ns[0..parent.namespace_instances.len], parent.namespace_instances);
-            @memcpy(merged_ns[parent.namespace_instances.len..], child.namespace_instances);
+            for (child.namespace_instances, 0..) |namespace, index| {
+                const substitutions = try self.arena.alloc(
+                    ast.Substitution,
+                    namespace.substitutions.len + effective_subs.len,
+                );
+                for (
+                    namespace.substitutions,
+                    substitutions[0..namespace.substitutions.len],
+                ) |
+                    substitution,
+                    *result,
+                | {
+                    result.* = .{
+                        .local_name = substitution.local_name,
+                        .expr = try copy_expr(
+                            self.arena,
+                            substitution.expr,
+                            effective_subs,
+                        ),
+                    };
+                }
+                for (
+                    effective_subs,
+                    substitutions[namespace.substitutions.len..],
+                ) |substitution, *result| {
+                    result.* = .{
+                        .local_name = substitution.local_name,
+                        .expr = try copy_expr(
+                            self.arena,
+                            substitution.expr,
+                            &.{},
+                        ),
+                    };
+                }
+                merged_ns[parent.namespace_instances.len + index] = .{
+                    .alias = namespace.alias,
+                    .params = namespace.params,
+                    .module_name = namespace.module_name,
+                    .substitutions = substitutions,
+                };
+            }
             parent.namespace_instances = merged_ns;
         }
     }
@@ -697,7 +737,14 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
                         sub_expr,
                         &[_]ast.Substitution{},
                     );
-                    if (copied_func.* == .apply) {
+                    if (copied_func.* == .apply and
+                        copied_func.apply.func.* == .ident and
+                        std.mem.indexOfScalar(
+                            u8,
+                            copied_func.apply.func.ident,
+                            '!',
+                        ) != null)
+                    {
                         const prefix = copied_func.apply;
                         const combined_args = try arena.alloc(
                             *ast.Expr,
@@ -715,6 +762,27 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
                         const ptr = try arena.alloc_object(ast.Expr);
                         ptr.* = .{ .apply = combined };
                         return ptr;
+                    }
+                    if (copied_func.* == .lambda) {
+                        const lambda = copied_func.lambda;
+                        if (lambda.params.len != ap.args.len) {
+                            return error.SyntaxError;
+                        }
+                        const lambda_subs = try arena.alloc(
+                            ast.Substitution,
+                            lambda.params.len,
+                        );
+                        for (lambda.params, ap.args, 0..) |param, arg, i| {
+                            lambda_subs[i] = .{
+                                .local_name = param,
+                                .expr = try copy_expr(arena, arg, subs),
+                            };
+                        }
+                        return try copy_expr(
+                            arena,
+                            lambda.body,
+                            lambda_subs,
+                        );
                     }
                 }
             }
@@ -1011,4 +1079,61 @@ fn find_substitution(
         if (std.mem.eql(u8, name, sub.local_name)) return sub.expr;
     }
     return null;
+}
+
+test "outer substitutions are composed into nested namespaces" {
+    var arena = try Arena.init(64 * 1024);
+    defer arena.deinit();
+    const loader = ModuleLoader.init(&arena, &.{});
+    var outer_value = ast.Expr{ .ident = "replacement" };
+    var nested_value = ast.Expr{ .ident = "OuterConstant" };
+    const child = ast.Module{
+        .name = "Child",
+        .extends = &.{},
+        .variables = &.{},
+        .constants = &.{},
+        .definitions = &.{},
+        .assumptions = &.{},
+        .instances = &.{},
+        .namespace_instances = &.{.{
+            .alias = "Nested",
+            .params = &.{},
+            .module_name = "NestedModule",
+            .substitutions = &.{.{
+                .local_name = "NestedConstant",
+                .expr = &nested_value,
+            }},
+        }},
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+    };
+    var parent = ast.Module{
+        .name = "Parent",
+        .extends = &.{},
+        .variables = &.{},
+        .constants = &.{},
+        .definitions = &.{},
+        .assumptions = &.{},
+        .instances = &.{},
+        .namespace_instances = &.{},
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+    };
+    try loader.merge_instance(&parent, child, &.{.{
+        .local_name = "OuterConstant",
+        .expr = &outer_value,
+    }});
+    try std.testing.expectEqual(@as(usize, 1), parent.namespace_instances.len);
+    const nested = parent.namespace_instances[0];
+    const composed = nested.substitutions[0].expr;
+    try std.testing.expect(composed.* == .ident);
+    try std.testing.expectEqualStrings("replacement", composed.ident);
+    const inherited = find_substitution(
+        nested.substitutions,
+        "OuterConstant",
+    ) orelse return error.UndefinedSymbol;
+    try std.testing.expect(inherited.* == .ident);
+    try std.testing.expectEqualStrings("replacement", inherited.ident);
 }

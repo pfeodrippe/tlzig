@@ -1,5 +1,6 @@
 const tlzig = @import("tlzig");
 
+pub const abi_version = tlzig.generated_runtime.generated_model_abi_version;
 pub const module_name = "";
 pub const config_replacements_hash: u64 = 0;
 pub const root_names = [_][]const u8{};

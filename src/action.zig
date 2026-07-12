@@ -13,7 +13,144 @@ const Error = @import("err.zig").Error;
 const generated_runtime = @import("generated_runtime.zig");
 const codegen = @import("codegen.zig");
 
-fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args: []const *ast.Expr) !*ast.Expr {
+const InlinedBoundExpression = struct {
+    vars: []const ast.BoundVar,
+    body: *ast.Expr,
+};
+
+const Substitutions = struct {
+    params: []const []const u8,
+    args: []const *ast.Expr,
+};
+
+fn filtered_substitutions(
+    arena: *Arena,
+    params: []const []const u8,
+    args: []const *ast.Expr,
+    bound_vars: []const ast.BoundVar,
+    bound_count: usize,
+) Error!Substitutions {
+    assert(params.len == args.len);
+    assert(bound_count <= bound_vars.len);
+    const filtered_params = try arena.alloc([]const u8, params.len);
+    const filtered_args = try arena.alloc(*ast.Expr, args.len);
+    var count: usize = 0;
+    for (params, args) |parameter, argument| {
+        var shadowed = false;
+        for (bound_vars[0..bound_count]) |bound| {
+            if (std.mem.eql(u8, parameter, bound.name)) {
+                shadowed = true;
+                break;
+            }
+        }
+        if (shadowed) continue;
+        filtered_params[count] = parameter;
+        filtered_args[count] = argument;
+        count += 1;
+    }
+    return .{
+        .params = filtered_params[0..count],
+        .args = filtered_args[0..count],
+    };
+}
+
+fn arguments_reference_identifier(
+    args: []const *ast.Expr,
+    name: []const u8,
+) bool {
+    for (args) |argument| {
+        if (codegen.expression_references_identifier(argument, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn inline_bound_expression(
+    arena: *Arena,
+    owner: *const anyopaque,
+    vars: []const ast.BoundVar,
+    body: *ast.Expr,
+    params: []const []const u8,
+    args: []const *ast.Expr,
+) Error!InlinedBoundExpression {
+    assert(params.len == args.len);
+    const result_vars = try arena.alloc(ast.BoundVar, vars.len);
+    const domains = try arena.alloc(*ast.Expr, vars.len);
+    for (vars, 0..) |bound, index| domains[index] = bound.domain;
+    var result_body = body;
+
+    for (vars, 0..) |bound, index| {
+        var result_name = bound.name;
+        if (arguments_reference_identifier(args, bound.name)) {
+            var name_buffer: [96]u8 = undefined;
+            const fresh_name = std.fmt.bufPrint(
+                &name_buffer,
+                "__tlzig_bound_{x}_{d}",
+                .{ @intFromPtr(owner), index },
+            ) catch return Error.OutOfMemory;
+            result_name = try arena.dup(fresh_name);
+            const fresh_ident = try arena.alloc_object(ast.Expr);
+            fresh_ident.* = .{ .ident = result_name };
+            result_body = try inline_expr(
+                arena,
+                result_body,
+                &.{bound.name},
+                &.{fresh_ident},
+            );
+            for (domains[index + 1 ..]) |*domain| {
+                domain.* = try inline_expr(
+                    arena,
+                    domain.*,
+                    &.{bound.name},
+                    &.{fresh_ident},
+                );
+            }
+        } else {
+            result_name = try arena.dup(result_name);
+        }
+        const domain_substitutions = try filtered_substitutions(
+            arena,
+            params,
+            args,
+            vars,
+            index,
+        );
+        result_vars[index] = .{
+            .name = result_name,
+            .domain = try inline_expr(
+                arena,
+                domains[index],
+                domain_substitutions.params,
+                domain_substitutions.args,
+            ),
+        };
+    }
+
+    const body_substitutions = try filtered_substitutions(
+        arena,
+        params,
+        args,
+        vars,
+        vars.len,
+    );
+    return .{
+        .vars = result_vars,
+        .body = try inline_expr(
+            arena,
+            result_body,
+            body_substitutions.params,
+            body_substitutions.args,
+        ),
+    };
+}
+
+fn inline_expr(
+    arena: *Arena,
+    expr: *ast.Expr,
+    params: []const []const u8,
+    args: []const *ast.Expr,
+) Error!*ast.Expr {
     switch (expr.*) {
         .ident => |name| {
             for (params, 0..) |p, i| {
@@ -24,6 +161,21 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
             return ptr;
         },
         .primed => |name| {
+            for (params, 0..) |param, i| {
+                if (!std.mem.eql(u8, name, param)) continue;
+                const ptr = try arena.alloc_object(ast.Expr);
+                if (args[i].* == .ident) {
+                    ptr.* = .{ .primed = try arena.dup(args[i].ident) };
+                } else {
+                    ptr.* = .{ .primed_expr = try inline_expr(
+                        arena,
+                        args[i],
+                        params,
+                        args,
+                    ) };
+                }
+                return ptr;
+            }
             const ptr = try arena.alloc_object(ast.Expr);
             ptr.* = .{ .primed = try arena.dup(name) };
             return ptr;
@@ -54,11 +206,50 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
             return ptr;
         },
         .unchanged => |names| {
-            const ptr = try arena.alloc_object(ast.Expr);
-            const copy = try arena.alloc([]const u8, names.len);
-            for (names, 0..) |n, i| copy[i] = try arena.dup(n);
-            ptr.* = .{ .unchanged = copy };
-            return ptr;
+            var result: ?*ast.Expr = null;
+            for (names) |name| {
+                const item = try arena.alloc_object(ast.Expr);
+                var substituted = false;
+                for (params, 0..) |param, i| {
+                    if (!std.mem.eql(u8, name, param)) continue;
+                    if (args[i].* == .ident) {
+                        const one = try arena.alloc([]const u8, 1);
+                        one[0] = try arena.dup(args[i].ident);
+                        item.* = .{ .unchanged = one };
+                    } else {
+                        item.* = .{ .unchanged_expr = try inline_expr(
+                            arena,
+                            args[i],
+                            params,
+                            args,
+                        ) };
+                    }
+                    substituted = true;
+                    break;
+                }
+                if (!substituted) {
+                    const one = try arena.alloc([]const u8, 1);
+                    one[0] = try arena.dup(name);
+                    item.* = .{ .unchanged = one };
+                }
+                if (result) |left| {
+                    const binary = try arena.alloc_object(ast.Binary);
+                    binary.* = .{
+                        .op = .and_op,
+                        .left = left,
+                        .right = item,
+                    };
+                    const combined = try arena.alloc_object(ast.Expr);
+                    combined.* = .{ .binary = binary };
+                    result = combined;
+                } else {
+                    result = item;
+                }
+            }
+            if (result) |expression| return expression;
+            const empty = try arena.alloc_object(ast.Expr);
+            empty.* = .{ .unchanged = &.{} };
+            return empty;
         },
         .unchanged_expr => |operand| {
             const ptr = try arena.alloc_object(ast.Expr);
@@ -135,7 +326,10 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
             const sfp = try arena.alloc_object(ast.SetFilter);
             const vars = try arena.alloc(ast.BoundVar, sf.vars.len);
             for (sf.vars, 0..) |v, i| {
-                vars[i] = .{ .name = try arena.dup(v.name), .domain = try inline_expr(arena, v.domain, params, args) };
+                vars[i] = .{
+                    .name = try arena.dup(v.name),
+                    .domain = try inline_expr(arena, v.domain, params, args),
+                };
             }
             sfp.* = .{
                 .vars = vars,
@@ -149,7 +343,10 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
             const smp = try arena.alloc_object(ast.SetMap);
             const vars = try arena.alloc(ast.BoundVar, sm.vars.len);
             for (sm.vars, 0..) |v, i| {
-                vars[i] = .{ .name = try arena.dup(v.name), .domain = try inline_expr(arena, v.domain, params, args) };
+                vars[i] = .{
+                    .name = try arena.dup(v.name),
+                    .domain = try inline_expr(arena, v.domain, params, args),
+                };
             }
             smp.* = .{
                 .vars = vars,
@@ -160,6 +357,28 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
             return ptr;
         },
         .function_literal => |fl| {
+            var capture = false;
+            for (fl.vars) |bound| {
+                if (arguments_reference_identifier(args, bound.name)) {
+                    capture = true;
+                    break;
+                }
+            }
+            if (capture) {
+                const inlined = try inline_bound_expression(
+                    arena,
+                    fl,
+                    fl.vars,
+                    fl.body,
+                    params,
+                    args,
+                );
+                const flp = try arena.alloc_object(ast.FunctionLiteral);
+                flp.* = .{ .vars = inlined.vars, .body = inlined.body };
+                const ptr = try arena.alloc_object(ast.Expr);
+                ptr.* = .{ .function_literal = flp };
+                return ptr;
+            }
             const vars = try arena.alloc(ast.BoundVar, fl.vars.len);
             for (fl.vars, 0..) |v, i| {
                 vars[i] = .{
@@ -168,7 +387,10 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
                 };
             }
             const flp = try arena.alloc_object(ast.FunctionLiteral);
-            flp.* = .{ .vars = vars, .body = try inline_expr(arena, fl.body, params, args) };
+            flp.* = .{
+                .vars = vars,
+                .body = try inline_expr(arena, fl.body, params, args),
+            };
             const ptr = try arena.alloc_object(ast.Expr);
             ptr.* = .{ .function_literal = flp };
             return ptr;
@@ -206,7 +428,10 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
             const cp = try arena.alloc_object(ast.Choose);
             cp.* = .{
                 .var_name = try arena.dup(c.var_name),
-                .domain = if (c.domain) |d| try inline_expr(arena, d, params, args) else null,
+                .domain = if (c.domain) |domain|
+                    try inline_expr(arena, domain, params, args)
+                else
+                    null,
                 .body = try inline_expr(arena, c.body, params, args),
             };
             const ptr = try arena.alloc_object(ast.Expr);
@@ -214,20 +439,86 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
             return ptr;
         },
         .let_in => |l| {
+            if (l.defs.len > 64) return Error.NotImplemented;
+            var renamed_from: [64][]const u8 = undefined;
+            var renamed_to: [64]*ast.Expr = undefined;
+            var renamed_count: usize = 0;
+            for (l.defs, 0..) |def, definition_index| {
+                var collides = false;
+                for (args) |argument| {
+                    if (codegen.expression_references_identifier(
+                        argument,
+                        def.name,
+                    )) {
+                        collides = true;
+                        break;
+                    }
+                }
+                if (!collides) continue;
+                var name_buffer: [96]u8 = undefined;
+                const fresh_name = std.fmt.bufPrint(
+                    &name_buffer,
+                    "__tlzig_inline_{x}_{d}",
+                    .{ @intFromPtr(l), definition_index },
+                ) catch return Error.OutOfMemory;
+                const fresh_ident = try arena.alloc_object(ast.Expr);
+                fresh_ident.* = .{ .ident = try arena.dup(fresh_name) };
+                renamed_from[renamed_count] = def.name;
+                renamed_to[renamed_count] = fresh_ident;
+                renamed_count += 1;
+            }
+
             const defs = try arena.alloc(ast.Definition, l.defs.len);
             for (l.defs, 0..) |def, i| {
+                var definition_body = def.body;
+                for (0..renamed_count) |rename_index| {
+                    definition_body = try inline_expr(
+                        arena,
+                        definition_body,
+                        &.{renamed_from[rename_index]},
+                        &.{renamed_to[rename_index]},
+                    );
+                }
+                var definition_name = def.name;
+                for (0..renamed_count) |rename_index| {
+                    if (std.mem.eql(
+                        u8,
+                        definition_name,
+                        renamed_from[rename_index],
+                    )) {
+                        definition_name = renamed_to[rename_index].ident;
+                        break;
+                    }
+                }
                 defs[i] = .{
-                    .name = try arena.dup(def.name),
+                    .name = try arena.dup(definition_name),
                     .params = blk: {
                         const copy = try arena.alloc([]const u8, def.params.len);
                         for (def.params, 0..) |p, j| copy[j] = try arena.dup(p);
                         break :blk copy;
                     },
-                    .body = try inline_expr(arena, def.body, params, args),
+                    .body = try inline_expr(
+                        arena,
+                        definition_body,
+                        params,
+                        args,
+                    ),
                 };
             }
+            var let_body = l.body;
+            for (0..renamed_count) |rename_index| {
+                let_body = try inline_expr(
+                    arena,
+                    let_body,
+                    &.{renamed_from[rename_index]},
+                    &.{renamed_to[rename_index]},
+                );
+            }
             const lp = try arena.alloc_object(ast.LetIn);
-            lp.* = .{ .defs = defs, .body = try inline_expr(arena, l.body, params, args) };
+            lp.* = .{
+                .defs = defs,
+                .body = try inline_expr(arena, let_body, params, args),
+            };
             const ptr = try arena.alloc_object(ast.Expr);
             ptr.* = .{ .let_in = lp };
             return ptr;
@@ -314,7 +605,9 @@ fn inline_expr(arena: *Arena, expr: *ast.Expr, params: []const []const u8, args:
         },
         .lambda => |l| {
             const params_copy = try arena.alloc([]const u8, l.params.len);
-            for (l.params, 0..) |p, i| params_copy[i] = try arena.dup(p);
+            for (l.params, 0..) |parameter, index| {
+                params_copy[index] = try arena.dup(parameter);
+            }
             const lp = try arena.alloc_object(ast.Lambda);
             lp.* = .{
                 .params = params_copy,
@@ -430,6 +723,7 @@ pub const ActionStep = union(enum(u8)) {
     assign_var: AssignVar,
     assign_prime: AssignPrime,
     condition: CompiledExpr,
+    enabled_check: EnabledCheck,
     mark_action: MarkAction,
     choose: Choose,
     branch: Branch,
@@ -468,6 +762,11 @@ pub const CompiledExpr = struct {
 pub const MarkAction = struct {
     name: []const u8,
     args: []const CompiledExpr,
+};
+
+pub const EnabledCheck = struct {
+    steps: []const ActionStep,
+    expected: bool,
 };
 
 pub const FairnessBinding = struct {
@@ -694,7 +993,8 @@ pub const ActionCompiler = struct {
     }
 
     fn is_action_expr(self: ActionCompiler, expr: *ast.Expr) bool {
-        return self.is_action_expr_inner(expr);
+        var path: [128]*ast.Expr = undefined;
+        return self.is_action_expr_inner(expr, &path, 0);
     }
 
     fn is_init_action(self: ActionCompiler, expr: *ast.Expr) bool {
@@ -714,35 +1014,92 @@ pub const ActionCompiler = struct {
         }
     }
 
-    fn is_action_expr_inner(self: ActionCompiler, expr: *ast.Expr) bool {
+    fn is_action_expr_inner(
+        self: ActionCompiler,
+        expr: *ast.Expr,
+        path: *[128]*ast.Expr,
+        depth: u8,
+    ) bool {
+        if (depth >= path.len) return false;
+        for (path[0..depth]) |ancestor| {
+            if (ancestor == expr) return false;
+        }
+        path[depth] = expr;
+        const next_depth = depth + 1;
         switch (expr.*) {
             .primed, .primed_expr, .unchanged, .unchanged_expr => return true,
             .ident => |name| {
-                if (self.is_constant_replacement(name)) return false;
-                if (self.evaluator.find_constant(name) != null) return false;
-                if (self.evaluator.find_definition(name)) |def| return self.is_action_expr_inner(def.body);
+                const resolved = self.evaluator.resolve_alias(name);
+                if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null and
+                    !std.mem.eql(u8, name, resolved))
+                {
+                    std.debug.print("NEXT alias {s} -> {s}\n", .{ name, resolved });
+                }
+                if (self.is_constant_replacement(resolved)) return false;
+                if (self.evaluator.find_constant(resolved) != null) return false;
+                if (self.evaluator.find_definition(resolved)) |def| {
+                    return self.is_action_expr_inner(
+                        def.body,
+                        path,
+                        next_depth,
+                    );
+                }
                 return false;
             },
             .binary => |b| {
-                if (b.op == .or_op) return self.is_action_expr(b.left) or self.is_action_expr(b.right);
-                if (b.op == .and_op) return self.is_action_expr(b.left) or self.is_action_expr(b.right);
-                return self.is_action_expr(b.left) or self.is_action_expr(b.right) or self.is_init_action(expr);
+                return self.is_action_expr_inner(
+                    b.left,
+                    path,
+                    next_depth,
+                ) or self.is_action_expr_inner(
+                    b.right,
+                    path,
+                    next_depth,
+                ) or self.is_init_action(expr);
             },
-            .let_in => |l| return self.is_action_expr_inner(l.body),
-            .if_then_else => |ite| return self.is_action_expr(ite.then_branch) or self.is_action_expr(ite.else_branch),
+            .let_in => |l| return self.is_action_expr_inner(
+                l.body,
+                path,
+                next_depth,
+            ),
+            .if_then_else => |ite| return self.is_action_expr_inner(
+                ite.then_branch,
+                path,
+                next_depth,
+            ) or self.is_action_expr_inner(
+                ite.else_branch,
+                path,
+                next_depth,
+            ),
             .case_expr => |case| {
                 for (case.arms) |arm| {
-                    if (self.is_action_expr(arm.value)) return true;
+                    if (self.is_action_expr_inner(
+                        arm.value,
+                        path,
+                        next_depth,
+                    )) return true;
                 }
-                if (case.otherwise) |otherwise| return self.is_action_expr(otherwise);
+                if (case.otherwise) |otherwise| return self.is_action_expr_inner(
+                    otherwise,
+                    path,
+                    next_depth,
+                );
                 return false;
             },
             .apply => |ap| {
                 if (ap.func.* == .ident) {
                     if (std.mem.eql(u8, ap.func.*.ident, "\\cdot")) {
                         return ap.args.len == 2 and
-                            self.is_action_expr(ap.args[0]) and
-                            self.is_action_expr(ap.args[1]);
+                            self.is_action_expr_inner(
+                                ap.args[0],
+                                path,
+                                next_depth,
+                            ) and
+                            self.is_action_expr_inner(
+                                ap.args[1],
+                                path,
+                                next_depth,
+                            );
                     }
                     if (self.is_constant_replacement(ap.func.*.ident)) {
                         return false;
@@ -750,11 +1107,21 @@ pub const ActionCompiler = struct {
                     if (self.evaluator.find_constant(ap.func.*.ident) != null) {
                         return false;
                     }
-                    if (self.evaluator.find_definition(ap.func.*.ident)) |def| return self.is_action_expr_inner(def.body);
+                    if (self.evaluator.find_definition(ap.func.*.ident)) |def| {
+                        return self.is_action_expr_inner(
+                            def.body,
+                            path,
+                            next_depth,
+                        );
+                    }
                 }
                 return false;
             },
-            .quantifier => |q| return self.is_action_expr_inner(q.body),
+            .quantifier => |q| return self.is_action_expr_inner(
+                q.body,
+                path,
+                next_depth,
+            ),
             else => return false,
         }
     }
@@ -766,7 +1133,41 @@ pub const ActionCompiler = struct {
         is_init: bool,
     ) !void {
         switch (expr.*) {
+            .unary => |unary| {
+                var enabled_operand: ?*ast.Expr = null;
+                var expected = true;
+                if (unary.op == .enabled) {
+                    enabled_operand = unary.operand;
+                } else if (unary.op == .not and
+                    unary.operand.* == .unary and
+                    unary.operand.unary.op == .enabled)
+                {
+                    enabled_operand = unary.operand.unary.operand;
+                    expected = false;
+                }
+                if (enabled_operand) |operand| {
+                    var enabled_steps = std.ArrayList(ActionStep).empty;
+                    defer enabled_steps.deinit(std.heap.page_allocator);
+                    try self.collect_steps(operand, &enabled_steps, false);
+                    try steps.append(std.heap.page_allocator, .{
+                        .enabled_check = .{
+                            .steps = try self.dup_slice(
+                                ActionStep,
+                                enabled_steps.items,
+                            ),
+                            .expected = expected,
+                        },
+                    });
+                    return;
+                }
+                try steps.append(std.heap.page_allocator, .{
+                    .condition = try self.compile_expr(expr),
+                });
+            },
             .binary => |b| {
+                if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null) {
+                    std.debug.print("NEXT binary {s}\n", .{@tagName(b.op)});
+                }
                 if (b.op == .and_op) {
                     try self.collect_steps(b.left, steps, is_init);
                     try self.collect_steps(b.right, steps, is_init);
@@ -811,15 +1212,19 @@ pub const ActionCompiler = struct {
                 if (b.op == .eq) {
                     if (!is_init and b.left.* == .primed) {
                         const name = self.evaluator.resolve_alias(b.left.*.primed);
-                        const index = self.evaluator.find_variable(name) orelse
+                        const index = self.evaluator.find_variable(name) orelse {
+                            std.debug.print("unknown primed action variable: {s}\n", .{name});
                             return Error.UndefinedSymbol;
+                        };
                         try steps.append(std.heap.page_allocator, ActionStep{ .assign_prime = .{ .var_name = try self.canonical_name(name), .var_index = index, .expr = try self.compile_expr(b.right), .is_membership = false } });
                         return;
                     }
                     if (is_init and b.left.* == .ident) {
                         const name = self.evaluator.resolve_alias(b.left.*.ident);
-                        const index = self.evaluator.find_variable(name) orelse
+                        const index = self.evaluator.find_variable(name) orelse {
+                            std.debug.print("unknown init variable: {s}\n", .{name});
                             return Error.UndefinedSymbol;
+                        };
                         try steps.append(std.heap.page_allocator, ActionStep{ .assign_var = .{ .var_name = try self.canonical_name(name), .var_index = index, .expr = try self.compile_expr(b.right), .is_membership = false } });
                         return;
                     }
@@ -827,15 +1232,19 @@ pub const ActionCompiler = struct {
                 if (b.op == .in) {
                     if (is_init and b.left.* == .ident) {
                         const name = self.evaluator.resolve_alias(b.left.*.ident);
-                        const index = self.evaluator.find_variable(name) orelse
+                        const index = self.evaluator.find_variable(name) orelse {
+                            std.debug.print("unknown init membership variable: {s}\n", .{name});
                             return Error.UndefinedSymbol;
+                        };
                         try steps.append(std.heap.page_allocator, ActionStep{ .assign_var = .{ .var_name = try self.canonical_name(name), .var_index = index, .expr = try self.compile_expr(b.right), .is_membership = true } });
                         return;
                     }
                     if (!is_init and b.left.* == .primed) {
                         const name = self.evaluator.resolve_alias(b.left.*.primed);
-                        const index = self.evaluator.find_variable(name) orelse
+                        const index = self.evaluator.find_variable(name) orelse {
+                            std.debug.print("unknown primed membership variable: {s}\n", .{name});
                             return Error.UndefinedSymbol;
+                        };
                         try steps.append(std.heap.page_allocator, ActionStep{ .assign_prime = .{ .var_name = try self.canonical_name(name), .var_index = index, .expr = try self.compile_expr(b.right), .is_membership = true } });
                         return;
                     }
@@ -843,16 +1252,17 @@ pub const ActionCompiler = struct {
                 try steps.append(std.heap.page_allocator, ActionStep{ .condition = try self.compile_expr(expr) });
             },
             .ident => |name| {
-                if (self.evaluator.find_constant(name) != null) {
+                const resolved = self.evaluator.resolve_alias(name);
+                if (self.evaluator.find_constant(resolved) != null) {
                     try steps.append(
                         std.heap.page_allocator,
                         ActionStep{ .condition = try self.compile_expr(expr) },
                     );
-                } else if (self.evaluator.find_definition(name)) |def| {
+                } else if (self.evaluator.find_definition(resolved)) |def| {
                     try steps.append(
                         std.heap.page_allocator,
                         ActionStep{ .mark_action = .{
-                            .name = name,
+                            .name = resolved,
                             .args = &.{},
                         } },
                     );
@@ -862,6 +1272,11 @@ pub const ActionCompiler = struct {
                 }
             },
             .quantifier => |q| {
+                if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null) {
+                    std.debug.print("NEXT quantifier body {s}\n", .{
+                        @tagName(q.body.*),
+                    });
+                }
                 if (q.kind == .exists and q.vars.len > 0) {
                     var body_steps = std.ArrayList(ActionStep).empty;
                     defer body_steps.deinit(std.heap.page_allocator);
@@ -1141,8 +1556,10 @@ pub const ActionCompiler = struct {
                             for (def.body.*.tuple) |it| {
                                 if (it.* != .ident) return Error.TypeError;
                                 const name = self.evaluator.resolve_alias(it.*.ident);
-                                const index = self.evaluator.find_variable(name) orelse
+                                const index = self.evaluator.find_variable(name) orelse {
+                                    std.debug.print("unknown UNCHANGED variable: {s}\n", .{name});
                                     return Error.UndefinedSymbol;
+                                };
                                 try steps.append(std.heap.page_allocator, ActionStep{ .unchanged = .{
                                     .var_name = try self.canonical_name(name),
                                     .var_index = index,
@@ -1152,6 +1569,7 @@ pub const ActionCompiler = struct {
                         }
                         return Error.TypeError;
                     } else {
+                        std.debug.print("unknown UNCHANGED tuple/operator: {s}\n", .{v});
                         return Error.UndefinedSymbol;
                     }
                 }
@@ -1171,7 +1589,6 @@ pub const ActionCompiler = struct {
         def: ast.Definition,
     ) !void {
         const use_generated_operator =
-            def.params.len > 0 and
             self.evaluator.generated_expression_count() > 0;
         const binding = if (def.params.len > 0 and
             !use_generated_operator)
@@ -1251,6 +1668,13 @@ fn dump_action_steps(label: []const u8, steps: []const ActionStep, depth: u32) v
                 .{ label, assign.var_name },
             ),
             .condition => std.debug.print("{s}: condition\n", .{label}),
+            .enabled_check => |enabled| {
+                std.debug.print(
+                    "{s}: enabled expected={}\n",
+                    .{ label, enabled.expected },
+                );
+                dump_action_steps(label, enabled.steps, depth + 1);
+            },
             .mark_action => |marker| std.debug.print(
                 "{s}: mark {s}\n",
                 .{ label, marker.name },
@@ -1386,10 +1810,12 @@ pub const ActionExecutor = struct {
     composition_generated: ?*u64 = null,
     fairness_markers: []const FairnessMarker = &.{},
     edge_action_masks: ?[]u64 = null,
+    enabled_probe: ?*bool = null,
 
     const Continuation = struct {
         steps: []const ActionStep,
         next: ?*const Continuation,
+        return_context: ?Context = null,
     };
 
     pub fn execute_init(
@@ -1420,14 +1846,24 @@ pub const ActionExecutor = struct {
         context: Context,
         state: ?*StateStore.State,
     ) !Value {
+        self.evaluator.begin_state_evaluation(self.eval_pool);
+        defer self.evaluator.end_state_evaluation();
         if (compiled.generated) |generated| generated: {
-            if (try self.evaluator.eval_generated_expression_if_args_available(
+            if (self.evaluator.eval_generated_expression_if_args_available(
                 generated,
                 context,
                 state,
                 self.eval_pool,
                 &self.source_state_store.values_pool,
-            )) |result| return result;
+            ) catch |err| {
+                if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                    std.debug.print(
+                        "generated expression {d} failed with {any}; args={any}\n",
+                        .{ generated.identity, err, generated.arg_names },
+                    );
+                }
+                return err;
+            }) |result| return result;
             break :generated;
         }
         return self.evaluator.eval_expr(
@@ -1445,14 +1881,24 @@ pub const ActionExecutor = struct {
         context: Context,
         state: ?*StateStore.State,
     ) !bool {
+        self.evaluator.begin_state_evaluation(self.eval_pool);
+        defer self.evaluator.end_state_evaluation();
         if (compiled.generated) |generated| generated: {
-            if (try self.evaluator.eval_generated_expression_bool_if_args_available(
+            if (self.evaluator.eval_generated_expression_bool_if_args_available(
                 generated,
                 context,
                 state,
                 self.eval_pool,
                 &self.source_state_store.values_pool,
-            )) |result| return result;
+            ) catch |err| {
+                if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                    std.debug.print(
+                        "generated boolean expression {d} failed with {any}; args={any}\n",
+                        .{ generated.identity, err, generated.arg_names },
+                    );
+                }
+                return err;
+            }) |result| return result;
             break :generated;
         }
         const result = try self.evaluator.eval_expr(
@@ -1465,6 +1911,31 @@ pub const ActionExecutor = struct {
         return result.is_truthy();
     }
 
+    fn existing_assignment_compatible(
+        self: *const ActionExecutor,
+        context: Context,
+        variable_index: u32,
+        value_v: Value,
+        is_membership: bool,
+    ) Error!?bool {
+        const assigned = context.lookup_state(variable_index) orelse return null;
+        const assigned_pool = assigned.value_pool orelse self.eval_pool;
+        if (!is_membership) {
+            return Value.eql_cross_pool(
+                assigned.value,
+                assigned_pool,
+                value_v,
+                self.eval_pool,
+            );
+        }
+        if (!value_v.is_set_like()) return Error.TypeError;
+        const member = if (assigned_pool == self.eval_pool)
+            assigned.value
+        else
+            try assigned.value.clone(assigned_pool, self.eval_pool);
+        return value_v.member(self.eval_pool, member);
+    }
+
     fn execute_steps(
         self: *const ActionExecutor,
         steps: []const ActionStep,
@@ -1475,6 +1946,8 @@ pub const ActionExecutor = struct {
         is_init: bool,
         action_mask: u64,
     ) !void {
+        const previous_context_floor = self.evaluator.pin_context_pool();
+        defer self.evaluator.unpin_context_pool(previous_context_floor);
         assert(self.eval_pool.value_count <= self.eval_pool.value_cap);
         assert(self.source_state_store.values_pool.value_count <=
             self.source_state_store.values_pool.value_cap);
@@ -1484,8 +1957,16 @@ pub const ActionExecutor = struct {
         var current_cont = continuation;
         var current_ctx = ctx;
         while (true) {
+            if (self.enabled_probe) |probe| {
+                if (probe.*) return;
+            }
             if (current_steps.len == 0) {
                 if (current_cont) |next| {
+                    if (next.return_context) |caller_context| {
+                        current_ctx = caller_context.restore_locals(
+                            current_ctx.state_head,
+                        );
+                    }
                     current_steps = next.steps;
                     current_cont = next.next;
                     continue;
@@ -1505,7 +1986,18 @@ pub const ActionExecutor = struct {
             switch (step) {
                 .assign_var => |a| {
                     const val = try self.eval_compiled_expr(a.expr, current_ctx, s0);
-                    if (a.is_membership and val.is_set_like()) {
+                    if (try self.existing_assignment_compatible(
+                        current_ctx,
+                        a.var_index,
+                        val,
+                        a.is_membership,
+                    )) |compatible| {
+                        if (!compatible) return;
+                        current_steps = rest;
+                        continue;
+                    }
+                    if (a.is_membership) {
+                        if (!val.is_set_like()) return Error.TypeError;
                         const mat = try self.evaluator.materialize_set(val, current_ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                         if (mat != .set_v) return Error.TypeError;
                         const items = mat.set_v.items(self.eval_pool);
@@ -1538,7 +2030,18 @@ pub const ActionExecutor = struct {
                 },
                 .assign_prime => |a| {
                     const val = try self.eval_compiled_expr(a.expr, current_ctx, s0);
-                    if (a.is_membership and val.is_set_like()) {
+                    if (try self.existing_assignment_compatible(
+                        current_ctx,
+                        a.var_index,
+                        val,
+                        a.is_membership,
+                    )) |compatible| {
+                        if (!compatible) return;
+                        current_steps = rest;
+                        continue;
+                    }
+                    if (a.is_membership) {
+                        if (!val.is_set_like()) return Error.TypeError;
                         const mat = try self.evaluator.materialize_set(val, current_ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                         if (mat != .set_v) return Error.TypeError;
                         const items = mat.set_v.items(self.eval_pool);
@@ -1571,6 +2074,32 @@ pub const ActionExecutor = struct {
                 },
                 .condition => |e| {
                     if (!try self.eval_compiled_bool(e, current_ctx, s0)) return;
+                    current_steps = rest;
+                    continue;
+                },
+                .enabled_check => |enabled_check| {
+                    const pool_snapshot = self.eval_pool.snapshot();
+                    const context_snapshot = self.evaluator.context_snapshot();
+                    var enabled = false;
+                    var probe_executor = self.*;
+                    probe_executor.enabled_probe = &enabled;
+                    var probe_storage: [1]u32 = undefined;
+                    var probe_states = StateBuffer{
+                        .storage = &probe_storage,
+                        .items = probe_storage[0..0],
+                    };
+                    try probe_executor.execute_steps(
+                        enabled_check.steps,
+                        null,
+                        current_ctx,
+                        s0,
+                        &probe_states,
+                        false,
+                        action_mask,
+                    );
+                    self.eval_pool.restore(pool_snapshot);
+                    self.evaluator.restore_context_pool(context_snapshot);
+                    if (enabled != enabled_check.expected) return;
                     current_steps = rest;
                     continue;
                 },
@@ -1621,7 +2150,11 @@ pub const ActionExecutor = struct {
                         current_steps = c.body_steps;
                         continue;
                     }
-                    const next = Continuation{ .steps = rest, .next = current_cont };
+                    const next = Continuation{
+                        .steps = rest,
+                        .next = current_cont,
+                        .return_context = current_ctx,
+                    };
                     for (items) |it| {
                         const new_ctx = try self.evaluator.extend_context(current_ctx, c.var_name, it);
                         try self.execute_steps(c.body_steps, &next, new_ctx, s0, out_states, is_init, action_mask);
@@ -1661,7 +2194,7 @@ pub const ActionExecutor = struct {
                             s0,
                         );
                     }
-                    var call_ctx = current_ctx;
+                    var call_ctx = current_ctx.operator_frame();
                     for (c.params, 0..) |p, i| {
                         call_ctx = try self.evaluator.extend_context(call_ctx, p, values[i]);
                     }
@@ -1670,7 +2203,11 @@ pub const ActionExecutor = struct {
                         current_steps = c.body_steps;
                         continue;
                     }
-                    const next = Continuation{ .steps = rest, .next = current_cont };
+                    const next = Continuation{
+                        .steps = rest,
+                        .next = current_cont,
+                        .return_context = current_ctx,
+                    };
                     const snap = self.eval_pool.snapshot();
                     try self.execute_steps(c.body_steps, &next, call_ctx, s0, out_states, is_init, action_mask);
                     self.eval_pool.restore(snap);
@@ -1806,6 +2343,17 @@ pub const ActionExecutor = struct {
                         unchanged.var_index,
                         &self.source_state_store.values_pool,
                     );
+                    if (current_ctx.lookup_state(unchanged.var_index)) |assigned| {
+                        const assigned_pool = assigned.value_pool orelse self.eval_pool;
+                        if (!Value.eql_cross_pool(
+                            assigned.value,
+                            assigned_pool,
+                            source_state.values[unchanged.var_index],
+                            source_pool,
+                        )) return;
+                        current_steps = rest;
+                        continue;
+                    }
                     current_ctx = try self.evaluator.extend_state_context_from_pool(
                         current_ctx,
                         unchanged.var_name,
@@ -1850,70 +2398,150 @@ pub const ActionExecutor = struct {
         ctx: Context,
         s0: ?*StateStore.State,
     ) !bool {
-        switch (fairness.action.*) {
+        if (!try self.fairness_action_marker_matches(
+            marker,
+            fairness.action,
+            fairness.bindings,
+            ctx,
+            s0,
+            0,
+        )) return false;
+        return try self.fairness_bindings_match(fairness.bindings, ctx);
+    }
+
+    fn fairness_action_marker_matches(
+        self: *const ActionExecutor,
+        marker: MarkAction,
+        fairness_action: *ast.Expr,
+        bindings: []const FairnessBinding,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        depth: u8,
+    ) !bool {
+        if (depth == 64) return Error.NotImplemented;
+        switch (fairness_action.*) {
             .ident => |name| {
-                if (!std.mem.eql(u8, marker.name, name)) return false;
-                if (marker.args.len != 0) return false;
+                if (std.mem.eql(u8, marker.name, name)) {
+                    return marker.args.len == 0;
+                }
+                const definition = self.evaluator.find_definition(name) orelse
+                    return false;
+                if (definition.params.len != 0) return false;
+                return self.fairness_action_marker_matches(
+                    marker,
+                    definition.body,
+                    bindings,
+                    ctx,
+                    s0,
+                    depth + 1,
+                );
             },
             .apply => |ap| {
                 if (ap.func.* != .ident) return false;
-                if (!std.mem.eql(u8, marker.name, ap.func.*.ident)) {
-                    return false;
+                if (std.mem.eql(u8, marker.name, ap.func.*.ident) and
+                    marker.args.len == ap.args.len)
+                {
+                    var i: usize = 0;
+                    while (i < marker.args.len) : (i += 1) {
+                        const actual = try self.eval_compiled_expr(
+                            marker.args[i],
+                            ctx,
+                            s0,
+                        );
+                        const expected = try self.eval_fairness_arg(
+                            ap.args[i],
+                            bindings,
+                            ctx,
+                            s0,
+                        );
+                        if (!Value.eql_cross_pool(
+                            actual,
+                            self.eval_pool,
+                            expected.value,
+                            expected.pool,
+                        )) return false;
+                    }
+                    return true;
                 }
-                if (marker.args.len != ap.args.len) return false;
-                var i: usize = 0;
-                while (i < marker.args.len) : (i += 1) {
-                    const actual = try self.eval_compiled_expr(
-                        marker.args[i],
-                        ctx,
-                        s0,
-                    );
-                    const expected = try self.eval_fairness_arg(
-                        ap.args[i],
-                        fairness.bindings,
-                    );
-                    if (!Value.eql_cross_pool(
-                        actual,
-                        self.eval_pool,
-                        expected,
-                        self.eval_pool,
-                    )) return false;
-                }
+                return false;
+            },
+            .quantifier => |quantifier| {
+                if (quantifier.kind != .exists) return false;
+                return self.fairness_action_marker_matches(
+                    marker,
+                    quantifier.body,
+                    bindings,
+                    ctx,
+                    s0,
+                    depth + 1,
+                );
+            },
+            .binary => |binary| {
+                if (binary.op != .or_op) return false;
+                return try self.fairness_action_marker_matches(
+                    marker,
+                    binary.left,
+                    bindings,
+                    ctx,
+                    s0,
+                    depth + 1,
+                ) or try self.fairness_action_marker_matches(
+                    marker,
+                    binary.right,
+                    bindings,
+                    ctx,
+                    s0,
+                    depth + 1,
+                );
             },
             else => return false,
         }
-        return try self.fairness_bindings_match(fairness.bindings, ctx);
     }
 
     fn eval_fairness_arg(
         self: *const ActionExecutor,
         expr: *ast.Expr,
         bindings: []const FairnessBinding,
-    ) !Value {
+        ctx: Context,
+        s0: ?*StateStore.State,
+    ) !struct { value: Value, pool: *const ValuePool } {
         if (expr.* == .ident) {
             for (bindings) |binding| {
                 if (std.mem.eql(u8, expr.*.ident, binding.name)) {
-                    return binding.value;
+                    return .{
+                        .value = binding.value,
+                        .pool = &self.source_state_store.values_pool,
+                    };
                 }
+            }
+            if (try ctx.lookup_value(expr.*.ident, self.eval_pool)) |local| {
+                return .{ .value = local, .pool = self.eval_pool };
             }
         }
         const context_snapshot = self.evaluator.context_snapshot();
         defer self.evaluator.restore_context_pool(context_snapshot);
-        var fairness_ctx = Context.empty();
+        var fairness_ctx = ctx;
         for (bindings) |binding| {
+            const local_value = try binding.value.clone(
+                &self.source_state_store.values_pool,
+                self.eval_pool,
+            );
             fairness_ctx = try self.evaluator.extend_context(
                 fairness_ctx,
                 binding.name,
-                binding.value,
+                local_value,
             );
         }
-        return self.evaluator.eval_expr(
-            expr,
-            fairness_ctx,
-            null,
-            self.eval_pool,
-            &self.source_state_store.values_pool,
-        );
+        return .{
+            .value = try self.evaluator.eval_expr(
+                expr,
+                fairness_ctx,
+                s0,
+                self.eval_pool,
+                &self.source_state_store.values_pool,
+            ),
+            .pool = self.eval_pool,
+        };
     }
 
     fn fairness_bindings_match(
@@ -1928,7 +2556,7 @@ pub const ActionExecutor = struct {
                 actual,
                 self.eval_pool,
                 binding.value,
-                self.eval_pool,
+                &self.source_state_store.values_pool,
             )) return false;
         }
         return true;
@@ -1943,6 +2571,10 @@ pub const ActionExecutor = struct {
         action_mask: u64,
     ) !void {
         _ = is_init;
+        if (self.enabled_probe) |probe| {
+            probe.* = true;
+            return;
+        }
         const new_idx = try self.candidate_store.alloc_state();
         const new_state = self.candidate_store.get(new_idx);
         if (s0) |parent| {
@@ -2037,3 +2669,40 @@ pub const ActionExecutor = struct {
         try out_states.append(new_idx);
     }
 };
+
+test "action inlining avoids capture by nested function binders" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+
+    const node_domain = try arena.alloc_object(ast.Expr);
+    node_domain.* = .{ .ident = "Node" };
+    const prospect = try arena.alloc_object(ast.Expr);
+    prospect.* = .{ .ident = "prospect" };
+    const function_literal = try arena.alloc_object(ast.FunctionLiteral);
+    function_literal.* = .{
+        .vars = &.{.{ .name = "n", .domain = node_domain }},
+        .body = prospect,
+    };
+    const expression = try arena.alloc_object(ast.Expr);
+    expression.* = .{ .function_literal = function_literal };
+    const argument = try arena.alloc_object(ast.Expr);
+    argument.* = .{ .ident = "n" };
+
+    const inlined = try inline_expr(
+        &arena,
+        expression,
+        &.{"prospect"},
+        &.{argument},
+    );
+    try std.testing.expect(inlined.* == .function_literal);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        inlined.function_literal.vars[0].name,
+        "n",
+    ));
+    try std.testing.expect(inlined.function_literal.body.* == .ident);
+    try std.testing.expectEqualStrings(
+        "n",
+        inlined.function_literal.body.ident,
+    );
+}

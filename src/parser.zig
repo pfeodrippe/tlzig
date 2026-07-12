@@ -699,6 +699,9 @@ pub const Parser = struct {
                     self.current.line == self.next.line)
                 {
                     const assumption = try self.parse_definition();
+                    // A named assumption introduces an operator name that can
+                    // be referenced by later assumptions and definitions.
+                    try definitions.append(std.heap.page_allocator, assumption);
                     try assumptions.append(std.heap.page_allocator, assumption.body);
                 } else {
                     // ASSUME can have labels (e.g. ASSUME Theorem!: body).
@@ -937,15 +940,32 @@ pub const Parser = struct {
                         try self.dup(try self.expect_ident_text()),
                     );
                     binder_vars = 1;
+                    while (self.current.kind == .comma and
+                        self.next.kind == .ident)
+                    {
+                        self.advance();
+                        try function_vars.append(
+                            std.heap.page_allocator,
+                            try self.dup(try self.expect_ident_text()),
+                        );
+                        binder_vars += 1;
+                    }
                 }
                 std.debug.assert(binder_vars > 0);
                 try self.expect(.in);
                 const binder_domain = try self.parse_expr();
-                function_domain = if (function_domain) |domain|
-                    try self.expr_set_binary(.cartesian_op, domain, binder_domain)
-                else
-                    binder_domain;
-                binder_count += 1;
+                var binder_index: u32 = 0;
+                while (binder_index < binder_vars) : (binder_index += 1) {
+                    function_domain = if (function_domain) |domain|
+                        try self.expr_set_binary(
+                            .cartesian_op,
+                            domain,
+                            binder_domain,
+                        )
+                    else
+                        binder_domain;
+                    binder_count += 1;
+                }
                 if (!self.match(.comma)) break;
             }
             std.debug.assert(function_vars.items.len > 0);
@@ -1079,6 +1099,7 @@ pub const Parser = struct {
             .range, .concat,   .ooverride, .recordto, .cartesian, .le,
             .ge,    .lt,       .gt,        .eq,       .neq,       .in,
             .notin, .subseteq, .leads_to,  .cup,      .cap,       .setminus,
+            .or_op,
         };
         for (single_op_kinds) |kind| {
             if (self.current.kind == kind and (self.next.kind == .ident or self.next.kind == .underscore)) {
@@ -1088,7 +1109,7 @@ pub const Parser = struct {
             }
         }
         // Double-character operators such as `++`, `--`, `**`, `//`, `%%`.
-        const double_op_kinds = [_]Token.Kind{ .plus, .minus, .star, .slash, .percent };
+        const double_op_kinds = [_]Token.Kind{ .plus, .minus, .star, .slash, .percent, .power };
         for (double_op_kinds) |kind| {
             if (self.current.kind == kind and self.next.kind == kind) {
                 self.advance();
@@ -1100,6 +1121,7 @@ pub const Parser = struct {
                     .star => '*',
                     .slash => '/',
                     .percent => '%',
+                    .power => '^',
                     else => unreachable,
                 };
                 text[1] = text[0];
@@ -1155,7 +1177,14 @@ pub const Parser = struct {
             self.advance();
             return try self.dup(name);
         }
-        const double_op_kinds = [_]Token.Kind{ .plus, .minus, .star, .slash, .percent };
+        if (self.current.kind == .or_op and
+            std.mem.eql(u8, self.current.text, "|") and
+            self.current.col > 1 and self.current.col > self.def_col)
+        {
+            self.advance();
+            return try self.dup("|");
+        }
+        const double_op_kinds = [_]Token.Kind{ .plus, .minus, .star, .slash, .percent, .power };
         for (double_op_kinds) |kind| {
             if (self.current.kind == kind and self.next.kind == kind and
                 self.current.col > 1 and self.current.col > self.def_col)
@@ -1178,6 +1207,7 @@ pub const Parser = struct {
                     .star => '*',
                     .slash => '/',
                     .percent => '%',
+                    .power => '^',
                     else => unreachable,
                 };
                 text[1] = text[0];
@@ -1628,6 +1658,23 @@ pub const Parser = struct {
             },
             .ident => {
                 const name = try self.parse_qualified_ident_name();
+                if ((std.mem.eql(u8, name, "WF_") or
+                    std.mem.eql(u8, name, "SF_")) and
+                    self.current.kind == .langle)
+                {
+                    const fairness_operator = try self.expr_ident(name);
+                    const vars = try self.parse_tuple();
+                    try self.expect(.lparen);
+                    const args = try self.parse_expr_list(.rparen);
+                    if (args.len != 1) return error.SyntaxError;
+                    const subscript_args = try self.arena.alloc(*ast.Expr, 1);
+                    subscript_args[0] = vars;
+                    const subscripted = try self.expr_apply(
+                        fairness_operator,
+                        subscript_args,
+                    );
+                    return try self.expr_apply(subscripted, args);
+                }
                 var expr = try self.expr_ident(name);
                 if (self.match(.prime)) {
                     expr = try self.expr_primed(name);
@@ -2190,6 +2237,7 @@ pub const Parser = struct {
         defer tuple_names.deinit(std.heap.page_allocator);
         var tuple_vars = std.ArrayList([]const u8).empty;
         defer tuple_vars.deinit(std.heap.page_allocator);
+        var consumed_colon = false;
         while (true) {
             if (self.match(.langle)) {
                 var names = std.ArrayList([]const u8).empty;
@@ -2218,6 +2266,19 @@ pub const Parser = struct {
                 try names.append(std.heap.page_allocator, try self.dup(name));
                 if (!self.match(.comma)) break;
             }
+            if (self.match(.colon)) {
+                const unbounded_domain = try self.expr_ident(
+                    "__tlzig_unbounded_domain",
+                );
+                for (names.items) |name| {
+                    try vars.append(std.heap.page_allocator, .{
+                        .name = name,
+                        .domain = unbounded_domain,
+                    });
+                }
+                consumed_colon = true;
+                break;
+            }
             try self.expect(.in);
             const domain = try self.parse_expr();
             for (names.items) |name| {
@@ -2225,7 +2286,7 @@ pub const Parser = struct {
             }
             if (!self.match(.comma)) break;
         }
-        try self.expect(.colon);
+        if (!consumed_colon) try self.expect(.colon);
         var body = try self.parse_expr();
         if (tuple_vars.items.len > 0) {
             var defs = std.ArrayList(ast.Definition).empty;
@@ -2260,6 +2321,17 @@ pub const Parser = struct {
         defer defs.deinit(std.heap.page_allocator);
         while (true) {
             if (self.current.kind == .keyword_in) break;
+            if (self.current.kind == .ident and
+                std.mem.eql(u8, self.current.text, "RECURSIVE"))
+            {
+                const declaration_line = self.current.line;
+                while (self.current.kind != .eof and
+                    self.current.line == declaration_line)
+                {
+                    self.advance();
+                }
+                continue;
+            }
             if (self.current.kind == .ident and self.next.kind == .defeq) {
                 const saved = self.*;
                 const alias = self.current.text;

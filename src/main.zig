@@ -6,6 +6,17 @@ const config = tlzig.config;
 const checker = tlzig.checker;
 const codegen = tlzig.codegen;
 const generated_model = @import("generated_model");
+
+comptime {
+    if (!@hasDecl(generated_model, "abi_version")) {
+        @compileError("generated model is stale; regenerate it with tlzig --emit-zig");
+    }
+    if (generated_model.abi_version !=
+        tlzig.generated_runtime.generated_model_abi_version)
+    {
+        @compileError("generated model ABI mismatch; regenerate it with tlzig --emit-zig");
+    }
+}
 const ModuleLoader = tlzig.ModuleLoader;
 const overrides = tlzig.overrides;
 
@@ -142,6 +153,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         .max_nat = max_nat,
         .min_int = min_int,
         .max_int = max_int,
+        .environ = init.environ,
     };
 
     if (unlimited_memory) {
@@ -299,12 +311,17 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     const eval_value_cap: u32 = 1_048_576;
     const eval_string_cap: u32 = 65_536;
+    const effective_values_per_state = if (unlimited_memory)
+        @max(state_values_per_state, 160)
+    else
+        state_values_per_state;
+    const canonical_value_budget = arena_bytes / 2 / @sizeOf(tlzig.value.Value);
     const state_value_cap = cap_u32(@min(
         @max(
-            @as(u64, max_states) * state_values_per_state,
+            @as(u64, max_states) * effective_values_per_state,
             1_000_000,
         ),
-        192_000_000,
+        @min(192_000_000, canonical_value_budget),
     ));
     const state_string_cap = cap_u32(@min(
         @max(@as(u64, max_states) * 4, 500_000),
@@ -339,6 +356,12 @@ pub fn main(init: std.process.Init.Minimal) void {
             std.debug.print(" -- context: {s} {s}", .{ ctx, ch.evaluator.err_ctx.detail orelse "" });
         }
         if (err == error.OutOfMemory) {
+            const state_values_remaining =
+                ch.state_store.values_pool.value_cap -
+                ch.state_store.values_pool.value_count;
+            if (state_values_remaining < 4096) {
+                std.debug.print(" -- CanonicalStorageExhausted", .{});
+            }
             std.debug.print(
                 " -- state-pool values={d}/{d} strings={d}/{d}",
                 .{

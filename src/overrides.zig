@@ -4,6 +4,7 @@ const value = @import("value.zig");
 const Value = value.Value;
 const ValuePool = value.ValuePool;
 const Error = @import("err.zig").Error;
+const fingerprint = @import("fingerprint.zig");
 const generated_runtime = @import("generated_runtime.zig");
 
 pub const OverrideContext = struct {
@@ -11,6 +12,7 @@ pub const OverrideContext = struct {
     max_nat: i64,
     min_int: i64,
     max_int: i64,
+    environ: ?std.process.Environ = null,
 
     pub fn default() OverrideContext {
         return .{
@@ -100,6 +102,50 @@ pub fn default_registry(ctx: OverrideContext) Registry {
     };
 }
 
+pub fn io_env(ctx: OverrideContext, pool: *ValuePool) Error!Value {
+    const environ = ctx.environ orelse return empty_function(pool);
+    var map = environ.createMap(std.heap.page_allocator) catch
+        return Error.OutOfMemory;
+    defer map.deinit();
+
+    const keys = map.keys();
+    const entries = map.values();
+    assert(keys.len == entries.len);
+    if (keys.len > std.math.maxInt(u32)) return Error.OutOfMemory;
+    const count: u32 = @intCast(keys.len);
+    const domain_offset = value_offset(
+        pool,
+        (try pool.alloc_values(count)).ptr,
+    );
+    const entry_offset = value_offset(
+        pool,
+        (try pool.alloc_values(count)).ptr,
+    );
+    for (keys, entries, 0..) |key, entry, index| {
+        pool.values[domain_offset + index] = .{
+            .string_v = try pool.push_string(key),
+        };
+        pool.values[entry_offset + index] = .{
+            .string_v = try pool.push_string(entry),
+        };
+    }
+    return .{ .function_v = .{
+        .domain = .{ .offset = domain_offset, .len = count },
+        .offset = entry_offset,
+        .len = count,
+    } };
+}
+
+pub fn atoi(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
+    if (args.len != 1 or args[0] != .string_v) return Error.TypeError;
+    const parsed = std.fmt.parseInt(
+        i64,
+        args[0].string_v.slice(pool),
+        10,
+    ) catch return Error.TypeError;
+    return .{ .int_v = parsed };
+}
+
 const default_overrides = [_]OverrideEntry{
     .{ .name = "\\o", .func = sequence_concat_entry },
     .{ .name = "@@", .func = ooverride_entry },
@@ -166,6 +212,14 @@ fn recordto_entry(
 const default_value_overrides = [_]ValueOverrideEntry{
     .{ .name = "BOOLEAN", .func = boolean_set },
 };
+
+fn empty_function(pool: *ValuePool) Value {
+    return .{ .function_v = .{
+        .domain = .{ .offset = pool.value_count, .len = 0 },
+        .offset = pool.value_count,
+        .len = 0,
+    } };
+}
 
 fn cardinality(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
@@ -878,10 +932,17 @@ fn next_permutation(order: []usize) bool {
 fn random_element(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
     if (args.len != 1) return Error.TypeError;
     const s = args[0];
-    if (s != .set_v) return Error.TypeError;
+    if (s != .set_v) {
+        // The evaluator catches NotImplemented from a built-in and retries
+        // after materializing symbolic set-like arguments.
+        return if (s.is_set_like()) Error.NotImplemented else Error.TypeError;
+    }
     const items = s.set_v.items(pool);
     if (items.len == 0) return Error.EmptyChoose;
-    return items[0];
+    const hash = fingerprint.hash_value_unseeded(pool, s);
+    const index: usize = @intCast(hash % items.len);
+    assert(index < items.len);
+    return items[index];
 }
 
 fn to_string(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
@@ -897,7 +958,7 @@ fn tlc_get(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Valu
     if (args.len == 1 and args[0] == .string_v) {
         const key = args[0].string_v.slice(pool);
         if (std.mem.eql(u8, key, "config")) {
-            const fields = try pool.alloc_values(2);
+            const fields = try pool.alloc_values(4);
             const fields_offset = value_offset(pool, fields.ptr);
             fields[0] = Value{
                 .string_v = try pool.push_string("mode"),
@@ -905,8 +966,12 @@ fn tlc_get(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Valu
             fields[1] = Value{
                 .string_v = try pool.push_string("bfs"),
             };
+            fields[2] = Value{
+                .string_v = try pool.push_string("worker"),
+            };
+            fields[3] = Value{ .int_v = 1 };
             return Value{
-                .record_v = .{ .offset = fields_offset, .len = 1 },
+                .record_v = .{ .offset = fields_offset, .len = 2 },
             };
         }
         if (std.mem.eql(

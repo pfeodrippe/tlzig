@@ -1,11 +1,14 @@
 const std = @import("std");
 const Value = @import("value.zig").Value;
 const ValuePool = @import("value.zig").ValuePool;
+const ModelTable = @import("value.zig").ModelTable;
 const Set = @import("value.zig").Set;
 const BinarySet = @import("value.zig").BinarySet;
 const Function = @import("value.zig").Function;
 const State = @import("state.zig").StateStore.State;
 const Error = @import("err.zig").Error;
+
+pub const generated_model_abi_version: u32 = 1;
 
 pub const NamedValue = struct {
     name: []const u8,
@@ -19,6 +22,23 @@ pub const CallContext = struct {
         []const u8,
         []const Value,
     ) Error!Value;
+    pub const CachedCall = *const fn (
+        *const anyopaque,
+        []const u8,
+        []const Value,
+        *ValuePool,
+        ?*State,
+        ?*State,
+    ) Error!?Value;
+    pub const PutCachedCall = *const fn (
+        *const anyopaque,
+        []const u8,
+        []const Value,
+        Value,
+        *ValuePool,
+        ?*State,
+        ?*State,
+    ) Error!void;
 
     eval_pool: *ValuePool,
     state_pool: *ValuePool,
@@ -32,10 +52,52 @@ pub const CallContext = struct {
     constant_slots: []const ?Value,
     generated_cache: []?Value,
     generated_cache_pool: *ValuePool,
+    models: *const ModelTable,
+    memo_context: ?*const anyopaque = null,
+    cached_call: ?CachedCall = null,
+    put_cached_call: ?PutCachedCall = null,
     native_context: *const anyopaque,
     native_call: NativeCall,
     max_seq_len: u32,
 };
+
+pub fn cached_recursive_call(
+    context: *CallContext,
+    name: []const u8,
+    args: []const Value,
+) Error!?Value {
+    const callback = context.cached_call orelse return null;
+    return callback(
+        context.memo_context orelse return null,
+        name,
+        args,
+        context.eval_pool,
+        context.state,
+        context.next_state,
+    );
+}
+
+pub fn put_cached_recursive_call(
+    context: *CallContext,
+    name: []const u8,
+    args: []const Value,
+    result: Value,
+) Error!Value {
+    if (context.put_cached_call) |callback| {
+        if (context.memo_context) |memo_context| {
+            try callback(
+                memo_context,
+                name,
+                args,
+                result,
+                context.eval_pool,
+                context.state,
+                context.next_state,
+            );
+        }
+    }
+    return result;
+}
 
 pub const OperatorFn = *const fn (*CallContext, []const Value) Error!Value;
 pub const OperatorBoolFn = *const fn (*CallContext, []const Value) Error!bool;
@@ -499,8 +561,20 @@ pub fn call(
             combined[0 .. captured.len + args.len],
         );
     }
-    if (args.len != 1) return Error.TypeError;
-    return apply(context, function, args[0]);
+    if (args.len == 1) return apply(context, function, args[0]);
+    if (args.len > 1 and function == .function_v) {
+        return apply(context, function, try tuple(context, args));
+    }
+    return Error.TypeError;
+}
+
+pub inline fn force(context: *CallContext, value: Value) Error!Value {
+    if (value != .generated_operator_v or
+        value.generated_operator_v.arity != 0)
+    {
+        return value;
+    }
+    return call(context, value, &.{});
 }
 
 pub fn string(context: *CallContext, bytes: []const u8) Error!Value {
@@ -2076,6 +2150,11 @@ pub fn set_union(
     left: Value,
     right: Value,
 ) Error!Value {
+    if (contains_unmaterializable_range(context, left, 0) or
+        contains_unmaterializable_range(context, right, 0))
+    {
+        return binary_set(context, left, right, .cup);
+    }
     return materialize_binary_set(context, left, right, .cup);
 }
 
@@ -2084,6 +2163,11 @@ pub fn set_intersection(
     left: Value,
     right: Value,
 ) Error!Value {
+    if (contains_unmaterializable_range(context, left, 0) or
+        contains_unmaterializable_range(context, right, 0))
+    {
+        return binary_set(context, left, right, .cap);
+    }
     return materialize_binary_set(context, left, right, .cap);
 }
 
@@ -2092,7 +2176,45 @@ pub fn set_difference(
     left: Value,
     right: Value,
 ) Error!Value {
+    if (contains_unmaterializable_range(context, left, 0) or
+        contains_unmaterializable_range(context, right, 0))
+    {
+        return binary_set(context, left, right, .diff);
+    }
     return materialize_binary_set(context, left, right, .diff);
+}
+
+fn contains_unmaterializable_range(
+    context: *const CallContext,
+    value: Value,
+    depth: u8,
+) bool {
+    if (depth >= 64) return true;
+    return switch (value) {
+        .range_v => |range_value| blk: {
+            if (range_value.hi < range_value.lo) break :blk false;
+            const length = @as(i128, range_value.hi) -
+                @as(i128, range_value.lo) + 1;
+            break :blk length > std.math.maxInt(u32);
+        },
+        .cup_v, .cap_v, .diff_v => |binary| blk: {
+            break :blk contains_unmaterializable_range(
+                context,
+                binary.left(context.eval_pool),
+                depth + 1,
+            ) or contains_unmaterializable_range(
+                context,
+                binary.right(context.eval_pool),
+                depth + 1,
+            );
+        },
+        .union_v => |union_value| contains_unmaterializable_range(
+            context,
+            union_value.set(context.eval_pool),
+            depth + 1,
+        ),
+        else => false,
+    };
 }
 
 pub fn sequence_set(
@@ -3141,7 +3263,11 @@ pub fn constant_function(
     domain_value: Value,
     result_value: Value,
 ) Error!Value {
-    const function_domain: Set = switch (domain_value) {
+    const materialized_domain = try iterable_for_iteration(
+        context,
+        domain_value,
+    );
+    const function_domain: Set = switch (materialized_domain) {
         .set_v => |set_value| set_value,
         .range_v => |range_value| blk: {
             if (range_value.hi < range_value.lo) {
@@ -3784,6 +3910,51 @@ pub fn function_map(
     } };
 }
 
+pub fn function_map_multi(
+    context: *CallContext,
+    operator_args: []const Value,
+    domain_value: Value,
+    arity: u16,
+    mapper: OperatorFn,
+) Error!Value {
+    if (arity < 2) return Error.TypeError;
+    if (arity > 64) return Error.NotImplemented;
+    const iterable = try iterable_for_iteration(context, domain_value);
+    const count = try iterable_count(iterable);
+    const keys = try context.eval_pool.alloc_values(count);
+    const keys_offset = value_offset(context.eval_pool, keys.ptr);
+    const entries = try context.eval_pool.alloc_values(count);
+    const entries_offset = value_offset(context.eval_pool, entries.ptr);
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const key = try iterable_value(context, iterable, index);
+        if (key != .tuple_v or key.tuple_v.len != arity) {
+            return Error.TypeError;
+        }
+        context.eval_pool.values[keys_offset + index] = key;
+        var bound_args: [64]Value = undefined;
+        @memcpy(
+            bound_args[0..arity],
+            key.tuple_v.items(context.eval_pool),
+        );
+        const entry = try call_bound(
+            context,
+            operator_args,
+            bound_args[0..arity],
+            mapper,
+        );
+        context.eval_pool.values[entries_offset + index] = entry;
+    }
+    return .{ .function_v = .{
+        .domain = .{
+            .offset = keys_offset,
+            .len = count,
+        },
+        .offset = entries_offset,
+        .len = count,
+    } };
+}
+
 pub fn let_expression(
     context: *CallContext,
     operator_args: []const Value,
@@ -3797,16 +3968,12 @@ pub fn let_expression(
     @memcpy(values[0..operator_args.len], operator_args);
     for (definitions, 0..) |definition, index| {
         const captures = values[0 .. operator_args.len + index];
-        values[operator_args.len + index] =
-            if (definition.arity == 0)
-                try definition.function(context, captures)
-            else
-                try operator(
-                    context,
-                    definition.function,
-                    definition.arity,
-                    captures,
-                );
+        values[operator_args.len + index] = try operator(
+            context,
+            definition.function,
+            definition.arity,
+            captures,
+        );
     }
     return body(
         context,
@@ -3823,6 +3990,7 @@ pub fn choose(
 ) Error!Value {
     const iterable = try iterable_for_iteration(context, domain_value);
     const count = try iterable_count(iterable);
+    var chosen: ?Value = null;
     var index: u32 = 0;
     while (index < count) : (index += 1) {
         const candidate = try iterable_value(context, iterable, index);
@@ -3831,8 +3999,19 @@ pub fn choose(
             operator_args,
             &.{candidate},
             predicate,
-        ))) return candidate;
+        ))) {
+            if (chosen == null) {
+                chosen = candidate;
+            } else if (compare_choose_values(
+                context,
+                candidate,
+                chosen.?,
+            )) |comparison| {
+                if (comparison < 0) chosen = candidate;
+            }
+        }
     }
+    if (chosen) |value| return value;
     std.debug.print(
         "generated CHOOSE empty: expression={d} args={any} domain={d}\n",
         .{ source_identity, operator_args, count },
@@ -3862,6 +4041,43 @@ pub fn choose(
         }
     }
     return Error.EmptyChoose;
+}
+
+fn compare_choose_values(
+    context: *const CallContext,
+    left: Value,
+    right: Value,
+) ?i8 {
+    if (left == .model_v) {
+        if (right != .model_v) return -1;
+        return switch (std.mem.order(
+            u8,
+            context.models.get_name(left.model_v),
+            context.models.get_name(right.model_v),
+        )) {
+            .lt => -1,
+            .eq => 0,
+            .gt => 1,
+        };
+    }
+    if (right == .model_v) return 1;
+    if (left == .tuple_v and right == .tuple_v) {
+        const left_items = left.tuple_v.items(context.eval_pool);
+        const right_items = right.tuple_v.items(context.eval_pool);
+        if (left_items.len != right_items.len) {
+            return if (left_items.len < right_items.len) -1 else 1;
+        }
+        for (left_items, right_items) |left_item, right_item| {
+            const comparison = compare_choose_values(
+                context,
+                left_item,
+                right_item,
+            ) orelse return null;
+            if (comparison != 0) return comparison;
+        }
+        return 0;
+    }
+    return left.compare(right, context.eval_pool);
 }
 
 pub fn reduce_sequence(
@@ -4037,7 +4253,11 @@ pub fn subset_equal(
     if (!left.is_set_like() or !right.is_set_like()) {
         return Error.TypeError;
     }
-    switch (left) {
+    const enumerable_left = switch (left) {
+        .set_v, .range_v => left,
+        else => try materialize_iterable(context, left),
+    };
+    switch (enumerable_left) {
         .set_v => |left_set| {
             for (left_set.items(context.eval_pool)) |item| {
                 if (!right.member(context.eval_pool, item)) {
@@ -4793,6 +5013,7 @@ test "generated finite values use only the value pool" {
     var arena = try Arena.init(1024 * 1024);
     defer arena.deinit();
     var pool = try ValuePool.init(&arena, 256, 256);
+    var models = try ModelTable.init(&arena, 16);
     var generated_cache = [_]?Value{};
     var context = CallContext{
         .eval_pool = &pool,
@@ -4807,6 +5028,7 @@ test "generated finite values use only the value pool" {
         .constant_slots = &.{},
         .generated_cache = &generated_cache,
         .generated_cache_pool = &pool,
+        .models = &models,
         .native_context = undefined,
         .native_call = test_native_call,
         .max_seq_len = 5,
@@ -4857,6 +5079,7 @@ test "generated finite values use only the value pool" {
     var source_arena = try Arena.init(1024 * 1024);
     defer source_arena.deinit();
     var source_pool = try ValuePool.init(&source_arena, 256, 256);
+    var source_models = try ModelTable.init(&source_arena, 16);
     var source_generated_cache = [_]?Value{};
     var source_context = CallContext{
         .eval_pool = &source_pool,
@@ -4871,6 +5094,7 @@ test "generated finite values use only the value pool" {
         .constant_slots = &.{},
         .generated_cache = &source_generated_cache,
         .generated_cache_pool = &source_pool,
+        .models = &source_models,
         .native_context = undefined,
         .native_call = test_native_call,
         .max_seq_len = 5,
@@ -5024,6 +5248,32 @@ test "generated finite values use only the value pool" {
     try std.testing.expectEqual(
         @as(i64, 9),
         (try field(&context, overridden_record, "field")).int_v,
+    );
+
+    const z_model = Value{ .model_v = try models.intern("z") };
+    const a_model = Value{ .model_v = try models.intern("a") };
+    const z_tuple = try tuple(&context, &.{ z_model, .{ .int_v = 1 } });
+    const a_tuple = try tuple(&context, &.{ a_model, .{ .int_v = 1 } });
+    const forward_domain = try set(&context, &.{ z_tuple, a_tuple });
+    const reverse_domain = try set(&context, &.{ a_tuple, z_tuple });
+    const forward_choice = try choose(
+        &context,
+        &.{},
+        forward_domain,
+        always_true_predicate,
+        1,
+    );
+    const reverse_choice = try choose(
+        &context,
+        &.{},
+        reverse_domain,
+        always_true_predicate,
+        2,
+    );
+    try std.testing.expect(forward_choice.eql(reverse_choice, &pool));
+    try std.testing.expectEqual(
+        a_model.model_v,
+        forward_choice.tuple_v.items(&pool)[0].model_v,
     );
 }
 

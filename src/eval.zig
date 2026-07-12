@@ -15,16 +15,42 @@ const Error = @import("err.zig").Error;
 const ModelTable = value.ModelTable;
 const overrides = @import("overrides.zig");
 const generated_runtime = @import("generated_runtime.zig");
+const codegen = @import("codegen.zig");
 
 pub const Constant = generated_runtime.NamedValue;
 
 pub const Context = struct {
     head: ?*const ContextBinding,
     state_head: ?*const ContextBinding,
-    len: u8,
+    local_floor: ?*const ContextBinding,
+    len: u16,
 
     pub fn empty() Context {
-        return .{ .head = null, .state_head = null, .len = 0 };
+        return .{
+            .head = null,
+            .state_head = null,
+            .local_floor = null,
+            .len = 0,
+        };
+    }
+
+    pub fn operator_frame(self: Context) Context {
+        return .{
+            .head = self.head,
+            .state_head = self.state_head,
+            .local_floor = self.head,
+            .len = 0,
+        };
+    }
+
+    pub fn restore_locals(self: Context, state_head: ?*const ContextBinding) Context {
+        if (state_head) |binding| assert(binding.variable_index != null);
+        return .{
+            .head = self.head,
+            .state_head = state_head,
+            .local_floor = self.local_floor,
+            .len = self.len,
+        };
     }
 
     pub fn lookup(self: Context, name: []const u8) ?Value {
@@ -49,6 +75,7 @@ pub const Context = struct {
     ) Error!?Value {
         var binding = self.head;
         while (binding) |current| : (binding = current.parent) {
+            if (current == self.local_floor) break;
             if (current.variable_index != null) continue;
             if (!name_eql(current.name, name)) continue;
             const source_pool = current.value_pool orelse return current.value;
@@ -60,6 +87,7 @@ pub const Context = struct {
     pub fn has_local_binding(self: Context, name: []const u8) bool {
         var binding = self.head;
         while (binding) |current| : (binding = current.parent) {
+            if (current == self.local_floor) break;
             if (current.variable_index != null) continue;
             if (name_eql(current.name, name)) return true;
         }
@@ -98,6 +126,26 @@ pub const Context = struct {
         );
     }
 
+    pub fn lookup_required_values_if_available(
+        self: Context,
+        names: []const []const u8,
+        required: []const bool,
+        values: []Value,
+        eval_pool: *ValuePool,
+    ) Error!bool {
+        _ = self.lookup_values_internal(
+            names,
+            required,
+            values,
+            eval_pool,
+            false,
+        ) catch |err| switch (err) {
+            Error.UndefinedSymbol => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     fn lookup_values_internal(
         self: Context,
         names: []const []const u8,
@@ -120,6 +168,27 @@ pub const Context = struct {
         var found_count: usize = 0;
         var binding = self.head;
         while (binding) |current| : (binding = current.parent) {
+            if (current == self.local_floor) break;
+            var index: usize = 0;
+            while (index < names.len) : (index += 1) {
+                if (found[index]) continue;
+                if (!name_eql(current.name, names[index])) continue;
+                found[index] = true;
+                found_count += 1;
+                if (current.value_pool) |source_pool| {
+                    values[index] = try current.value.clone(
+                        source_pool,
+                        eval_pool,
+                    );
+                } else {
+                    values[index] = current.value;
+                }
+                if (found_count == names.len) return true;
+                break;
+            }
+        }
+        binding = self.state_head;
+        while (binding) |current| : (binding = current.state_parent) {
             var index: usize = 0;
             while (index < names.len) : (index += 1) {
                 if (found[index]) continue;
@@ -162,6 +231,7 @@ pub const Context = struct {
         while (index > 0) {
             index -= 1;
             const current = binding orelse return false;
+            if (current == self.local_floor) return false;
             if (!name_eql(current.name, names[index])) return false;
             if (current.value_pool) |source_pool| {
                 values[index] = try current.value.clone(
@@ -179,8 +249,14 @@ pub const Context = struct {
     fn lookup_binding(self: Context, name: []const u8) ?*const ContextBinding {
         var binding = self.head;
         while (binding) |current| {
+            if (current == self.local_floor) break;
             if (name_eql(current.name, name)) return current;
             binding = current.parent;
+        }
+        binding = self.state_head;
+        while (binding) |current| {
+            if (name_eql(current.name, name)) return current;
+            binding = current.state_parent;
         }
         return null;
     }
@@ -246,27 +322,83 @@ pub const AssignmentKind = enum {
 const ContextPool = struct {
     bindings: []ContextBinding,
     count: u32,
+    restore_floor: u32,
+    state_bindings: []ContextBinding,
+    state_count: u32,
+    state_restore_floor: u32,
+    pin_depth: u16,
 
     fn init(arena: *Arena) !ContextPool {
         return .{
             .bindings = try arena.alloc(ContextBinding, 131_072),
             .count = 0,
+            .restore_floor = 0,
+            .state_bindings = try arena.alloc(ContextBinding, 131_072),
+            .state_count = 0,
+            .state_restore_floor = 0,
+            .pin_depth = 0,
         };
     }
 
     fn reset(self: *ContextPool) void {
         assert(self.count <= self.bindings.len);
+        assert(self.state_count <= self.state_bindings.len);
         self.count = 0;
+        self.restore_floor = 0;
+        self.state_count = 0;
+        self.state_restore_floor = 0;
+        assert(self.pin_depth == 0);
     }
 
-    fn snapshot(self: *const ContextPool) u32 {
+    fn snapshot(self: *const ContextPool) u64 {
         assert(self.count <= self.bindings.len);
-        return self.count;
+        assert(self.state_count <= self.state_bindings.len);
+        return pack_counts(self.count, self.state_count);
     }
 
-    fn restore(self: *ContextPool, saved_count: u32) void {
-        assert(saved_count <= self.count);
-        self.count = saved_count;
+    fn restore(self: *ContextPool, mark: u64) void {
+        const saved_count: u32 = @truncate(mark);
+        const saved_state_count: u32 = @truncate(mark >> 32);
+        const local_target = @max(saved_count, self.restore_floor);
+        const state_target = @max(saved_state_count, self.state_restore_floor);
+        assert(local_target <= self.count);
+        assert(state_target <= self.state_count);
+        self.count = local_target;
+        self.state_count = state_target;
+    }
+
+    fn pin(self: *ContextPool) u64 {
+        assert(self.pin_depth < std.math.maxInt(u16));
+        const previous = pack_counts(
+            self.restore_floor,
+            self.state_restore_floor,
+        );
+        self.restore_floor = @max(self.restore_floor, self.count);
+        self.state_restore_floor = @max(
+            self.state_restore_floor,
+            self.state_count,
+        );
+        self.pin_depth += 1;
+        return previous;
+    }
+
+    fn unpin(self: *ContextPool, previous: u64) void {
+        assert(self.pin_depth > 0);
+        const previous_local: u32 = @truncate(previous);
+        const previous_state: u32 = @truncate(previous >> 32);
+        assert(previous_local <= self.restore_floor);
+        assert(previous_state <= self.state_restore_floor);
+        self.restore_floor = previous_local;
+        self.state_restore_floor = previous_state;
+        self.pin_depth -= 1;
+    }
+
+    fn can_reset_at_root(self: *const ContextPool) bool {
+        return self.pin_depth == 0;
+    }
+
+    fn pack_counts(local: u32, state_count: u32) u64 {
+        return @as(u64, state_count) << 32 | local;
     }
 
     fn extend(
@@ -278,11 +410,35 @@ const ContextPool = struct {
         value_pool: ?*const ValuePool,
         assignment: AssignmentKind,
     ) Error!Context {
-        assert(context.len < 32);
+        assert(context.len < std.math.maxInt(u16));
         assert((assignment == .local) == (variable_index == null));
-        if (self.count >= self.bindings.len) return Error.OutOfMemory;
-        const binding = &self.bindings[self.count];
-        self.count += 1;
+        const binding = if (variable_index != null) blk: {
+            if (self.state_count >= self.state_bindings.len) {
+                if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                    std.debug.print(
+                        "context state bindings exhausted: {d}/{d}\n",
+                        .{ self.state_count, self.state_bindings.len },
+                    );
+                }
+                return Error.OutOfMemory;
+            }
+            const state_binding = &self.state_bindings[self.state_count];
+            self.state_count += 1;
+            break :blk state_binding;
+        } else blk: {
+            if (self.count >= self.bindings.len) {
+                if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                    std.debug.print(
+                        "context local bindings exhausted: {d}/{d}\n",
+                        .{ self.count, self.bindings.len },
+                    );
+                }
+                return Error.OutOfMemory;
+            }
+            const local_binding = &self.bindings[self.count];
+            self.count += 1;
+            break :blk local_binding;
+        };
         binding.* = .{
             .parent = context.head,
             .state_parent = if (variable_index != null) context.state_head else null,
@@ -295,6 +451,7 @@ const ContextPool = struct {
         return .{
             .head = binding,
             .state_head = if (variable_index != null) binding else context.state_head,
+            .local_floor = context.local_floor,
             .len = context.len + 1,
         };
     }
@@ -350,7 +507,7 @@ const DefinitionMemo = struct {
     ) ?Value {
         if (self.pool != pool) return null;
         for (self.entries[0..self.count]) |entry| {
-            if (name_eql(entry.name, name)) return entry.value;
+            if (std.mem.eql(u8, entry.name, name)) return entry.value;
         }
         return null;
     }
@@ -369,6 +526,146 @@ const DefinitionMemo = struct {
     }
 };
 
+const CallMemoEntry = struct {
+    hash: fingerprint.Fingerprint,
+    name: []const u8,
+    args_offset: u32,
+    args_len: u16,
+    state_address: usize,
+    next_state_address: usize,
+    value: Value,
+};
+
+const StateCallMemo = struct {
+    const slot_count = 2048;
+
+    pool: ?*ValuePool = null,
+    count: u16 = 0,
+    entries: [1024]CallMemoEntry = undefined,
+    slots: [slot_count]u16 = @splat(0),
+
+    fn reset(self: *StateCallMemo, pool: ?*ValuePool) void {
+        self.pool = pool;
+        self.count = 0;
+        @memset(&self.slots, 0);
+    }
+
+    fn hash_call(
+        name: []const u8,
+        args: []const Value,
+        args_pool: *const ValuePool,
+        state_address: usize,
+        next_state_address: usize,
+    ) fingerprint.Fingerprint {
+        var hash = fingerprint.hash_bytes(fingerprint.hash_init(), name);
+        hash = fingerprint.hash_combine(hash, state_address);
+        hash = fingerprint.hash_combine(hash, next_state_address);
+        for (args) |argument| {
+            hash = fingerprint.hash_combine(
+                hash,
+                fingerprint.hash_value_unseeded(args_pool, argument),
+            );
+        }
+        return hash;
+    }
+
+    fn get(
+        self: *const StateCallMemo,
+        name: []const u8,
+        args: []const Value,
+        args_pool: *const ValuePool,
+        state_address: usize,
+        next_state_address: usize,
+    ) ?Value {
+        const memo_pool = self.pool orelse return null;
+        const hash = hash_call(
+            name,
+            args,
+            args_pool,
+            state_address,
+            next_state_address,
+        );
+        var slot: usize = @intCast(hash & (slot_count - 1));
+        var probes: usize = 0;
+        while (probes < slot_count) : (probes += 1) {
+            const encoded_index = self.slots[slot];
+            if (encoded_index == 0) return null;
+            const entry = self.entries[encoded_index - 1];
+            if (entry.hash != hash or
+                !std.mem.eql(u8, entry.name, name) or
+                entry.args_len != args.len or
+                entry.state_address != state_address or
+                entry.next_state_address != next_state_address)
+            {
+                slot = (slot + 1) & (slot_count - 1);
+                continue;
+            }
+            for (args, 0..) |argument, index| {
+                if (!Value.eql_cross_pool(
+                    argument,
+                    args_pool,
+                    memo_pool.values[entry.args_offset + index],
+                    memo_pool,
+                )) break;
+            } else return entry.value;
+            slot = (slot + 1) & (slot_count - 1);
+        }
+        return null;
+    }
+
+    fn put(
+        self: *StateCallMemo,
+        name: []const u8,
+        args: []const Value,
+        args_pool: *const ValuePool,
+        state_address: usize,
+        next_state_address: usize,
+        value_v: Value,
+    ) error{ OutOfMemory, NotImplemented }!void {
+        const memo_pool = self.pool orelse return;
+        if (self.count >= self.entries.len or
+            args.len > std.math.maxInt(u16))
+        {
+            return error.OutOfMemory;
+        }
+        const hash = hash_call(
+            name,
+            args,
+            args_pool,
+            state_address,
+            next_state_address,
+        );
+        var slot: usize = @intCast(hash & (slot_count - 1));
+        var probes: usize = 0;
+        while (probes < slot_count and self.slots[slot] != 0) : (probes += 1) {
+            slot = (slot + 1) & (slot_count - 1);
+        }
+        if (probes == slot_count) return error.OutOfMemory;
+        const snapshot = memo_pool.snapshot();
+        errdefer memo_pool.restore(snapshot);
+        const args_offset = memo_pool.value_count;
+        _ = try memo_pool.alloc_values(@intCast(args.len));
+        for (args, 0..) |argument, index| {
+            memo_pool.values[args_offset + index] = try argument.clone(
+                args_pool,
+                memo_pool,
+            );
+        }
+        const memo_value = try value_v.clone(args_pool, memo_pool);
+        self.entries[self.count] = .{
+            .hash = hash,
+            .name = name,
+            .args_offset = args_offset,
+            .args_len = @intCast(args.len),
+            .state_address = state_address,
+            .next_state_address = next_state_address,
+            .value = memo_value,
+        };
+        self.slots[slot] = self.count + 1;
+        self.count += 1;
+    }
+};
+
 pub const Evaluator = struct {
     module: ast.Module,
     constants: []const Constant,
@@ -380,6 +677,10 @@ pub const Evaluator = struct {
     next_state: ?*state.StateStore.State,
     enabled_result: ?bool,
     definition_memo: *DefinitionMemo,
+    state_definition_memo: *DefinitionMemo,
+    state_call_memo: *StateCallMemo,
+    state_definition_pool: *ValuePool,
+    recursive_definitions: []?bool,
     generated_cache_pool: *ValuePool,
     generated_cache: []?Value,
     context_pool: *ContextPool,
@@ -403,6 +704,14 @@ pub const Evaluator = struct {
         err_ctx.* = .{};
         const definition_memo = try arena.alloc_object(DefinitionMemo);
         definition_memo.* = .{};
+        const state_definition_memo = try arena.alloc_object(DefinitionMemo);
+        state_definition_memo.* = .{};
+        const state_call_memo = try arena.alloc_object(StateCallMemo);
+        state_call_memo.* = .{};
+        const state_definition_pool = try arena.alloc_object(ValuePool);
+        state_definition_pool.* = try ValuePool.init(arena, 4096, 4096);
+        const recursive_definitions = try arena.alloc(?bool, module.definitions.len);
+        @memset(recursive_definitions, null);
         const generated_cache_pool = try arena.alloc_object(ValuePool);
         generated_cache_pool.* = try ValuePool.init(arena, 4096, 4096);
         const generated_cache = try arena.alloc(?Value, module.definitions.len);
@@ -425,6 +734,10 @@ pub const Evaluator = struct {
             .next_state = null,
             .enabled_result = null,
             .definition_memo = definition_memo,
+            .state_definition_memo = state_definition_memo,
+            .state_call_memo = state_call_memo,
+            .state_definition_pool = state_definition_pool,
+            .recursive_definitions = recursive_definitions,
             .generated_cache_pool = generated_cache_pool,
             .generated_cache = generated_cache,
             .context_pool = context_pool,
@@ -441,6 +754,17 @@ pub const Evaluator = struct {
         err_ctx.* = .{};
         const definition_memo = try arena.alloc_object(DefinitionMemo);
         definition_memo.* = .{};
+        const state_definition_memo = try arena.alloc_object(DefinitionMemo);
+        state_definition_memo.* = .{};
+        const state_call_memo = try arena.alloc_object(StateCallMemo);
+        state_call_memo.* = .{};
+        const state_definition_pool = try arena.alloc_object(ValuePool);
+        state_definition_pool.* = try ValuePool.init(arena, 4096, 4096);
+        const recursive_definitions = try arena.alloc(
+            ?bool,
+            self.module.definitions.len,
+        );
+        @memset(recursive_definitions, null);
         const generated_cache_pool = try arena.alloc_object(ValuePool);
         generated_cache_pool.* = try ValuePool.init(arena, 4096, 4096);
         const generated_cache = try arena.alloc(?Value, self.module.definitions.len);
@@ -456,6 +780,10 @@ pub const Evaluator = struct {
         copy.next_state = null;
         copy.enabled_result = null;
         copy.definition_memo = definition_memo;
+        copy.state_definition_memo = state_definition_memo;
+        copy.state_call_memo = state_call_memo;
+        copy.state_definition_pool = state_definition_pool;
+        copy.recursive_definitions = recursive_definitions;
         copy.generated_cache_pool = generated_cache_pool;
         copy.generated_cache = generated_cache;
         copy.context_pool = context_pool;
@@ -468,12 +796,20 @@ pub const Evaluator = struct {
         self.context_pool.reset();
     }
 
-    pub fn context_snapshot(self: *const Evaluator) u32 {
+    pub fn context_snapshot(self: *const Evaluator) u64 {
         return self.context_pool.snapshot();
     }
 
-    pub fn restore_context_pool(self: *const Evaluator, saved_count: u32) void {
-        self.context_pool.restore(saved_count);
+    pub fn restore_context_pool(self: *const Evaluator, snapshot: u64) void {
+        self.context_pool.restore(snapshot);
+    }
+
+    pub fn pin_context_pool(self: *const Evaluator) u64 {
+        return self.context_pool.pin();
+    }
+
+    pub fn unpin_context_pool(self: *const Evaluator, previous: u64) void {
+        self.context_pool.unpin(previous);
     }
 
     pub fn extend_context(
@@ -552,6 +888,8 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!Value {
+        self.begin_state_evaluation(eval_pool);
+        defer self.end_state_evaluation();
         const resolved = self.resolve_alias(name);
         if (self.override_registry.find_generated(resolved, 0)) |function| {
             return self.call_generated(
@@ -574,6 +912,85 @@ pub const Evaluator = struct {
             eval_pool,
             state_pool,
         );
+    }
+
+    pub fn begin_state_evaluation(
+        self: *const Evaluator,
+        eval_pool: *ValuePool,
+    ) void {
+        self.state_definition_pool.restore(.{
+            .value_count = 0,
+            .string_count = 0,
+            .string_intern_count = 0,
+        });
+        self.state_definition_memo.reset(self.state_definition_pool);
+        self.state_call_memo.reset(self.state_definition_pool);
+        _ = eval_pool;
+    }
+
+    pub fn end_state_evaluation(self: *const Evaluator) void {
+        self.state_definition_memo.reset(null);
+        self.state_call_memo.reset(null);
+    }
+
+    fn cached_state_call(
+        self: *const Evaluator,
+        name: []const u8,
+        args: []const Value,
+        current_state: ?*StateStore.State,
+        eval_pool: *ValuePool,
+    ) Error!?Value {
+        const cached = self.state_call_memo.get(
+            name,
+            args,
+            eval_pool,
+            if (current_state) |state_v| @intFromPtr(state_v) else 0,
+            if (self.next_state) |state_v| @intFromPtr(state_v) else 0,
+        ) orelse return null;
+        return try cached.clone(self.state_definition_pool, eval_pool);
+    }
+
+    fn memoize_state_call(
+        self: *const Evaluator,
+        name: []const u8,
+        args: []const Value,
+        current_state: ?*StateStore.State,
+        result: Value,
+        eval_pool: *ValuePool,
+    ) Error!void {
+        self.state_call_memo.put(
+            name,
+            args,
+            eval_pool,
+            if (current_state) |state_v| @intFromPtr(state_v) else 0,
+            if (self.next_state) |state_v| @intFromPtr(state_v) else 0,
+            result,
+        ) catch |err| switch (err) {
+            error.OutOfMemory, error.NotImplemented => {},
+        };
+    }
+
+    fn definition_is_recursive(
+        self: *const Evaluator,
+        definition: ast.Definition,
+    ) bool {
+        for (self.module.definitions, 0..) |candidate, index| {
+            if (candidate.body != definition.body or
+                !std.mem.eql(u8, candidate.name, definition.name))
+            {
+                continue;
+            }
+            if (self.recursive_definitions[index]) |recursive| {
+                return recursive;
+            }
+            const recursive = codegen.expression_calls_identifier(
+                definition.body,
+                definition.name,
+            );
+            self.recursive_definitions[index] = recursive;
+            return recursive;
+        }
+        return false;
     }
 
     pub fn find_generated_expression(
@@ -610,7 +1027,7 @@ pub const Evaluator = struct {
                 eval_pool,
             );
         }
-        const result = try self.call_generated(
+        const result = self.call_generated(
             expression.function,
             args[0..expression.arg_names.len],
             context,
@@ -618,7 +1035,15 @@ pub const Evaluator = struct {
             eval_pool,
             state_pool,
             expression.uses_primed,
-        );
+        ) catch |err| {
+            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                std.debug.print(
+                    "generated expression {d} failed with {any}; args={any}\n",
+                    .{ expression.identity, err, expression.arg_names },
+                );
+            }
+            return err;
+        };
         return result;
     }
 
@@ -631,15 +1056,23 @@ pub const Evaluator = struct {
         state_pool: *ValuePool,
     ) Error!?Value {
         if (expression.arg_names.len > 32) return Error.NotImplemented;
+        if (expression.arg_required.len != 0 and
+            expression.arg_required.len != expression.arg_names.len)
+        {
+            return Error.TypeError;
+        }
         var args: [32]Value = undefined;
-        if (expression.arg_names.len > 0 and !try context.lookup_all_values(
-            expression.arg_names,
-            args[0..expression.arg_names.len],
-            eval_pool,
-        )) {
+        if (expression.arg_names.len > 0 and
+            !try context.lookup_required_values_if_available(
+                expression.arg_names,
+                expression.arg_required,
+                args[0..expression.arg_names.len],
+                eval_pool,
+            ))
+        {
             return null;
         }
-        return try self.call_generated(
+        return self.call_generated(
             expression.function,
             args[0..expression.arg_names.len],
             context,
@@ -647,7 +1080,15 @@ pub const Evaluator = struct {
             eval_pool,
             state_pool,
             expression.uses_primed,
-        );
+        ) catch |err| {
+            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                std.debug.print(
+                    "generated expression {d} failed with {any}; args={any}\n",
+                    .{ expression.identity, err, expression.arg_names },
+                );
+            }
+            return err;
+        };
     }
 
     pub fn eval_generated_expression_bool(
@@ -683,7 +1124,7 @@ pub const Evaluator = struct {
                 eval_pool,
             );
         }
-        return try self.call_generated_bool(
+        return self.call_generated_bool(
             boolean_function,
             args[0..expression.arg_names.len],
             context,
@@ -691,7 +1132,15 @@ pub const Evaluator = struct {
             eval_pool,
             state_pool,
             expression.uses_primed,
-        );
+        ) catch |err| {
+            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                std.debug.print(
+                    "generated boolean expression {d} failed with {any}; args={any}\n",
+                    .{ expression.identity, err, expression.arg_names },
+                );
+            }
+            return err;
+        };
     }
 
     pub fn eval_generated_expression_bool_if_args_available(
@@ -713,15 +1162,23 @@ pub const Evaluator = struct {
             return result.is_truthy();
         };
         if (expression.arg_names.len > 32) return Error.NotImplemented;
+        if (expression.arg_required.len != 0 and
+            expression.arg_required.len != expression.arg_names.len)
+        {
+            return Error.TypeError;
+        }
         var args: [32]Value = undefined;
-        if (expression.arg_names.len > 0 and !try context.lookup_all_values(
-            expression.arg_names,
-            args[0..expression.arg_names.len],
-            eval_pool,
-        )) {
+        if (expression.arg_names.len > 0 and
+            !try context.lookup_required_values_if_available(
+                expression.arg_names,
+                expression.arg_required,
+                args[0..expression.arg_names.len],
+                eval_pool,
+            ))
+        {
             return null;
         }
-        return try self.call_generated_bool(
+        return self.call_generated_bool(
             boolean_function,
             args[0..expression.arg_names.len],
             context,
@@ -729,7 +1186,15 @@ pub const Evaluator = struct {
             eval_pool,
             state_pool,
             expression.uses_primed,
-        );
+        ) catch |err| {
+            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                std.debug.print(
+                    "generated boolean expression {d} failed with {any}; args={any}\n",
+                    .{ expression.identity, err, expression.arg_names },
+                );
+            }
+            return err;
+        };
     }
 
     pub fn make_generated_expression_operator(
@@ -744,8 +1209,15 @@ pub const Evaluator = struct {
         const capture_count = expression.arg_names.len - arity;
         const captures = try eval_pool.alloc_values(@intCast(capture_count));
         for (expression.arg_names[0..capture_count], 0..) |name, index| {
-            captures[index] = (try context.lookup_value(name, eval_pool)) orelse
+            captures[index] = (try context.lookup_value(name, eval_pool)) orelse {
+                if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                    std.debug.print(
+                        "generated operator expression {d} missing capture {s}; args={any} arity={d}\n",
+                        .{ expression.identity, name, expression.arg_names, arity },
+                    );
+                }
                 return Error.UndefinedSymbol;
+            };
         }
         const offset: u32 = if (captures.len == 0)
             0
@@ -850,7 +1322,9 @@ pub const Evaluator = struct {
         assert(state_pool.value_count <= state_pool.value_cap);
         const root_call = !self.err_ctx.active;
         if (root_call) {
-            if (ctx.len == 0) self.context_pool.reset();
+            if (ctx.len == 0 and self.context_pool.can_reset_at_root()) {
+                self.context_pool.reset();
+            }
             self.err_ctx.context = null;
             self.err_ctx.detail = null;
             self.err_ctx.active = true;
@@ -861,9 +1335,13 @@ pub const Evaluator = struct {
         };
         const result = self.eval_expr_inner(expr, ctx, s0, eval_pool, state_pool);
         return result catch |err| {
-            if (err == Error.TypeError and self.err_ctx.context == null) {
+            if (self.err_ctx.context == null) {
                 self.err_ctx.context = "expr";
-                self.err_ctx.detail = @tagName(expr.*);
+                self.err_ctx.detail = if (expr.* == .apply and
+                    expr.apply.func.* == .ident)
+                    expr.apply.func.ident
+                else
+                    @tagName(expr.*);
             }
             return err;
         };
@@ -882,10 +1360,22 @@ pub const Evaluator = struct {
             .int_literal => |i| return Value{ .int_v = i },
             .string_literal => |s| return Value{ .string_v = try eval_pool.push_string(s) },
             .ident => |name| {
-                if (try ctx.lookup_local_value(name, eval_pool)) |v| return v;
+                if (try self.eval_local_identifier(
+                    ctx,
+                    name,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                )) |v| return v;
                 const aliased = self.resolve_alias(name);
                 if (!std.mem.eql(u8, aliased, name)) {
-                    if (try ctx.lookup_local_value(aliased, eval_pool)) |v| return v;
+                    if (try self.eval_local_identifier(
+                        ctx,
+                        aliased,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    )) |v| return v;
                 }
                 if (s0) |st| {
                     if (self.find_variable(name)) |idx| {
@@ -909,6 +1399,16 @@ pub const Evaluator = struct {
                     }
                 }
                 if (self.find_constant(name)) |v| return try v.clone(state_pool, eval_pool);
+                if (self.is_module_operator(
+                    aliased,
+                    "IOUtils",
+                    "IOEnv",
+                )) {
+                    return try overrides.io_env(
+                        self.override_registry.ctx,
+                        eval_pool,
+                    );
+                }
                 if (self.override_registry.find_value(aliased)) |func| {
                     return try func(self.override_registry.ctx, eval_pool);
                 }
@@ -932,7 +1432,7 @@ pub const Evaluator = struct {
                     const dest = try eval_pool.alloc_values(2);
                     dest[0] = Value{ .bool_v = false };
                     dest[1] = Value{ .bool_v = true };
-                    return Value{ .set_v = make_set(eval_pool, dest) };
+                    return Value{ .set_v = try make_set(eval_pool, dest) };
                 }
                 if (std.mem.eql(u8, aliased, "STRING")) {
                     // STRING (set of all strings) — represented as a model value
@@ -955,10 +1455,18 @@ pub const Evaluator = struct {
                 }
                 if (self.find_definition(aliased)) |def| {
                     if (def.is_function) {
-                        return try self.make_recursive_function(def, ctx, eval_pool);
+                        return try self.make_recursive_function(
+                            def,
+                            ctx.operator_frame(),
+                            eval_pool,
+                        );
                     }
                     if (def.params.len != 0) {
-                        return try self.make_lambda(def, ctx, eval_pool);
+                        return try self.make_lambda(
+                            def,
+                            ctx.operator_frame(),
+                            eval_pool,
+                        );
                     }
                     if (s0 == null and ctx.len == 0) {
                         if (self.definition_memo.get(eval_pool, aliased)) |v| {
@@ -978,9 +1486,42 @@ pub const Evaluator = struct {
                         );
                         return v;
                     }
+                    if (s0 != null) {
+                        if (self.state_definition_memo.get(
+                            self.state_definition_pool,
+                            aliased,
+                        )) |value_v| {
+                            return try value_v.clone(
+                                self.state_definition_pool,
+                                eval_pool,
+                            );
+                        }
+                        const value_v = try self.eval_expr(
+                            def.body,
+                            ctx.operator_frame(),
+                            s0,
+                            eval_pool,
+                            state_pool,
+                        );
+                        const memo_value = value_v.clone(
+                            eval_pool,
+                            self.state_definition_pool,
+                        ) catch |err| switch (err) {
+                            error.NotImplemented => return value_v,
+                            else => return err,
+                        };
+                        self.state_definition_memo.put(
+                            self.state_definition_pool,
+                            aliased,
+                            memo_value,
+                        ) catch |err| {
+                            if (err != Error.OutOfMemory) return err;
+                        };
+                        return value_v;
+                    }
                     return try self.eval_expr(
                         def.body,
-                        ctx,
+                        ctx.operator_frame(),
                         s0,
                         eval_pool,
                         state_pool,
@@ -1009,7 +1550,13 @@ pub const Evaluator = struct {
                     }
                     if (self.find_definition(aliased)) |def| {
                         if (def.params.len != 0) return Error.TypeError;
-                        return try self.eval_expr(def.body, ctx, ns, eval_pool, state_pool);
+                        return try self.eval_expr(
+                            def.body,
+                            ctx.operator_frame(),
+                            ns,
+                            eval_pool,
+                            state_pool,
+                        );
                     }
                 }
                 if (s0) |st| {
@@ -1094,7 +1641,7 @@ pub const Evaluator = struct {
                 }
                 const dest = try eval_pool.alloc_values(@intCast(items.len));
                 @memcpy(dest, scratch[0..items.len]);
-                return Value{ .set_v = make_set(eval_pool, dest) };
+                return Value{ .set_v = try make_set(eval_pool, dest) };
             },
             .set_filter => |sf| return try self.eval_set_filter(sf, ctx, s0, eval_pool, state_pool),
             .set_map => |sm| {
@@ -1144,7 +1691,12 @@ pub const Evaluator = struct {
                     return self.fail(Error.TypeError, "UNCHANGED", "missing next state");
                 for (names) |name| {
                     if (self.find_variable(name)) |idx| {
-                        if (!parent.values[idx].eql(child.values[idx], state_pool)) {
+                        if (!Value.eql_cross_pool(
+                            parent.values[idx],
+                            parent.value_pool(idx, state_pool),
+                            child.values[idx],
+                            child.value_pool(idx, state_pool),
+                        )) {
                             return Value{ .bool_v = false };
                         }
                         continue;
@@ -1265,36 +1817,15 @@ pub const Evaluator = struct {
                         state_pool,
                     ) };
                 }
-                // Lazy SUBSET membership: x \in SUBSET S ⟺ x ⊆ S.
-                // Check each element of x for membership in S without
-                // materializing S (S could be Seq(...) or another lazy set).
-                if (b.right.* == .unary and b.right.unary.op == .subset) {
-                    const inner = b.right.unary.operand;
-                    const s = try self.eval_expr(inner, ctx, s0, eval_pool, state_pool);
-                    if (!s.is_set_like()) return self.fail(Error.TypeError, "\\in SUBSET", "rhs not set");
-                    if (!left.is_set_like()) return Value{ .bool_v = false };
-                    const lmat = try self.materialize_set(left, ctx, s0, eval_pool, state_pool);
-                    if (lmat != .set_v) return self.fail(Error.TypeError, "\\in SUBSET", "lhs materialize failed");
-                    // Check each element of left is a member of s.
-                    const items = lmat.set_v.items(eval_pool);
-                    for (items) |item| {
-                        if (!s.member(eval_pool, item)) return Value{ .bool_v = false };
-                    }
-                    return Value{ .bool_v = true };
-                }
-                if (try eval_symbolic_set(self, b.right, ctx, s0, eval_pool, state_pool)) |right| {
-                    assert(right.is_set_like());
-                    return Value{ .bool_v = right.member(eval_pool, left) };
-                }
-                const right = try self.eval_expr(b.right, ctx, s0, eval_pool, state_pool);
-                if (!right.is_set_like()) {
-                    return self.fail(
-                        Error.TypeError,
-                        "\\in: rhs not a set",
-                        @tagName(right),
-                    );
-                }
-                return Value{ .bool_v = right.member(eval_pool, left) };
+                return Value{ .bool_v = try self.value_in_set_expression(
+                    left,
+                    b.right,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                    0,
+                ) };
             },
             .notin => {
                 if (is_seq_application(b.right)) {
@@ -1327,8 +1858,22 @@ pub const Evaluator = struct {
             state_pool,
         );
         return switch (b.op) {
-            .eq => Value{ .bool_v = left.eql(right, eval_pool) },
-            .ne => Value{ .bool_v = !left.eql(right, eval_pool) },
+            .eq => Value{ .bool_v = try self.equal_values(
+                left,
+                right,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            ) },
+            .ne => Value{ .bool_v = !try self.equal_values(
+                left,
+                right,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            ) },
             .lt => Value{ .bool_v = (left.as_int() orelse return self.fail(Error.TypeError, "<", @tagName(left))) < (right.as_int() orelse return self.fail(Error.TypeError, "<", @tagName(right))) },
             .le => Value{ .bool_v = (left.as_int() orelse return self.fail(Error.TypeError, "<=", @tagName(left))) <= (right.as_int() orelse return self.fail(Error.TypeError, "<=", @tagName(right))) },
             .gt => Value{ .bool_v = (left.as_int() orelse return self.fail(Error.TypeError, ">", @tagName(left))) > (right.as_int() orelse return self.fail(Error.TypeError, ">", @tagName(right))) },
@@ -1388,6 +1933,45 @@ pub const Evaluator = struct {
         };
     }
 
+    fn equal_values(
+        self: *const Evaluator,
+        left: Value,
+        right: Value,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!bool {
+        if (!left.is_set_like() or !right.is_set_like()) {
+            return left.eql(right, eval_pool);
+        }
+        const left_empty = known_set_empty(left, eval_pool);
+        const right_empty = known_set_empty(right, eval_pool);
+        if (left_empty != null and right_empty != null and
+            (left_empty.? or right_empty.?))
+        {
+            return left_empty.? == right_empty.?;
+        }
+        if (std.meta.activeTag(left) == std.meta.activeTag(right)) {
+            return left.eql(right, eval_pool);
+        }
+        const materialized_left = try self.materialize_set(
+            left,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        const materialized_right = try self.materialize_set(
+            right,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        return materialized_left.eql(materialized_right, eval_pool);
+    }
+
     fn eval_binary_operand(
         self: *const Evaluator,
         binary: *ast.Binary,
@@ -1405,8 +1989,17 @@ pub const Evaluator = struct {
             eval_pool,
             state_pool,
         ) catch |err| {
-            if (err == Error.TypeError and
-                self.err_ctx.context != null and
+            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                std.debug.print(
+                    "binary operand failed: side={s} op={s} node={s}",
+                    .{ side, @tagName(binary.op), @tagName(operand.*) },
+                );
+                if (operand.* == .ident) {
+                    std.debug.print(" ident={s}", .{operand.*.ident});
+                }
+                std.debug.print(" error={any}\n", .{err});
+            }
+            if (self.err_ctx.context != null and
                 std.mem.eql(u8, self.err_ctx.context.?, "expr"))
             {
                 self.err_ctx.context = side;
@@ -1513,14 +2106,14 @@ pub const Evaluator = struct {
                         assert(fields[i * 2] == .string_v);
                         names[i] = fields[i * 2];
                     }
-                    return Value{ .set_v = make_set(eval_pool, names) };
+                    return Value{ .set_v = try make_set(eval_pool, names) };
                 }
                 // Tuples (sequences) have domain 1..Len.
                 if (domain_operand == .tuple_v) {
                     const n = domain_operand.tuple_v.len;
                     if (n == 0) {
                         const empty = try eval_pool.alloc_values(0);
-                        return Value{ .set_v = make_set(eval_pool, empty) };
+                        return Value{ .set_v = try make_set(eval_pool, empty) };
                     }
                     return Value{ .range_v = .{ .lo = 1, .hi = @intCast(n) } };
                 }
@@ -1539,6 +2132,25 @@ pub const Evaluator = struct {
         state_pool: *ValuePool,
     ) Error!Value {
         if (sf.vars.len == 1) {
+            if (try self.eval_hereditary_power_set_filter(
+                sf,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            )) |symbolic| {
+                return symbolic;
+            }
+            if (try eval_symbolic_integer_filter(
+                self,
+                sf,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            )) |symbolic| {
+                return symbolic;
+            }
             const bv = sf.vars[0];
             if (try self.eval_function_set_filter(
                 sf,
@@ -1554,28 +2166,106 @@ pub const Evaluator = struct {
                 return sorted;
             }
             const domain = try self.eval_set_materialized(bv.domain, ctx, s0, eval_pool, state_pool);
-            const items = domain.set_v.items(eval_pool);
-            const accepted = try eval_pool.alloc_values(domain.set_v.len);
+            const domain_set = domain.set_v;
+            assert(domain_set.offset + domain_set.len <= eval_pool.value_count);
+            const accepted_offset = eval_pool.value_count;
+            _ = try eval_pool.alloc_values(domain_set.len);
             const scratch_snapshot = eval_pool.snapshot();
             const context_snap = self.context_snapshot();
             var accepted_count: u32 = 0;
-            for (items) |it| {
+            for (0..domain_set.len) |item_index| {
+                // Keep offsets rather than slices across predicate evaluation:
+                // a growable scratch pool may replace its backing allocation.
+                const it = eval_pool.values[domain_set.offset + item_index];
                 const new_ctx = try self.extend_context(ctx, bv.name, it);
                 const pred = try self.eval_expr(sf.pred, new_ctx, s0, eval_pool, state_pool);
                 if (pred.is_truthy()) {
-                    assert(accepted_count < accepted.len);
-                    accepted[accepted_count] = it;
+                    assert(accepted_count < domain_set.len);
+                    eval_pool.values[accepted_offset + accepted_count] = it;
                     accepted_count += 1;
                 }
                 eval_pool.restore(scratch_snapshot);
                 self.restore_context_pool(context_snap);
             }
-            return Value{ .set_v = make_set(
-                eval_pool,
-                accepted[0..accepted_count],
-            ) };
+            assert(accepted_offset + accepted_count <= eval_pool.value_count);
+            return Value{ .set_v = .{
+                .offset = accepted_offset,
+                .len = accepted_count,
+            } };
         }
         return try self.eval_set_filter_tuples(sf, 0, ctx, s0, eval_pool, state_pool);
+    }
+
+    fn eval_hereditary_power_set_filter(
+        self: *const Evaluator,
+        filter: *ast.SetFilter,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!?Value {
+        if (filter.vars.len != 1 or
+            filter.vars[0].domain.* != .unary or
+            filter.vars[0].domain.unary.op != .subset or
+            filter.pred.* != .quantifier)
+        {
+            return null;
+        }
+        const outer_name = filter.vars[0].name;
+        const predicate = filter.pred.quantifier;
+        if (predicate.kind != .forall or predicate.vars.len != 1 or
+            predicate.vars[0].domain.* != .ident or
+            !std.mem.eql(
+                u8,
+                predicate.vars[0].domain.ident,
+                outer_name,
+            ))
+        {
+            return null;
+        }
+
+        const inner_domain = try self.eval_set_materialized(
+            filter.vars[0].domain.unary.operand,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        if (inner_domain != .set_v) return null;
+        const source = inner_domain.set_v;
+        const accepted_offset = eval_pool.value_count;
+        _ = try eval_pool.alloc_values(source.len);
+        const scratch_snapshot = eval_pool.snapshot();
+        const context_mark = self.context_snapshot();
+        var accepted_count: u32 = 0;
+        for (0..source.len) |i| {
+            const candidate = eval_pool.values[source.offset + i];
+            const predicate_ctx = try self.extend_context(
+                ctx,
+                predicate.vars[0].name,
+                candidate,
+            );
+            const accepted = try self.eval_expr(
+                predicate.body,
+                predicate_ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            );
+            if (accepted.is_truthy()) {
+                eval_pool.values[accepted_offset + accepted_count] = candidate;
+                accepted_count += 1;
+            }
+            eval_pool.restore(scratch_snapshot);
+            self.restore_context_pool(context_mark);
+        }
+        const accepted = Value{ .set_v = .{
+            .offset = accepted_offset,
+            .len = accepted_count,
+        } };
+        return Value{ .power_set_v = .{
+            .set_offset = try eval_pool.push_value(accepted),
+        } };
     }
 
     fn eval_function_set_filter(
@@ -1915,7 +2605,7 @@ pub const Evaluator = struct {
         }
         const dest = try eval_pool.alloc_values(@intCast(tuples.items.len));
         @memcpy(dest, tuples.items);
-        return Value{ .set_v = make_set(eval_pool, dest) };
+        return Value{ .set_v = try make_set(eval_pool, dest) };
     }
 
     fn eval_sorted_sequence_filter(
@@ -2001,7 +2691,7 @@ pub const Evaluator = struct {
         );
         const dest = try eval_pool.alloc_values(@intCast(total));
         @memcpy(dest, results);
-        return Value{ .set_v = make_set(eval_pool, dest) };
+        return Value{ .set_v = try make_set(eval_pool, dest) };
     }
 
     fn eval_set_map_vars(
@@ -2076,7 +2766,7 @@ pub const Evaluator = struct {
             .range_v => |r| {
                 if (r.lo > r.hi) {
                     const empty = try eval_pool.alloc_values(0);
-                    return Value{ .set_v = make_set(eval_pool, empty) };
+                    return Value{ .set_v = try make_set(eval_pool, empty) };
                 }
                 const span = std.math.sub(i64, r.hi, r.lo) catch return Error.NotImplemented;
                 const len_i64 = std.math.add(i64, span, 1) catch return Error.NotImplemented;
@@ -2086,7 +2776,7 @@ pub const Evaluator = struct {
                 for (0..len) |i| {
                     dest[i] = Value{ .int_v = r.lo + @as(i64, @intCast(i)) };
                 }
-                return Value{ .set_v = make_set(eval_pool, dest) };
+                return Value{ .set_v = try make_set(eval_pool, dest) };
             },
             .record_set_v => |rs| {
                 var domains = std.ArrayList(Value).empty;
@@ -2123,7 +2813,7 @@ pub const Evaluator = struct {
                     }
                     dest[combo] = Value{ .record_v = make_record(eval_pool, fields_dest) };
                 }
-                return Value{ .set_v = make_set(eval_pool, dest) };
+                return Value{ .set_v = try make_set(eval_pool, dest) };
             },
             .tuple_set_v => |ts| {
                 const ss = ts.sets(eval_pool);
@@ -2153,7 +2843,7 @@ pub const Evaluator = struct {
                     }
                     dest[combo] = Value{ .tuple_v = make_tuple(eval_pool, tuple_dest) };
                 }
-                return Value{ .set_v = make_set(eval_pool, dest) };
+                return Value{ .set_v = try make_set(eval_pool, dest) };
             },
             .function_set_v => |fs| {
                 const domain = fs.domain(eval_pool);
@@ -2172,7 +2862,7 @@ pub const Evaluator = struct {
                     } };
                     const dest = try eval_pool.alloc_values(1);
                     dest[0] = func;
-                    return Value{ .set_v = make_set(eval_pool, dest) };
+                    return Value{ .set_v = try make_set(eval_pool, dest) };
                 }
                 var count: u64 = 1;
                 for (0..n) |_| {
@@ -2198,7 +2888,7 @@ pub const Evaluator = struct {
                         .len = n,
                     } };
                 }
-                return Value{ .set_v = make_set(eval_pool, func_values) };
+                return Value{ .set_v = try make_set(eval_pool, func_values) };
             },
             .union_v => |u| {
                 const inner = u.set(eval_pool);
@@ -2242,7 +2932,7 @@ pub const Evaluator = struct {
                         }
                     }
                 }
-                return Value{ .set_v = make_set(eval_pool, dest[0..pos]) };
+                return Value{ .set_v = try make_set(eval_pool, dest[0..pos]) };
             },
             .cup_v => |bs| {
                 const l = try self.materialize_set(bs.left(eval_pool), ctx, s0, eval_pool, state_pool);
@@ -2259,7 +2949,7 @@ pub const Evaluator = struct {
                         count += 1;
                     }
                 }
-                return Value{ .set_v = make_set(eval_pool, dest[0..count]) };
+                return Value{ .set_v = try make_set(eval_pool, dest[0..count]) };
             },
             .cap_v => |bs| {
                 const l = try self.materialize_set(bs.left(eval_pool), ctx, s0, eval_pool, state_pool);
@@ -2275,7 +2965,7 @@ pub const Evaluator = struct {
                         count += 1;
                     }
                 }
-                return Value{ .set_v = make_set(eval_pool, dest[0..count]) };
+                return Value{ .set_v = try make_set(eval_pool, dest[0..count]) };
             },
             .diff_v => |bs| {
                 const l = try self.materialize_set(bs.left(eval_pool), ctx, s0, eval_pool, state_pool);
@@ -2290,7 +2980,7 @@ pub const Evaluator = struct {
                         count += 1;
                     }
                 }
-                return Value{ .set_v = make_set(eval_pool, dest[0..count]) };
+                return Value{ .set_v = try make_set(eval_pool, dest[0..count]) };
             },
             else => return Error.TypeError,
         }
@@ -2306,7 +2996,7 @@ pub const Evaluator = struct {
     ) Error!Value {
         if (rs.fields.len == 0) {
             const empty = try eval_pool.alloc_values(0);
-            return Value{ .set_v = make_set(eval_pool, empty) };
+            return Value{ .set_v = try make_set(eval_pool, empty) };
         }
         var domains = std.ArrayList(Value).empty;
         defer domains.deinit(std.heap.page_allocator);
@@ -2337,7 +3027,289 @@ pub const Evaluator = struct {
             }
             dest[combo] = Value{ .record_v = make_record(eval_pool, fields_dest) };
         }
-        return Value{ .set_v = make_set(eval_pool, dest) };
+        return Value{ .set_v = try make_set(eval_pool, dest) };
+    }
+
+    fn value_in_set_expression(
+        self: *const Evaluator,
+        candidate: Value,
+        expression: *ast.Expr,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+        depth: u8,
+    ) Error!bool {
+        if (depth == 64) return Error.NotImplemented;
+        switch (expression.*) {
+            .ident => |name| {
+                const aliased = self.resolve_alias(name);
+                const builtin_set = std.mem.eql(u8, aliased, "Nat") or
+                    std.mem.eql(u8, aliased, "Int") or
+                    std.mem.eql(u8, aliased, "BOOLEAN") or
+                    std.mem.eql(u8, aliased, "STRING");
+                if (std.mem.eql(u8, aliased, "STRING")) {
+                    return candidate == .string_v;
+                }
+                if (!builtin_set and
+                    self.find_constant(name) == null and
+                    self.find_constant(aliased) == null)
+                {
+                    if (self.find_definition(aliased)) |definition| {
+                        if (definition.params.len == 0) {
+                            return self.value_in_set_expression(
+                                candidate,
+                                definition.body,
+                                ctx,
+                                s0,
+                                eval_pool,
+                                state_pool,
+                                depth + 1,
+                            );
+                        }
+                    }
+                }
+            },
+            .apply => |application| {
+                if (application.func.* == .ident and
+                    application.args.len == 0)
+                {
+                    if (self.find_definition(application.func.*.ident)) |definition| {
+                        if (definition.params.len == 0) {
+                            return self.value_in_set_expression(
+                                candidate,
+                                definition.body,
+                                ctx,
+                                s0,
+                                eval_pool,
+                                state_pool,
+                                depth + 1,
+                            );
+                        }
+                    }
+                }
+            },
+            .set_enum => |items| {
+                for (items) |item_expression| {
+                    const item = try self.eval_expr(
+                        item_expression,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    );
+                    if (try self.equal_values(
+                        candidate,
+                        item,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    )) return true;
+                }
+                return false;
+            },
+            .set_binary => |binary_set| {
+                const in_left = try self.value_in_set_expression(
+                    candidate,
+                    binary_set.left,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                    depth + 1,
+                );
+                return switch (binary_set.op) {
+                    .union_op => in_left or try self.value_in_set_expression(
+                        candidate,
+                        binary_set.right,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                        depth + 1,
+                    ),
+                    .intersection_op => in_left and try self.value_in_set_expression(
+                        candidate,
+                        binary_set.right,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                        depth + 1,
+                    ),
+                    .difference_op => in_left and !try self.value_in_set_expression(
+                        candidate,
+                        binary_set.right,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                        depth + 1,
+                    ),
+                    .cartesian_op => blk: {
+                        const materialized = try self.eval_expr(
+                            expression,
+                            ctx,
+                            s0,
+                            eval_pool,
+                            state_pool,
+                        );
+                        if (!materialized.is_set_like()) return Error.TypeError;
+                        break :blk materialized.member(eval_pool, candidate);
+                    },
+                };
+            },
+            .unary => |unary| {
+                if (unary.op == .subset) {
+                    if (!candidate.is_set_like()) return false;
+                    const concrete = try self.materialize_set(
+                        candidate,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    );
+                    if (concrete != .set_v) return Error.TypeError;
+                    for (concrete.set_v.items(eval_pool)) |item| {
+                        if (!try self.value_in_set_expression(
+                            item,
+                            unary.operand,
+                            ctx,
+                            s0,
+                            eval_pool,
+                            state_pool,
+                            depth + 1,
+                        )) return false;
+                    }
+                    return true;
+                }
+            },
+            .record_set => |record_set| {
+                if (candidate != .record_v or
+                    candidate.record_v.len != record_set.fields.len)
+                {
+                    return false;
+                }
+                for (record_set.fields) |field| {
+                    const field_value = candidate.record_v.lookup(
+                        eval_pool,
+                        field.name,
+                    ) orelse return false;
+                    if (!try self.value_in_set_expression(
+                        field_value,
+                        field.domain,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                        depth + 1,
+                    )) return false;
+                }
+                return true;
+            },
+            .set_of_functions => |function_set| {
+                var domain = try self.eval_expr(
+                    function_set.domain,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
+                domain = try self.materialize_set(
+                    domain,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
+                if (domain != .set_v) return false;
+                const domain_items = domain.set_v.items(eval_pool);
+                switch (candidate) {
+                    .function_v => |function| {
+                        if (!function.domain.eql(domain.set_v, eval_pool)) {
+                            return false;
+                        }
+                    },
+                    .tuple_v => |tuple| {
+                        if (tuple.len != domain_items.len) return false;
+                    },
+                    .record_v => |record| {
+                        if (record.len != domain_items.len) return false;
+                    },
+                    else => return false,
+                }
+                for (domain_items) |key| {
+                    const entry = switch (candidate) {
+                        .function_v => |function| blk: {
+                            break :blk function.apply(
+                                eval_pool,
+                                key,
+                            ) orelse return false;
+                        },
+                        .tuple_v => |tuple| blk: {
+                            if (key != .int_v or
+                                key.int_v < 1 or
+                                key.int_v > tuple.len)
+                            {
+                                return false;
+                            }
+                            break :blk tuple.items(eval_pool)[
+                                @intCast(key.int_v - 1)
+                            ];
+                        },
+                        .record_v => |record| blk: {
+                            if (key != .string_v) {
+                                return false;
+                            }
+                            break :blk record.lookup(
+                                eval_pool,
+                                key.string_v.slice(eval_pool),
+                            ) orelse return false;
+                        },
+                        else => return false,
+                    };
+                    if (!try self.value_in_set_expression(
+                        entry,
+                        function_set.codomain,
+                        ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                        depth + 1,
+                    )) return false;
+                }
+                return true;
+            },
+            else => {},
+        }
+
+        if (try eval_symbolic_set(
+            self,
+            expression,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        )) |set| {
+            assert(set.is_set_like());
+            return set.member(eval_pool, candidate);
+        }
+        const set = try self.eval_expr(
+            expression,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
+        if (!set.is_set_like()) {
+            return self.fail(
+                Error.TypeError,
+                "\\in: rhs not a set",
+                @tagName(set),
+            );
+        }
+        return set.member(eval_pool, candidate);
     }
 
     fn is_function_in_set(_: Evaluator, func: Function, domain: Set, codomain: Set, eval_pool: *ValuePool) Error!bool {
@@ -2375,7 +3347,7 @@ pub const Evaluator = struct {
             } };
             const dest = try eval_pool.alloc_values(1);
             dest[0] = func;
-            return Value{ .set_v = make_set(eval_pool, dest) };
+            return Value{ .set_v = try make_set(eval_pool, dest) };
         }
         var count: u64 = 1;
         for (0..n) |_| {
@@ -2401,7 +3373,7 @@ pub const Evaluator = struct {
                 .len = n,
             } };
         }
-        return Value{ .set_v = make_set(eval_pool, func_values) };
+        return Value{ .set_v = try make_set(eval_pool, func_values) };
     }
 
     fn eval_set_binary(
@@ -2429,11 +3401,11 @@ pub const Evaluator = struct {
                 collect_cartesian_sets(eval_pool, right, &components) catch return Error.TypeError;
                 if (components.items.len > 1) {
                     const product = try self.cartesian_product(eval_pool, components.items);
-                    return Value{ .set_v = make_set(eval_pool, product) };
+                    return Value{ .set_v = try make_set(eval_pool, product) };
                 }
                 // Fallback: simple 2-way product.
                 const product = try self.cartesian_product(eval_pool, &[_]Value{ left, right });
-                return Value{ .set_v = make_set(eval_pool, product) };
+                return Value{ .set_v = try make_set(eval_pool, product) };
             },
             .union_op => {
                 const dest = try eval_pool.alloc_values(@intCast(a.len + b.len));
@@ -2445,7 +3417,7 @@ pub const Evaluator = struct {
                         count += 1;
                     }
                 }
-                return Value{ .set_v = make_set(eval_pool, dest[0..count]) };
+                return Value{ .set_v = try make_set(eval_pool, dest[0..count]) };
             },
             .intersection_op => {
                 const dest = try eval_pool.alloc_values(@intCast(@min(a.len, b.len)));
@@ -2456,7 +3428,7 @@ pub const Evaluator = struct {
                         count += 1;
                     }
                 }
-                return Value{ .set_v = make_set(eval_pool, dest[0..count]) };
+                return Value{ .set_v = try make_set(eval_pool, dest[0..count]) };
             },
             .difference_op => {
                 const dest = try eval_pool.alloc_values(@intCast(a.len));
@@ -2467,7 +3439,7 @@ pub const Evaluator = struct {
                         count += 1;
                     }
                 }
-                return Value{ .set_v = make_set(eval_pool, dest[0..count]) };
+                return Value{ .set_v = try make_set(eval_pool, dest[0..count]) };
             },
         };
     }
@@ -2524,7 +3496,7 @@ pub const Evaluator = struct {
             domains[i] = d;
         }
         const product = try self.cartesian_product(eval_pool, domains[0..fl.vars.len]);
-        const product_set = make_set(eval_pool, product);
+        const product_set = try make_set(eval_pool, product);
         if (product_set.len > 4096) return self.fail(Error.NotImplemented, "function literal", "product domain larger than 4096");
         var scratch: [4096]Value = undefined;
         const context_snap = self.context_snapshot();
@@ -2705,7 +3677,7 @@ pub const Evaluator = struct {
                 if (def.params.len != ap.args.len) {
                     return self.fail(Error.TypeError, "primed apply arity", name);
                 }
-                var new_ctx = ctx;
+                var new_ctx = ctx.operator_frame();
                 for (def.params, ap.args) |param, arg| {
                     const arg_value = try self.eval_expr(arg, ctx, s0, eval_pool, state_pool);
                     new_ctx = try self.extend_context(new_ctx, param, arg_value);
@@ -2799,6 +3771,24 @@ pub const Evaluator = struct {
         }
         if (ap.func.* == .ident) {
             const name = self.resolve_alias(ap.func.*.ident);
+            if (self.is_module_operator(name, "IOUtils", "atoi")) {
+                var argument_storage: [1]Value = undefined;
+                if (ap.args.len != argument_storage.len) {
+                    return self.fail(Error.TypeError, "atoi", "arity");
+                }
+                argument_storage[0] = try self.eval_expr(
+                    ap.args[0],
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
+                return try overrides.atoi(
+                    self.override_registry.ctx,
+                    eval_pool,
+                    &argument_storage,
+                );
+            }
             if (self.is_module_operator(name, "Functions", "FoldFunction") and
                 ap.args.len == 3)
             {
@@ -2836,35 +3826,52 @@ pub const Evaluator = struct {
             {
                 return try self.eval_fold_function_on_set(ap, ctx, s0, eval_pool, state_pool);
             }
-            if (try ctx.lookup_local_value(name, eval_pool)) |local_function| {
-                const values = try eval_pool.alloc_values(
-                    @intCast(ap.args.len),
+            if (try self.eval_local_identifier(
+                ctx,
+                name,
+                s0,
+                eval_pool,
+                state_pool,
+            )) |local_function| {
+                var argument_storage: [64]Value = undefined;
+                const values = try self.eval_application_arguments(
+                    ap.args,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                    &argument_storage,
                 );
-                for (ap.args, 0..) |arg, i| {
-                    values[i] = try self.eval_expr(
-                        arg,
-                        ctx,
-                        s0,
-                        eval_pool,
-                        state_pool,
-                    );
-                }
-                return try self.apply_values(
+                return self.apply_values(
                     local_function,
                     values,
                     eval_pool,
                     state_pool,
                     s0,
-                );
+                ) catch |err| {
+                    if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                        std.debug.print(
+                            "local application failed: {s} value={s} args={d}: {any}\n",
+                            .{ name, @tagName(local_function), values.len, err },
+                        );
+                    }
+                    return err;
+                };
             }
             if (self.override_registry.find(name)) |func| {
-                const values = try eval_pool.alloc_values(@intCast(ap.args.len));
-                for (ap.args, 0..) |arg, i| {
-                    values[i] = try self.eval_expr(arg, ctx, s0, eval_pool, state_pool);
-                }
+                var argument_storage: [64]Value = undefined;
+                const values = try self.eval_application_arguments(
+                    ap.args,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                    &argument_storage,
+                );
                 return func(self.override_registry.ctx, eval_pool, values) catch |err| blk: {
                     if (err == Error.NotImplemented) {
-                        const mat_values = try eval_pool.alloc_values(@intCast(ap.args.len));
+                        var materialized_storage: [64]Value = undefined;
+                        const mat_values = materialized_storage[0..values.len];
                         for (values, 0..) |v2, i| {
                             mat_values[i] = if (v2.is_set_like())
                                 try self.materialize_set(v2, ctx, s0, eval_pool, state_pool)
@@ -2884,18 +3891,15 @@ pub const Evaluator = struct {
                 name,
                 ap.args.len,
             )) |func| {
-                const values = try eval_pool.alloc_values(
-                    @intCast(ap.args.len),
+                var argument_storage: [64]Value = undefined;
+                const values = try self.eval_application_arguments(
+                    ap.args,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                    &argument_storage,
                 );
-                for (ap.args, 0..) |arg, i| {
-                    values[i] = try self.eval_expr(
-                        arg,
-                        ctx,
-                        s0,
-                        eval_pool,
-                        state_pool,
-                    );
-                }
                 return self.call_generated(
                     func,
                     values,
@@ -2918,18 +3922,15 @@ pub const Evaluator = struct {
             if (self.find_constant(name)) |constant| {
                 switch (constant) {
                     .function_v, .lambda_v => {
-                        const values = try eval_pool.alloc_values(
-                            @intCast(ap.args.len),
+                        var argument_storage: [64]Value = undefined;
+                        const values = try self.eval_application_arguments(
+                            ap.args,
+                            ctx,
+                            s0,
+                            eval_pool,
+                            state_pool,
+                            &argument_storage,
                         );
-                        for (ap.args, 0..) |arg, i| {
-                            values[i] = try self.eval_expr(
-                                arg,
-                                ctx,
-                                s0,
-                                eval_pool,
-                                state_pool,
-                            );
-                        }
                         return try self.apply_values(
                             constant,
                             values,
@@ -2947,17 +3948,83 @@ pub const Evaluator = struct {
                 }
             }
             if (self.find_definition(name)) |def| {
-                const values = try eval_pool.alloc_values(@intCast(ap.args.len));
-                for (ap.args, 0..) |arg, i| {
-                    values[i] = try self.eval_expr(arg, ctx, s0, eval_pool, state_pool);
-                }
+                var argument_storage: [64]Value = undefined;
+                const values = try self.eval_application_arguments(
+                    ap.args,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                    &argument_storage,
+                );
+                const memoize_recursive = self.definition_is_recursive(def);
                 if (def.is_function) {
-                    const func = try self.make_recursive_function(def, ctx, eval_pool);
-                    return try self.apply_values(func, values, eval_pool, state_pool, s0);
+                    const params = if (def.function_vars.len > 0)
+                        def.function_vars
+                    else
+                        &[_][]const u8{def.function_var};
+                    if (params.len != values.len) {
+                        return self.fail(
+                            Error.TypeError,
+                            "recursive function apply arity",
+                            name,
+                        );
+                    }
+                    if (memoize_recursive) {
+                        if (try self.cached_state_call(
+                            name,
+                            values,
+                            s0,
+                            eval_pool,
+                        )) |cached| return cached;
+                    }
+                    var function_ctx = ctx.operator_frame();
+                    for (params, values) |param, argument| {
+                        function_ctx = try self.extend_context(
+                            function_ctx,
+                            param,
+                            argument,
+                        );
+                    }
+                    const result = try self.eval_expr(
+                        def.body,
+                        function_ctx,
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    );
+                    if (memoize_recursive) {
+                        try self.memoize_state_call(
+                            name,
+                            values,
+                            s0,
+                            result,
+                            eval_pool,
+                        );
+                    }
+                    return result;
                 }
                 if (def.params.len == 0) {
-                    const func = try self.eval_expr(def.body, ctx, s0, eval_pool, state_pool);
-                    return try self.apply_values(func, values, eval_pool, state_pool, s0);
+                    const func = try self.eval_expr(
+                        def.body,
+                        ctx.operator_frame(),
+                        s0,
+                        eval_pool,
+                        state_pool,
+                    );
+                    return self.apply_values(
+                        func,
+                        values,
+                        eval_pool,
+                        state_pool,
+                        s0,
+                    ) catch |err| {
+                        std.debug.print(
+                            "zero-arity definition value application failed: {s} value={s} args={d}: {any}\n",
+                            .{ name, @tagName(func), values.len, err },
+                        );
+                        return err;
+                    };
                 }
                 if (def.params.len != ap.args.len) {
                     std.debug.print(
@@ -2970,25 +4037,88 @@ pub const Evaluator = struct {
                         name,
                     );
                 }
-                var new_ctx = ctx;
+                if (memoize_recursive) {
+                    if (try self.cached_state_call(
+                        name,
+                        values,
+                        s0,
+                        eval_pool,
+                    )) |cached| return cached;
+                }
+                var new_ctx = ctx.operator_frame();
                 for (def.params, 0..) |p, i| {
                     new_ctx = try self.extend_context(new_ctx, p, values[i]);
                 }
-                return try self.eval_expr(
+                const result = try self.eval_expr(
                     def.body,
                     new_ctx,
                     s0,
                     eval_pool,
                     state_pool,
                 );
+                if (memoize_recursive) {
+                    try self.memoize_state_call(
+                        name,
+                        values,
+                        s0,
+                        result,
+                        eval_pool,
+                    );
+                }
+                return result;
             }
         }
         const func = try self.eval_expr(ap.func, ctx, s0, eval_pool, state_pool);
-        const values = try eval_pool.alloc_values(@intCast(ap.args.len));
-        for (ap.args, 0..) |a, i| {
-            values[i] = try self.eval_expr(a, ctx, s0, eval_pool, state_pool);
+        var argument_storage: [64]Value = undefined;
+        const values = try self.eval_application_arguments(
+            ap.args,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+            &argument_storage,
+        );
+        return self.apply_values(func, values, eval_pool, state_pool, s0) catch |err| {
+            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                std.debug.print(
+                    "value application failed: func-expr={s} func-value={s} args={d}",
+                    .{ @tagName(ap.func.*), @tagName(func), values.len },
+                );
+                if (ap.func.* == .ident) {
+                    std.debug.print(" ident={s}", .{ap.func.ident});
+                }
+                std.debug.print(" error={any}\n", .{err});
+            }
+            return err;
+        };
+    }
+
+    fn eval_application_arguments(
+        self: *const Evaluator,
+        arguments: []const *ast.Expr,
+        ctx: Context,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+        storage: *[64]Value,
+    ) Error![]const Value {
+        if (arguments.len > storage.len) {
+            return self.fail(
+                Error.NotImplemented,
+                "operator application",
+                "more than 64 arguments",
+            );
         }
-        return try self.apply_values(func, values, eval_pool, state_pool, s0);
+        for (arguments, 0..) |argument, index| {
+            storage[index] = try self.eval_expr(
+                argument,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            );
+        }
+        return storage[0..arguments.len];
     }
 
     fn eval_primed_definition(
@@ -3107,6 +4237,10 @@ pub const Evaluator = struct {
             .constant_slots = self.constant_slots,
             .generated_cache = self.generated_cache,
             .generated_cache_pool = self.generated_cache_pool,
+            .models = self.models,
+            .memo_context = self,
+            .cached_call = generated_cached_call,
+            .put_cached_call = generated_put_cached_call,
             .native_context = &self.override_registry,
             .native_call = generated_native_call,
             .max_seq_len = self.override_registry.ctx.max_seq_len,
@@ -3162,6 +4296,10 @@ pub const Evaluator = struct {
             .constant_slots = self.constant_slots,
             .generated_cache = self.generated_cache,
             .generated_cache_pool = self.generated_cache_pool,
+            .models = self.models,
+            .memo_context = self,
+            .cached_call = generated_cached_call,
+            .put_cached_call = generated_put_cached_call,
             .native_context = &self.override_registry,
             .native_call = generated_native_call,
             .max_seq_len = self.override_registry.ctx.max_seq_len,
@@ -3213,15 +4351,8 @@ pub const Evaluator = struct {
         var index: u32 = 0;
         while (index < len) : (index += 1) {
             const element = switch (sequence) {
-                .tuple_v => |tuple| tuple.items(eval_pool)[index],
-                .function_v => |function| function.apply(
-                    eval_pool,
-                    Value{ .int_v = @as(i64, index) + 1 },
-                ) orelse return self.fail(
-                    Error.IndexOutOfBounds,
-                    "sequence fold",
-                    "function domain is not 1..Len",
-                ),
+                .tuple_v => |tuple| eval_pool.values[tuple.offset + index],
+                .function_v => |function| eval_pool.values[function.offset + index],
                 else => unreachable,
             };
             const args = [_]Value{ element, accumulator };
@@ -3393,7 +4524,36 @@ pub const Evaluator = struct {
 
     fn apply_value(self: *const Evaluator, func: Value, arg: Value, eval_pool: *ValuePool, state_pool: *ValuePool, s0: ?*StateStore.State) Error!Value {
         switch (func) {
-            .function_v => |f| return f.apply(eval_pool, arg) orelse self.fail(Error.IndexOutOfBounds, "apply function", @tagName(arg)),
+            .function_v => |f| return f.apply(eval_pool, arg) orelse {
+                if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                    std.debug.print(
+                        "function lookup missed: arg={s}",
+                        .{@tagName(arg)},
+                    );
+                    if (arg == .model_v) {
+                        std.debug.print("({d})", .{arg.model_v});
+                    } else if (arg == .int_v) {
+                        std.debug.print("({d})", .{arg.int_v});
+                    }
+                    std.debug.print(" domain=[", .{});
+                    for (f.domain.items(eval_pool), 0..) |item, index| {
+                        if (index != 0) std.debug.print(",", .{});
+                        if (item == .model_v) {
+                            std.debug.print("model({d})", .{item.model_v});
+                        } else if (item == .int_v) {
+                            std.debug.print("int({d})", .{item.int_v});
+                        } else {
+                            std.debug.print("{s}", .{@tagName(item)});
+                        }
+                    }
+                    std.debug.print("]\n", .{});
+                }
+                return self.fail(
+                    Error.IndexOutOfBounds,
+                    "apply function",
+                    @tagName(arg),
+                );
+            },
             .tuple_v => |t| {
                 const idx = (arg.as_int() orelse return Error.TypeError) - 1;
                 if (idx < 0 or idx >= t.len) return self.fail(Error.IndexOutOfBounds, "apply tuple", @tagName(arg));
@@ -3436,7 +4596,8 @@ pub const Evaluator = struct {
     ) Error!Value {
         const rec = try self.eval_expr(f.expr, ctx, s0, eval_pool, state_pool);
         if (rec != .record_v) return Error.TypeError;
-        return rec.record_v.lookup(eval_pool, f.name) orelse Error.UndefinedSymbol;
+        return rec.record_v.lookup(eval_pool, f.name) orelse
+            self.fail(Error.UndefinedSymbol, "record field", f.name);
     }
 
     fn eval_quantifier(
@@ -3613,9 +4774,33 @@ pub const Evaluator = struct {
         const saved_context_count = self.context_pool.snapshot();
         defer self.context_pool.restore(saved_context_count);
         if (idx >= q.vars.len) {
+            if (self.boolean_membership_is_tautology(q.body, 0)) {
+                return .{ .bool_v = true };
+            }
             return try self.eval_expr(q.body, ctx, s0, eval_pool, state_pool);
         }
         const bv = q.vars[idx];
+        if (bv.domain.* == .ident and std.mem.eql(
+            u8,
+            bv.domain.ident,
+            "__tlzig_unbounded_domain",
+        )) {
+            if (!self.boolean_membership_is_tautology(q.body, 0)) {
+                return self.fail(
+                    Error.NotImplemented,
+                    "unbounded quantifier",
+                    bv.name,
+                );
+            }
+            return try self.eval_quantifier_vars(
+                q,
+                idx + 1,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            );
+        }
         if (try self.eval_filtered_power_set_quantifier(
             q,
             idx,
@@ -3626,6 +4811,55 @@ pub const Evaluator = struct {
             state_pool,
         )) |result| {
             return result;
+        }
+        var independent = !codegen.expression_references_identifier(
+            q.body,
+            bv.name,
+        );
+        if (independent) {
+            for (q.vars[idx + 1 ..]) |later| {
+                if (codegen.expression_references_identifier(
+                    later.domain,
+                    bv.name,
+                )) {
+                    independent = false;
+                    break;
+                }
+            }
+        }
+        if (independent) {
+            const symbolic_domain = (try eval_symbolic_set(
+                self,
+                bv.domain,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            )) orelse try self.eval_expr(
+                bv.domain,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            );
+            const domain_nonempty: ?bool = switch (symbolic_domain) {
+                .set_v => |set| set.len > 0,
+                .range_v => |range| range.hi >= range.lo,
+                else => null,
+            };
+            if (domain_nonempty) |nonempty| {
+                if (!nonempty) {
+                    return .{ .bool_v = q.kind == .forall };
+                }
+                return try self.eval_quantifier_vars(
+                    q,
+                    idx + 1,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
+            }
         }
         const domain = try self.eval_set_materialized(bv.domain, ctx, s0, eval_pool, state_pool);
         assert(domain == .set_v);
@@ -3644,6 +4878,70 @@ pub const Evaluator = struct {
             }
         }
         return Value{ .bool_v = expected };
+    }
+
+    fn boolean_membership_is_tautology(
+        self: *const Evaluator,
+        expression: *const ast.Expr,
+        depth: u8,
+    ) bool {
+        if (expression.* != .binary or expression.binary.op != .in or
+            expression.binary.right.* != .ident or
+            !std.mem.eql(u8, expression.binary.right.ident, "BOOLEAN"))
+        {
+            return false;
+        }
+        return self.expression_guaranteed_boolean(
+            expression.binary.left,
+            depth,
+        );
+    }
+
+    fn expression_guaranteed_boolean(
+        self: *const Evaluator,
+        expression: *const ast.Expr,
+        depth: u8,
+    ) bool {
+        if (depth >= 32) return false;
+        return switch (expression.*) {
+            .bool_literal => true,
+            .binary => |binary| switch (binary.op) {
+                .eq,
+                .ne,
+                .lt,
+                .le,
+                .gt,
+                .ge,
+                .in,
+                .notin,
+                .subseteq,
+                .and_op,
+                .or_op,
+                .implies,
+                .equiv,
+                => true,
+                else => false,
+            },
+            .unary => |unary| switch (unary.op) {
+                .not, .enabled, .temporal_box, .temporal_diamond => true,
+                else => false,
+            },
+            .quantifier => true,
+            .apply => |application| blk: {
+                if (application.func.* != .ident) break :blk false;
+                const name = self.resolve_alias(application.func.ident);
+                const definition = self.find_definition(name) orelse
+                    break :blk false;
+                if (definition.params.len != application.args.len) {
+                    break :blk false;
+                }
+                break :blk self.expression_guaranteed_boolean(
+                    definition.body,
+                    depth + 1,
+                );
+            },
+            else => false,
+        };
     }
 
     fn eval_filtered_power_set_quantifier(
@@ -3702,7 +5000,7 @@ pub const Evaluator = struct {
                     item_count += 1;
                 }
             }
-            const subset = Value{ .set_v = make_set(
+            const subset = Value{ .set_v = try make_set(
                 eval_pool,
                 subset_storage[0..item_count],
             ) };
@@ -3756,13 +5054,36 @@ pub const Evaluator = struct {
         for (l.defs) |def| {
             const v = if (def.is_function)
                 try self.make_recursive_function(def, new_ctx, eval_pool)
-            else if (def.params.len > 0)
-                try self.make_lambda(def, new_ctx, eval_pool)
             else
-                try self.eval_expr(def.body, new_ctx, s0, eval_pool, state_pool);
+                try self.make_lambda(def, new_ctx, eval_pool);
             new_ctx = try self.extend_context(new_ctx, def.name, v);
         }
         return try self.eval_expr(l.body, new_ctx, s0, eval_pool, state_pool);
+    }
+
+    fn eval_local_identifier(
+        self: *const Evaluator,
+        ctx: Context,
+        name: []const u8,
+        s0: ?*StateStore.State,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) Error!?Value {
+        const value_v = (try ctx.lookup_local_value(name, eval_pool)) orelse
+            return null;
+        if (value_v != .lambda_v or value_v.lambda_v.params.len != 0) {
+            return value_v;
+        }
+        const lambda = value_v.lambda_v;
+        const body: *ast.Expr = @ptrCast(@alignCast(lambda.body));
+        const lambda_ctx: *Context = @ptrCast(@alignCast(lambda.ctx));
+        return try self.eval_expr(
+            body,
+            lambda_ctx.*,
+            s0,
+            eval_pool,
+            state_pool,
+        );
     }
 
     fn make_lambda(
@@ -3771,18 +5092,21 @@ pub const Evaluator = struct {
         ctx: Context,
         eval_pool: *ValuePool,
     ) Error!Value {
-        _ = self;
         const lam = try eval_pool.arena.alloc_object(value.Lambda);
         const ctx_ptr = try eval_pool.arena.alloc_object(Context);
-        ctx_ptr.* = ctx;
         const params_copy = try eval_pool.arena.alloc([]const u8, def.params.len);
         for (def.params, 0..) |p, i| params_copy[i] = p;
+        const function = Value{ .lambda_v = lam };
+        // LET operators may be declared RECURSIVE. Self-binding every local
+        // parameterized operator is semantically inert when it is not
+        // recursive and avoids carrying parser-only declaration metadata.
+        ctx_ptr.* = try self.extend_context(ctx, def.name, function);
         lam.* = value.Lambda{
             .params = params_copy,
             .body = @ptrCast(def.body),
             .ctx = @ptrCast(ctx_ptr),
         };
-        return Value{ .lambda_v = lam };
+        return function;
     }
 
     fn eval_case_expr(
@@ -3815,28 +5139,35 @@ pub const Evaluator = struct {
     ) Error!Value {
         if (c.domain) |domain_expr| {
             const domain = try self.eval_set_materialized(domain_expr, ctx, s0, eval_pool, state_pool);
-            const items = domain.set_v.items(eval_pool);
+            const domain_set = domain.set_v;
+            assert(domain_set.offset + domain_set.len <= eval_pool.value_count);
             const scratch_snapshot = eval_pool.snapshot();
             const context_snap = self.context_snapshot();
             var chosen: ?Value = null;
-            for (items) |it| {
+            for (0..domain_set.len) |item_index| {
+                const it = eval_pool.values[domain_set.offset + item_index];
                 const new_ctx = try self.extend_context(ctx, c.var_name, it);
                 const pred = try self.eval_expr(c.body, new_ctx, s0, eval_pool, state_pool);
                 if (pred.is_truthy()) {
                     if (chosen == null) {
                         chosen = it;
-                    } else if (it.compare(chosen.?, eval_pool)) |cmp| {
+                    } else if (self.compare_choose_values(
+                        it,
+                        chosen.?,
+                        eval_pool,
+                    )) |cmp| {
                         if (cmp < 0) chosen = it;
                     }
                 }
                 eval_pool.restore(scratch_snapshot);
                 self.restore_context_pool(context_snap);
             }
-            return chosen orelse self.fail(
-                Error.EmptyChoose,
-                "CHOOSE",
-                c.var_name,
+            if (chosen) |value_v| return value_v;
+            std.debug.print(
+                "CHOOSE has no witness: variable={s} domain_size={d}\n",
+                .{ c.var_name, domain_set.len },
             );
+            return self.fail(Error.EmptyChoose, "CHOOSE", c.var_name);
         }
         // Domain-free CHOOSE: try fresh model values until the predicate holds.
         var attempt: u32 = 0;
@@ -3854,6 +5185,44 @@ pub const Evaluator = struct {
             if (pred.is_truthy()) return candidate;
         }
         return self.fail(Error.EmptyChoose, "CHOOSE", c.var_name);
+    }
+
+    fn compare_choose_values(
+        self: *const Evaluator,
+        left: Value,
+        right: Value,
+        pool: *const ValuePool,
+    ) ?i8 {
+        if (left == .model_v) {
+            if (right != .model_v) return -1;
+            return switch (std.mem.order(
+                u8,
+                self.models.get_name(left.model_v),
+                self.models.get_name(right.model_v),
+            )) {
+                .lt => -1,
+                .eq => 0,
+                .gt => 1,
+            };
+        }
+        if (right == .model_v) return 1;
+        if (left == .tuple_v and right == .tuple_v) {
+            const left_items = left.tuple_v.items(pool);
+            const right_items = right.tuple_v.items(pool);
+            if (left_items.len != right_items.len) {
+                return if (left_items.len < right_items.len) -1 else 1;
+            }
+            for (left_items, right_items) |left_item, right_item| {
+                const comparison = self.compare_choose_values(
+                    left_item,
+                    right_item,
+                    pool,
+                ) orelse return null;
+                if (comparison != 0) return comparison;
+            }
+            return 0;
+        }
+        return left.compare(right, pool);
     }
 
     fn eval_except(
@@ -4382,6 +5751,22 @@ inline fn name_eql(left: []const u8, right: []const u8) bool {
     return std.mem.eql(u8, left, right);
 }
 
+fn known_set_empty(set: Value, pool: *const ValuePool) ?bool {
+    return switch (set) {
+        .set_v => |materialized| materialized.len == 0,
+        .range_v => |range| range.hi < range.lo,
+        .power_set_v, .seq_set_v, .function_set_v => false,
+        .cup_v => |binary| blk: {
+            const left = known_set_empty(binary.left(pool), pool) orelse
+                break :blk null;
+            const right = known_set_empty(binary.right(pool), pool) orelse
+                break :blk null;
+            break :blk left and right;
+        },
+        else => null,
+    };
+}
+
 fn definition_source_module(
     definition: ast.Definition,
     module_name: []const u8,
@@ -4404,6 +5789,47 @@ fn generated_native_call(
     const function = registry.find(name) orelse
         return Error.UndefinedSymbol;
     return function(registry.ctx, pool, args);
+}
+
+fn generated_cached_call(
+    context: *const anyopaque,
+    name: []const u8,
+    args: []const Value,
+    eval_pool: *ValuePool,
+    current_state: ?*StateStore.State,
+    next_state: ?*StateStore.State,
+) Error!?Value {
+    const evaluator: *const Evaluator = @ptrCast(@alignCast(context));
+    const cached = evaluator.state_call_memo.get(
+        name,
+        args,
+        eval_pool,
+        if (current_state) |state_v| @intFromPtr(state_v) else 0,
+        if (next_state) |state_v| @intFromPtr(state_v) else 0,
+    ) orelse return null;
+    return try cached.clone(evaluator.state_definition_pool, eval_pool);
+}
+
+fn generated_put_cached_call(
+    context: *const anyopaque,
+    name: []const u8,
+    args: []const Value,
+    result: Value,
+    eval_pool: *ValuePool,
+    current_state: ?*StateStore.State,
+    next_state: ?*StateStore.State,
+) Error!void {
+    const evaluator: *const Evaluator = @ptrCast(@alignCast(context));
+    evaluator.state_call_memo.put(
+        name,
+        args,
+        eval_pool,
+        if (current_state) |state_v| @intFromPtr(state_v) else 0,
+        if (next_state) |state_v| @intFromPtr(state_v) else 0,
+        result,
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.NotImplemented => {},
+    };
 }
 
 fn expr_mentions_bound_names(
@@ -4752,7 +6178,7 @@ fn make_sequence_function(eval_pool: *ValuePool, items: []const Value) Error!Val
         dom[i] = Value{ .int_v = @as(i64, @intCast(i + 1)) };
     }
     return Value{ .function_v = .{
-        .domain = make_set(eval_pool, dom),
+        .domain = try make_set(eval_pool, dom),
         .offset = entries_offset,
         .len = len,
     } };
@@ -4790,7 +6216,7 @@ fn eval_union_all(eval_pool: *ValuePool, operand: Value) Error!Value {
             }
         }
     }
-    return Value{ .set_v = make_set(eval_pool, dest[0..pos]) };
+    return Value{ .set_v = try make_set(eval_pool, dest[0..pos]) };
 }
 
 fn eval_subset(eval_pool: *ValuePool, operand: Value) Error!Value {
@@ -4814,14 +6240,86 @@ fn eval_subset(eval_pool: *ValuePool, operand: Value) Error!Value {
                 j += 1;
             }
         }
-        dest[mask] = Value{ .set_v = make_set(eval_pool, sub) };
+        dest[mask] = Value{ .set_v = try make_set(eval_pool, sub) };
     }
-    return Value{ .set_v = make_set(eval_pool, dest) };
+    return Value{ .set_v = try make_set(eval_pool, dest) };
 }
 
-fn make_set(eval_pool: *ValuePool, values: []Value) value.Set {
+fn make_set(eval_pool: *ValuePool, values: []Value) Error!value.Set {
     var hashes: [65_536]fingerprint.Fingerprint = undefined;
     const use_hashes = values.len <= hashes.len;
+    if (!use_hashes) {
+        if (values.len > std.math.maxInt(u32)) return Error.OutOfMemory;
+        var table_len: usize = 1;
+        while (table_len < values.len * 2) table_len *= 2;
+        const snapshot = eval_pool.snapshot();
+        defer eval_pool.restore(snapshot);
+        const alignment_padding = @alignOf(fingerprint.Fingerprint) - 1;
+        const hashes_bytes = std.math.mul(
+            usize,
+            values.len,
+            @sizeOf(fingerprint.Fingerprint),
+        ) catch return Error.OutOfMemory;
+        const table_bytes = std.math.mul(
+            usize,
+            table_len,
+            @sizeOf(u32),
+        ) catch return Error.OutOfMemory;
+        const scratch_len = std.math.add(
+            usize,
+            alignment_padding,
+            std.math.add(usize, hashes_bytes, table_bytes) catch
+                return Error.OutOfMemory,
+        ) catch return Error.OutOfMemory;
+        if (scratch_len > std.math.maxInt(u32)) return Error.OutOfMemory;
+        const scratch = try eval_pool.alloc_scratch_bytes(@intCast(scratch_len));
+        const hashes_address = std.mem.alignForward(
+            usize,
+            @intFromPtr(scratch.ptr),
+            @alignOf(fingerprint.Fingerprint),
+        );
+        const dynamic_hashes_ptr: [*]fingerprint.Fingerprint =
+            @ptrFromInt(hashes_address);
+        const dynamic_hashes = dynamic_hashes_ptr[0..values.len];
+        const table_address = hashes_address + hashes_bytes;
+        assert(table_address % @alignOf(u32) == 0);
+        const dynamic_table_ptr: [*]u32 = @ptrFromInt(table_address);
+        const dynamic_table = dynamic_table_ptr[0..table_len];
+        @memset(dynamic_table, 0);
+
+        var unique_len: u32 = 0;
+        for (values) |candidate| {
+            const candidate_hash = fingerprint.hash_value(
+                eval_pool,
+                candidate,
+                fingerprint.hash_init(),
+            );
+            var slot = @as(usize, @truncate(candidate_hash)) &
+                (table_len - 1);
+            var duplicate = false;
+            while (dynamic_table[slot] != 0) {
+                const existing_index = dynamic_table[slot] - 1;
+                if (dynamic_hashes[existing_index] == candidate_hash and
+                    (builtin.mode == .ReleaseFast or
+                        values[existing_index].eql(candidate, eval_pool)))
+                {
+                    duplicate = true;
+                    break;
+                }
+                slot = (slot + 1) & (table_len - 1);
+            }
+            if (duplicate) continue;
+            values[unique_len] = candidate;
+            dynamic_hashes[unique_len] = candidate_hash;
+            dynamic_table[slot] = unique_len + 1;
+            unique_len += 1;
+        }
+        assert(unique_len <= values.len);
+        return value.Set{
+            .offset = value_offset(eval_pool, values.ptr),
+            .len = unique_len,
+        };
+    }
     var table: [131_072]u32 = undefined;
     var table_len: usize = 1;
     while (table_len < values.len * 2) table_len *= 2;
@@ -4879,7 +6377,7 @@ fn make_set(eval_pool: *ValuePool, values: []Value) value.Set {
         }
     }
     assert(unique_len <= values.len);
-    return .{
+    return value.Set{
         .offset = value_offset(eval_pool, values.ptr),
         .len = unique_len,
     };
@@ -5020,9 +6518,29 @@ fn eval_symbolic_set(
     state_pool: *ValuePool,
 ) Error!?Value {
     switch (expr.*) {
-        .ident, .set_enum => {
+        .ident => {
             const set = try self.eval_expr(expr, ctx, s0, eval_pool, state_pool);
             return if (set.is_set_like()) set else null;
+        },
+        .set_enum => |items| {
+            const dest = try eval_pool.alloc_values(@intCast(items.len));
+            for (items, 0..) |item, index| {
+                dest[index] = (try eval_symbolic_set(
+                    self,
+                    item,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                )) orelse try self.eval_expr(
+                    item,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
+            }
+            return Value{ .set_v = try make_set(eval_pool, dest) };
         },
         .set_of_functions => |sf| {
             const domain = (try eval_symbolic_set(
@@ -5082,6 +6600,16 @@ fn eval_symbolic_set(
                 .offset = value_offset(eval_pool, dest.ptr),
                 .len = @intCast(rs.fields.len),
             } };
+        },
+        .set_filter => |sf| {
+            return try eval_symbolic_integer_filter(
+                self,
+                sf,
+                ctx,
+                s0,
+                eval_pool,
+                state_pool,
+            );
         },
         .set_binary => |sb| {
             switch (sb.op) {
@@ -5203,11 +6731,16 @@ fn eval_symbolic_set(
             }
             if (self.find_definition(name)) |def| {
                 if (def.params.len != ap.args.len) return null;
-                const values = try eval_pool.alloc_values(@intCast(ap.args.len));
-                for (ap.args, 0..) |arg, i| {
-                    values[i] = try self.eval_expr(arg, ctx, s0, eval_pool, state_pool);
-                }
-                var new_ctx = Context.empty();
+                var argument_storage: [64]Value = undefined;
+                const values = try self.eval_application_arguments(
+                    ap.args,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                    &argument_storage,
+                );
+                var new_ctx = ctx.operator_frame();
                 for (def.params, 0..) |p, i| {
                     new_ctx = try self.extend_context(new_ctx, p, values[i]);
                 }
@@ -5232,6 +6765,115 @@ fn eval_symbolic_set(
         },
         else => return null,
     }
+}
+
+fn eval_symbolic_integer_filter(
+    self: *const Evaluator,
+    filter: *ast.SetFilter,
+    ctx: Context,
+    s0: ?*StateStore.State,
+    eval_pool: *ValuePool,
+    state_pool: *ValuePool,
+) Error!?Value {
+    if (filter.vars.len != 1) return null;
+    const bound = filter.vars[0];
+    const domain = (try eval_symbolic_set(
+        self,
+        bound.domain,
+        ctx,
+        s0,
+        eval_pool,
+        state_pool,
+    )) orelse return null;
+    if (domain != .range_v) return null;
+
+    var range = domain.range_v;
+    if (!try apply_symbolic_integer_bounds(
+        self,
+        filter.pred,
+        bound.name,
+        ctx,
+        s0,
+        eval_pool,
+        state_pool,
+        &range.lo,
+        &range.hi,
+    )) return null;
+    return Value{ .range_v = range };
+}
+
+fn apply_symbolic_integer_bounds(
+    self: *const Evaluator,
+    predicate: *ast.Expr,
+    variable_name: []const u8,
+    ctx: Context,
+    s0: ?*StateStore.State,
+    eval_pool: *ValuePool,
+    state_pool: *ValuePool,
+    lo: *i64,
+    hi: *i64,
+) Error!bool {
+    if (predicate.* != .binary) return false;
+    const binary = predicate.binary;
+    if (binary.op == .and_op) {
+        return try apply_symbolic_integer_bounds(
+            self,
+            binary.left,
+            variable_name,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+            lo,
+            hi,
+        ) and try apply_symbolic_integer_bounds(
+            self,
+            binary.right,
+            variable_name,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+            lo,
+            hi,
+        );
+    }
+
+    const variable_on_left = binary.left.* == .ident and
+        std.mem.eql(u8, binary.left.ident, variable_name);
+    const variable_on_right = binary.right.* == .ident and
+        std.mem.eql(u8, binary.right.ident, variable_name);
+    if (variable_on_left == variable_on_right) return false;
+    const constant_expr = if (variable_on_left) binary.right else binary.left;
+    const constant = try self.eval_expr(
+        constant_expr,
+        ctx,
+        s0,
+        eval_pool,
+        state_pool,
+    );
+    if (constant != .int_v) return false;
+
+    const op = if (variable_on_left) binary.op else switch (binary.op) {
+        .lt => ast.BinaryOp.gt,
+        .le => ast.BinaryOp.ge,
+        .gt => ast.BinaryOp.lt,
+        .ge => ast.BinaryOp.le,
+        else => binary.op,
+    };
+    const threshold = constant.int_v;
+    switch (op) {
+        .eq => {
+            lo.* = @max(lo.*, threshold);
+            hi.* = @min(hi.*, threshold);
+        },
+        .gt => lo.* = @max(lo.*, std.math.add(i64, threshold, 1) catch return false),
+        .ge => lo.* = @max(lo.*, threshold),
+        .lt => hi.* = @min(hi.*, std.math.sub(i64, threshold, 1) catch return false),
+        .le => hi.* = @min(hi.*, threshold),
+        else => return false,
+    }
+    return true;
 }
 
 fn make_function_set_value(eval_pool: *ValuePool, domain: Value, codomain: Value) Error!Value {
@@ -5390,4 +7032,56 @@ test "pointwise function predicate requires access by bound key" {
         bad.vars[0].name,
         bad_quantifier.vars[0].name,
     ));
+}
+
+test "generated expression availability ignores unused captures" {
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 16, 64);
+    var binding = ContextBinding{
+        .parent = null,
+        .state_parent = null,
+        .name = "used",
+        .variable_index = null,
+        .value = .{ .int_v = 7 },
+        .value_pool = null,
+        .assignment = .local,
+    };
+    const context = Context{
+        .head = &binding,
+        .state_head = null,
+        .local_floor = null,
+        .len = 1,
+    };
+    var values: [2]Value = undefined;
+
+    try std.testing.expect(try context.lookup_required_values_if_available(
+        &.{ "used", "unused" },
+        &.{ true, false },
+        &values,
+        &pool,
+    ));
+    try std.testing.expectEqual(Value{ .int_v = 7 }, values[0]);
+    try std.testing.expectEqual(Value{ .bool_v = false }, values[1]);
+    try std.testing.expect(!try context.lookup_required_values_if_available(
+        &.{ "used", "missing" },
+        &.{ true, true },
+        &values,
+        &pool,
+    ));
+}
+
+test "large sets deduplicate without quadratic fallback" {
+    var arena = try Arena.init(8 * 1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 70_000, 64);
+    const items = try pool.alloc_values(65_538);
+    for (items, 0..) |*item, index| {
+        item.* = .{ .int_v = @intCast(index % 65_537) };
+    }
+
+    const result = try make_set(&pool, items);
+    try std.testing.expectEqual(@as(u32, 65_537), result.len);
+    try std.testing.expect(result.contains(&pool, .{ .int_v = 0 }));
+    try std.testing.expect(result.contains(&pool, .{ .int_v = 65_536 }));
 }

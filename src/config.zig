@@ -6,6 +6,7 @@ pub const ConstantAssignment = struct {
     name: []const u8,
     expr: []const u8,
     is_substitution: bool,
+    module: ?[]const u8 = null,
 };
 
 pub fn is_operator_alias(expr: []const u8) bool {
@@ -33,6 +34,7 @@ pub const Config = struct {
     constraints: []const []const u8,
     action_constraints: []const []const u8,
     symmetry_name: ?[]const u8 = null,
+    view_name: ?[]const u8 = null,
     check_deadlock: bool,
     strict_constants: bool = false,
 
@@ -47,6 +49,7 @@ pub const Config = struct {
             .constraints = &[_][]const u8{},
             .action_constraints = &[_][]const u8{},
             .symmetry_name = null,
+            .view_name = null,
             .check_deadlock = true,
             .strict_constants = false,
         };
@@ -66,6 +69,7 @@ pub const Config = struct {
             .constraints = &[_][]const u8{},
             .action_constraints = &[_][]const u8{},
             .symmetry_name = null,
+            .view_name = null,
             .check_deadlock = true,
             .strict_constants = false,
         };
@@ -95,6 +99,7 @@ pub const Config = struct {
             .constraints = &[_][]const u8{},
             .action_constraints = &[_][]const u8{},
             .symmetry_name = null,
+            .view_name = null,
             .check_deadlock = true,
             .strict_constants = false,
         };
@@ -321,6 +326,18 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
         } else if (eql(first_word, "CHECK_DEADLOCK")) {
             if (rest.len > 0) {
                 cfg.check_deadlock = !eql(first_token(rest), "FALSE");
+            } else {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
+                    if (t.len == 0 or is_comment(t)) continue;
+                    if (is_directive(t)) {
+                        i -= 1;
+                        break;
+                    }
+                    cfg.check_deadlock = !eql(first_token(t), "FALSE");
+                    break;
+                }
             }
         } else if (eql(first_word, "SYMMETRY")) {
             if (rest.len > 0) {
@@ -339,12 +356,27 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
                     break;
                 }
             }
+        } else if (eql(first_word, "VIEW")) {
+            if (rest.len > 0) {
+                cfg.view_name = try arena_dup(arena, first_token(rest));
+            } else {
+                i += 1;
+                while (i < lines.len) : (i += 1) {
+                    const t = trim(lines[i]);
+                    if (t.len == 0 or is_comment(t)) continue;
+                    if (is_directive(t)) {
+                        i -= 1;
+                        break;
+                    }
+                    cfg.view_name = try arena_dup(arena, first_token(t));
+                    break;
+                }
+            }
         } else if (eql(first_word, "ALIAS") or
-            eql(first_word, "VIEW") or
             eql(first_word, "POSTCONDITION"))
         {
             // Not implemented yet; parse and ignore for now.
-            if (eql(first_word, "ALIAS") or eql(first_word, "VIEW") or
+            if (eql(first_word, "ALIAS") or
                 eql(first_word, "POSTCONDITION"))
             {
                 // Single-line or block values are ignored.
@@ -378,6 +410,7 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
             action_constraints.items,
         ),
         .symmetry_name = cfg.symmetry_name,
+        .view_name = cfg.view_name,
         .check_deadlock = cfg.check_deadlock,
         .strict_constants = true,
     };
@@ -413,7 +446,7 @@ fn parse_name_list(arena: *Arena, line: []const u8, out: *std.ArrayList([]const 
 }
 
 fn parse_constant_assignment(arena: *Arena, line: []const u8, out: *std.ArrayList(ConstantAssignment)) !void {
-    const is_substitution = std.mem.indexOf(u8, line, "<-") != null;
+    var is_substitution = std.mem.indexOf(u8, line, "<-") != null;
     const sep_idx = if (is_substitution)
         std.mem.indexOf(u8, line, "<-").?
     else
@@ -421,10 +454,23 @@ fn parse_constant_assignment(arena: *Arena, line: []const u8, out: *std.ArrayLis
     const name = trim(line[0..sep_idx]);
     const expr_start = sep_idx + (if (is_substitution) @as(usize, 2) else @as(usize, 1));
     var expr = trim(line[expr_start..]);
+    var module_name: ?[]const u8 = null;
     // Handle parameterized substitutions like Ballot <-[Voting] MCBallot
     if (is_substitution and std.mem.startsWith(u8, expr, "[")) {
         const bracket_end = std.mem.indexOf(u8, expr, "]") orelse return error.SyntaxError;
         expr = trim(expr[bracket_end + 1 ..]);
+    }
+    if (!is_substitution and std.mem.startsWith(u8, expr, "[")) {
+        const bracket_end = std.mem.indexOfScalar(u8, expr, ']') orelse
+            return error.SyntaxError;
+        const qualifier = trim(expr[1..bracket_end]);
+        const qualified_value = trim(expr[bracket_end + 1 ..]);
+        if (qualifier.len == 0 or qualified_value.len == 0) {
+            return error.SyntaxError;
+        }
+        module_name = try arena_dup(arena, qualifier);
+        expr = qualified_value;
+        is_substitution = true;
     }
     if (name.len == 0 or expr.len == 0) return error.SyntaxError;
     std.debug.assert(name.len > 0);
@@ -433,6 +479,7 @@ fn parse_constant_assignment(arena: *Arena, line: []const u8, out: *std.ArrayLis
         .name = try arena_dup(arena, name),
         .expr = try arena_dup(arena, expr),
         .is_substitution = is_substitution,
+        .module = module_name,
     });
 }
 
@@ -665,6 +712,21 @@ test "parse boolean operator substitutions" {
     try std.testing.expect(cfg.constants[1].is_substitution);
 }
 
+test "parse module-scoped model assignment" {
+    const source =
+        \\CONSTANT NoHash = [Nano]NoHashVal
+    ;
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+
+    const cfg = try parse(&arena, source);
+    try std.testing.expectEqual(@as(usize, 1), cfg.constants.len);
+    try std.testing.expectEqualStrings("NoHash", cfg.constants[0].name);
+    try std.testing.expectEqualStrings("NoHashVal", cfg.constants[0].expr);
+    try std.testing.expectEqualStrings("Nano", cfg.constants[0].module.?);
+    try std.testing.expect(cfg.constants[0].is_substitution);
+}
+
 test "state and action constraints remain distinct" {
     const source =
         \\CONSTRAINT StateLimit
@@ -720,4 +782,30 @@ test "parse block symmetry operator" {
         "ModelSymmetry",
         cfg.symmetry_name.?,
     );
+}
+
+test "parse view operator" {
+    const source =
+        \\SPECIFICATION Spec
+        \\VIEW
+        \\    StateView
+    ;
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+
+    const cfg = try parse(&arena, source);
+    try std.testing.expectEqualStrings("StateView", cfg.view_name.?);
+}
+
+test "parse block CHECK_DEADLOCK value" {
+    const source =
+        \\SPECIFICATION Spec
+        \\CHECK_DEADLOCK
+        \\    FALSE
+    ;
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+
+    const cfg = try parse(&arena, source);
+    try std.testing.expect(!cfg.check_deadlock);
 }

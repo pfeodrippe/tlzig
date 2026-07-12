@@ -358,6 +358,13 @@ pub const Value = union(ValueTag) {
         if (tags_equal and a != .lambda_v and same_repr(a, b)) {
             return true;
         }
+        if ((is_symbolic_finite_set(a) or is_symbolic_finite_set(b)) and
+            a.is_set_like() and b.is_set_like())
+        {
+            if (finite_set_extensional_equal(a, b, pool)) |equal| {
+                return equal;
+            }
+        }
         return switch (a) {
             .set_v => |sa| blk: {
                 if (!tags_equal and b == .range_v) break :blk range_equals_set(b.range_v, sa, pool);
@@ -808,6 +815,101 @@ pub const Value = union(ValueTag) {
         };
     }
 };
+
+fn is_symbolic_finite_set(value_v: Value) bool {
+    return switch (value_v) {
+        .cup_v, .cap_v, .diff_v, .union_v => true,
+        else => false,
+    };
+}
+
+fn finite_set_extensional_equal(
+    left: Value,
+    right: Value,
+    pool: *const ValuePool,
+) ?bool {
+    const left_subset = finite_set_subset(left, right, pool) orelse return null;
+    if (!left_subset) return false;
+    return finite_set_subset(right, left, pool);
+}
+
+fn finite_set_subset(
+    left: Value,
+    right: Value,
+    pool: *const ValuePool,
+) ?bool {
+    return finite_set_support_subset(left, left, right, pool);
+}
+
+fn finite_set_support_subset(
+    container: Value,
+    support: Value,
+    right: Value,
+    pool: *const ValuePool,
+) ?bool {
+    return switch (support) {
+        .set_v => |set| blk: {
+            for (set.items(pool)) |item| {
+                if (container.member(pool, item) and !right.member(pool, item)) {
+                    break :blk false;
+                }
+            }
+            break :blk true;
+        },
+        .range_v => |range| blk: {
+            if (range.hi < range.lo) break :blk true;
+            var item = range.lo;
+            while (true) {
+                const value_v = Value{ .int_v = item };
+                if (container.member(pool, value_v) and
+                    !right.member(pool, value_v))
+                {
+                    break :blk false;
+                }
+                if (item == range.hi) break;
+                item += 1;
+            }
+            break :blk true;
+        },
+        .cup_v => |set| blk: {
+            const left_subset = finite_set_support_subset(
+                container,
+                set.left(pool),
+                right,
+                pool,
+            ) orelse break :blk null;
+            if (!left_subset) break :blk false;
+            break :blk finite_set_support_subset(
+                container,
+                set.right(pool),
+                right,
+                pool,
+            );
+        },
+        .cap_v, .diff_v => |set| finite_set_support_subset(
+            container,
+            set.left(pool),
+            right,
+            pool,
+        ),
+        .union_v => |set| blk: {
+            const sets = set.set(pool);
+            if (sets != .set_v) break :blk null;
+            for (sets.set_v.items(pool)) |nested| {
+                if (!nested.is_set_like()) break :blk null;
+                const nested_subset = finite_set_support_subset(
+                    container,
+                    nested,
+                    right,
+                    pool,
+                ) orelse break :blk null;
+                if (!nested_subset) break :blk false;
+            }
+            break :blk true;
+        },
+        else => null,
+    };
+}
 
 fn power_set_member(pool: *const ValuePool, base: Value, elem: Value) bool {
     assert(base.is_set_like());
@@ -1470,6 +1572,22 @@ pub const ValuePool = struct {
         return self.push_string_uninterned(s);
     }
 
+    pub fn alloc_scratch_bytes(self: *ValuePool, count: u32) ![]u8 {
+        assert(self.string_count <= self.string_cap);
+        const needed = @as(u64, self.string_count) + count;
+        if (needed > std.math.maxInt(u32)) return error.OutOfMemory;
+        while (needed > self.string_cap) {
+            if (self.growable) {
+                try self.grow_strings();
+            } else {
+                return error.OutOfMemory;
+            }
+        }
+        const start = self.string_count;
+        self.string_count = @intCast(needed);
+        return self.strings[start..][0..count];
+    }
+
     fn push_string_uninterned(self: *ValuePool, s: []const u8) !String {
         assert(self.string_count <= self.string_cap);
         if (s.len > std.math.maxInt(u32)) return error.OutOfMemory;
@@ -1552,6 +1670,39 @@ test "set contains dense probe falls back for sparse and unsorted sets" {
     try std.testing.expect(set_value.contains(&pool, .{ .int_v = 1 }));
     try std.testing.expect(set_value.contains(&pool, .{ .int_v = 5 }));
     try std.testing.expect(!set_value.contains(&pool, .{ .int_v = 4 }));
+}
+
+test "symbolic finite set equality is extensional" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 32, 64);
+
+    const singleton_offset = try pool.push_values(&.{.{ .int_v = 1 }});
+    const pair_offset = try pool.push_values(&.{
+        .{ .int_v = 1 },
+        .{ .int_v = 2 },
+    });
+    const singleton = Value{ .set_v = .{
+        .offset = singleton_offset,
+        .len = 1,
+    } };
+    const pair = Value{ .set_v = .{
+        .offset = pair_offset,
+        .len = 2,
+    } };
+    const singleton_value_offset = try pool.push_value(singleton);
+    const pair_value_offset = try pool.push_value(pair);
+    const left = Value{ .cup_v = .{
+        .left_offset = singleton_value_offset,
+        .right_offset = pair_value_offset,
+    } };
+    const right = Value{ .cup_v = .{
+        .left_offset = pair_value_offset,
+        .right_offset = singleton_value_offset,
+    } };
+
+    try std.testing.expect(left.eql(right, &pool));
+    try std.testing.expect(left.eql(pair, &pool));
 }
 
 test "record equality ignores field order" {

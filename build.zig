@@ -116,9 +116,6 @@ pub fn build(b: *std.Build) void {
     if (benchmark_generated_expressions) {
         run_bench.addArg("--generated-expressions");
     }
-    if (generated_model_path == null) {
-        run_bench.addArg("--skip-prefer-generated");
-    }
     const benchmark_step = b.step("benchmark", "Benchmark tlzig vs Java TLC");
     benchmark_step.dependOn(&run_bench.step);
     if (generated_model_path == null) {
@@ -127,108 +124,148 @@ pub fn build(b: *std.Build) void {
             .{
                 .name = "benchmark_mdbtla_client_centric_aot",
                 .model_path = "generated_models/mdbtla_client_centric.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/ClientCentricTests.tla",
+                .cfg = "vendor/MDBTLA/MultiShardTxn/ClientCentricTests.cfg",
                 .filter = "MultiShardTxn ClientCentric",
             },
             .{
                 .name = "benchmark_mdbtla_mcm_snapshot_aot",
                 .model_path = "generated_models/mdbtla_mcm_snapshot_invariant.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+                .cfg = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.cfg",
                 .filter = "MultiShardTxn MCM/snapshot-invariant",
             },
             .{
                 .name = "benchmark_mdbtla_mcm_rc_local_aot",
                 .model_path = "generated_models/mdbtla_mcm_rc_local_invariant.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+                .cfg = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn_rc_local.cfg",
                 .filter = "MultiShardTxn MCM/rc-local-invariant",
             },
             .{
                 .name = "benchmark_mdbtla_storage_aot",
                 .model_path = "generated_models/mdbtla_storage.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/Storage.tla",
+                .cfg = "vendor/MDBTLA/MultiShardTxn/Storage.cfg",
                 .filter = "MultiShardTxn Storage",
             },
             .{
                 .name = "benchmark_mdbtla_storage_exhaustive_aot",
                 .model_path = "generated_models/mdbtla_storage_exhaustive.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/Storage.tla",
+                .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/Storage_exhaustive.cfg",
                 .filter = "MultiShardTxn Storage exhaustive",
                 .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_no_prepare_aot",
                 .model_path = "generated_models/mdbtla_rc_no_prepare_block.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+                .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block.cfg",
                 .filter = "MultiShardTxn RC/no-prepare-block",
             },
             .{
                 .name = "benchmark_mdbtla_rc_no_prepare_exhaustive_aot",
                 .model_path = "generated_models/mdbtla_rc_no_prepare_block_exhaustive.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+                .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_exhaustive.cfg",
                 .filter = "MultiShardTxn RC/no-prepare-block exhaustive",
                 .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_no_prepare_ww_aot",
                 .model_path = "generated_models/mdbtla_rc_no_prepare_block_or_ww.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+                .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_or_ww.cfg",
                 .filter = "MultiShardTxn RC/no-prepare-block-or-ww",
             },
             .{
                 .name = "benchmark_mdbtla_rc_no_prepare_ww_exhaustive_aot",
                 .model_path = "generated_models/mdbtla_rc_no_prepare_block_or_ww_exhaustive.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+                .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_or_ww_exhaustive.cfg",
                 .filter = "MultiShardTxn RC/no-prepare-block-or-ww exhaustive",
                 .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_snapshot_aot",
                 .model_path = "generated_models/mdbtla_rc_snapshot.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+                .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_snapshot.cfg",
                 .filter = "MultiShardTxn RC/snapshot",
             },
             .{
                 .name = "benchmark_mdbtla_rc_snapshot_exhaustive_aot",
                 .model_path = "generated_models/mdbtla_rc_snapshot_exhaustive.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+                .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_snapshot_exhaustive.cfg",
                 .filter = "MultiShardTxn RC/snapshot exhaustive",
                 .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_rc_with_prepare_aot",
                 .model_path = "generated_models/mdbtla_rc_with_prepare_block.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+                .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_with_prepare_block.cfg",
                 .filter = "MultiShardTxn RC/with-prepare-block",
             },
             .{
                 .name = "benchmark_mdbtla_rc_with_prepare_exhaustive_aot",
                 .model_path = "generated_models/mdbtla_rc_with_prepare_block_exhaustive.zig",
+                .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
+                .cfg = "benchmark_configs/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_with_prepare_block_exhaustive.cfg",
                 .filter = "MultiShardTxn RC/with-prepare-block exhaustive",
                 .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_single_shard_txn_full_aot",
                 .model_path = "generated_models/mdbtla_single_shard_txn_full.zig",
+                .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
+                .cfg = "vendor/MDBTLA/SingleShardTxn/ShardTxn.cfg",
                 .filter = "SingleShardTxn ShardTxn",
                 .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_single_shard_txn_small_aot",
                 .model_path = "generated_models/mdbtla_single_shard_txn_small.zig",
+                .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
+                .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_small.cfg",
                 .filter = "SingleShardTxn ShardTxn/small",
             },
             .{
                 .name = "benchmark_mdbtla_single_shard_txn_small_no_sym_aot",
                 .model_path = "generated_models/mdbtla_single_shard_txn_small_no_sym.zig",
+                .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
+                .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_small_no_sym.cfg",
                 .filter = "SingleShardTxn ShardTxn/small no-sym",
             },
             .{
                 .name = "benchmark_mdbtla_single_shard_txn_small_safety_aot",
                 .model_path = "generated_models/mdbtla_single_shard_txn_small_safety.zig",
+                .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
+                .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_small_safety.cfg",
                 .filter = "SingleShardTxn ShardTxn/small safety",
             },
             .{
                 .name = "benchmark_mdbtla_single_shard_txn_small_safety_no_sym_aot",
                 .model_path = "generated_models/mdbtla_single_shard_txn_small_safety_no_sym.zig",
+                .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
+                .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_small_safety_no_sym.cfg",
                 .filter = "SingleShardTxn ShardTxn/small safety no-sym",
             },
             .{
                 .name = "benchmark_mdbtla_singlelog_mcmdbprops_aot",
                 .model_path = "generated_models/mdbtla_singlelog_mcmdbprops.zig",
+                .tla = "vendor/MDBTLA/SingleLog/MCMDBProps.tla",
+                .cfg = "vendor/MDBTLA/SingleLog/MCMDBProps.cfg",
                 .filter = "SingleLog MCMDBProps",
                 .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_singlelog_mdblinearizability_aot",
                 .model_path = "generated_models/mdbtla_singlelog_mdblinearizability.zig",
+                .tla = "vendor/MDBTLA/SingleLog/MDBLinearizability.tla",
+                .cfg = "vendor/MDBTLA/SingleLog/MDBLinearizability.cfg",
                 .filter = "SingleLog MDBLinearizability",
             },
         };
@@ -247,8 +284,11 @@ pub fn build(b: *std.Build) void {
                 target,
                 optimize,
                 tlzig_module,
+                exe,
                 generated_benchmark.name,
                 generated_benchmark.model_path,
+                generated_benchmark.tla,
+                generated_benchmark.cfg,
                 generated_benchmark.filter,
                 benchmark_generated_expressions,
             );
@@ -279,6 +319,8 @@ pub fn build(b: *std.Build) void {
 const GeneratedBenchmark = struct {
     name: []const u8,
     model_path: []const u8,
+    tla: []const u8,
+    cfg: []const u8,
     filter: []const u8,
     default_enabled: bool = true,
 };
@@ -288,11 +330,24 @@ fn addGeneratedBenchmark(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     tlzig_module: *std.Build.Module,
+    emitter: *std.Build.Step.Compile,
     name: []const u8,
     generated_model_path: []const u8,
+    generated_benchmark_tla: []const u8,
+    generated_benchmark_cfg: []const u8,
     filter: []const u8,
     generated_expressions: bool,
 ) *std.Build.Step.Run {
+    const regenerate = b.addRunArtifact(emitter);
+    regenerate.has_side_effects = true;
+    regenerate.addArgs(&.{
+        "--spec",
+        generated_benchmark_tla,
+        "--cfg",
+        generated_benchmark_cfg,
+        "--emit-zig",
+        generated_model_path,
+    });
     const generated_model_module = b.createModule(.{
         .root_source_file = b.path(generated_model_path),
         .target = target,
@@ -308,6 +363,7 @@ fn addGeneratedBenchmark(
             .optimize = optimize,
         }),
     });
+    bench.step.dependOn(&regenerate.step);
     bench.root_module.addImport("tlzig", tlzig_module);
     bench.root_module.addImport("generated_model", generated_model_module);
     const run_bench = b.addRunArtifact(bench);
@@ -316,8 +372,8 @@ fn addGeneratedBenchmark(
     run_bench.addArgs(&.{
         "--label-suffix",
         " [AOT]",
-        "--tlzig-only",
         "--auto-only",
+        "--tlzig-only",
     });
     if (generated_expressions) {
         run_bench.addArg("--generated-expressions");

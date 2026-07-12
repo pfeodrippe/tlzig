@@ -28,6 +28,310 @@ test "parse function literal init" {
     try std.testing.expectEqual(module.definitions.len, 1);
 }
 
+test "named assumption remains available as a definition" {
+    const source =
+        \\---------------------- MODULE TestNamedAssume ----------------------
+        \\ASSUME FirstAssume == TRUE
+        \\ASSUME FirstAssume
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    try std.testing.expectEqual(@as(usize, 1), module.definitions.len);
+    try std.testing.expectEqualStrings("FirstAssume", module.definitions[0].name);
+    try std.testing.expectEqual(@as(usize, 2), module.assumptions.len);
+}
+
+test "bounded operator declaration accepts a shared domain" {
+    const source =
+        \\---------------------- MODULE TestBoundedOperator ----------------------
+        \\EXTENDS Naturals
+        \\Floor == 1..3
+        \\Distance[a, b \in Floor] == IF a > b THEN a - b ELSE b - a
+        \\Result == Distance[1, 3]
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var pool = try value.ValuePool.init(&eval_arena, 1024, 256);
+    const result = try evaluator.eval_named_zero(
+        "Result",
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expectEqual(@as(i64, 2), result.int_v);
+}
+
+test "module loader preserves custom infix definitions" {
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    const search_paths = [_][]const u8{
+        "vendor/tlaplus-examples/specifications/LeastCircularSubstring",
+        "vendor/tlaplus/tlatools/org.lamport.tlatools/src/tla2sany/StandardModules",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = try loader.load(
+        "vendor/tlaplus-examples/specifications/LeastCircularSubstring/MCLeastCircularSubstring.tla",
+    );
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    try std.testing.expect(evaluator.find_definition("\\preceq") != null);
+}
+
+test "recursive operator stops before choosing from an empty set" {
+    const source =
+        \\---------------------- MODULE TestRecursiveChoose ----------------------
+        \\EXTENDS Naturals
+        \\RECURSIVE Sum(_, _)
+        \\Sum(f, S) == IF S = {} THEN 0
+        \\             ELSE LET x == CHOOSE x \in S : TRUE
+        \\                  IN f[x] + Sum(f, S \ {x})
+        \\F == [i \in 1..12 |-> i]
+        \\Result == Sum(F, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12})
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 4096, 256);
+    const result = try evaluator.eval_named_zero(
+        "Result",
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expectEqual(@as(i64, 78), result.int_v);
+}
+
+test "unused LET operator is evaluated lazily" {
+    const source =
+        \\---------------------- MODULE TestLazyLet ----------------------
+        \\Result == LET unreachable == CHOOSE x \in {} : TRUE
+        \\          IN IF TRUE THEN 1 ELSE unreachable
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 4096, 256);
+    const result = try evaluator.eval_named_zero(
+        "Result",
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expectEqual(@as(i64, 1), result.int_v);
+}
+
+test "lazy LET function value can be applied" {
+    const source =
+        \\---------------------- MODULE TestLazyLetFunction ----------------------
+        \\Result == LET f == [x \in {1} |-> x + 1] IN f[1]
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 4096, 256);
+    const result = try evaluator.eval_named_zero(
+        "Result",
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expectEqual(@as(i64, 2), result.int_v);
+}
+
+test "recursive set subtraction compares a symbolic empty set by value" {
+    const source =
+        \\---------------------- MODULE TestRecursiveRangeSum ----------------------
+        \\EXTENDS Naturals
+        \\RECURSIVE Sum(_, _)
+        \\Sum(f, S) == IF S = {} THEN 0
+        \\             ELSE LET x == CHOOSE x \in S : TRUE
+        \\                  IN f[x] + Sum(f, S \ {x})
+        \\F == [i \in 1..12 |-> i]
+        \\Result == Sum(F, 1..12)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 4096, 256);
+    const result = try evaluator.eval_named_zero(
+        "Result",
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expectEqual(@as(i64, 78), result.int_v);
+}
+
+test "unbounded quantifier accepts a provable BOOLEAN membership" {
+    const source =
+        \\---------------------- MODULE TestUnboundedQuantifier ----------------------
+        \\Bool(x, y) == x = y
+        \\Ok == \A x, y : Bool(x, y) \in BOOLEAN
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 256, 64);
+    const result = try evaluator.eval_named_zero(
+        "Ok",
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expect(result.is_truthy());
+}
+
+test "custom bitwise infix operators parse without changing logical OR" {
+    const source =
+        \\---------------------- MODULE TestBitwiseInfix ----------------------
+        \\x | y == x + y
+        \\x ^^ y == x - y
+        \\Ok == (2 | 3) = 5 /\ (5 ^^ 3) = 2 /\ (TRUE \/ FALSE)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 256, 64);
+    const result = try evaluator.eval_named_zero(
+        "Ok",
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expect(result.is_truthy());
+}
+
+test "filtered Nat remains symbolic in an ordinary subset comparison" {
+    const source =
+        \\---------------------- MODULE TestFilteredNatSubset ----------------------
+        \\EXTENDS Naturals
+        \\Ok == {1, 2, 3} \subseteq {n \in Nat : n > 0}
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 256, 64);
+    const result = try evaluator.eval_named_zero(
+        "Ok",
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expect(result.is_truthy());
+}
+
+test "hereditary power-set filter lowers before outer enumeration" {
+    const source =
+        \\---------------------- MODULE TestPowerSetFilter ----------------------
+        \\EXTENDS Naturals, FiniteSets
+        \\Pairs == {E \in SUBSET (SUBSET (1..5)) :
+        \\             \A e \in E : Cardinality(e) = 2}
+        \\Ok == Cardinality(Pairs) = 1024
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 32 * 1024, 256);
+    const result = try evaluator.eval_named_zero(
+        "Ok",
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expect(result.is_truthy());
+}
+
 test "parse SimpleRegular-style Init" {
     const source =
         \\---------------------- MODULE TestInit ----------------------
@@ -649,6 +953,514 @@ test "spec-shaped temporal property is checked from initial states" {
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
 }
 
+test "weak fairness does not count a matching stuttering action" {
+    const source =
+        \\---------------------- MODULE TestWeakFairnessStutter ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Next == x' = 1
+        \\vars == <<x>>
+        \\Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+        \\Prop == (x = 0) ~> (x = 1)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Prop"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "liveness resolves fairness through a specification alias" {
+    const source =
+        \\---------------------- MODULE TestAliasedFairness ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Next == x' = 1
+        \\vars == <<x>>
+        \\Fairness == WF_vars(Next)
+        \\Spec == Init /\ [][Next]_vars /\ Fairness
+        \\Prop == <>(x = 1)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Prop"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "liveness supports tuple-subscript weak fairness" {
+    const source =
+        \\---------------------- MODULE TestTupleFairness ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLES x, y
+        \\Init == x = 0 /\ y = 0
+        \\Next == x' = 1 /\ UNCHANGED y
+        \\Spec == Init /\ [][Next]_<<x, y>> /\ WF_<<x, y>>(Next)
+        \\Prop == <>(x = 1)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Prop"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "eventually detects an avoiding cycle inside a larger SCC" {
+    const source =
+        \\---------------------- MODULE TestInducedLivenessScc ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Next == \/ /\ x = 0 /\ x' = 1
+        \\        \/ /\ x = 1 /\ x' = 1
+        \\        \/ /\ x = 1 /\ x' = 2
+        \\        \/ /\ x = 2 /\ x' = 1
+        \\Prop == <>(x = 2)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = null,
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{"Prop"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expectError(error.PropertyViolated, model_checker.check());
+    try std.testing.expectEqual(@as(u64, 3), model_checker.distinct);
+}
+
+test "compiled actions evaluate ENABLED without allocating a candidate" {
+    const source =
+        \\---------------------- MODULE TestActionEnabled ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Advance == /\ x = 0 /\ x' = 1
+        \\Finish == /\ ~ENABLED Advance /\ x' = 2
+        \\Next == Advance \/ Finish
+        \\Spec == Init /\ [][Next]_x
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 3), result.distinct);
+}
+
+test "repeated action assignments are conjunctive constraints" {
+    const source =
+        \\---------------------- MODULE TestRepeatedActionAssignment ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 1
+        \\Next == /\ x' = x + 1
+        \\        /\ x' \in 1..2
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = null,
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.generated);
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "nested action return restores caller parameters" {
+    const source =
+        \\---------------------- MODULE TestNestedActionReturn ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE y
+        \\Init == y = 0
+        \\Inner(value) == y' = value
+        \\Outer(flag) == /\ Inner(1)
+        \\               /\ flag
+        \\               /\ y' = 1
+        \\Next == Outer(TRUE)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = null,
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "root expression does not invalidate continued action contexts" {
+    const source =
+        \\---------------------- MODULE TestContinuedActionContext ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE y
+        \\Init == y = 0
+        \\Inner == \E value \in {1} : y' = value
+        \\Next == /\ Inner
+        \\        /\ IF TRUE THEN y' = 1 ELSE FALSE
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = null,
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "action inlining avoids capture by LET definitions" {
+    const source =
+        \\---------------------- MODULE TestActionCapture ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Inner(signedBlock) == LET block == signedBlock + 1 IN x' = signedBlock + block
+        \\Next == \E block \in {1} : Inner(block)
+        \\Spec == Init /\ [][Next]_x
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+    try std.testing.expectEqual(
+        @as(i64, 3),
+        model_checker.state_store.get(1).values[0].int_v,
+    );
+}
+
+test "function-set membership checks a record codomain structurally" {
+    const source =
+        \\---------------------- MODULE TestStructuralFunctionSet ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE f
+        \\LargeRecord == [kind : {"a", "b"}, number : 1..1000]
+        \\Init == f = [i \in 1..8 |-> [kind |-> "a", number |-> i]]
+        \\Next == UNCHANGED f
+        \\Spec == Init /\ [][Next]_f
+        \\TypeOK == f \in [1..8 -> LargeRecord]
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{"TypeOK"},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        4,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 1), result.distinct);
+}
+
+test "boxed state property is checked on each discovered child" {
+    const source =
+        \\---------------------- MODULE TestBoxedStateChild ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Next == x' = x + 1
+        \\Spec == Init /\ [][Next]_x
+        \\Prop == [](x < 1)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Prop"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expectError(error.PropertyViolated, model_checker.check());
+    try std.testing.expectEqual(@as(u64, 1), model_checker.distinct);
+}
+
 test "recursive action property may update derived view" {
     const source =
         \\---------------------- MODULE TestRecursiveActionProperty ----------------------
@@ -898,6 +1710,52 @@ test "compound temporal property checks boxed action transitions" {
     );
     defer model_checker.deinit();
     try std.testing.expectError(error.PropertyViolated, model_checker.check());
+}
+
+test "VIEW defines state identity while retaining a concrete representative" {
+    const source =
+        \\---------------------- MODULE TestView ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Next == x' = 1 - x
+        \\View == TRUE
+        \\============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = null,
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .view_name = "View",
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.generated);
+    try std.testing.expectEqual(@as(u64, 1), result.distinct);
 }
 
 test "UNCHANGED expression checks parent and next state" {
@@ -1207,10 +2065,12 @@ test "parameterized definitions inherit caller context" {
     const evaluator = try eval.Evaluator.init(module, &arena, overrides.OverrideContext.default());
     var pool = try value.ValuePool.init(&arena, 64, 64);
     var state_pool = try value.ValuePool.init(&arena, 64, 64);
-    const ctx = try evaluator.extend_context(
+    const ctx = try evaluator.extend_state_context(
         eval.Context.empty(),
         "x",
+        0,
         .{ .int_v = 1 },
+        .changed,
     );
     const result = try evaluator.eval_expr(expr, ctx, null, &pool, &state_pool);
     try std.testing.expect(result.is_truthy());
@@ -1357,6 +2217,38 @@ test "parameterized operator can be passed as a value" {
     var state_pool = try value.ValuePool.init(&arena, 128, 64);
     const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
     const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
+    try std.testing.expect(result.is_truthy());
+}
+
+test "CHOOSE normalizes tuple-valued sets independent of insertion order" {
+    const source =
+        \\---------------------- MODULE TestChooseTupleOrder ----------------------
+        \\Left == CHOOSE x \in {<<2>>, <<1>>} : TRUE
+        \\Right == CHOOSE x \in {<<1>>, <<2>>} : TRUE
+        \\Ok == Left = Right /\ Left = <<1>>
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 256, 64);
+    var state_pool = try value.ValuePool.init(&arena, 256, 64);
+    const ok = evaluator.find_definition("Ok") orelse
+        return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(
+        ok.body,
+        eval.Context.empty(),
+        null,
+        &pool,
+        &state_pool,
+    );
     try std.testing.expect(result.is_truthy());
 }
 
@@ -1696,6 +2588,38 @@ test "user FoldFunctionOnSet definition is not bypassed by module override" {
     try std.testing.expect(result.is_truthy());
 }
 
+test "FoldFunction accepts an arbitrary finite function domain" {
+    const source =
+        \\---------------------- MODULE TestFoldFunctionDomain ----------------------
+        \\EXTENDS Naturals, Functions
+        \\F == [k \in {"left", "right"} |-> IF k = "left" THEN 20 ELSE 22]
+        \\Ok == Functions!FoldFunction(+, 0, F) = 42
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 256, 64);
+    var state_pool = try value.ValuePool.init(&arena, 256, 64);
+    const ok = evaluator.find_definition("Ok") orelse
+        return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(
+        ok.body,
+        eval.Context.empty(),
+        null,
+        &pool,
+        &state_pool,
+    );
+    try std.testing.expect(result.is_truthy());
+}
+
 test "parser retains assumptions" {
     const source =
         \\---------------------- MODULE TestAssumptions ----------------------
@@ -1714,7 +2638,7 @@ test "TLCGet config exposes bfs mode record" {
     const source =
         \\---------------------- MODULE TestTLCGetConfig ----------------------
         \\EXTENDS TLC
-        \\ModeOK == TLCGet("config").mode = "bfs"
+        \\ModeOK == TLCGet("config").mode = "bfs" /\ TLCGet("config").worker = 1
         \\==============================================================
         \\
     ;
@@ -1801,6 +2725,66 @@ test "parameterized definition keeps its name column as expression boundary" {
     try std.testing.expect(evaluator.find_definition(
         "GossipAndReduction",
     ) != null);
+}
+
+test "quantified multiline disjunction retains every branch" {
+    const source =
+        \\---------------------- MODULE TestQuantifiedActionList ----------------------
+        \\CONSTANT Node
+        \\A(n) == TRUE
+        \\B(n, o) == TRUE
+        \\C(n) == TRUE
+        \\D(n, o) == TRUE
+        \\Next ==
+        \\    \E n, o \in Node :
+        \\        \/ A(n)
+        \\        \/ B(n, o)
+        \\        \/ C(n)
+        \\        \/ D(n, o)
+        \\=============================================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const next = module.definitions[4].body.quantifier;
+    var branches: u32 = 1;
+    var expression = next.body;
+    while (expression.* == .binary and expression.binary.op == .or_op) {
+        branches += 1;
+        expression = expression.binary.left;
+    }
+    try std.testing.expectEqual(@as(u32, 4), branches);
+}
+
+test "loaded MCCRDT retains every ReductionNext branch" {
+    var arena = try Arena.init(64 * 1024 * 1024);
+    defer arena.deinit();
+    const search_paths = [_][]const u8{
+        "vendor/tlaplus-examples/specifications/FiniteMonotonic",
+        "vendor/tlaplus/tlatools/org.lamport.tlatools/src/tla2sany/StandardModules",
+    };
+    const loader = ModuleLoader.init(&arena, &search_paths);
+    const module = try loader.load(
+        "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.tla",
+    );
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    const reduction_next = evaluator.find_definition("ReductionNext") orelse
+        return error.UndefinedSymbol;
+    try std.testing.expect(reduction_next.body.* == .quantifier);
+
+    var branches: u32 = 1;
+    var expression = reduction_next.body.quantifier.body;
+    while (expression.* == .binary and expression.binary.op == .or_op) {
+        branches += 1;
+        expression = expression.binary.left;
+    }
+    try std.testing.expectEqual(@as(u32, 4), branches);
 }
 
 test "parameterized namespace call flattens instance and operator arguments" {

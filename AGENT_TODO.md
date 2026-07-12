@@ -2518,7 +2518,100 @@ allocation-free Zig operator overrides, and
   first-error rows compare the violation/deadlock outcome because all-core
   traversal can reach the same error at a different nondeterministic frontier.
 
+- [x] Replace the permissive tlzig-only corpus probe with a paired TLC/tlzig
+  auditor. `scripts/audit_spec_coverage.py` resolves configured roots, runs TLC
+  first, compares semantic outcomes, requires exact distinct counts for
+  exhaustively successful rows, records bounded runs separately, and rewrites
+  manifests atomically with normalized parity labels.
+- [x] Complete a fresh 280-config primary-corpus gate after the 2026-07-11
+  correctness work. `coverage_results/primary_final_candidate.jsonl` contains
+  `89` exact rows, `14` same-outcome first-witness rows, `115` bounded rows,
+  `60` TLC-invalid rows, and `2` non-model harnesses. There are zero hard tlzig
+  gaps, zero outcome mismatches, and zero exhaustive count mismatches.
+- [x] Fix temporal eventuality checking on induced graphs. `<>P` now finds fair
+  cycles in the subgraph induced by `~P` instead of reusing full-graph SCCs,
+  reevaluates WF/SF witnesses on internal edges, and rejects acyclic singleton
+  SCCs as infinite behaviors. Added a regression with a `~P` self-cycle inside
+  a larger SCC.
+- [x] Fix repeated action assignment semantics. Equality, membership, and
+  `UNCHANGED` clauses for an already assigned variable are conjunctive
+  constraints instead of last-write-wins updates. This removed spurious
+  Moving Cat transitions and restored exact TLC generated/distinct counts:
+  even boxes `128/48`, odd boxes `78/30`.
+- [x] Keep the coverage audit side-effect free. CarTalk Model 3 (top-level
+  `AllSolutions` expression) and `SmokeEWD998_SC` (nested TLC/CSV driver) are
+  explicitly recorded as non-model harnesses instead of being hidden or
+  launched as ordinary state-space checks.
+- [ ] Exhaustively validate the `115` rows that exceed the short 15-second or
+  200,000-state corpus gate. Bounded acceptance is not a 100% compatibility
+  claim.
+- [ ] Re-run and accept the default `ReleaseFast` benchmark after the latest
+  liveness/action fixes. Any correctness or performance regression takes
+  priority over additional optimization work.
+
+- [x] Complete the 2026-07-12 generated-code correctness follow-up. Multi-bound
+  function literals now use Cartesian-product domains and tuple keys;
+  multi-argument function application applies the tuple key; zero-arity `LET`
+  definitions are lazy generated thunks; and decomposed action plans honor
+  generated-expression required-argument masks. Strict btree AOT now completes
+  exact TLC counts `2820091/374727` in `14.52s`, versus fresh TLC `28.27s`.
+- [x] Prevent stale generated code from silently running against a changed
+  runtime. Generated models now carry ABI version `1`, main/benchmark builds
+  reject missing or mismatched versions, and every selected AOT benchmark row
+  regenerates its model from an explicit TLA+/CFG pair before compilation.
+  All regenerated default models report `fallback_count = 0`.
+- [x] Restore one honest paired comparison per generated benchmark row. The
+  base runner skips generated-preferred MDBTLA models; each AOT row now runs
+  TLC-auto once and tlzig-AOT-auto once, with no interpreted duplicate. The
+  complete default ReleaseFast benchmark passed in `123.03s`; all default
+  MDBTLA AOT rows were faster than TLC.
+- [x] Refresh MDBTLA coverage after lazy generated `LET` changes.
+  `coverage_results/mdbtla_post_lazy.jsonl` has `2` exact, `7` outcome-exact,
+  `2` TLC-invalid, and `2` explicitly bounded rows, with no semantic gaps or
+  completed count mismatches. Extended MCMDBProps interpreted tlzig completed
+  exact `3101918/269881` in `208.27s`; current zero-fallback AOT completed the
+  same counts in `99.42s` with 569 MiB peak RSS.
+- [x] Re-run full upstream SingleShardTxn through the paired generated
+  benchmark. TLC-auto and tlzig AOT both completed exact
+  `14931205/5502547`; TLC took `179.117s` and tlzig took `24.286s` (`7.38x`).
+- [ ] The short primary audit still has `62` explicitly bounded rows. Do not
+  describe bounded acceptance as exhaustive compatibility; continue moving
+  those rows to exact or outcome-exact with opt-in long runs.
+
 ## Notes
 - Update this file after every spec/example milestone.
 - Record Java TLC command and timing in the spec row.
 - Record tlzig command and timing in the spec row.
+
+## 2026-07-12 Correctness And Benchmark Gate
+
+- [x] Fix inherited `FairSpec` extraction so a boxed action nested under
+  fairness cannot replace the configured transition relation. MCCRDT now
+  lowers all four `ReductionNext` branches and completes at `25,000` distinct
+  states, matching TLC. ReleaseFast auto timing: TLC `1.684s`, tlzig `0.786s`.
+- [x] Restore capture-avoiding substitution only when a generated argument
+  collides with a function binder. CheckpointCoordination completed with exact
+  TLC distinct parity at `901,692`; a 1,000-state post-fix smoke reached the
+  bound with no false invariant.
+- [x] Separate exact recursion detection from the conservative dependency
+  scanner. Nonrecursive CHOOSE operators no longer receive recursive memo
+  wrappers, while Sailfish recursive AOT remains exact and improved from
+  `94.99s` to `14.27s` (`6.66x`).
+- [x] Replace the large-set quadratic fallback with scratch-pool open
+  addressing and skip redundant initial-edge deduplication when graph storage
+  is disabled. CoffeeCan1000 is exact at `2,000,002/501,500` and improved from
+  over `131s` to `6.878s`; CoffeeCan3000 is exact at
+  `18,000,002/4,504,500` in `97.649s` versus TLC `156.464s`.
+- [x] Refresh `coverage_results/primary_final_clean.jsonl`: `156` exact, `24`
+  outcome-exact, `1` stochastic-outcome, `37` bounded, `60` TLC-invalid, and
+  `2` non-model rows, with zero hard gaps.
+- [x] Run TLC once per default benchmark model. Generated AOT rows are now
+  tlzig-only and validate against the interpreted baseline; completed rows
+  require exact configured counts, while first-error rows use deterministic
+  one-worker count tolerances and all-core outcome equality. The full
+  ReleaseFast benchmark exits `0`.
+- [ ] Move the remaining `37` bounded corpus rows to exact/outcome-exact with
+  opt-in long runs, prioritizing SlushMedium and EWD998.
+- [ ] Continue generic AOT work for the remaining performance gaps. Do not add
+  model-specific runtime semantics; `src/overrides.zig` remains built-in and
+  standard-module-only.

@@ -76,9 +76,17 @@ const specs = [_]Spec{
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.cfg", .max_states = 500_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.cfg", .max_states = 200_000, .compare_generated = false },
     // Representative larger state spaces and advanced semantics:
+    .{
+        .label = "Slush Medium",
+        .tla = "vendor/tlaplus-examples/specifications/SlushProtocol/Slush.tla",
+        .cfg = "vendor/tlaplus-examples/specifications/SlushProtocol/SlushMedium.cfg",
+        .one_core_default = false,
+        .max_states = 10_000_000,
+        .prefer_generated = true,
+    },
     .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.cfg", .max_states = 200_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.cfg", .max_states = 200_000, .compare_generated = false },
-    .{ .tla = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.tla", .cfg = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000 },
+    .{ .label = "MCBinarySearch", .tla = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.tla", .cfg = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.cfg", .one_core_default = false, .max_states = 200_000, .prefer_generated = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.tla", .cfg = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000 },
@@ -88,7 +96,6 @@ const specs = [_]Spec{
         .tla = "vendor/MDBTLA/MultiShardTxn/ClientCentricTests.tla",
         .cfg = "vendor/MDBTLA/MultiShardTxn/ClientCentricTests.cfg",
         .max_states = 2_000,
-        .compare_generated = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
             "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
@@ -455,10 +462,7 @@ fn run_comparison(
     write_baseline: bool,
     use_generated_expressions: bool,
 ) !void {
-    const cpu_count: u16 = @intCast(@min(
-        std.Thread.getCpuCount() catch 1,
-        std.math.maxInt(u16),
-    ));
+    const cpu_count = tlzig.platform.auto_worker_count();
     const tlzig_one: ?RunResult = if (run_one_core)
         try run_tlzig_internal(
             allocator,
@@ -867,6 +871,7 @@ fn run_tlzig_internal(
         return error.CheckFailed;
     };
     defer ch.deinit();
+    ch.set_scratch_growable(false);
     ch.set_diagnostics(std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null);
 
     const result = ch.check() catch |err| {

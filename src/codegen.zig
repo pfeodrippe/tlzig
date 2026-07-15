@@ -2,6 +2,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const overrides = @import("overrides.zig");
 const generated_runtime = @import("generated_runtime.zig");
+const sequence_patterns = @import("sequence_patterns.zig");
 
 pub const Result = struct {
     source: []const u8,
@@ -30,12 +31,17 @@ const DefinitionKind = enum {
 const GeneratedExpressionMeta = struct {
     expression: *const ast.Expr,
     params: [32][]const u8,
+    param_depths: [32]u8,
     param_count: u8,
     identity: u32,
     uses_primed: bool,
 
     fn param_slice(self: *const GeneratedExpressionMeta) []const []const u8 {
         return self.params[0..self.param_count];
+    }
+
+    fn param_depth_slice(self: *const GeneratedExpressionMeta) []const u8 {
+        return self.param_depths[0..self.param_count];
     }
 };
 
@@ -81,7 +87,6 @@ pub fn emit_module_with_options(
         options.type_invariants,
     );
     defer allocator.free(type_facts);
-
     try append(&output, allocator,
         \\const std = @import("std");
         \\const tlzig = @import("tlzig");
@@ -183,11 +188,13 @@ pub fn emit_module_with_options(
     }
     var expression_index: usize = 0;
     for (module.definitions, 0..) |definition, definition_index| {
-        try collect_generated_expressions(
+        const body_params = definition_body_params(definition);
+        try collect_generated_expression_root(
             allocator,
             module,
             definition.body,
-            definition.params,
+            body_params,
+            body_params.len,
             reachable[definition_index],
             &expression_index,
             &generated_expressions,
@@ -219,14 +226,25 @@ pub fn emit_module_with_options(
         if (reachable[definition_index] and
             operator_supported(module, definition, 0))
         {
+            const body_params = definition_body_params(definition);
             try emit_helpers(
                 &output,
                 allocator,
                 module,
                 definition.body,
-                definition.params,
+                body_params,
                 &emitted_helpers,
             );
+            if (definition.function_domain) |domain| {
+                try emit_helpers(
+                    &output,
+                    allocator,
+                    module,
+                    domain,
+                    definition.params,
+                    &emitted_helpers,
+                );
+            }
         }
     }
     for (generated_expressions.items) |entry| {
@@ -304,13 +322,35 @@ pub fn emit_module_with_options(
         if (!supported) continue;
         const function_name = try zig_operator_name(allocator, definition_index);
         defer allocator.free(function_name);
+        const cacheable = !definition_is_boolean(module, definition) and
+            definition_context_free(module, definition);
         const line = try std.fmt.allocPrint(
             allocator,
-            "    .{{ .name = \"{f}\", .arity = {d}, .function = {s} }},\n",
+            "    .{{ .name = \"{f}\", .arity = {d}, .function = {s}, .cacheable = {s}, .eager_cache = {s}, .cache_index = {d}, .state_memo_required = {s} }},\n",
             .{
                 std.zig.fmtString(definition.name),
                 definition.params.len,
                 if (supported) function_name else "null",
+                if (cacheable) "true" else "false",
+                if (cacheable and
+                    ((definition.function_domain != null and
+                        !definition_references_definition(
+                            module,
+                            definition,
+                        )) or
+                        (definition.function_domain == null and
+                            definition_eager_cache_safe(
+                                module,
+                                definition,
+                            ))))
+                    "true"
+                else
+                    "false",
+                definition_index,
+                if (expression_calls_identifier(
+                    definition.body,
+                    definition.name,
+                )) "true" else "false",
             },
         );
         defer allocator.free(line);
@@ -340,26 +380,73 @@ pub fn emit_module_with_options(
             defer allocator.free(name);
             try append(&output, allocator, name);
         }
-        const suffix = try std.fmt.allocPrint(
-            allocator,
-            "}}, .arg_required = &[_]bool{{",
-            .{},
-        );
-        defer allocator.free(suffix);
-        try append(&output, allocator, suffix);
-        for (expression_params, 0..) |param, param_index_v| {
-            if (param_index_v > 0) try append(&output, allocator, ", ");
-            try append(
+        if (expression_params.len > 0) {
+            try append(&output, allocator, "}, .arg_depths = &[_]u8{");
+            for (entry.param_depth_slice(), 0..) |depth, depth_index| {
+                if (depth_index > 0) try append(&output, allocator, ", ");
+                const value = try std.fmt.allocPrint(
+                    allocator,
+                    "{d}",
+                    .{depth},
+                );
+                defer allocator.free(value);
+                try append(&output, allocator, value);
+            }
+        }
+        var has_optional_capture = false;
+        for (expression_params) |param| {
+            if (!expr_references_identifier(entry.expression, param)) {
+                has_optional_capture = true;
+                break;
+            }
+        }
+        if (has_optional_capture) {
+            try append(&output, allocator, "}, .arg_required = &[_]bool{");
+            for (expression_params, 0..) |param, param_index_v| {
+                if (param_index_v > 0) try append(&output, allocator, ", ");
+                try append(
+                    &output,
+                    allocator,
+                    if (expr_references_identifier(entry.expression, param))
+                        "true"
+                    else
+                        "false",
+                );
+            }
+        }
+        try append(&output, allocator, "}");
+        switch (entry.expression.*) {
+            .ident => |identifier| direct: {
+                for (expression_params, 0..) |param, direct_index| {
+                    if (!std.mem.eql(u8, identifier, param)) continue;
+                    const direct_arg = try std.fmt.allocPrint(
+                        allocator,
+                        ", .direct_arg_index = {d}",
+                        .{direct_index},
+                    );
+                    defer allocator.free(direct_arg);
+                    try append(&output, allocator, direct_arg);
+                    break :direct;
+                }
+            },
+            .bool_literal => |literal| try append(
                 &output,
                 allocator,
-                if (expr_references_identifier(
-                    entry.expression,
-                    param,
-                ))
-                    "true"
+                if (literal)
+                    ", .direct_value = Value{ .bool_v = true }"
                 else
-                    "false",
-            );
+                    ", .direct_value = Value{ .bool_v = false }",
+            ),
+            .int_literal => |literal| {
+                const direct_value = try std.fmt.allocPrint(
+                    allocator,
+                    ", .direct_value = Value{{ .int_v = {d} }}",
+                    .{literal},
+                );
+                defer allocator.free(direct_value);
+                try append(&output, allocator, direct_value);
+            },
+            else => {},
         }
         const expression_suffix = if (expr_is_boolean(
             module,
@@ -368,13 +455,13 @@ pub fn emit_module_with_options(
         ))
             try std.fmt.allocPrint(
                 allocator,
-                "}}, .uses_primed = {}, .function = expr_{d}, .boolean_function = expr_{d}_bool }},\n",
+                ", .uses_primed = {}, .function = expr_{d}, .boolean_function = expr_{d}_bool }},\n",
                 .{ entry.uses_primed, entry.identity, entry.identity },
             )
         else
             try std.fmt.allocPrint(
                 allocator,
-                "}}, .uses_primed = {}, .function = expr_{d} }},\n",
+                ", .uses_primed = {}, .function = expr_{d} }},\n",
                 .{ entry.uses_primed, entry.identity },
             );
         defer allocator.free(expression_suffix);
@@ -455,6 +542,222 @@ fn definition_context_free(
 ) bool {
     if (definition.params.len != 0) return false;
     return expr_context_free(module, definition.body, 0);
+}
+
+fn definition_references_definition(
+    module: ast.Module,
+    definition: ast.Definition,
+) bool {
+    for (module.definitions) |candidate| {
+        if (std.mem.eql(u8, candidate.name, definition.name)) continue;
+        if (expression_references_identifier(
+            definition.body,
+            candidate.name,
+        )) return true;
+        if (definition.function_domain) |domain| {
+            if (expression_references_identifier(
+                domain,
+                candidate.name,
+            )) return true;
+        }
+    }
+    return false;
+}
+
+fn definition_eager_cache_safe(
+    module: ast.Module,
+    definition: ast.Definition,
+) bool {
+    var active: [64][]const u8 = undefined;
+    active[0] = definition.name;
+    return expr_eager_cache_safe(module, definition.body, &active, 1);
+}
+
+fn expr_eager_cache_safe(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    active: *[64][]const u8,
+    active_len: usize,
+) bool {
+    if (active_len >= active.len) return false;
+    return switch (expr.*) {
+        .bool_literal,
+        .int_literal,
+        .string_literal,
+        .at,
+        => true,
+        .ident => |name| blk: {
+            const resolved = resolved_definition_name(module, name) orelse
+                break :blk true;
+            for (active[0..active_len]) |active_name| {
+                if (std.mem.eql(u8, active_name, resolved)) break :blk false;
+            }
+            const dependency = find_definition(module, resolved) orelse
+                break :blk true;
+            if (dependency.params.len != 0 or
+                dependency.function_domain != null)
+            {
+                break :blk false;
+            }
+            active[active_len] = resolved;
+            break :blk expr_eager_cache_safe(
+                module,
+                dependency.body,
+                active,
+                active_len + 1,
+            );
+        },
+        .binary => |binary| expr_eager_cache_safe(
+            module,
+            binary.left,
+            active,
+            active_len,
+        ) and expr_eager_cache_safe(
+            module,
+            binary.right,
+            active,
+            active_len,
+        ),
+        .unary => |unary| expr_eager_cache_safe(
+            module,
+            unary.operand,
+            active,
+            active_len,
+        ),
+        .if_then_else => |conditional| expr_eager_cache_safe(
+            module,
+            conditional.cond,
+            active,
+            active_len,
+        ) and expr_eager_cache_safe(
+            module,
+            conditional.then_branch,
+            active,
+            active_len,
+        ) and expr_eager_cache_safe(
+            module,
+            conditional.else_branch,
+            active,
+            active_len,
+        ),
+        .field => |field_value| expr_eager_cache_safe(
+            module,
+            field_value.expr,
+            active,
+            active_len,
+        ),
+        .tuple, .set_enum => |items| blk: {
+            for (items) |item| {
+                if (!expr_eager_cache_safe(
+                    module,
+                    item,
+                    active,
+                    active_len,
+                )) break :blk false;
+            }
+            break :blk true;
+        },
+        .record => |fields| blk: {
+            for (fields) |field_value| {
+                if (!expr_eager_cache_safe(
+                    module,
+                    field_value.value,
+                    active,
+                    active_len,
+                )) break :blk false;
+            }
+            break :blk true;
+        },
+        .set_binary => |set_binary| expr_eager_cache_safe(
+            module,
+            set_binary.left,
+            active,
+            active_len,
+        ) and expr_eager_cache_safe(
+            module,
+            set_binary.right,
+            active,
+            active_len,
+        ),
+        .set_of_functions => |function_set| expr_eager_cache_safe(
+            module,
+            function_set.domain,
+            active,
+            active_len,
+        ) and expr_eager_cache_safe(
+            module,
+            function_set.codomain,
+            active,
+            active_len,
+        ),
+        .record_set => |record_set_value| blk: {
+            for (record_set_value.fields) |field_value| {
+                if (!expr_eager_cache_safe(
+                    module,
+                    field_value.domain,
+                    active,
+                    active_len,
+                )) break :blk false;
+            }
+            break :blk true;
+        },
+        .let_in => |let_value| blk: {
+            for (let_value.defs) |local_definition| {
+                if (local_definition.params.len != 0 or
+                    local_definition.function_domain != null or
+                    !expr_eager_cache_safe(
+                        module,
+                        local_definition.body,
+                        active,
+                        active_len,
+                    )) break :blk false;
+            }
+            break :blk expr_eager_cache_safe(
+                module,
+                let_value.body,
+                active,
+                active_len,
+            );
+        },
+        .case_expr => |case_value| blk: {
+            for (case_value.arms) |arm| {
+                if (!expr_eager_cache_safe(
+                    module,
+                    arm.cond,
+                    active,
+                    active_len,
+                ) or !expr_eager_cache_safe(
+                    module,
+                    arm.value,
+                    active,
+                    active_len,
+                )) break :blk false;
+            }
+            if (case_value.otherwise) |otherwise| {
+                if (!expr_eager_cache_safe(
+                    module,
+                    otherwise,
+                    active,
+                    active_len,
+                )) break :blk false;
+            }
+            break :blk true;
+        },
+        .primed,
+        .primed_expr,
+        .unchanged,
+        .unchanged_expr,
+        .quantifier,
+        .choose,
+        .apply,
+        .set_filter,
+        .set_map,
+        .function_literal,
+        .except,
+        .box_action,
+        .lambda,
+        => false,
+    };
 }
 
 fn expr_context_free(
@@ -706,7 +1009,9 @@ fn expr_is_boolean(
         .ident => |name| blk: {
             const definition = find_definition(module, name) orelse
                 break :blk false;
-            if (definition.params.len != 0) break :blk false;
+            if (definition.params.len != 0 or definition.is_function) {
+                break :blk false;
+            }
             break :blk expr_is_boolean(
                 module,
                 definition.body,
@@ -757,7 +1062,9 @@ fn expr_can_emit_boolean(
         .ident => |name| blk: {
             const definition = find_definition(module, name) orelse
                 break :blk false;
-            if (definition.params.len != 0) break :blk false;
+            if (definition.params.len != 0 or definition.is_function) {
+                break :blk false;
+            }
             break :blk expr_can_emit_boolean(
                 module,
                 definition.body,
@@ -918,6 +1225,7 @@ fn emit_operator(
 ) !void {
     const function_name = try zig_operator_name(allocator, definition_index);
     defer allocator.free(function_name);
+    const body_params = definition_body_params(definition);
     const recursive = expression_calls_identifier(
         definition.body,
         definition.name,
@@ -933,9 +1241,9 @@ fn emit_operator(
     );
     defer allocator.free(provenance);
     try append(output, allocator, provenance);
-    if (definition.params.len > 0) {
+    if (body_params.len > 0) {
         try append(output, allocator, "(");
-        for (definition.params, 0..) |parameter, index| {
+        for (body_params, 0..) |parameter, index| {
             if (index > 0) try append(output, allocator, ", ");
             try append(output, allocator, parameter);
         }
@@ -950,6 +1258,18 @@ fn emit_operator(
         );
         defer allocator.free(excerpt);
         try append(output, allocator, excerpt);
+    }
+    if (definition.is_function) {
+        try emit_top_level_function(
+            output,
+            allocator,
+            module,
+            definition,
+            definition_index,
+            function_name,
+            recursive,
+        );
+        return;
     }
     const header = try std.fmt.allocPrint(
         allocator,
@@ -1048,6 +1368,168 @@ fn emit_operator(
     try append(output, allocator, "}\n\n");
 }
 
+fn emit_top_level_function(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    definition: ast.Definition,
+    definition_index: usize,
+    function_name: []const u8,
+    recursive: bool,
+) error{OutOfMemory}!void {
+    const function_params = definition_body_params(definition);
+    const domain = definition.function_domain orelse unreachable;
+    const context_free = definition_context_free(module, definition);
+    std.debug.assert(function_params.len > 0);
+
+    const apply_name = try zig_function_apply_name(
+        allocator,
+        definition_index,
+    );
+    defer allocator.free(apply_name);
+    const cache_prefix = if (context_free)
+        try std.fmt.allocPrint(
+            allocator,
+            "    if (try runtime.cached_definition(context, {d})) |cached| return cached;\n",
+            .{definition_index},
+        )
+    else
+        null;
+    defer if (cache_prefix) |prefix| allocator.free(prefix);
+    const header = try std.fmt.allocPrint(
+        allocator,
+        "pub fn {s}(context: *runtime.CallContext, args: []const Value) Error!Value {{\n" ++
+            "    std.debug.assert(args.len == 0);\n" ++
+            "    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);\n" ++
+            "{s}" ++
+            "    {s}try runtime.{s}(context, args, ",
+        .{
+            function_name,
+            cache_prefix orelse "",
+            if (context_free) "const result = " else "return ",
+            if (function_params.len == 1)
+                "function_map"
+            else
+                "function_map_multi",
+        },
+    );
+    defer allocator.free(header);
+    try append(output, allocator, header);
+    try emit_expr(output, allocator, module, domain, definition.params);
+    if (function_params.len > 1) {
+        const arity = try std.fmt.allocPrint(
+            allocator,
+            ", {d}",
+            .{function_params.len},
+        );
+        defer allocator.free(arity);
+        try append(output, allocator, arity);
+    }
+    try append(output, allocator, ", ");
+    try append(output, allocator, apply_name);
+    if (context_free) {
+        const cache_suffix = try std.fmt.allocPrint(
+            allocator,
+            ");\n    return try runtime.put_cached_definition(context, {d}, result);\n}}\n\n",
+            .{definition_index},
+        );
+        defer allocator.free(cache_suffix);
+        try append(output, allocator, cache_suffix);
+    } else {
+        try append(output, allocator, ");\n}\n\n");
+    }
+
+    if (context_free) {
+        const cached_apply_name = try zig_function_cached_apply_name(
+            allocator,
+            definition_index,
+        );
+        defer allocator.free(cached_apply_name);
+        const cached_apply = try std.fmt.allocPrint(
+            allocator,
+            "fn {s}(context: *runtime.CallContext, args: []const Value) Error!Value {{\n" ++
+                "    std.debug.assert(args.len == {d});\n" ++
+                "    if (try runtime.cached_function_apply(context, {d}, args)) |cached| return cached;\n" ++
+                "    return try {s}(context, args);\n" ++
+                "}}\n\n",
+            .{
+                cached_apply_name,
+                function_params.len,
+                definition_index,
+                apply_name,
+            },
+        );
+        defer allocator.free(cached_apply);
+        try append(output, allocator, cached_apply);
+    }
+
+    const apply_header = try std.fmt.allocPrint(
+        allocator,
+        "fn {s}(context: *runtime.CallContext, args: []const Value) Error!Value {{\n" ++
+            "    std.debug.assert(args.len == {d});\n" ++
+            "    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);\n",
+        .{ apply_name, function_params.len },
+    );
+    defer allocator.free(apply_header);
+    try append(output, allocator, apply_header);
+    if (recursive) {
+        const recursive_wrapper = try std.fmt.allocPrint(
+            allocator,
+            "    if (try runtime.cached_recursive_call(context, \"{f}\", args)) |cached| return cached;\n" ++
+                "    const result = try {s}_uncached(context, args);\n" ++
+                "    return try runtime.put_cached_recursive_call(context, \"{f}\", args, result);\n" ++
+                "}}\n\n" ++
+                "fn {s}_uncached(context: *runtime.CallContext, args: []const Value) Error!Value {{\n" ++
+                "    std.debug.assert(args.len == {d});\n" ++
+                "    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);\n",
+            .{
+                std.zig.fmtString(definition.name),
+                apply_name,
+                std.zig.fmtString(definition.name),
+                apply_name,
+                function_params.len,
+            },
+        );
+        defer allocator.free(recursive_wrapper);
+        try append(output, allocator, recursive_wrapper);
+    }
+    if (definition_is_boolean(module, definition)) {
+        const boolean_name = try zig_function_apply_boolean_name(
+            allocator,
+            definition_index,
+        );
+        defer allocator.free(boolean_name);
+        const wrapper = try std.fmt.allocPrint(
+            allocator,
+            "    return Value{{ .bool_v = try {s}(context, args) }};\n" ++
+                "}}\n\n" ++
+                "fn {s}(context: *runtime.CallContext, args: []const Value) Error!bool {{\n" ++
+                "    std.debug.assert(args.len == {d});\n" ++
+                "    runtime.keep_expression_parameters(context, args);\n",
+            .{ boolean_name, boolean_name, function_params.len },
+        );
+        defer allocator.free(wrapper);
+        try append(output, allocator, wrapper);
+        try emit_boolean_function_body(
+            output,
+            allocator,
+            module,
+            definition.body,
+            function_params,
+        );
+        try append(output, allocator, "}\n\n");
+        return;
+    }
+    try emit_function_body(
+        output,
+        allocator,
+        module,
+        definition.body,
+        function_params,
+    );
+    try append(output, allocator, "}\n\n");
+}
+
 fn emit_boolean_function_body(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -1134,6 +1616,7 @@ fn emit_boolean_expr(
             if (find_definition_index(module, name)) |index| {
                 const definition = module.definitions[index];
                 if (definition.params.len == 0 and
+                    !definition.is_function and
                     !is_native_override(name) and
                     constant_substitution_name(module, name) == null and
                     definition_kind(module, definition) == .generated and
@@ -1171,9 +1654,17 @@ fn emit_boolean_expr(
                             application.func.ident,
                         ) == null and
                         definition_kind(module, definition) == .generated and
+                        (!definition.is_function or
+                            application.args.len ==
+                                definition_body_params(definition).len) and
                         definition_is_boolean(module, definition))
                     {
-                        const function_name =
+                        const function_name = if (definition.is_function)
+                            try zig_function_apply_boolean_name(
+                                allocator,
+                                index,
+                            )
+                        else
                             try zig_boolean_operator_name(
                                 allocator,
                                 index,
@@ -1288,6 +1779,13 @@ fn emit_boolean_expr(
                             params,
                         )) return;
                     }
+                    if (try emit_variable_set_relation(
+                        output,
+                        allocator,
+                        module,
+                        binary,
+                        params,
+                    )) return;
                     if (binary.op == .eq or binary.op == .ne) {
                         if (try emit_primed_except_update_comparison(
                             output,
@@ -2088,6 +2586,33 @@ fn emit_expr(
             try append(output, allocator, suffix);
         },
         .set_filter => |filter_value| {
+            if (sorted_bounded_sequence_filter(
+                module,
+                filter_value,
+            )) |sorted| {
+                try append(
+                    output,
+                    allocator,
+                    "try runtime.sorted_sequences(context, ",
+                );
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    sorted.element_set,
+                    params,
+                );
+                try append(output, allocator, ", ");
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    sorted.lengths,
+                    params,
+                );
+                try append(output, allocator, ")");
+                return;
+            }
             try append(output, allocator, "try runtime.filter_at(context, args, ");
             try emit_expr(
                 output,
@@ -2200,18 +2725,35 @@ fn emit_expr(
             try append(output, allocator, ")");
         },
         .except => |except_value| {
-            try append(
-                output,
-                allocator,
-                "try runtime.except_update(context, args, ",
-            );
-            try emit_expr(
-                output,
-                allocator,
-                module,
-                except_value.func,
-                params,
-            );
+            const direct_variable_index = switch (except_value.func.*) {
+                .ident => |name| if (param_index(params, name) == null)
+                    variable_index(module, name)
+                else
+                    null,
+                else => null,
+            };
+            if (direct_variable_index) |index| {
+                const prefix = try std.fmt.allocPrint(
+                    allocator,
+                    "try runtime.variable_except_update(context, args, {d}",
+                    .{index},
+                );
+                defer allocator.free(prefix);
+                try append(output, allocator, prefix);
+            } else {
+                try append(
+                    output,
+                    allocator,
+                    "try runtime.except_update(context, args, ",
+                );
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    except_value.func,
+                    params,
+                );
+            }
             try append(output, allocator, ", &[_]Value{");
             for (except_value.steps, 0..) |step, index| {
                 if (index > 0) try append(output, allocator, ", ");
@@ -2302,6 +2844,32 @@ fn emit_expr(
             try append(output, allocator, "})");
         },
         .unary => |unary| {
+            if (unary.op == .union_all) {
+                if (sequence_patterns.bounded_sequence_union(expr)) |shape| {
+                    try append(
+                        output,
+                        allocator,
+                        "try runtime.bounded_sequence_union(context, ",
+                    );
+                    try emit_expr(
+                        output,
+                        allocator,
+                        module,
+                        shape.element_set,
+                        params,
+                    );
+                    try append(output, allocator, ", ");
+                    try emit_expr(
+                        output,
+                        allocator,
+                        module,
+                        shape.lengths,
+                        params,
+                    );
+                    try append(output, allocator, ")");
+                    return;
+                }
+            }
             if (unary.op == .domain) {
                 if (direct_field_path_scoped(module, unary.operand, params)) |field_path| {
                     try emit_field_path_call(
@@ -2717,6 +3285,44 @@ fn emit_expr(
             else
                 null;
             if (target) |definition| {
+                if (definition.is_function and
+                    application.args.len ==
+                        definition_body_params(definition).len)
+                {
+                    const definition_index = find_definition_index(
+                        module,
+                        definition.name,
+                    ).?;
+                    const apply_name = if (definition_context_free(
+                        module,
+                        definition,
+                    ))
+                        try zig_function_cached_apply_name(
+                            allocator,
+                            definition_index,
+                        )
+                    else
+                        try zig_function_apply_name(
+                            allocator,
+                            definition_index,
+                        );
+                    defer allocator.free(apply_name);
+                    try append(output, allocator, "try ");
+                    try append(output, allocator, apply_name);
+                    try append(output, allocator, "(context, &[_]Value{");
+                    for (application.args, 0..) |argument, index| {
+                        if (index > 0) try append(output, allocator, ", ");
+                        try emit_expr(
+                            output,
+                            allocator,
+                            module,
+                            argument,
+                            params,
+                        );
+                    }
+                    try append(output, allocator, "})");
+                    return;
+                }
                 if (definition.params.len != application.args.len) {
                     std.debug.assert(definition.params.len == 0);
                     const definition_index = find_definition_index(
@@ -2947,17 +3553,30 @@ fn operator_supported_active(
         if (std.mem.eql(u8, name, definition.name)) return true;
     }
     if (depth > 64 or
-        definition.is_function or
         definition_kind_shallow(module, definition) != .generated)
     {
         return false;
     }
     if (active_len == active.len) return false;
     active[active_len] = definition.name;
+    const body_params = definition_body_params(definition);
+    if (definition.is_function) {
+        if (body_params.len == 0 or definition.function_domain == null) {
+            return false;
+        }
+        if (!expr_supported_active(
+            module,
+            definition.function_domain.?,
+            definition.params,
+            depth,
+            active,
+            active_len + 1,
+        )) return false;
+    }
     return expr_supported_active(
         module,
         definition.body,
-        definition.params,
+        body_params,
         depth,
         active,
         active_len + 1,
@@ -2973,7 +3592,6 @@ fn definition_kind_shallow(
     {
         return .native;
     }
-    if (definition.is_function) return .unsupported;
     if (direct_native_name(module, definition.name) != null) return .native;
     return .generated;
 }
@@ -3036,7 +3654,7 @@ fn expr_supported_active(
     active: *[64][]const u8,
     active_len: usize,
 ) bool {
-    return switch (expr.*) {
+    const supported = switch (expr.*) {
         .bool_literal, .int_literal, .string_literal => true,
         .ident => |name| param_index(params, name) != null or
             variable_index(module, name) != null or
@@ -3457,6 +4075,15 @@ fn expr_supported_active(
         },
         else => false,
     };
+    if (!supported and
+        std.c.getenv("TLZIG_CODEGEN_DIAGNOSTICS") != null)
+    {
+        std.debug.print(
+            "codegen unsupported expression: kind={s} depth={d} params={d}\n",
+            .{ @tagName(expr.*), depth, params.len },
+        );
+    }
+    return supported;
 }
 
 fn definition_value_supported(
@@ -3510,13 +4137,26 @@ fn bound_expression_supported_active(
     active: *[64][]const u8,
     active_len: usize,
 ) bool {
-    if (vars.len == 0 or params.len + vars.len > 64) return false;
+    const diagnostics = std.c.getenv("TLZIG_CODEGEN_DIAGNOSTICS") != null;
+    if (vars.len == 0 or params.len + vars.len > 64) {
+        if (diagnostics) std.debug.print(
+            "codegen unsupported binding count: vars={d} params={d}\n",
+            .{ vars.len, params.len },
+        );
+        return false;
+    }
     for (vars) |bound| {
         for (vars) |other| {
             if (expr_references_identifier(
                 bound.domain,
                 other.name,
-            )) return false;
+            )) {
+                if (diagnostics) std.debug.print(
+                    "codegen dependent bound domain: bound={s} references={s}\n",
+                    .{ bound.name, other.name },
+                );
+                return false;
+            }
         }
         if (!expr_supported_active(
             module,
@@ -3525,14 +4165,20 @@ fn bound_expression_supported_active(
             depth,
             active,
             active_len,
-        )) return false;
+        )) {
+            if (diagnostics) std.debug.print(
+                "codegen unsupported bound domain: bound={s}\n",
+                .{bound.name},
+            );
+            return false;
+        }
     }
     var extended: [64][]const u8 = undefined;
     @memcpy(extended[0..params.len], params);
     for (vars, 0..) |bound, index| {
         extended[params.len + index] = bound.name;
     }
-    return expr_supported_active(
+    const body_supported = expr_supported_active(
         module,
         body,
         extended[0 .. params.len + vars.len],
@@ -3540,6 +4186,11 @@ fn bound_expression_supported_active(
         active,
         active_len,
     );
+    if (!body_supported and diagnostics) std.debug.print(
+        "codegen unsupported bound body: first_bound={s}\n",
+        .{vars[0].name},
+    );
+    return body_supported;
 }
 
 fn emit_helpers(
@@ -4239,6 +4890,52 @@ fn direct_helper_requires_shape(name: []const u8) bool {
         if (std.mem.eql(u8, name, helper)) return true;
     }
     return false;
+}
+
+const SortedBoundedSequenceFilter = struct {
+    element_set: *const ast.Expr,
+    lengths: *const ast.Expr,
+};
+
+fn sorted_bounded_sequence_filter(
+    module: ast.Module,
+    filter_value: *const ast.SetFilter,
+) ?SortedBoundedSequenceFilter {
+    if (filter_value.vars.len != 1) return null;
+    const bound = filter_value.vars[0];
+    if (!sequence_patterns.is_sorted_sequence_predicate(
+        filter_value.pred,
+        bound.name,
+    )) return null;
+
+    if (sequence_patterns.bounded_sequence_union(bound.domain)) |shape| {
+        return .{
+            .element_set = shape.element_set,
+            .lengths = shape.lengths,
+        };
+    }
+    if (bound.domain.* != .apply) return null;
+    const application = bound.domain.apply;
+    if (application.func.* != .ident or application.args.len != 1) {
+        return null;
+    }
+    const definition_name = resolved_definition_name(
+        module,
+        application.func.ident,
+    ) orelse return null;
+    const definition = find_definition(module, definition_name) orelse
+        return null;
+    const shape = sequence_patterns.bounded_sequence_definition(
+        definition,
+    ) orelse return null;
+    if (expr_references_identifier(
+        shape.lengths,
+        definition.params[0],
+    )) return null;
+    return .{
+        .element_set = application.args[0],
+        .lengths = shape.lengths,
+    };
 }
 
 fn direct_helper_definition_matches(
@@ -5544,6 +6241,123 @@ fn emit_unchanged_term(
     try append(output, allocator, expression);
 }
 
+fn expression_uses_shared_helper(
+    module: ast.Module,
+    expr: *const ast.Expr,
+) bool {
+    return switch (expr.*) {
+        .primed_expr,
+        .quantifier,
+        .choose,
+        .set_filter,
+        .set_map,
+        .function_literal,
+        .except,
+        .let_in,
+        .lambda,
+        => true,
+        .binary => |binary| expression_uses_shared_helper(
+            module,
+            binary.left,
+        ) or expression_uses_shared_helper(module, binary.right),
+        .unary => |unary| expression_uses_shared_helper(
+            module,
+            unary.operand,
+        ),
+        .unchanged_expr => |operand| expression_uses_shared_helper(
+            module,
+            operand,
+        ),
+        .if_then_else => |conditional| expression_uses_shared_helper(
+            module,
+            conditional.cond,
+        ) or expression_uses_shared_helper(
+            module,
+            conditional.then_branch,
+        ) or expression_uses_shared_helper(
+            module,
+            conditional.else_branch,
+        ),
+        .apply => |application| blk: {
+            if (is_select_sequence_call(application) or
+                is_reduce_sequence_call(module, application))
+            {
+                break :blk true;
+            }
+            if (expression_uses_shared_helper(module, application.func)) {
+                break :blk true;
+            }
+            for (application.args) |argument| {
+                if (expression_uses_shared_helper(module, argument)) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .field => |field_value| expression_uses_shared_helper(
+            module,
+            field_value.expr,
+        ),
+        .tuple, .set_enum => |items| blk: {
+            for (items) |item| {
+                if (expression_uses_shared_helper(module, item)) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .record => |fields| blk: {
+            for (fields) |field_value| {
+                if (expression_uses_shared_helper(module, field_value.value)) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .set_binary => |set_binary| expression_uses_shared_helper(
+            module,
+            set_binary.left,
+        ) or expression_uses_shared_helper(module, set_binary.right),
+        .set_of_functions => |function_set| expression_uses_shared_helper(
+            module,
+            function_set.domain,
+        ) or expression_uses_shared_helper(module, function_set.codomain),
+        .record_set => |record_set_value| blk: {
+            for (record_set_value.fields) |field_value| {
+                if (expression_uses_shared_helper(module, field_value.domain)) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .case_expr => |case_value| blk: {
+            for (case_value.arms) |arm| {
+                if (expression_uses_shared_helper(module, arm.cond) or
+                    expression_uses_shared_helper(module, arm.value))
+                {
+                    break :blk true;
+                }
+            }
+            if (case_value.otherwise) |otherwise| {
+                break :blk expression_uses_shared_helper(module, otherwise);
+            }
+            break :blk false;
+        },
+        .box_action => |box_action| expression_uses_shared_helper(
+            module,
+            box_action.action,
+        ) or expression_uses_shared_helper(module, box_action.vars),
+        .ident,
+        .primed,
+        .unchanged,
+        .bool_literal,
+        .int_literal,
+        .string_literal,
+        .at,
+        => false,
+    };
+}
+
 fn expr_references_identifier(
     expr: *const ast.Expr,
     name: []const u8,
@@ -5654,13 +6468,89 @@ fn expr_references_identifier(
             }
             break :blk expr_references_identifier(quantifier.body, name);
         },
-        .bool_literal,
-        .int_literal,
-        .string_literal,
-        .unchanged,
-        .at,
-        => false,
-        else => true,
+        .choose => |choose_value| (if (choose_value.domain) |domain|
+            expr_references_identifier(domain, name)
+        else
+            false) or
+            (!std.mem.eql(u8, choose_value.var_name, name) and
+                expr_references_identifier(choose_value.body, name)),
+        .except => |except_value| blk: {
+            if (expr_references_identifier(except_value.func, name)) {
+                break :blk true;
+            }
+            for (except_value.steps) |step| {
+                if (step == .index and
+                    expr_references_identifier(step.index, name))
+                {
+                    break :blk true;
+                }
+            }
+            break :blk expr_references_identifier(
+                except_value.value,
+                name,
+            );
+        },
+        .let_in => |let_value| blk: {
+            var shadowed = false;
+            for (let_value.defs) |definition| {
+                if (!shadowed) {
+                    if (definition.function_domain) |domain| {
+                        if (expr_references_identifier(domain, name)) {
+                            break :blk true;
+                        }
+                    }
+                    var parameter_shadows = false;
+                    for (definition_body_params(definition)) |parameter| {
+                        if (std.mem.eql(u8, parameter, name)) {
+                            parameter_shadows = true;
+                            break;
+                        }
+                    }
+                    if (!parameter_shadows and
+                        expr_references_identifier(definition.body, name))
+                    {
+                        break :blk true;
+                    }
+                }
+                if (std.mem.eql(u8, definition.name, name)) {
+                    shadowed = true;
+                }
+            }
+            break :blk !shadowed and
+                expr_references_identifier(let_value.body, name);
+        },
+        .case_expr => |case_value| blk: {
+            for (case_value.arms) |arm| {
+                if (expr_references_identifier(arm.cond, name) or
+                    expr_references_identifier(arm.value, name))
+                {
+                    break :blk true;
+                }
+            }
+            if (case_value.otherwise) |otherwise| {
+                break :blk expr_references_identifier(otherwise, name);
+            }
+            break :blk false;
+        },
+        .box_action => |box_action| expr_references_identifier(
+            box_action.action,
+            name,
+        ) or expr_references_identifier(box_action.vars, name),
+        .lambda => |lambda_value| blk: {
+            for (lambda_value.params) |parameter| {
+                if (std.mem.eql(u8, parameter, name)) break :blk false;
+            }
+            break :blk expr_references_identifier(lambda_value.body, name);
+        },
+        .unchanged => |identifiers| blk: {
+            for (identifiers) |identifier| {
+                if (std.mem.eql(u8, identifier, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .unchanged_expr => |operand| expr_references_identifier(operand, name),
+        .at => std.mem.eql(u8, name, "$at"),
+        .bool_literal, .int_literal, .string_literal => false,
     };
 }
 
@@ -6234,6 +7124,21 @@ fn mark_reachable_expr(
 ) void {
     switch (expr.*) {
         .ident, .primed => |name| {
+            if (find_config_replacement(module, name)) |replacement| {
+                switch (replacement.kind) {
+                    .constant => return,
+                    .alias => {
+                        const resolved_name = resolved_definition_name(
+                            module,
+                            name,
+                        ) orelse return;
+                        if (find_definition_index(module, resolved_name)) |index| {
+                            mark_definition(module, reachable, index);
+                        }
+                        return;
+                    },
+                }
+            }
             if (is_native_override(name)) return;
             const resolved_name = resolved_definition_name(
                 module,
@@ -6283,7 +7188,14 @@ fn mark_reachable_expr(
                 if (constant_substitution_name(module, name) != null) {
                     return;
                 }
-                if (is_select_sequence_call(application) or
+                if (find_config_replacement(module, name)) |replacement| {
+                    std.debug.assert(replacement.kind == .alias);
+                    if (resolved_definition_name(module, name)) |resolved_name| {
+                        if (find_definition_index(module, resolved_name)) |index| {
+                            mark_definition(module, reachable, index);
+                        }
+                    }
+                } else if (is_select_sequence_call(application) or
                     is_reduce_sequence_call(module, application) or
                     direct_native_name(module, name) != null or
                     is_native_override(name))
@@ -6434,16 +7346,56 @@ fn collect_generated_expressions(
     enabled: bool,
     identity: *usize,
     entries: *std.ArrayList(GeneratedExpressionMeta),
-) !void {
+) error{ OutOfMemory, InvalidArgument }!void {
+    return collect_generated_expression_root(
+        allocator,
+        module,
+        expr,
+        params,
+        0,
+        enabled,
+        identity,
+        entries,
+    );
+}
+
+fn collect_generated_expression_root(
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    expr: *const ast.Expr,
+    params: []const []const u8,
+    callable_arity: usize,
+    enabled: bool,
+    identity: *usize,
+    entries: *std.ArrayList(GeneratedExpressionMeta),
+) error{ OutOfMemory, InvalidArgument }!void {
     identity.* += 1;
     if (enabled and expr_supported(module, expr, params, 0)) {
         if (params.len > 32) return error.OutOfMemory;
+        if (callable_arity > params.len) return error.InvalidArgument;
         var params_copy: [32][]const u8 = @splat("");
-        @memcpy(params_copy[0..params.len], params);
+        var param_depths: [32]u8 = @splat(0);
+        const formal_start = params.len - callable_arity;
+        const compact = !expression_uses_shared_helper(module, expr);
+        var param_count: u8 = 0;
+        for (params, 0..) |param, param_index_v| {
+            if (compact and
+                param_index_v < formal_start and
+                !expr_references_identifier(expr, param))
+            {
+                continue;
+            }
+            params_copy[param_count] = param;
+            param_depths[param_count] = @intCast(
+                params.len - param_index_v - 1,
+            );
+            param_count += 1;
+        }
         try entries.append(allocator, .{
             .expression = expr,
             .params = params_copy,
-            .param_count = @intCast(params.len),
+            .param_depths = param_depths,
+            .param_count = param_count,
             .identity = @intCast(identity.*),
             .uses_primed = expression_uses_primed(module, expr),
         });
@@ -6632,7 +7584,16 @@ fn collect_generated_expressions(
                     definition_storage[scoped_len..][0..definition.params.len],
                     definition.params,
                 );
-                try collect_generated_expressions(allocator, module, definition.body, definition_storage[0 .. scoped_len + definition.params.len], enabled, identity, entries);
+                try collect_generated_expression_root(
+                    allocator,
+                    module,
+                    definition.body,
+                    definition_storage[0 .. scoped_len + definition.params.len],
+                    definition.params.len,
+                    enabled,
+                    identity,
+                    entries,
+                );
                 if (definition.function_domain) |domain| {
                     try collect_generated_expressions(allocator, module, domain, scoped_storage[0..scoped_len], enabled, identity, entries);
                 }
@@ -7794,6 +8755,38 @@ fn emit_variable_path_membership(
     return true;
 }
 
+fn emit_variable_set_relation(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    binary: *const ast.Binary,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    const function_name = switch (binary.op) {
+        .in => "variable_member_bool",
+        .notin => "variable_not_member_bool",
+        .subseteq => "variable_subset_equal_bool",
+        else => return false,
+    };
+    if (binary.left.* != .ident or
+        param_index(params, binary.left.ident) != null)
+    {
+        return false;
+    }
+    const index = variable_index(module, binary.left.ident) orelse
+        return false;
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "try runtime.{s}(context, {d}, ",
+        .{ function_name, index },
+    );
+    defer allocator.free(prefix);
+    try append(output, allocator, prefix);
+    try emit_expr(output, allocator, module, binary.right, params);
+    try append(output, allocator, ")");
+    return true;
+}
+
 fn emit_variable_path_int_comparison(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -8322,37 +9315,56 @@ fn emit_variable_comparison(
     binary: *const ast.Binary,
     params: []const []const u8,
 ) error{OutOfMemory}!bool {
-    if (binary.left.* == .ident and binary.right.* != .ident) {
-        if (param_index(params, binary.left.ident) == null) {
-            if (variable_index(module, binary.left.ident)) |index| {
-                return try emit_one_sided_variable_comparison(
-                    output,
-                    allocator,
-                    module,
-                    binary,
-                    @intCast(index),
-                    binary.right,
-                    params,
-                );
-            }
-        }
+    const left_variable = direct_state_variable_index(module, binary.left, params);
+    const right_variable = direct_state_variable_index(module, binary.right, params);
+    if (left_variable != null and right_variable != null) {
+        const function_name = if (binary.op == .eq)
+            "variables_equal_bool"
+        else
+            "variables_not_equal_bool";
+        const call = try std.fmt.allocPrint(
+            allocator,
+            "try runtime.{s}(context, {d}, {d})",
+            .{ function_name, left_variable.?, right_variable.? },
+        );
+        defer allocator.free(call);
+        try append(output, allocator, call);
+        return true;
     }
-    if (binary.right.* == .ident and binary.left.* != .ident) {
-        if (param_index(params, binary.right.ident) == null) {
-            if (variable_index(module, binary.right.ident)) |index| {
-                return try emit_one_sided_variable_comparison(
-                    output,
-                    allocator,
-                    module,
-                    binary,
-                    @intCast(index),
-                    binary.left,
-                    params,
-                );
-            }
-        }
+    if (left_variable) |index| {
+        return try emit_one_sided_variable_comparison(
+            output,
+            allocator,
+            module,
+            binary,
+            index,
+            binary.right,
+            params,
+        );
+    }
+    if (right_variable) |index| {
+        return try emit_one_sided_variable_comparison(
+            output,
+            allocator,
+            module,
+            binary,
+            index,
+            binary.left,
+            params,
+        );
     }
     return false;
+}
+
+fn direct_state_variable_index(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    params: []const []const u8,
+) ?u32 {
+    if (expr.* != .ident) return null;
+    if (param_index(params, expr.ident) != null) return null;
+    const index = variable_index(module, expr.ident) orelse return null;
+    return @intCast(index);
 }
 
 fn emit_one_sided_variable_comparison(
@@ -8452,6 +9464,39 @@ fn zig_operator_name(
     );
 }
 
+fn zig_function_apply_name(
+    allocator: std.mem.Allocator,
+    definition_index: usize,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "op_{d}_apply",
+        .{definition_index},
+    );
+}
+
+fn zig_function_cached_apply_name(
+    allocator: std.mem.Allocator,
+    definition_index: usize,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "op_{d}_apply_cached",
+        .{definition_index},
+    );
+}
+
+fn zig_function_apply_boolean_name(
+    allocator: std.mem.Allocator,
+    definition_index: usize,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "op_{d}_apply_bool",
+        .{definition_index},
+    );
+}
+
 fn zig_boolean_operator_name(
     allocator: std.mem.Allocator,
     definition_index: usize,
@@ -8463,12 +9508,63 @@ fn zig_boolean_operator_name(
     );
 }
 
+fn definition_body_params(
+    definition: ast.Definition,
+) []const []const u8 {
+    if (!definition.is_function) return definition.params;
+    std.debug.assert(definition.function_vars.len > 0);
+    return definition.function_vars;
+}
+
 fn append(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     bytes: []const u8,
 ) !void {
     try output.appendSlice(allocator, bytes);
+}
+
+test "generated expressions capture only referenced lexical parameters" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------- MODULE CompactExpressionCaptures ----------------
+        \\Check(x, unused) == /\ x = 1
+        \\                    /\ TRUE
+        \\===================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Check"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        ".{ .identity = 1, .arg_names = &[_][]const u8{\"x\", \"unused\"}",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        ".{ .identity = 2, .arg_names = &[_][]const u8{\"x\"}",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        ".{ .identity = 5, .arg_names = &[_][]const u8{}",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        ".arg_required = &[_]bool{",
+    ) != null);
 }
 
 test "emit scalar and direct native operators without fallbacks" {
@@ -8514,6 +9610,64 @@ test "emit scalar and direct native operators without fallbacks" {
     ) != null);
 }
 
+test "emit top-level function definitions without fallbacks" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedFunction ----------------------
+        \\F[x \in {1, 2}] == x + 1
+        \\Direct == F[1] = 2
+        \\AsValue == DOMAIN F = {1, 2}
+        \\IndependentDomain ==
+        \\  \E x \in LET S == {1, 2} IN {y \in S : y > 0} : x = 1
+        \\======================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module(
+        std.testing.allocator,
+        module,
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 4), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expectEqual(@as(usize, 0), result.unsupported.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.function_map(context, args",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "fn op_0_apply(",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "try op_0_apply(context",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.cached_definition(context, 0)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.cached_function_apply(context, 0, args)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "try op_0_apply_cached(context",
+    ) != null);
+}
+
 test "configuration roots are emitted with transitive dependencies" {
     const Arena = @import("arena.zig").Arena;
     const parser = @import("parser.zig");
@@ -8543,7 +9697,7 @@ test "configuration roots are emitted with transitive dependencies" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         result.source,
-        "pub const abi_version: u32 = 1;",
+        "pub const abi_version: u32 = 2;",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -8657,6 +9811,120 @@ test "operator formals shadow state variables in generated paths" {
         result.source,
         "try runtime.call(context, try runtime.force(context, args[0])",
     ) != null);
+}
+
+test "state variable comparisons avoid materializing named operands" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedVariableComparisons ----------------------
+        \\VARIABLES x, y
+        \\Empty == {}
+        \\Named == x = Empty
+        \\Pair == x /= y
+        \\=========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Named", "Pair" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_equal_bool(context, 0, try op_0(context",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variables_not_equal_bool(context, 0, 1)",
+    ) != null);
+}
+
+test "state set relations avoid cloning generated variables" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedSetRelations ----------------------
+        \\VARIABLES f, messages
+        \\TypeInvariant == /\ f \in {1, 2}
+        \\                 /\ messages \subseteq {1, 2}
+        \\=========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    try std.testing.expectEqual(@as(usize, 1), module.definitions.len);
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"TypeInvariant"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.native_count);
+    try std.testing.expectEqual(@as(u32, 1), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_member_bool(context, 0",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_subset_equal_bool(context, 1",
+    ) != null);
+}
+
+test "state variable EXCEPT lowers to a cross-pool update" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedVariableExcept ----------------------
+        \\VARIABLE f
+        \\Update(i) == [f EXCEPT ![i] = @ + 1]
+        \\=========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Update"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_except_update(context, args, 0",
+    ) != null);
+    const source_z = try std.testing.allocator.allocSentinel(
+        u8,
+        result.source.len,
+        0,
+    );
+    defer std.testing.allocator.free(source_z);
+    @memcpy(source_z, result.source);
+    var tree = try std.zig.Ast.parse(std.testing.allocator, source_z, .zig);
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
 }
 
 test "self-recursive operators are generated without fallbacks" {
@@ -8787,7 +10055,11 @@ test "configured operator replacement wins over direct native lowering" {
             .is_substitution = true,
         },
     };
-    const result = try emit_module(std.testing.allocator, module);
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Sequences"},
+    );
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u32, 2), result.generated_count);
@@ -8798,6 +10070,53 @@ test "configured operator replacement wins over direct native lowering" {
     try std.testing.expect(
         std.mem.indexOf(u8, result.source, "try op_0(context") != null,
     );
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "pub fn op_0(") != null,
+    );
+}
+
+test "bounded sorted sequences use direct generic generation" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE SortedGeneration ----------------------
+        \\CONSTANT MaxSeqLen
+        \\LimitedSeq(S) == UNION {[1 .. n -> S] : n \in 1 .. MaxSeqLen}
+        \\Sorted == {ss \in Seq({1, 2}) :
+        \\    \A i, j \in 1 .. Len(ss) : (i < j) => (ss[i] =< ss[j])}
+        \\====================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    var module = try module_parser.parse_module();
+    module.config_replacements = &.{
+        .{
+            .name = "Seq",
+            .value = "LimitedSeq",
+            .kind = .alias,
+            .is_substitution = true,
+        },
+    };
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Sorted"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.bounded_sequence_union(context",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.sorted_sequences(context",
+    ) != null);
 }
 
 test "generated Cartesian products use the direct runtime path" {

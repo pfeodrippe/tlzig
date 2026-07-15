@@ -358,6 +358,16 @@ pub const Value = union(ValueTag) {
         if (tags_equal and a != .lambda_v and same_repr(a, b)) {
             return true;
         }
+        if (!tags_equal and a == .set_v and b.is_set_like()) {
+            if (concrete_finite_set_equal(a.set_v, b, pool)) |equal| {
+                return equal;
+            }
+        }
+        if (!tags_equal and b == .set_v and a.is_set_like()) {
+            if (concrete_finite_set_equal(b.set_v, a, pool)) |equal| {
+                return equal;
+            }
+        }
         if ((is_symbolic_finite_set(a) or is_symbolic_finite_set(b)) and
             a.is_set_like() and b.is_set_like())
         {
@@ -415,8 +425,28 @@ pub const Value = union(ValueTag) {
         right: Value,
         right_pool: *const ValuePool,
     ) bool {
+        assert(left_pool.value_count <= left_pool.value_cap);
+        assert(left_pool.string_count <= left_pool.string_cap);
+        assert(right_pool.value_count <= right_pool.value_cap);
+        assert(right_pool.string_count <= right_pool.string_cap);
         const tags_equal = left.tag() == right.tag();
         if (!tags_equal) {
+            if (left == .set_v and right.is_set_like()) {
+                if (concrete_finite_set_equal_cross_pool(
+                    left.set_v,
+                    left_pool,
+                    right,
+                    right_pool,
+                )) |equal| return equal;
+            }
+            if (right == .set_v and left.is_set_like()) {
+                if (concrete_finite_set_equal_cross_pool(
+                    right.set_v,
+                    right_pool,
+                    left,
+                    left_pool,
+                )) |equal| return equal;
+            }
             if (left == .function_v and right == .tuple_v) {
                 return function_equals_tuple_cross_pool(
                     left.function_v,
@@ -657,6 +687,85 @@ pub const Value = union(ValueTag) {
         };
     }
 
+    /// A linear, sufficient proof of equality for values whose concrete
+    /// representation order matches. False does not imply semantic inequality.
+    pub fn eql_ordered_cross_pool(
+        left: Value,
+        left_pool: *const ValuePool,
+        right: Value,
+        right_pool: *const ValuePool,
+    ) bool {
+        assert(left_pool.value_count <= left_pool.value_cap);
+        assert(left_pool.string_count <= left_pool.string_cap);
+        assert(right_pool.value_count <= right_pool.value_cap);
+        assert(right_pool.string_count <= right_pool.string_cap);
+        if (left.tag() != right.tag()) return false;
+        if (left_pool == right_pool and
+            left != .lambda_v and
+            same_repr(left, right))
+        {
+            return true;
+        }
+        return switch (left) {
+            .bool_v => |value_v| value_v == right.bool_v,
+            .int_v => |value_v| value_v == right.int_v,
+            .model_v => |value_v| value_v == right.model_v,
+            .range_v => |value_v| value_v.eql(right.range_v),
+            .string_v => |value_v| std.mem.eql(
+                u8,
+                value_v.slice(left_pool),
+                right.string_v.slice(right_pool),
+            ),
+            .set_v => |value_v| ordered_values_eql_cross_pool(
+                value_v.items(left_pool),
+                left_pool,
+                right.set_v.items(right_pool),
+                right_pool,
+            ),
+            .tuple_v => |value_v| ordered_values_eql_cross_pool(
+                value_v.items(left_pool),
+                left_pool,
+                right.tuple_v.items(right_pool),
+                right_pool,
+            ),
+            .function_v => |value_v| blk: {
+                const right_value = right.function_v;
+                break :blk ordered_values_eql_cross_pool(
+                    value_v.domain.items(left_pool),
+                    left_pool,
+                    right_value.domain.items(right_pool),
+                    right_pool,
+                ) and ordered_values_eql_cross_pool(
+                    value_v.entries(left_pool),
+                    left_pool,
+                    right_value.entries(right_pool),
+                    right_pool,
+                );
+            },
+            .record_v => |value_v| ordered_record_eql_cross_pool(
+                value_v,
+                left_pool,
+                right.record_v,
+                right_pool,
+            ),
+            .generated_operator_v => |operator| std.meta.eql(
+                operator,
+                right.generated_operator_v,
+            ),
+            .lambda_v,
+            .function_set_v,
+            .record_set_v,
+            .tuple_set_v,
+            .union_v,
+            .cup_v,
+            .cap_v,
+            .diff_v,
+            .seq_set_v,
+            .power_set_v,
+            => false,
+        };
+    }
+
     pub fn compare(a: Value, b: Value, pool: *const ValuePool) ?i8 {
         assert(pool.value_count <= pool.value_cap);
         assert(pool.string_count <= pool.string_cap);
@@ -678,6 +787,11 @@ pub const Value = union(ValueTag) {
         assert(source.string_count <= source.string_cap);
         assert(target.value_count <= target.value_cap);
         assert(target.string_count <= target.string_cap);
+        if (source == target) return self;
+        switch (self) {
+            .bool_v, .int_v, .model_v, .range_v => return self,
+            else => {},
+        }
         if (!target.growable) {
             return self.clone_assume_capacity(source, target);
         }
@@ -814,7 +928,365 @@ pub const Value = union(ValueTag) {
             else => return false,
         };
     }
+
+    /// Membership where the set and element live in different stable pools.
+    /// This avoids cloning canonical state values into a scratch pool merely
+    /// to inspect them.
+    pub fn member_cross_pool(
+        self: Value,
+        set_pool: *const ValuePool,
+        elem: Value,
+        elem_pool: *const ValuePool,
+    ) bool {
+        if (set_pool == elem_pool) return self.member(set_pool, elem);
+        return switch (self) {
+            .set_v => |set| set_contains_cross_pool(
+                set,
+                set_pool,
+                elem,
+                elem_pool,
+            ),
+            .function_set_v => |function_set| function_set_member_cross_pool(
+                set_pool,
+                function_set,
+                elem,
+                elem_pool,
+            ),
+            .record_set_v => |record_set| record_set_member_cross_pool(
+                set_pool,
+                record_set,
+                elem,
+                elem_pool,
+            ),
+            .tuple_set_v => |tuple_set| tuple_set_member_cross_pool(
+                set_pool,
+                tuple_set,
+                elem,
+                elem_pool,
+            ),
+            .union_v => |union_set| union_member_cross_pool(
+                set_pool,
+                union_set.set(set_pool),
+                elem,
+                elem_pool,
+            ),
+            .cup_v => |binary_set| binary_set.left(set_pool).member_cross_pool(
+                set_pool,
+                elem,
+                elem_pool,
+            ) or binary_set.right(set_pool).member_cross_pool(
+                set_pool,
+                elem,
+                elem_pool,
+            ),
+            .cap_v => |binary_set| binary_set.left(set_pool).member_cross_pool(
+                set_pool,
+                elem,
+                elem_pool,
+            ) and binary_set.right(set_pool).member_cross_pool(
+                set_pool,
+                elem,
+                elem_pool,
+            ),
+            .diff_v => |binary_set| binary_set.left(set_pool).member_cross_pool(
+                set_pool,
+                elem,
+                elem_pool,
+            ) and !binary_set.right(set_pool).member_cross_pool(
+                set_pool,
+                elem,
+                elem_pool,
+            ),
+            .range_v => |range_value| range_value.member(elem),
+            .seq_set_v => |sequence_set| sequence_set_member_cross_pool(
+                set_pool,
+                sequence_set.element_set(set_pool),
+                elem,
+                elem_pool,
+            ),
+            .power_set_v => |power_set| power_set_member_cross_pool(
+                set_pool,
+                power_set.set(set_pool),
+                elem,
+                elem_pool,
+            ),
+            else => false,
+        };
+    }
 };
+
+fn ordered_values_eql_cross_pool(
+    left: []const Value,
+    left_pool: *const ValuePool,
+    right: []const Value,
+    right_pool: *const ValuePool,
+) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_item, right_item| {
+        if (!Value.eql_ordered_cross_pool(
+            left_item,
+            left_pool,
+            right_item,
+            right_pool,
+        )) return false;
+    }
+    return true;
+}
+
+fn ordered_record_eql_cross_pool(
+    left: Record,
+    left_pool: *const ValuePool,
+    right: Record,
+    right_pool: *const ValuePool,
+) bool {
+    if (left.len != right.len) return false;
+    const left_fields = left.fields(left_pool);
+    const right_fields = right.fields(right_pool);
+    var index: u32 = 0;
+    while (index < left.len) : (index += 1) {
+        const offset = index * 2;
+        if (!std.mem.eql(
+            u8,
+            left_fields[offset].string_v.slice(left_pool),
+            right_fields[offset].string_v.slice(right_pool),
+        )) return false;
+        if (!Value.eql_ordered_cross_pool(
+            left_fields[offset + 1],
+            left_pool,
+            right_fields[offset + 1],
+            right_pool,
+        )) return false;
+    }
+    return true;
+}
+
+fn set_contains_cross_pool(
+    set: Set,
+    set_pool: *const ValuePool,
+    elem: Value,
+    elem_pool: *const ValuePool,
+) bool {
+    for (set.items(set_pool)) |item| {
+        if (Value.eql_cross_pool(
+            item,
+            set_pool,
+            elem,
+            elem_pool,
+        )) return true;
+    }
+    return false;
+}
+
+fn record_set_member_cross_pool(
+    set_pool: *const ValuePool,
+    record_set: RecordSet,
+    elem: Value,
+    elem_pool: *const ValuePool,
+) bool {
+    if (elem != .record_v or elem.record_v.len != record_set.len) return false;
+    var field_index: u32 = 0;
+    while (field_index < record_set.len) : (field_index += 1) {
+        const field_name = record_set.field_name(
+            set_pool,
+            field_index,
+        ).slice(set_pool);
+        const field_value = elem.record_v.lookup(elem_pool, field_name) orelse
+            return false;
+        if (!record_set.field_domain(set_pool, field_index).member_cross_pool(
+            set_pool,
+            field_value,
+            elem_pool,
+        )) return false;
+    }
+    return true;
+}
+
+fn tuple_set_member_cross_pool(
+    set_pool: *const ValuePool,
+    tuple_set: TupleSet,
+    elem: Value,
+    elem_pool: *const ValuePool,
+) bool {
+    const component_sets = tuple_set.sets(set_pool);
+    switch (elem) {
+        .tuple_v => |tuple_value| {
+            if (tuple_value.len != tuple_set.len) return false;
+            for (component_sets, tuple_value.items(elem_pool)) |set, item| {
+                if (!set.member_cross_pool(
+                    set_pool,
+                    item,
+                    elem_pool,
+                )) return false;
+            }
+            return true;
+        },
+        .function_v => |function_value| {
+            if (function_value.len != tuple_set.len) return false;
+            var index: u32 = 0;
+            while (index < tuple_set.len) : (index += 1) {
+                const item = function_value.apply(
+                    elem_pool,
+                    .{ .int_v = @as(i64, @intCast(index)) + 1 },
+                ) orelse return false;
+                if (!component_sets[index].member_cross_pool(
+                    set_pool,
+                    item,
+                    elem_pool,
+                )) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn function_set_member_cross_pool(
+    set_pool: *const ValuePool,
+    function_set: FunctionSet,
+    elem: Value,
+    elem_pool: *const ValuePool,
+) bool {
+    const domain = function_set.domain(set_pool);
+    const codomain = function_set.codomain(set_pool);
+    switch (elem) {
+        .tuple_v => |tuple_value| {
+            if (!domain_matches_counted_keys_cross_pool(
+                domain,
+                set_pool,
+                tuple_value.len,
+                null,
+                elem_pool,
+            )) return false;
+            for (tuple_value.items(elem_pool)) |item| {
+                if (!codomain.member_cross_pool(
+                    set_pool,
+                    item,
+                    elem_pool,
+                )) return false;
+            }
+            return true;
+        },
+        .function_v => |function_value| {
+            if (!domain_matches_counted_keys_cross_pool(
+                domain,
+                set_pool,
+                function_value.len,
+                function_value.domain.items(elem_pool),
+                elem_pool,
+            )) return false;
+            for (function_value.entries(elem_pool)) |item| {
+                if (!codomain.member_cross_pool(
+                    set_pool,
+                    item,
+                    elem_pool,
+                )) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn domain_matches_counted_keys_cross_pool(
+    domain: Value,
+    domain_pool: *const ValuePool,
+    key_count: u32,
+    keys: ?[]const Value,
+    key_pool: *const ValuePool,
+) bool {
+    const cardinality = finite_cardinality(domain_pool, domain) orelse
+        return false;
+    if (cardinality != key_count) return false;
+    if (keys) |function_keys| {
+        assert(function_keys.len == key_count);
+        for (function_keys) |key| {
+            if (!domain.member_cross_pool(
+                domain_pool,
+                key,
+                key_pool,
+            )) return false;
+        }
+        return true;
+    }
+    var index: u32 = 0;
+    while (index < key_count) : (index += 1) {
+        if (!domain.member(
+            domain_pool,
+            .{ .int_v = @as(i64, @intCast(index)) + 1 },
+        )) return false;
+    }
+    return true;
+}
+
+fn sequence_set_member_cross_pool(
+    set_pool: *const ValuePool,
+    element_set: Value,
+    elem: Value,
+    elem_pool: *const ValuePool,
+) bool {
+    switch (elem) {
+        .tuple_v => |tuple_value| {
+            for (tuple_value.items(elem_pool)) |item| {
+                if (!element_set.member_cross_pool(
+                    set_pool,
+                    item,
+                    elem_pool,
+                )) return false;
+            }
+            return true;
+        },
+        .function_v => |function_value| {
+            var index: u32 = 0;
+            while (index < function_value.len) : (index += 1) {
+                const item = function_value.apply(
+                    elem_pool,
+                    .{ .int_v = @as(i64, @intCast(index)) + 1 },
+                ) orelse return false;
+                if (!element_set.member_cross_pool(
+                    set_pool,
+                    item,
+                    elem_pool,
+                )) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn power_set_member_cross_pool(
+    set_pool: *const ValuePool,
+    base: Value,
+    elem: Value,
+    elem_pool: *const ValuePool,
+) bool {
+    if (elem != .set_v) return false;
+    for (elem.set_v.items(elem_pool)) |item| {
+        if (!base.member_cross_pool(
+            set_pool,
+            item,
+            elem_pool,
+        )) return false;
+    }
+    return true;
+}
+
+fn union_member_cross_pool(
+    set_pool: *const ValuePool,
+    set: Value,
+    elem: Value,
+    elem_pool: *const ValuePool,
+) bool {
+    if (set != .set_v) return false;
+    for (set.set_v.items(set_pool)) |nested| {
+        if (nested.member_cross_pool(
+            set_pool,
+            elem,
+            elem_pool,
+        )) return true;
+    }
+    return false;
+}
 
 fn is_symbolic_finite_set(value_v: Value) bool {
     return switch (value_v) {
@@ -831,6 +1303,38 @@ fn finite_set_extensional_equal(
     const left_subset = finite_set_subset(left, right, pool) orelse return null;
     if (!left_subset) return false;
     return finite_set_subset(right, left, pool);
+}
+
+fn concrete_finite_set_equal(
+    concrete: Set,
+    symbolic: Value,
+    pool: *const ValuePool,
+) ?bool {
+    const cardinality = finite_cardinality(pool, symbolic) orelse return null;
+    if (cardinality != concrete.len) return false;
+    for (concrete.items(pool)) |item| {
+        if (!symbolic.member(pool, item)) return false;
+    }
+    return true;
+}
+
+fn concrete_finite_set_equal_cross_pool(
+    concrete: Set,
+    concrete_pool: *const ValuePool,
+    symbolic: Value,
+    symbolic_pool: *const ValuePool,
+) ?bool {
+    const cardinality = finite_cardinality(symbolic_pool, symbolic) orelse
+        return null;
+    if (cardinality != concrete.len) return false;
+    for (concrete.items(concrete_pool)) |item| {
+        if (!symbolic.member_cross_pool(
+            symbolic_pool,
+            item,
+            concrete_pool,
+        )) return false;
+    }
+    return true;
 }
 
 fn finite_set_subset(
@@ -1082,8 +1586,53 @@ fn finite_cardinality(pool: *const ValuePool, set: Value) ?u64 {
             }
             return total;
         },
+        .record_set_v => |record_set| {
+            var total: u64 = 1;
+            var field_index: u32 = 0;
+            while (field_index < record_set.len) : (field_index += 1) {
+                const count = finite_cardinality(
+                    pool,
+                    record_set.field_domain(pool, field_index),
+                ) orelse return null;
+                total = std.math.mul(u64, total, count) catch return null;
+            }
+            return total;
+        },
+        .function_set_v => |function_set| {
+            const domain_count = finite_cardinality(
+                pool,
+                function_set.domain(pool),
+            ) orelse return null;
+            const codomain_count = finite_cardinality(
+                pool,
+                function_set.codomain(pool),
+            ) orelse return null;
+            return finite_power(codomain_count, domain_count);
+        },
+        .power_set_v => |power_set| {
+            const base_count = finite_cardinality(
+                pool,
+                power_set.set(pool),
+            ) orelse return null;
+            return finite_power(2, base_count);
+        },
         else => return null,
     }
+}
+
+fn finite_power(base: u64, exponent: u64) ?u64 {
+    var result: u64 = 1;
+    var factor = base;
+    var remaining = exponent;
+    while (remaining > 0) : (remaining >>= 1) {
+        if (remaining & 1 != 0) {
+            result = std.math.mul(u64, result, factor) catch return null;
+        }
+        if (remaining > 1) {
+            factor = std.math.mul(u64, factor, factor) catch return null;
+        }
+    }
+    return result;
 }
 
 fn union_member(pool: *const ValuePool, set: Value, elem: Value) bool {
@@ -1705,6 +2254,154 @@ test "symbolic finite set equality is extensional" {
     try std.testing.expect(left.eql(pair, &pool));
 }
 
+test "concrete set equals finite symbolic record set" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 128, 128);
+
+    const type_name = try pool.push_string("type");
+    const pid_name = try pool.push_string("pid");
+    const termination_type = Value{
+        .string_v = try pool.push_string("TerminationMessageType"),
+    };
+    const type_domain_offset = try pool.push_values(&.{termination_type});
+    const type_domain = Value{ .set_v = .{
+        .offset = type_domain_offset,
+        .len = 1,
+    } };
+    const pid_values = [_]Value{
+        .{ .model_v = 1 },
+        .{ .model_v = 2 },
+        .{ .model_v = 3 },
+    };
+    const pid_domain_offset = try pool.push_values(&pid_values);
+    const pid_domain = Value{ .set_v = .{
+        .offset = pid_domain_offset,
+        .len = pid_values.len,
+    } };
+    const record_set_fields = [_]Value{
+        .{ .string_v = type_name },
+        type_domain,
+        .{ .string_v = pid_name },
+        pid_domain,
+    };
+    const record_set_offset = try pool.push_values(&record_set_fields);
+    const symbolic = Value{ .record_set_v = .{
+        .offset = record_set_offset,
+        .len = 2,
+    } };
+
+    var records: [pid_values.len]Value = undefined;
+    for (pid_values, 0..) |pid, index| {
+        const fields = [_]Value{
+            .{ .string_v = type_name },
+            termination_type,
+            .{ .string_v = pid_name },
+            pid,
+        };
+        records[index] = .{ .record_v = .{
+            .offset = try pool.push_values(&fields),
+            .len = 2,
+        } };
+    }
+    const concrete_offset = try pool.push_values(&records);
+    const concrete = Value{ .set_v = .{
+        .offset = concrete_offset,
+        .len = records.len,
+    } };
+
+    try std.testing.expect(concrete.eql(symbolic, &pool));
+    try std.testing.expect(symbolic.eql(concrete, &pool));
+
+    const incomplete = Value{ .set_v = .{
+        .offset = concrete_offset,
+        .len = records.len - 1,
+    } };
+    try std.testing.expect(!incomplete.eql(symbolic, &pool));
+
+    var clone_arena = try Arena.init(1024 * 1024);
+    defer clone_arena.deinit();
+    var clone_pool = try ValuePool.init(&clone_arena, 128, 128);
+    const cloned_concrete = try concrete.clone(&pool, &clone_pool);
+    const cloned_incomplete = try incomplete.clone(&pool, &clone_pool);
+
+    try std.testing.expect(Value.eql_cross_pool(
+        cloned_concrete,
+        &clone_pool,
+        symbolic,
+        &pool,
+    ));
+    try std.testing.expect(Value.eql_cross_pool(
+        symbolic,
+        &pool,
+        cloned_concrete,
+        &clone_pool,
+    ));
+    try std.testing.expect(!Value.eql_cross_pool(
+        cloned_incomplete,
+        &clone_pool,
+        symbolic,
+        &pool,
+    ));
+}
+
+test "symbolic membership reads an element from another pool" {
+    var set_arena = try Arena.init(1024 * 1024);
+    defer set_arena.deinit();
+    var element_arena = try Arena.init(1024 * 1024);
+    defer element_arena.deinit();
+    var set_pool = try ValuePool.init(&set_arena, 128, 128);
+    var element_pool = try ValuePool.init(&element_arena, 128, 128);
+
+    const domain_offset = try set_pool.push_values(&.{
+        .{ .int_v = 1 },
+        .{ .int_v = 2 },
+    });
+    const domain = Value{ .set_v = .{
+        .offset = domain_offset,
+        .len = 2,
+    } };
+    const red = Value{ .string_v = try set_pool.push_string("red") };
+    const blue = Value{ .string_v = try set_pool.push_string("blue") };
+    const codomain_offset = try set_pool.push_values(&.{ red, blue });
+    const codomain = Value{ .set_v = .{
+        .offset = codomain_offset,
+        .len = 2,
+    } };
+    const function_set = Value{ .function_set_v = .{
+        .domain_offset = try set_pool.push_value(domain),
+        .codomain_offset = try set_pool.push_value(codomain),
+    } };
+
+    const function_domain_offset = try element_pool.push_values(&.{
+        .{ .int_v = 1 },
+        .{ .int_v = 2 },
+    });
+    const function_entries_offset = try element_pool.push_values(&.{
+        .{ .string_v = try element_pool.push_string("red") },
+        .{ .string_v = try element_pool.push_string("blue") },
+    });
+    const function = Value{ .function_v = .{
+        .domain = .{ .offset = function_domain_offset, .len = 2 },
+        .offset = function_entries_offset,
+        .len = 2,
+    } };
+    try std.testing.expect(function_set.member_cross_pool(
+        &set_pool,
+        function,
+        &element_pool,
+    ));
+
+    element_pool.values[function_entries_offset + 1] = .{
+        .string_v = try element_pool.push_string("green"),
+    };
+    try std.testing.expect(!function_set.member_cross_pool(
+        &set_pool,
+        function,
+        &element_pool,
+    ));
+}
+
 test "record equality ignores field order" {
     var arena = try Arena.init(1024 * 1024);
     defer arena.deinit();
@@ -1736,6 +2433,19 @@ test "record equality ignores field order" {
     var clone_pool = try ValuePool.init(&clone_arena, 32, 64);
     const cloned_right = try right.clone(&pool, &clone_pool);
     try std.testing.expect(Value.eql_cross_pool(left, &pool, cloned_right, &clone_pool));
+    try std.testing.expect(!Value.eql_ordered_cross_pool(
+        left,
+        &pool,
+        cloned_right,
+        &clone_pool,
+    ));
+    const cloned_left = try left.clone(&pool, &clone_pool);
+    try std.testing.expect(Value.eql_ordered_cross_pool(
+        left,
+        &pool,
+        cloned_left,
+        &clone_pool,
+    ));
 }
 
 test "deep cross-pool clone reserves capacity before recursive writes" {

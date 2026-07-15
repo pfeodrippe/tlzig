@@ -116,11 +116,28 @@ pub fn build(b: *std.Build) void {
     if (benchmark_generated_expressions) {
         run_bench.addArg("--generated-expressions");
     }
+    if (generated_model_path == null) {
+        run_bench.addArg("--skip-prefer-generated");
+    }
     const benchmark_step = b.step("benchmark", "Benchmark tlzig vs Java TLC");
     benchmark_step.dependOn(&run_bench.step);
     if (generated_model_path == null) {
         var previous_generated_benchmark: *std.Build.Step = &run_bench.step;
         const generated_benchmarks = [_]GeneratedBenchmark{
+            .{
+                .name = "benchmark_slush_medium_aot",
+                .model_path = "generated_models/slush_medium.zig",
+                .tla = "vendor/tlaplus-examples/specifications/SlushProtocol/Slush.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/SlushProtocol/SlushMedium.cfg",
+                .filter = "Slush Medium",
+            },
+            .{
+                .name = "benchmark_mc_binary_search_aot",
+                .model_path = "generated_models/mc_binary_search.zig",
+                .tla = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.cfg",
+                .filter = "MCBinarySearch",
+            },
             .{
                 .name = "benchmark_mdbtla_client_centric_aot",
                 .model_path = "generated_models/mdbtla_client_centric.zig",
@@ -373,7 +390,6 @@ fn addGeneratedBenchmark(
         "--label-suffix",
         " [AOT]",
         "--auto-only",
-        "--tlzig-only",
     });
     if (generated_expressions) {
         run_bench.addArg("--generated-expressions");

@@ -1,6 +1,6 @@
 # TLA+ Specification Coverage
 
-Last updated: 2026-07-12
+Last updated: 2026-07-14
 
 ## Goal
 
@@ -53,12 +53,12 @@ Manifest: `coverage_results/primary_final_clean.jsonl`
 | Resolved model path | Exact | Outcome exact | Stochastic | Bounded | TLC invalid | Non-model | Hard gaps |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `specs` | 6 | 1 | 0 | 0 | 16 | 0 | 0 |
-| `tlaplus-examples` | 148 | 16 | 1 | 35 | 42 | 2 | 0 |
+| `tlaplus-examples` | 150 | 16 | 1 | 33 | 42 | 2 | 0 |
 | `MDBTLA` | 2 | 7 | 0 | 2 | 2 | 0 | 0 |
-| **Total** | **156** | **24** | **1** | **37** | **60** | **2** | **0** |
+| **Total** | **158** | **24** | **1** | **35** | **60** | **2** | **0** |
 
 The short audit has zero tlzig rejections, zero outcome mismatches, and zero
-exhaustive distinct-count mismatches. It does **not** prove all 37 bounded
+exhaustive distinct-count mismatches. It does **not** prove all 35 bounded
 rows exhaustively. Long MDBTLA evidence is maintained separately because its
 largest rows require minutes rather than the short corpus gate.
 
@@ -109,7 +109,7 @@ the long rows, including:
 | RC/no-prepare-block exhaustive | 17,057,584 | 172.084s | 86.18s | 2.00x |
 | RC/no-prepare-block-or-ww exhaustive | 18,764,120 | 191.966s | 91.94s | 2.09x |
 | RC/with-prepare-block exhaustive | 15,738,792 | 155.452s | 75.65s | 2.05x |
-| RC/snapshot exhaustive | 67,629,092 | 669.976s | 360.86s | 1.86x |
+| RC/snapshot exhaustive | 67,629,092 | 669.976s | 328.100s | 2.042x |
 | SingleLog MCMDBProps | 269,881 | 1,434.504s | 99.42s | 14.4x |
 | SingleShardTxn ShardTxn | 5,502,547 | 179.117s | 24.286s | 7.38x |
 
@@ -120,16 +120,27 @@ completed exact generated and distinct counts. First-error MultiShard rows
 compare outcome rather than partial counts because parallel traversal may stop
 on different valid witnesses.
 
-The current default paired ReleaseFast benchmark completes in under three
-minutes. TLC runs once in the primary comparison; strict zero-fallback AOT
-rows run tlzig-only and compare against the stored interpreted tlzig baseline,
-so generated rows do not launch duplicate Java checks. In the latest run,
-TLC-auto versus tlzig-AOT-auto was ClientCentric `2.385s` vs `0.933s`, Storage
-`1.539s` vs `0.340s`, RC/snapshot `2.395s` vs `0.571s`,
-SingleShardTxn/small `2.352s` vs `0.093s`, and SingleLog MDBLinearizability
-`2.030s` vs `1.186s`. Completed rows retain exact distinct counts. Configured
-first-error rows compare deterministic one-worker counts within explicit
-tolerances and compare AOT outcome under all-core scheduling.
+The RC/snapshot entry was refreshed on 2026-07-14 after generic ABI-2 generated
+expression and bounded-state-trail changes. The strict generated model reported
+`67` operators and `fallback_count = 0`; the all-core ReleaseFast run again
+completed exact `405,005,930/67,629,092` generated/distinct parity in
+`328.100s`, with `57.138T` retired instructions and `26,281,590,784` bytes peak
+RSS. This is `1.020x` faster than the immediately preceding `334.557s` tlzig
+run and `2.042x` faster than the retained exact TLC baseline. No Java process
+was rerun for this tlzig-only AOT gate.
+
+The default ReleaseFast benchmark keeps heavy exhaustive rows opt-in. The base
+runner skips generated-preferred models; each strict zero-fallback AOT row runs
+TLC-auto once and tlzig-AOT-auto once in the same comparison, so there is no
+interpreted tlzig duplicate and no dependency on an untracked baseline file.
+The latest completed run passed all `56/56` build steps in `170.66s`, including
+generation and compilation. TLC-auto versus tlzig-AOT-auto was ClientCentric
+`2.503s` vs `1.141s`, Storage `1.471s` vs `0.197s`, RC/snapshot `2.278s` vs
+`0.256s`, SingleShardTxn/small `2.628s` vs `0.099s`, SingleLog
+MDBLinearizability `2.037s` vs `0.761s`, MCBinarySearch `2.229s` vs `0.855s`,
+and Slush Medium `23.267s` vs `16.031s`. Completed rows retain exact distinct
+counts. Configured first-error rows compare semantic outcome because parallel
+frontier order can reach different valid witnesses and partial state counts.
 
 ## Generic Fixes In This Audit
 
@@ -173,10 +184,25 @@ tolerances and compare AOT outcome under all-core scheduling.
   of a quadratic fallback, and ungraphed initial states avoid redundant edge
   deduplication. CoffeeCan1000 improved from over `131s` to `6.878s`, versus
   TLC-auto `15.875s`, with exact `2,000,002/501,500` counts.
+- Canonical value capacity is derived from the configured arena instead of an
+  artificial 192-million-value ceiling. `MCKVSSafetyMedium` now completes at
+  the TLC-exact `365,609,473/17,220,672` counts in `103.64s`, versus TLC-auto
+  `173.982s`. `MCKVSSafetySmall` is also exact at
+  `56,349,379/3,409,605`, taking `21.516s` versus TLC-auto `31.494s`.
+- State assignments now use a bounded 64-variable mutable SoA trail with O(1)
+  lookup and mark/rollback backtracking. Generated calls borrow the contiguous
+  state value/source-pool columns directly; lexical extension no longer carries
+  an impossible alternate pool. CLI/benchmark scratch pools are fixed after
+  initialization unless unlimited growth is explicitly selected. The exact
+  RC/snapshot run and the full default benchmark passed after these changes.
+- All 25 checked-in generated models independently compile in ReleaseFast with
+  ABI `2` and `fallback_count = 0`. An identifier audit finds audited MDBTLA,
+  MCBinarySearch, and EWD998 names only in parser tests under `src`; production
+  runtime overrides remain built-ins and standard-module operators.
 
 ## Remaining Work
 
-- [ ] Run opt-in exhaustive paired checks for the 37 bounded primary rows.
+- [ ] Run opt-in exhaustive paired checks for the 35 bounded primary rows.
 - [ ] Complete the extended paired runs for upstream `MCMDBProps` and
   `ShardTxn`; their fresh 60-second audit rows are intentionally still bounded.
 - [ ] Audit ordinary non-TLAPS model fixtures under `vendor/tlaplus` separately
@@ -184,6 +210,12 @@ tolerances and compare AOT outcome under all-core scheduling.
 - [ ] Continue generic typed AOT lowering from trusted TypeOK facts and
   measured profile data. PGO observations may select optimizations, but cannot
   silently assume semantics not guaranteed by the model/configuration.
+- [ ] Lower the measured generated-code backlog generically: 25,472 nested
+  helper chains, 5,068 variable paths, 1,231 whole-root primed comparisons,
+  555 mapped sets, 435 unchanged expressions, 234 EXCEPT reconstructions, and
+  176 materialized function ranges. Clone, fingerprint, action execution, and
+  aggregate movement dominate the current profile; SIMD should follow typed
+  contiguous lowering rather than pack recursive `Value` trees at runtime.
 
 ## Reproduction
 

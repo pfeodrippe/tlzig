@@ -295,6 +295,7 @@ def run_tlzig(
     timeout: int,
     max_states: int,
     max_successors: int,
+    state_values_per_state: int,
     arena_bytes: int,
     eval_arena_bytes: int,
     workers: str,
@@ -311,6 +312,8 @@ def run_tlzig(
         str(max_states),
         "--max-successors",
         str(max_successors),
+        "--state-values-per-state",
+        str(state_values_per_state),
         "--unlimited-memory",
         "--arena-bytes",
         str(arena_bytes),
@@ -354,6 +357,7 @@ def resolve_and_run(
     resolve_timeout: int,
     max_states: int,
     max_successors: int,
+    state_values_per_state: int,
     arena_bytes: int,
     eval_arena_bytes: int,
     tlc_workers: str,
@@ -395,6 +399,7 @@ def resolve_and_run(
             timeout,
             max_states,
             max_successors,
+            state_values_per_state,
             arena_bytes,
             eval_arena_bytes,
             tlzig_workers,
@@ -518,6 +523,15 @@ def main() -> int:
     parser.add_argument("--resolve-timeout", type=int, default=10)
     parser.add_argument("--max-states", type=int, default=200_000)
     parser.add_argument("--max-successors", type=int, default=65_536)
+    parser.add_argument(
+        "--state-values-per-state",
+        type=int,
+        default=160,
+        help=(
+            "canonical Value budget per state; --arena-bytes must also be "
+            "large enough because canonical values use at most half the arena"
+        ),
+    )
     parser.add_argument("--arena-bytes", type=int, default=1_073_741_824)
     parser.add_argument("--eval-arena-bytes", type=int, default=1_073_741_824)
     parser.add_argument("--tlc-workers", default="1")
@@ -556,6 +570,7 @@ def main() -> int:
                 args.resolve_timeout,
                 args.max_states,
                 args.max_successors,
+                args.state_values_per_state,
                 args.arena_bytes,
                 args.eval_arena_bytes,
                 args.tlc_workers,

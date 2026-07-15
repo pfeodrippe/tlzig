@@ -53,7 +53,8 @@ pub const FpSet = struct {
             if (slot == effective) {
                 return self.indices[idx];
             }
-            idx = (idx + 1) % self.cap;
+            idx += 1;
+            if (idx == self.cap) idx = 0;
         }
         return state_index;
     }
@@ -74,7 +75,8 @@ pub const FpSet = struct {
                 assert(self.indices[idx] < self.cap);
                 return self.indices[idx];
             }
-            idx = (idx + 1) % self.cap;
+            idx += 1;
+            if (idx == self.cap) idx = 0;
         }
         return null;
     }

@@ -16,19 +16,20 @@ const ModelTable = value.ModelTable;
 const overrides = @import("overrides.zig");
 const generated_runtime = @import("generated_runtime.zig");
 const codegen = @import("codegen.zig");
+const sequence_patterns = @import("sequence_patterns.zig");
 
 pub const Constant = generated_runtime.NamedValue;
 
 pub const Context = struct {
     head: ?*const ContextBinding,
-    state_head: ?*const ContextBinding,
+    state: ?*const StateContext,
     local_floor: ?*const ContextBinding,
     len: u16,
 
     pub fn empty() Context {
         return .{
             .head = null,
-            .state_head = null,
+            .state = null,
             .local_floor = null,
             .len = 0,
         };
@@ -37,24 +38,26 @@ pub const Context = struct {
     pub fn operator_frame(self: Context) Context {
         return .{
             .head = self.head,
-            .state_head = self.state_head,
+            .state = self.state,
             .local_floor = self.head,
             .len = 0,
         };
     }
 
-    pub fn restore_locals(self: Context, state_head: ?*const ContextBinding) Context {
-        if (state_head) |binding| assert(binding.variable_index != null);
+    pub fn restore_locals(
+        self: Context,
+        state_context: Context,
+    ) Context {
         return .{
             .head = self.head,
-            .state_head = state_head,
+            .state = state_context.state,
             .local_floor = self.local_floor,
             .len = self.len,
         };
     }
 
     pub fn lookup(self: Context, name: []const u8) ?Value {
-        const binding = self.lookup_binding(name) orelse return null;
+        const binding = self.lookup_binding_value(name) orelse return null;
         return binding.value;
     }
 
@@ -63,7 +66,7 @@ pub const Context = struct {
         name: []const u8,
         eval_pool: *ValuePool,
     ) Error!?Value {
-        const binding = self.lookup_binding(name) orelse return null;
+        const binding = self.lookup_binding_value(name) orelse return null;
         const source_pool = binding.value_pool orelse return binding.value;
         return try binding.value.clone(source_pool, eval_pool);
     }
@@ -71,15 +74,12 @@ pub const Context = struct {
     pub fn lookup_local_value(
         self: Context,
         name: []const u8,
-        eval_pool: *ValuePool,
-    ) Error!?Value {
+    ) ?Value {
         var binding = self.head;
         while (binding) |current| : (binding = current.parent) {
             if (current == self.local_floor) break;
-            if (current.variable_index != null) continue;
             if (!name_eql(current.name, name)) continue;
-            const source_pool = current.value_pool orelse return current.value;
-            return try current.value.clone(source_pool, eval_pool);
+            return current.value;
         }
         return null;
     }
@@ -88,7 +88,6 @@ pub const Context = struct {
         var binding = self.head;
         while (binding) |current| : (binding = current.parent) {
             if (current == self.local_floor) break;
-            if (current.variable_index != null) continue;
             if (name_eql(current.name, name)) return true;
         }
         return false;
@@ -157,10 +156,9 @@ pub const Context = struct {
         assert(names.len == values.len);
         assert(required.len == 0 or required.len == names.len);
         assert(names.len <= 32);
-        if (require_all and try self.lookup_values_stack_top(
+        if (self.lookup_values_stack_top(
             names,
             values,
-            eval_pool,
         )) {
             return true;
         }
@@ -175,33 +173,26 @@ pub const Context = struct {
                 if (!name_eql(current.name, names[index])) continue;
                 found[index] = true;
                 found_count += 1;
-                if (current.value_pool) |source_pool| {
-                    values[index] = try current.value.clone(
-                        source_pool,
-                        eval_pool,
-                    );
-                } else {
-                    values[index] = current.value;
-                }
+                values[index] = current.value;
                 if (found_count == names.len) return true;
                 break;
             }
         }
-        binding = self.state_head;
-        while (binding) |current| : (binding = current.state_parent) {
+        var state_iterator = self.state_assignments();
+        while (state_iterator.next()) |current| {
             var index: usize = 0;
             while (index < names.len) : (index += 1) {
                 if (found[index]) continue;
                 if (!name_eql(current.name, names[index])) continue;
                 found[index] = true;
                 found_count += 1;
-                if (current.value_pool) |source_pool| {
-                    values[index] = try current.value.clone(
+                if (current.value.value_pool) |source_pool| {
+                    values[index] = try current.value.value.clone(
                         source_pool,
                         eval_pool,
                     );
                 } else {
-                    values[index] = current.value;
+                    values[index] = current.value.value;
                 }
                 if (found_count == names.len) return true;
                 break;
@@ -222,8 +213,7 @@ pub const Context = struct {
         self: Context,
         names: []const []const u8,
         values: []Value,
-        eval_pool: *ValuePool,
-    ) Error!bool {
+    ) bool {
         if (names.len == 0) return true;
         if (names.len > self.len) return false;
         var binding = self.head;
@@ -233,67 +223,147 @@ pub const Context = struct {
             const current = binding orelse return false;
             if (current == self.local_floor) return false;
             if (!name_eql(current.name, names[index])) return false;
-            if (current.value_pool) |source_pool| {
-                values[index] = try current.value.clone(
-                    source_pool,
-                    eval_pool,
-                );
-            } else {
-                values[index] = current.value;
-            }
+            values[index] = current.value;
             binding = current.parent;
         }
         return true;
     }
 
-    fn lookup_binding(self: Context, name: []const u8) ?*const ContextBinding {
+    fn lookup_values_at_depths(
+        self: Context,
+        names: []const []const u8,
+        depths: []const u8,
+        values: []Value,
+    ) bool {
+        assert(names.len == depths.len);
+        assert(names.len == values.len);
+        if (names.len == 0) return true;
+
+        var binding = self.head;
+        var current_depth: usize = 0;
+        var index = names.len;
+        while (index > 0) {
+            index -= 1;
+            const target_depth = depths[index];
+            if (index + 1 < names.len) {
+                assert(target_depth > depths[index + 1]);
+            }
+            while (current_depth < target_depth) : (current_depth += 1) {
+                const current = binding orelse return false;
+                if (current == self.local_floor) return false;
+                binding = current.parent;
+            }
+            const current = binding orelse return false;
+            if (current == self.local_floor or
+                !name_eql(current.name, names[index]))
+            {
+                return false;
+            }
+            values[index] = current.value;
+        }
+        return true;
+    }
+
+    pub fn lookup_value_at_depth(
+        self: Context,
+        name: []const u8,
+        depth: u8,
+    ) ?Value {
+        var binding = self.head;
+        var current_depth: usize = 0;
+        while (current_depth < depth) : (current_depth += 1) {
+            const current = binding orelse return null;
+            if (current == self.local_floor) return null;
+            binding = current.parent;
+        }
+        const current = binding orelse return null;
+        if (current == self.local_floor or !name_eql(current.name, name)) {
+            return null;
+        }
+        return current.value;
+    }
+
+    fn lookup_binding_value(self: Context, name: []const u8) ?ContextLookup {
         var binding = self.head;
         while (binding) |current| {
             if (current == self.local_floor) break;
-            if (name_eql(current.name, name)) return current;
+            if (name_eql(current.name, name)) return .{
+                .value = current.value,
+                .value_pool = null,
+            };
             binding = current.parent;
         }
-        binding = self.state_head;
-        while (binding) |current| {
-            if (name_eql(current.name, name)) return current;
-            binding = current.state_parent;
+        var state_iterator = self.state_assignments();
+        while (state_iterator.next()) |current| {
+            if (name_eql(current.name, name)) return .{
+                .value = current.value.value,
+                .value_pool = current.value.value_pool,
+            };
         }
         return null;
     }
 
     pub fn lookup_state(self: Context, variable_index: u32) ?StateContextValue {
-        var binding = self.state_head;
-        while (binding) |current| {
-            assert(current.variable_index != null);
-            if (current.variable_index == variable_index) {
-                assert(current.assignment != .local);
-                return .{
-                    .value = current.value,
-                    .value_pool = current.value_pool,
-                    .assignment = current.assignment,
-                };
-            }
-            binding = current.state_parent;
-        }
-        return null;
+        if (variable_index >= 64) return null;
+        const bit = @as(u64, 1) << @intCast(variable_index);
+        const state_context = self.state orelse return null;
+        if (state_context.mask & bit == 0) return null;
+        assert(state_context.count == @popCount(state_context.mask));
+        return .{
+            .value = state_context.values[variable_index],
+            .value_pool = state_context.value_pools[variable_index],
+            .assignment = state_context.assignments[variable_index],
+        };
     }
 
     pub fn collect_state_assignments(
         self: Context,
         assignments: []?StateContextValue,
     ) void {
-        var binding = self.state_head;
-        while (binding) |current| : (binding = current.state_parent) {
-            const variable_index = current.variable_index.?;
-            assert(current.assignment != .local);
-            assert(variable_index < assignments.len);
-            if (assignments[variable_index] != null) continue;
-            assignments[variable_index] = .{
-                .value = current.value,
-                .value_pool = current.value_pool,
-                .assignment = current.assignment,
-            };
+        var iterator = self.state_assignments();
+        while (iterator.next()) |current| {
+            assert(current.variable_index < assignments.len);
+            assignments[current.variable_index] = current.value;
         }
+    }
+
+    pub fn state_assignments(self: Context) StateAssignmentIterator {
+        const state_context = self.state orelse return .{
+            .names = null,
+            .values = null,
+            .value_pools = null,
+            .assignments = null,
+            .remaining = 0,
+        };
+        assert(state_context.count == @popCount(state_context.mask));
+        return .{
+            .names = &state_context.names,
+            .values = &state_context.values,
+            .value_pools = &state_context.value_pools,
+            .assignments = &state_context.assignments,
+            .remaining = state_context.mask,
+        };
+    }
+
+    pub fn state_values(self: Context, count: u32) []const Value {
+        assert(count <= 64);
+        const state_context = self.state orelse return &.{};
+        return state_context.values[0..count];
+    }
+
+    pub fn state_value_pools(
+        self: Context,
+        count: u32,
+    ) []const ?*const ValuePool {
+        assert(count <= 64);
+        const state_context = self.state orelse return &.{};
+        return state_context.value_pools[0..count];
+    }
+
+    pub fn state_assignment_mask(self: Context) u64 {
+        const state_context = self.state orelse return 0;
+        assert(state_context.count == @popCount(state_context.mask));
+        return state_context.mask;
     }
 };
 
@@ -303,14 +373,56 @@ pub const StateContextValue = struct {
     assignment: AssignmentKind,
 };
 
-const ContextBinding = struct {
-    parent: ?*const ContextBinding,
-    state_parent: ?*const ContextBinding,
+const StateContext = struct {
+    names: [64][]const u8 = @splat(&.{}),
+    values: [64]Value = @splat(.{ .bool_v = false }),
+    value_pools: [64]?*const ValuePool = @splat(null),
+    assignments: [64]AssignmentKind = @splat(.unchanged),
+    mask: u64 = 0,
+    count: u8 = 0,
+};
+
+pub const IndexedStateContextValue = struct {
     name: []const u8,
-    variable_index: ?u32,
+    variable_index: u32,
+    value: StateContextValue,
+};
+
+pub const StateAssignmentIterator = struct {
+    names: ?*const [64][]const u8,
+    values: ?*const [64]Value,
+    value_pools: ?*const [64]?*const ValuePool,
+    assignments: ?*const [64]AssignmentKind,
+    remaining: u64,
+
+    pub fn next(self: *StateAssignmentIterator) ?IndexedStateContextValue {
+        if (self.remaining == 0) return null;
+        const variable_index: u6 = @intCast(@ctz(self.remaining));
+        const bit = @as(u64, 1) << variable_index;
+        self.remaining &= ~bit;
+        const assignment = (self.assignments orelse unreachable)[variable_index];
+        assert(assignment != .local);
+        return .{
+            .name = (self.names orelse unreachable)[variable_index],
+            .variable_index = variable_index,
+            .value = .{
+                .value = (self.values orelse unreachable)[variable_index],
+                .value_pool = (self.value_pools orelse unreachable)[variable_index],
+                .assignment = assignment,
+            },
+        };
+    }
+};
+
+const ContextLookup = struct {
     value: Value,
     value_pool: ?*const ValuePool,
-    assignment: AssignmentKind,
+};
+
+const ContextBinding = struct {
+    parent: ?*const ContextBinding,
+    name: []const u8,
+    value: Value,
 };
 
 pub const AssignmentKind = enum {
@@ -323,9 +435,9 @@ const ContextPool = struct {
     bindings: []ContextBinding,
     count: u32,
     restore_floor: u32,
-    state_bindings: []ContextBinding,
-    state_count: u32,
-    state_restore_floor: u32,
+    state: StateContext,
+    state_trail: [64]u6,
+    state_restore_floor: u8,
     pin_depth: u16,
 
     fn init(arena: *Arena) !ContextPool {
@@ -333,8 +445,8 @@ const ContextPool = struct {
             .bindings = try arena.alloc(ContextBinding, 131_072),
             .count = 0,
             .restore_floor = 0,
-            .state_bindings = try arena.alloc(ContextBinding, 131_072),
-            .state_count = 0,
+            .state = .{},
+            .state_trail = undefined,
             .state_restore_floor = 0,
             .pin_depth = 0,
         };
@@ -342,29 +454,43 @@ const ContextPool = struct {
 
     fn reset(self: *ContextPool) void {
         assert(self.count <= self.bindings.len);
-        assert(self.state_count <= self.state_bindings.len);
+        assert(self.state.count <= self.state.values.len);
         self.count = 0;
         self.restore_floor = 0;
-        self.state_count = 0;
+        self.state.count = 0;
+        self.state.mask = 0;
         self.state_restore_floor = 0;
         assert(self.pin_depth == 0);
     }
 
     fn snapshot(self: *const ContextPool) u64 {
         assert(self.count <= self.bindings.len);
-        assert(self.state_count <= self.state_bindings.len);
-        return pack_counts(self.count, self.state_count);
+        assert(self.state.count == @popCount(self.state.mask));
+        return pack_counts(self.count, self.state.count);
     }
 
     fn restore(self: *ContextPool, mark: u64) void {
         const saved_count: u32 = @truncate(mark);
-        const saved_state_count: u32 = @truncate(mark >> 32);
+        const saved_state_count: u8 = @truncate(mark >> 32);
         const local_target = @max(saved_count, self.restore_floor);
         const state_target = @max(saved_state_count, self.state_restore_floor);
         assert(local_target <= self.count);
-        assert(state_target <= self.state_count);
+        assert(state_target <= self.state.count);
         self.count = local_target;
-        self.state_count = state_target;
+        while (self.state.count > state_target) {
+            self.state.count -= 1;
+            const variable_index = self.state_trail[self.state.count];
+            const bit = @as(u64, 1) << variable_index;
+            assert(self.state.mask & bit != 0);
+            self.state.mask &= ~bit;
+            if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+                self.state.names[variable_index] = &.{};
+                self.state.values[variable_index] = .{ .bool_v = false };
+                self.state.value_pools[variable_index] = null;
+                self.state.assignments[variable_index] = .unchanged;
+            }
+        }
+        assert(self.state.count == @popCount(self.state.mask));
     }
 
     fn pin(self: *ContextPool) u64 {
@@ -376,7 +502,7 @@ const ContextPool = struct {
         self.restore_floor = @max(self.restore_floor, self.count);
         self.state_restore_floor = @max(
             self.state_restore_floor,
-            self.state_count,
+            self.state.count,
         );
         self.pin_depth += 1;
         return previous;
@@ -385,7 +511,7 @@ const ContextPool = struct {
     fn unpin(self: *ContextPool, previous: u64) void {
         assert(self.pin_depth > 0);
         const previous_local: u32 = @truncate(previous);
-        const previous_state: u32 = @truncate(previous >> 32);
+        const previous_state: u8 = @truncate(previous >> 32);
         assert(previous_local <= self.restore_floor);
         assert(previous_state <= self.state_restore_floor);
         self.restore_floor = previous_local;
@@ -397,60 +523,86 @@ const ContextPool = struct {
         return self.pin_depth == 0;
     }
 
-    fn pack_counts(local: u32, state_count: u32) u64 {
+    fn pack_counts(local: u32, state_count: u8) u64 {
         return @as(u64, state_count) << 32 | local;
     }
 
-    fn extend(
+    fn extend_state(
         self: *ContextPool,
         context: Context,
         name: []const u8,
-        variable_index: ?u32,
+        variable_index: u32,
         value_v: Value,
         value_pool: ?*const ValuePool,
         assignment: AssignmentKind,
     ) Error!Context {
-        assert(context.len < std.math.maxInt(u16));
-        assert((assignment == .local) == (variable_index == null));
-        const binding = if (variable_index != null) blk: {
-            if (self.state_count >= self.state_bindings.len) {
-                if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
-                    std.debug.print(
-                        "context state bindings exhausted: {d}/{d}\n",
-                        .{ self.state_count, self.state_bindings.len },
-                    );
-                }
-                return Error.OutOfMemory;
+        assert(assignment != .local);
+        if (variable_index >= self.state.values.len or
+            self.state.count >= self.state.values.len)
+        {
+            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                std.debug.print(
+                    "context state trail exhausted: {d}/{d}\n",
+                    .{ self.state.count, self.state.values.len },
+                );
             }
-            const state_binding = &self.state_bindings[self.state_count];
-            self.state_count += 1;
-            break :blk state_binding;
-        } else blk: {
-            if (self.count >= self.bindings.len) {
-                if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
-                    std.debug.print(
-                        "context local bindings exhausted: {d}/{d}\n",
-                        .{ self.count, self.bindings.len },
-                    );
-                }
-                return Error.OutOfMemory;
-            }
-            const local_binding = &self.bindings[self.count];
-            self.count += 1;
-            break :blk local_binding;
+            return Error.OutOfMemory;
+        }
+        if (self.state.mask == 0) {
+            assert(context.state == null or context.state == &self.state);
+        } else {
+            assert(context.state == &self.state);
+        }
+        const variable_index_u6: u6 = @intCast(variable_index);
+        const bit = @as(u64, 1) << variable_index_u6;
+        if (self.state.mask & bit != 0) return Error.TypeError;
+        self.state_trail[self.state.count] = variable_index_u6;
+        self.state.names[variable_index] = name;
+        self.state.values[variable_index] = value_v;
+        self.state.value_pools[variable_index] = value_pool;
+        self.state.assignments[variable_index] = assignment;
+        self.state.mask |= bit;
+        self.state.count += 1;
+        assert(self.state.count == @popCount(self.state.mask));
+        return .{
+            .head = context.head,
+            .state = &self.state,
+            .local_floor = context.local_floor,
+            .len = context.len,
         };
+    }
+
+    fn extend_local(
+        self: *ContextPool,
+        context: Context,
+        name: []const u8,
+        value_v: Value,
+    ) Error!Context {
+        assert(context.len < std.math.maxInt(u16));
+        if (self.state.mask == 0) {
+            assert(context.state == null or context.state == &self.state);
+        } else {
+            assert(context.state == &self.state);
+        }
+        if (self.count >= self.bindings.len) {
+            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                std.debug.print(
+                    "context local bindings exhausted: {d}/{d}\n",
+                    .{ self.count, self.bindings.len },
+                );
+            }
+            return Error.OutOfMemory;
+        }
+        const binding = &self.bindings[self.count];
+        self.count += 1;
         binding.* = .{
             .parent = context.head,
-            .state_parent = if (variable_index != null) context.state_head else null,
             .name = name,
-            .variable_index = variable_index,
             .value = value_v,
-            .value_pool = value_pool,
-            .assignment = assignment,
         };
         return .{
             .head = binding,
-            .state_head = if (variable_index != null) binding else context.state_head,
+            .state = context.state,
             .local_floor = context.local_floor,
             .len = context.len + 1,
         };
@@ -542,12 +694,18 @@ const StateCallMemo = struct {
     pool: ?*ValuePool = null,
     count: u16 = 0,
     entries: [1024]CallMemoEntry = undefined,
-    slots: [slot_count]u16 = @splat(0),
+    slots: [slot_count]u16 = undefined,
+    slot_generations: [slot_count]u64 = @splat(0),
+    generation: u64 = 0,
 
     fn reset(self: *StateCallMemo, pool: ?*ValuePool) void {
         self.pool = pool;
         self.count = 0;
-        @memset(&self.slots, 0);
+        self.generation +%= 1;
+        if (self.generation == 0) {
+            @memset(&self.slot_generations, 0);
+            self.generation = 1;
+        }
     }
 
     fn hash_call(
@@ -588,8 +746,10 @@ const StateCallMemo = struct {
         var slot: usize = @intCast(hash & (slot_count - 1));
         var probes: usize = 0;
         while (probes < slot_count) : (probes += 1) {
+            if (self.slot_generations[slot] != self.generation) return null;
             const encoded_index = self.slots[slot];
-            if (encoded_index == 0) return null;
+            assert(encoded_index > 0);
+            assert(encoded_index <= self.count);
             const entry = self.entries[encoded_index - 1];
             if (entry.hash != hash or
                 !std.mem.eql(u8, entry.name, name) or
@@ -637,7 +797,9 @@ const StateCallMemo = struct {
         );
         var slot: usize = @intCast(hash & (slot_count - 1));
         var probes: usize = 0;
-        while (probes < slot_count and self.slots[slot] != 0) : (probes += 1) {
+        while (probes < slot_count and
+            self.slot_generations[slot] == self.generation) : (probes += 1)
+        {
             slot = (slot + 1) & (slot_count - 1);
         }
         if (probes == slot_count) return error.OutOfMemory;
@@ -662,6 +824,7 @@ const StateCallMemo = struct {
             .value = memo_value,
         };
         self.slots[slot] = self.count + 1;
+        self.slot_generations[slot] = self.generation;
         self.count += 1;
     }
 };
@@ -683,6 +846,9 @@ pub const Evaluator = struct {
     recursive_definitions: []?bool,
     generated_cache_pool: *ValuePool,
     generated_cache: []?Value,
+    generated_cache_rollback: []?Value,
+    generated_cache_frozen: bool,
+    generated_state_memo_required: bool,
     context_pool: *ContextPool,
     /// Error context stored via pointer so all by-value copies share state.
     err_ctx: *ErrorContext,
@@ -716,6 +882,11 @@ pub const Evaluator = struct {
         generated_cache_pool.* = try ValuePool.init(arena, 4096, 4096);
         const generated_cache = try arena.alloc(?Value, module.definitions.len);
         @memset(generated_cache, null);
+        const generated_cache_rollback = try arena.alloc(
+            ?Value,
+            module.definitions.len,
+        );
+        @memset(generated_cache_rollback, null);
         const context_pool = try arena.alloc_object(ContextPool);
         context_pool.* = try ContextPool.init(arena);
         const constant_slots = try arena.alloc(?Value, module.constants.len);
@@ -723,6 +894,13 @@ pub const Evaluator = struct {
         var override_registry = overrides.default_registry(override_ctx);
         override_registry.generated = generated;
         override_registry.generated_expressions = generated_expressions;
+        var generated_state_memo_required = false;
+        for (generated) |operator| {
+            if (operator.state_memo_required) {
+                generated_state_memo_required = true;
+                break;
+            }
+        }
         return Evaluator{
             .module = module,
             .constants = &[_]Constant{},
@@ -740,6 +918,9 @@ pub const Evaluator = struct {
             .recursive_definitions = recursive_definitions,
             .generated_cache_pool = generated_cache_pool,
             .generated_cache = generated_cache,
+            .generated_cache_rollback = generated_cache_rollback,
+            .generated_cache_frozen = false,
+            .generated_state_memo_required = generated_state_memo_required,
             .context_pool = context_pool,
             .err_ctx = err_ctx,
         };
@@ -769,6 +950,11 @@ pub const Evaluator = struct {
         generated_cache_pool.* = try ValuePool.init(arena, 4096, 4096);
         const generated_cache = try arena.alloc(?Value, self.module.definitions.len);
         @memset(generated_cache, null);
+        const generated_cache_rollback = try arena.alloc(
+            ?Value,
+            self.module.definitions.len,
+        );
+        @memset(generated_cache_rollback, null);
         const context_pool = try arena.alloc_object(ContextPool);
         context_pool.* = try ContextPool.init(arena);
         const constant_slots = try arena.alloc(
@@ -786,10 +972,181 @@ pub const Evaluator = struct {
         copy.recursive_definitions = recursive_definitions;
         copy.generated_cache_pool = generated_cache_pool;
         copy.generated_cache = generated_cache;
+        copy.generated_cache_rollback = generated_cache_rollback;
+        copy.generated_cache_frozen = false;
         copy.context_pool = context_pool;
         copy.constant_slots = constant_slots;
         copy.err_ctx = err_ctx;
         return copy;
+    }
+
+    pub fn freeze_generated_cache(
+        self: *Evaluator,
+        eval_pool: *ValuePool,
+    ) Error!void {
+        assert(!self.generated_cache_frozen);
+        assert(self.generated_cache_pool != eval_pool);
+        const source_pool = self.generated_cache_pool;
+        for (self.generated_cache) |*cached| {
+            if (cached.*) |value_v| {
+                cached.* = try value_v.clone(source_pool, eval_pool);
+            }
+        }
+        self.generated_cache_pool = eval_pool;
+        self.generated_cache_frozen = true;
+    }
+
+    pub fn warm_eager_generated_cache(
+        self: *Evaluator,
+        eval_pool: *ValuePool,
+        state_pool: *ValuePool,
+    ) void {
+        const cache_value_budget: u32 = 4096;
+        const cache_string_budget: u32 = 64 * 1024;
+        assert(!self.generated_cache_frozen);
+        assert(self.generated_cache_pool != eval_pool);
+        assert(self.generated_cache_rollback.len == self.generated_cache.len);
+        for (self.override_registry.generated) |operator| {
+            if (!operator.eager_cache) continue;
+            assert(operator.cacheable);
+            assert(operator.arity == 0);
+            const function = operator.function orelse continue;
+            const cache_index = operator.cache_index orelse continue;
+            assert(cache_index < self.generated_cache.len);
+            if (self.generated_cache[cache_index] != null) continue;
+
+            const eval_snapshot = eval_pool.snapshot();
+            const cache_snapshot = self.generated_cache_pool.snapshot();
+            @memcpy(self.generated_cache_rollback, self.generated_cache);
+            const eval_growable = eval_pool.growable;
+            const cache_growable = self.generated_cache_pool.growable;
+            eval_pool.growable = false;
+            self.generated_cache_pool.growable = false;
+            const warmed = blk: {
+                _ = self.call_generated(
+                    function,
+                    &.{},
+                    Context.empty(),
+                    null,
+                    eval_pool,
+                    state_pool,
+                    false,
+                ) catch break :blk false;
+                break :blk true;
+            };
+            eval_pool.growable = eval_growable;
+            self.generated_cache_pool.growable = cache_growable;
+            eval_pool.restore(eval_snapshot);
+
+            const cache_values = self.generated_cache_pool.value_count -
+                cache_snapshot.value_count;
+            const cache_strings = self.generated_cache_pool.string_count -
+                cache_snapshot.string_count;
+            const admitted = warmed and
+                cache_values <= cache_value_budget and
+                cache_strings <= cache_string_budget;
+            if (!admitted) {
+                @memcpy(self.generated_cache, self.generated_cache_rollback);
+                self.generated_cache_pool.restore(cache_snapshot);
+                self.err_ctx.* = .{};
+            }
+            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                std.debug.print(
+                    "generated cache warm {s}: admitted={} values={d} strings={d}\n",
+                    .{ operator.name, admitted, cache_values, cache_strings },
+                );
+            }
+        }
+    }
+
+    pub fn generated_cache_is_frozen(self: *const Evaluator) bool {
+        return self.generated_cache_frozen;
+    }
+
+    pub fn share_generated_cache_from(
+        self: *Evaluator,
+        source: *const Evaluator,
+    ) void {
+        assert(source.generated_cache_frozen);
+        assert(source.generated_cache_pool != self.generated_cache_pool);
+        self.generated_cache = source.generated_cache;
+        self.generated_cache_pool = source.generated_cache_pool;
+        self.generated_cache_frozen = true;
+    }
+
+    pub fn localize_generated_cache_from(
+        self: *Evaluator,
+        source: *const Evaluator,
+        local_pool: *ValuePool,
+    ) void {
+        const entry_value_budget: u32 = 8192;
+        const entry_string_budget: u32 = 256 * 1024;
+        const total_value_budget: u32 = 64 * 1024;
+        const total_string_budget: u32 = 1024 * 1024;
+        assert(source.generated_cache_frozen);
+        assert(!self.generated_cache_frozen);
+        assert(self.generated_cache.len == source.generated_cache.len);
+        assert(local_pool != source.generated_cache_pool);
+
+        const base = local_pool.snapshot();
+        for (source.override_registry.generated) |operator| {
+            if (!operator.cacheable) continue;
+            const cache_index = operator.cache_index orelse continue;
+            assert(cache_index < self.generated_cache.len);
+            const source_value = source.generated_cache[cache_index] orelse
+                continue;
+            const used_values = local_pool.value_count - base.value_count;
+            const used_strings = local_pool.string_count - base.string_count;
+            if (used_values >= total_value_budget or
+                used_strings >= total_string_budget)
+            {
+                break;
+            }
+            const value_budget = @min(
+                entry_value_budget,
+                total_value_budget - used_values,
+            );
+            const string_budget = @min(
+                entry_string_budget,
+                total_string_budget - used_strings,
+            );
+            const snapshot = local_pool.snapshot();
+            const value_cap = local_pool.value_cap;
+            const string_cap = local_pool.string_cap;
+            const growable = local_pool.growable;
+            local_pool.value_cap = @min(
+                value_cap,
+                snapshot.value_count + value_budget,
+            );
+            local_pool.string_cap = @min(
+                string_cap,
+                snapshot.string_count + string_budget,
+            );
+            local_pool.growable = false;
+            const localized = source_value.clone(
+                source.generated_cache_pool,
+                local_pool,
+            ) catch null;
+            local_pool.value_cap = value_cap;
+            local_pool.string_cap = string_cap;
+            local_pool.growable = growable;
+            if (localized) |value_v| {
+                self.generated_cache[cache_index] = value_v;
+            } else {
+                local_pool.restore(snapshot);
+            }
+        }
+        self.generated_cache_pool = local_pool;
+        self.generated_cache_frozen = true;
+        if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            std.debug.print(
+                "generated cache localized values={d} strings={d}\n",
+                .{
+                    local_pool.value_count - base.value_count,
+                    local_pool.string_count - base.string_count,
+                },
+            );
+        }
     }
 
     pub fn reset_context_pool(self: *const Evaluator) void {
@@ -812,23 +1169,20 @@ pub const Evaluator = struct {
         self.context_pool.unpin(previous);
     }
 
-    pub fn extend_context(
+    pub inline fn extend_context(
         self: *const Evaluator,
         context: Context,
         name: []const u8,
         value_v: Value,
     ) Error!Context {
-        return self.context_pool.extend(
+        return self.context_pool.extend_local(
             context,
             name,
-            null,
             value_v,
-            null,
-            .local,
         );
     }
 
-    pub fn extend_state_context(
+    pub inline fn extend_state_context(
         self: *const Evaluator,
         context: Context,
         name: []const u8,
@@ -846,7 +1200,7 @@ pub const Evaluator = struct {
         );
     }
 
-    pub fn extend_state_context_from_pool(
+    pub inline fn extend_state_context_from_pool(
         self: *const Evaluator,
         context: Context,
         name: []const u8,
@@ -858,7 +1212,7 @@ pub const Evaluator = struct {
         assert(assignment != .local);
         assert(variable_index < self.module.variables.len);
         assert(name_eql(name, self.module.variables[variable_index]));
-        return self.context_pool.extend(
+        return self.context_pool.extend_state(
             context,
             name,
             variable_index,
@@ -874,10 +1228,11 @@ pub const Evaluator = struct {
         name: []const u8,
     ) AssignmentKind {
         _ = self;
-        return if (context.lookup_binding(name)) |binding|
-            binding.assignment
-        else
-            .local;
+        var assignments = context.state_assignments();
+        while (assignments.next()) |current| {
+            if (name_eql(current.name, name)) return current.value.assignment;
+        }
+        return .local;
     }
 
     pub fn eval_named_zero(
@@ -1004,14 +1359,32 @@ pub const Evaluator = struct {
         return self.override_registry.generated_expressions.len;
     }
 
+    pub fn generated_requires_state_memo(self: *const Evaluator) bool {
+        return self.generated_state_memo_required;
+    }
+
     pub fn eval_generated_expression(
         self: *const Evaluator,
-        expression: generated_runtime.Expression,
+        expression: *const generated_runtime.Expression,
         context: Context,
         current_state: ?*StateStore.State,
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!Value {
+        if (expression.direct_value) |direct| return direct;
+        if (expression.direct_arg_index) |index| {
+            if (index >= expression.arg_names.len or
+                index >= expression.arg_depths.len)
+            {
+                return Error.TypeError;
+            }
+            if (context.lookup_value_at_depth(
+                expression.arg_names[index],
+                expression.arg_depths[index],
+            )) |direct| {
+                if (!generated_runtime.requires_force(direct)) return direct;
+            }
+        }
         if (expression.arg_names.len > 32) return Error.NotImplemented;
         if (expression.arg_required.len != 0 and
             expression.arg_required.len != expression.arg_names.len)
@@ -1020,12 +1393,21 @@ pub const Evaluator = struct {
         }
         var args: [32]Value = undefined;
         if (expression.arg_names.len > 0) {
-            try context.lookup_values(
+            const found_at_depths = expression.arg_required.len == 0 and
+                expression.arg_depths.len == expression.arg_names.len and
+                context.lookup_values_at_depths(
+                    expression.arg_names,
+                    expression.arg_depths,
+                    args[0..expression.arg_names.len],
+                );
+            const found = found_at_depths or try context.lookup_values_internal(
                 expression.arg_names,
                 expression.arg_required,
                 args[0..expression.arg_names.len],
                 eval_pool,
+                false,
             );
+            assert(found);
         }
         const result = self.call_generated(
             expression.function,
@@ -1049,12 +1431,26 @@ pub const Evaluator = struct {
 
     pub fn eval_generated_expression_if_args_available(
         self: *const Evaluator,
-        expression: generated_runtime.Expression,
+        expression: *const generated_runtime.Expression,
         context: Context,
         current_state: ?*StateStore.State,
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!?Value {
+        if (expression.direct_value) |direct| return direct;
+        if (expression.direct_arg_index) |index| {
+            if (index >= expression.arg_names.len or
+                index >= expression.arg_depths.len)
+            {
+                return Error.TypeError;
+            }
+            if (context.lookup_value_at_depth(
+                expression.arg_names[index],
+                expression.arg_depths[index],
+            )) |direct| {
+                if (!generated_runtime.requires_force(direct)) return direct;
+            }
+        }
         if (expression.arg_names.len > 32) return Error.NotImplemented;
         if (expression.arg_required.len != 0 and
             expression.arg_required.len != expression.arg_names.len)
@@ -1062,15 +1458,25 @@ pub const Evaluator = struct {
             return Error.TypeError;
         }
         var args: [32]Value = undefined;
-        if (expression.arg_names.len > 0 and
-            !try context.lookup_required_values_if_available(
+        if (expression.arg_names.len > 0) {
+            const found_at_depths = expression.arg_required.len == 0 and
+                expression.arg_depths.len == expression.arg_names.len and
+                context.lookup_values_at_depths(
+                    expression.arg_names,
+                    expression.arg_depths,
+                    args[0..expression.arg_names.len],
+                );
+            const found = found_at_depths or context.lookup_values_internal(
                 expression.arg_names,
                 expression.arg_required,
                 args[0..expression.arg_names.len],
                 eval_pool,
-            ))
-        {
-            return null;
+                false,
+            ) catch |err| switch (err) {
+                Error.UndefinedSymbol => false,
+                else => return err,
+            };
+            if (!found) return null;
         }
         return self.call_generated(
             expression.function,
@@ -1093,12 +1499,30 @@ pub const Evaluator = struct {
 
     pub fn eval_generated_expression_bool(
         self: *const Evaluator,
-        expression: generated_runtime.Expression,
+        expression: *const generated_runtime.Expression,
         context: Context,
         current_state: ?*StateStore.State,
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!bool {
+        if (expression.direct_value) |direct| {
+            return generated_runtime.boolean(direct);
+        }
+        if (expression.direct_arg_index) |index| {
+            if (index >= expression.arg_names.len or
+                index >= expression.arg_depths.len)
+            {
+                return Error.TypeError;
+            }
+            if (context.lookup_value_at_depth(
+                expression.arg_names[index],
+                expression.arg_depths[index],
+            )) |direct| {
+                if (!generated_runtime.requires_force(direct)) {
+                    return generated_runtime.boolean(direct);
+                }
+            }
+        }
         const boolean_function = expression.boolean_function orelse {
             const result = try self.eval_generated_expression(
                 expression,
@@ -1117,12 +1541,21 @@ pub const Evaluator = struct {
         }
         var args: [32]Value = undefined;
         if (expression.arg_names.len > 0) {
-            try context.lookup_values(
+            const found_at_depths = expression.arg_required.len == 0 and
+                expression.arg_depths.len == expression.arg_names.len and
+                context.lookup_values_at_depths(
+                    expression.arg_names,
+                    expression.arg_depths,
+                    args[0..expression.arg_names.len],
+                );
+            const found = found_at_depths or try context.lookup_values_internal(
                 expression.arg_names,
                 expression.arg_required,
                 args[0..expression.arg_names.len],
                 eval_pool,
+                false,
             );
+            assert(found);
         }
         return self.call_generated_bool(
             boolean_function,
@@ -1145,12 +1578,30 @@ pub const Evaluator = struct {
 
     pub fn eval_generated_expression_bool_if_args_available(
         self: *const Evaluator,
-        expression: generated_runtime.Expression,
+        expression: *const generated_runtime.Expression,
         context: Context,
         current_state: ?*StateStore.State,
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!?bool {
+        if (expression.direct_value) |direct| {
+            return try generated_runtime.boolean(direct);
+        }
+        if (expression.direct_arg_index) |index| {
+            if (index >= expression.arg_names.len or
+                index >= expression.arg_depths.len)
+            {
+                return Error.TypeError;
+            }
+            if (context.lookup_value_at_depth(
+                expression.arg_names[index],
+                expression.arg_depths[index],
+            )) |direct| {
+                if (!generated_runtime.requires_force(direct)) {
+                    return try generated_runtime.boolean(direct);
+                }
+            }
+        }
         const boolean_function = expression.boolean_function orelse {
             const result = try self.eval_generated_expression_if_args_available(
                 expression,
@@ -1168,15 +1619,25 @@ pub const Evaluator = struct {
             return Error.TypeError;
         }
         var args: [32]Value = undefined;
-        if (expression.arg_names.len > 0 and
-            !try context.lookup_required_values_if_available(
+        if (expression.arg_names.len > 0) {
+            const found_at_depths = expression.arg_required.len == 0 and
+                expression.arg_depths.len == expression.arg_names.len and
+                context.lookup_values_at_depths(
+                    expression.arg_names,
+                    expression.arg_depths,
+                    args[0..expression.arg_names.len],
+                );
+            const found = found_at_depths or context.lookup_values_internal(
                 expression.arg_names,
                 expression.arg_required,
                 args[0..expression.arg_names.len],
                 eval_pool,
-            ))
-        {
-            return null;
+                false,
+            ) catch |err| switch (err) {
+                Error.UndefinedSymbol => false,
+                else => return err,
+            };
+            if (!found) return null;
         }
         return self.call_generated_bool(
             boolean_function,
@@ -1199,7 +1660,7 @@ pub const Evaluator = struct {
 
     pub fn make_generated_expression_operator(
         self: *const Evaluator,
-        expression: generated_runtime.Expression,
+        expression: *const generated_runtime.Expression,
         arity: u16,
         context: Context,
         eval_pool: *ValuePool,
@@ -1322,7 +1783,10 @@ pub const Evaluator = struct {
         assert(state_pool.value_count <= state_pool.value_cap);
         const root_call = !self.err_ctx.active;
         if (root_call) {
-            if (ctx.len == 0 and self.context_pool.can_reset_at_root()) {
+            if (ctx.len == 0 and
+                ctx.state_assignment_mask() == 0 and
+                self.context_pool.can_reset_at_root())
+            {
                 self.context_pool.reset();
             }
             self.err_ctx.context = null;
@@ -2617,7 +3081,10 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!?Value {
-        if (!is_sorted_sequence_predicate(sf.pred, bv.name)) return null;
+        if (!sequence_patterns.is_sorted_sequence_predicate(
+            sf.pred,
+            bv.name,
+        )) return null;
         const symbolic_domain = (try eval_symbolic_set(self, bv.domain, ctx, s0, eval_pool, state_pool)) orelse return null;
 
         var lengths = std.ArrayList(u32).empty;
@@ -4199,31 +4666,24 @@ pub const Evaluator = struct {
         state_pool: *ValuePool,
         uses_primed: bool,
     ) Error!Value {
-        var partial_values: [64]Value = undefined;
-        var partial_value_pools: [64]?*const ValuePool = undefined;
-        assert(self.module.variables.len <= partial_values.len);
+        assert(self.module.variables.len <= 64);
         const skip_partial_values = !uses_primed and current_state != null;
-        var partial_mask: u64 = 0;
-        if (!skip_partial_values and evaluator_context.state_head != null) {
-            var binding = evaluator_context.state_head;
-            while (binding) |current| : (binding = current.state_parent) {
-                const index = current.variable_index.?;
-                assert(index < self.module.variables.len);
-                const bit = @as(u64, 1) << @intCast(index);
-                if (partial_mask & bit != 0) continue;
-                partial_mask |= bit;
-                partial_values[index] = current.value;
-                partial_value_pools[index] = current.value_pool;
-            }
-        }
+        const partial_mask = if (skip_partial_values)
+            0
+        else
+            evaluator_context.state_assignment_mask();
         const partial_value_slice = if (partial_mask == 0)
-            partial_values[0..0]
+            &.{}
         else
-            partial_values[0..self.module.variables.len];
+            evaluator_context.state_values(
+                @intCast(self.module.variables.len),
+            );
         const partial_pool_slice = if (partial_mask == 0)
-            partial_value_pools[0..0]
+            &.{}
         else
-            partial_value_pools[0..self.module.variables.len];
+            evaluator_context.state_value_pools(
+                @intCast(self.module.variables.len),
+            );
         var context = generated_runtime.CallContext{
             .eval_pool = eval_pool,
             .state_pool = state_pool,
@@ -4237,6 +4697,7 @@ pub const Evaluator = struct {
             .constant_slots = self.constant_slots,
             .generated_cache = self.generated_cache,
             .generated_cache_pool = self.generated_cache_pool,
+            .generated_cache_frozen = self.generated_cache_frozen,
             .models = self.models,
             .memo_context = self,
             .cached_call = generated_cached_call,
@@ -4258,31 +4719,24 @@ pub const Evaluator = struct {
         state_pool: *ValuePool,
         uses_primed: bool,
     ) Error!bool {
-        var partial_values: [64]Value = undefined;
-        var partial_value_pools: [64]?*const ValuePool = undefined;
-        assert(self.module.variables.len <= partial_values.len);
+        assert(self.module.variables.len <= 64);
         const skip_partial_values = !uses_primed and current_state != null;
-        var partial_mask: u64 = 0;
-        if (!skip_partial_values and evaluator_context.state_head != null) {
-            var binding = evaluator_context.state_head;
-            while (binding) |current| : (binding = current.state_parent) {
-                const index = current.variable_index.?;
-                assert(index < self.module.variables.len);
-                const bit = @as(u64, 1) << @intCast(index);
-                if (partial_mask & bit != 0) continue;
-                partial_mask |= bit;
-                partial_values[index] = current.value;
-                partial_value_pools[index] = current.value_pool;
-            }
-        }
+        const partial_mask = if (skip_partial_values)
+            0
+        else
+            evaluator_context.state_assignment_mask();
         const partial_value_slice = if (partial_mask == 0)
-            partial_values[0..0]
+            &.{}
         else
-            partial_values[0..self.module.variables.len];
+            evaluator_context.state_values(
+                @intCast(self.module.variables.len),
+            );
         const partial_pool_slice = if (partial_mask == 0)
-            partial_value_pools[0..0]
+            &.{}
         else
-            partial_value_pools[0..self.module.variables.len];
+            evaluator_context.state_value_pools(
+                @intCast(self.module.variables.len),
+            );
         var context = generated_runtime.CallContext{
             .eval_pool = eval_pool,
             .state_pool = state_pool,
@@ -4296,6 +4750,7 @@ pub const Evaluator = struct {
             .constant_slots = self.constant_slots,
             .generated_cache = self.generated_cache,
             .generated_cache_pool = self.generated_cache_pool,
+            .generated_cache_frozen = self.generated_cache_frozen,
             .models = self.models,
             .memo_context = self,
             .cached_call = generated_cached_call,
@@ -5069,7 +5524,7 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!?Value {
-        const value_v = (try ctx.lookup_local_value(name, eval_pool)) orelse
+        const value_v = ctx.lookup_local_value(name) orelse
             return null;
         if (value_v != .lambda_v or value_v.lambda_v.params.len != 0) {
             return value_v;
@@ -6034,62 +6489,12 @@ fn function_sets_have_distinct_domain_sizes(pool: *ValuePool, sets: []const Valu
     return true;
 }
 
-fn is_sorted_sequence_predicate(expr: *ast.Expr, seq_name: []const u8) bool {
-    if (expr.* != .quantifier) return false;
-    const q = expr.quantifier;
-    if (q.kind != .forall or q.vars.len != 2) return false;
-    const i_name = q.vars[0].name;
-    const j_name = q.vars[1].name;
-    if (!is_one_to_len_range(q.vars[0].domain, seq_name)) return false;
-    if (!is_one_to_len_range(q.vars[1].domain, seq_name)) return false;
-    if (q.body.* != .binary) return false;
-    const implies = q.body.binary;
-    if (implies.op != .implies) return false;
-    if (!is_binary_ident_ident(implies.left, .lt, i_name, j_name)) return false;
-    return is_sequence_index_order(implies.right, .le, seq_name, i_name, j_name);
-}
-
-fn is_one_to_len_range(expr: *ast.Expr, seq_name: []const u8) bool {
-    if (expr.* != .binary) return false;
-    const b = expr.binary;
-    if (b.op != .range) return false;
-    if (b.left.* != .int_literal or b.left.int_literal != 1) return false;
-    if (b.right.* != .apply) return false;
-    const ap = b.right.apply;
-    if (ap.func.* != .ident or !std.mem.eql(u8, ap.func.ident, "Len")) return false;
-    return ap.args.len == 1 and is_ident(ap.args[0], seq_name);
-}
-
-fn is_binary_ident_ident(expr: *ast.Expr, op: ast.BinaryOp, left_name: []const u8, right_name: []const u8) bool {
-    if (expr.* != .binary) return false;
-    const b = expr.binary;
-    return b.op == op and is_ident(b.left, left_name) and is_ident(b.right, right_name);
-}
-
 fn is_seq_application(expr: *ast.Expr) bool {
     if (expr.* != .apply) return false;
     const application = expr.apply;
     return application.args.len == 1 and
         application.func.* == .ident and
         std.mem.eql(u8, application.func.ident, "Seq");
-}
-
-fn is_sequence_index_order(expr: *ast.Expr, op: ast.BinaryOp, seq_name: []const u8, left_index: []const u8, right_index: []const u8) bool {
-    if (expr.* != .binary) return false;
-    const b = expr.binary;
-    return b.op == op and
-        is_sequence_index(b.left, seq_name, left_index) and
-        is_sequence_index(b.right, seq_name, right_index);
-}
-
-fn is_sequence_index(expr: *ast.Expr, seq_name: []const u8, index_name: []const u8) bool {
-    if (expr.* != .apply) return false;
-    const ap = expr.apply;
-    return is_ident(ap.func, seq_name) and ap.args.len == 1 and is_ident(ap.args[0], index_name);
-}
-
-fn is_ident(expr: *ast.Expr, name: []const u8) bool {
-    return expr.* == .ident and std.mem.eql(u8, expr.ident, name);
 }
 
 fn extract_sequence_codomain_and_lengths(pool: *ValuePool, seq_set: Value, lengths: *std.ArrayList(u32)) Error!?Value {
@@ -6943,20 +7348,25 @@ fn eval_symbolic_seq_map(
     eval_pool: *ValuePool,
     state_pool: *ValuePool,
 ) Error!?Value {
-    // Recognize { [1..n -> S] : n \in Domain } as a sequence set.
-    if (sm.vars.len != 1) return null;
-    const map_var = sm.vars[0];
-    if (sm.value.* != .set_of_functions) return null;
-    const fs = sm.value.*.set_of_functions;
-    if (fs.domain.* != .binary or fs.domain.*.binary.op != .range) return null;
-    const range = fs.domain.*.binary;
-    if (range.left.* != .int_literal or range.left.*.int_literal != 1) return null;
-    if (range.right.* != .ident or !std.mem.eql(u8, range.right.*.ident, map_var.name)) return null;
+    const shape = sequence_patterns.bounded_sequence_map(sm) orelse
+        return null;
 
-    const codomain = try self.eval_expr(fs.codomain, ctx, s0, eval_pool, state_pool);
+    const codomain = try self.eval_expr(
+        @constCast(shape.element_set),
+        ctx,
+        s0,
+        eval_pool,
+        state_pool,
+    );
     if (!codomain.is_set_like()) return null;
 
-    const domain = try self.eval_expr(map_var.domain, ctx, s0, eval_pool, state_pool);
+    const domain = try self.eval_expr(
+        @constCast(shape.lengths),
+        ctx,
+        s0,
+        eval_pool,
+        state_pool,
+    );
     if (!domain.is_set_like()) return null;
 
     const slots = switch (domain) {
@@ -7001,6 +7411,123 @@ fn make_symbolic_function_set(eval_pool: *ValuePool, n: u32, codomain: Value) er
     } };
 }
 
+fn test_eager_cache_dependency(
+    context: *generated_runtime.CallContext,
+    args: []const Value,
+) Error!Value {
+    assert(args.len == 0);
+    if (try generated_runtime.cached_definition(context, 0)) |cached| {
+        return cached;
+    }
+    const offset = try context.eval_pool.push_values(&.{.{ .int_v = 1 }});
+    const result = Value{ .tuple_v = .{ .offset = offset, .len = 1 } };
+    return generated_runtime.put_cached_definition(context, 0, result);
+}
+
+fn test_eager_cache_root(
+    context: *generated_runtime.CallContext,
+    args: []const Value,
+) Error!Value {
+    assert(args.len == 0);
+    if (try generated_runtime.cached_definition(context, 1)) |cached| {
+        return cached;
+    }
+    _ = try test_eager_cache_dependency(context, &.{});
+    const items = try context.eval_pool.alloc_values(4096);
+    @memset(items, Value{ .int_v = 1 });
+    const result = Value{ .tuple_v = .{
+        .offset = @intCast((@intFromPtr(items.ptr) -
+            @intFromPtr(context.eval_pool.values.ptr)) / @sizeOf(Value)),
+        .len = @intCast(items.len),
+    } };
+    return generated_runtime.put_cached_definition(context, 1, result);
+}
+
+test "rejected eager cache admission rolls back dependency slots" {
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE CacheRollback ----------------------
+        \\Dependency == <<1>>
+        \\Root == <<1>>
+        \\==================================================================
+        \\
+    ;
+    var arena = try Arena.init(8 * 1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const generated = [_]generated_runtime.Operator{
+        .{
+            .name = "Dependency",
+            .arity = 0,
+            .function = test_eager_cache_dependency,
+            .cacheable = true,
+            .cache_index = 0,
+        },
+        .{
+            .name = "Root",
+            .arity = 0,
+            .function = test_eager_cache_root,
+            .cacheable = true,
+            .eager_cache = true,
+            .cache_index = 1,
+        },
+    };
+    var evaluator = try Evaluator.init_generated(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+        &generated,
+        &.{},
+    );
+    var eval_pool = try ValuePool.init(&arena, 8192, 64);
+    var state_pool = try ValuePool.init(&arena, 64, 64);
+    const cache_snapshot = evaluator.generated_cache_pool.snapshot();
+
+    evaluator.warm_eager_generated_cache(&eval_pool, &state_pool);
+
+    try std.testing.expectEqual(cache_snapshot, evaluator.generated_cache_pool.snapshot());
+    try std.testing.expectEqual(@as(?Value, null), evaluator.generated_cache[0]);
+    try std.testing.expectEqual(@as(?Value, null), evaluator.generated_cache[1]);
+}
+
+test "state call memo resets with generations" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var argument_pool = try ValuePool.init(&arena, 64, 64);
+    var memo_pool = try ValuePool.init(&arena, 64, 64);
+    var memo = StateCallMemo{};
+    const arguments = [_]Value{.{ .int_v = 7 }};
+    const expected = Value{ .int_v = 11 };
+
+    memo.reset(&memo_pool);
+    try memo.put(
+        "F",
+        &arguments,
+        &argument_pool,
+        1,
+        2,
+        expected,
+    );
+    try std.testing.expectEqual(
+        expected,
+        memo.get("F", &arguments, &argument_pool, 1, 2).?,
+    );
+
+    const previous_generation = memo.generation;
+    memo_pool.restore(.{
+        .value_count = 0,
+        .string_count = 0,
+        .string_intern_count = 0,
+    });
+    memo.reset(&memo_pool);
+    try std.testing.expect(memo.generation != previous_generation);
+    try std.testing.expectEqual(
+        @as(?Value, null),
+        memo.get("F", &arguments, &argument_pool, 1, 2),
+    );
+}
+
 test "pointwise function predicate requires access by bound key" {
     const parser = @import("parser.zig");
     const source =
@@ -7040,16 +7567,12 @@ test "generated expression availability ignores unused captures" {
     var pool = try ValuePool.init(&arena, 16, 64);
     var binding = ContextBinding{
         .parent = null,
-        .state_parent = null,
         .name = "used",
-        .variable_index = null,
         .value = .{ .int_v = 7 },
-        .value_pool = null,
-        .assignment = .local,
     };
     const context = Context{
         .head = &binding,
-        .state_head = null,
+        .state = null,
         .local_floor = null,
         .len = 1,
     };
@@ -7069,6 +7592,87 @@ test "generated expression availability ignores unused captures" {
         &values,
         &pool,
     ));
+}
+
+test "state bindings preserve local stack lookup and lexical shadowing" {
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+    var contexts = try ContextPool.init(&arena);
+    var pool = try ValuePool.init(&arena, 16, 64);
+
+    var context = try contexts.extend_local(
+        Context.empty(),
+        "x",
+        .{ .int_v = 7 },
+    );
+    context = try contexts.extend_local(
+        context,
+        "y",
+        .{ .int_v = 11 },
+    );
+    context = try contexts.extend_state(
+        context,
+        "x",
+        0,
+        .{ .int_v = 99 },
+        null,
+        .changed,
+    );
+
+    var values: [2]Value = undefined;
+    try std.testing.expect(try context.lookup_all_values(
+        &.{ "x", "y" },
+        &values,
+        &pool,
+    ));
+    try std.testing.expectEqual(Value{ .int_v = 7 }, values[0]);
+    try std.testing.expectEqual(Value{ .int_v = 11 }, values[1]);
+    try std.testing.expectEqual(
+        Value{ .int_v = 7 },
+        (try context.lookup_value("x", &pool)).?,
+    );
+    const state_value = context.lookup_state(0).?;
+    try std.testing.expectEqual(Value{ .int_v = 99 }, state_value.value);
+    try std.testing.expectEqual(AssignmentKind.changed, state_value.assignment);
+}
+
+test "state context trail restores bounded slots" {
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(Context));
+
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+    var contexts = try ContextPool.init(&arena);
+    const root = contexts.snapshot();
+
+    const x_context = try contexts.extend_state(
+        Context.empty(),
+        "x",
+        0,
+        .{ .int_v = 7 },
+        null,
+        .changed,
+    );
+    const x_mark = contexts.snapshot();
+    const xy_context = try contexts.extend_state(
+        x_context,
+        "y",
+        1,
+        .{ .int_v = 11 },
+        null,
+        .unchanged,
+    );
+    try std.testing.expectEqual(@as(u8, 2), xy_context.state.?.count);
+    try std.testing.expectEqual(Value{ .int_v = 7 }, xy_context.lookup_state(0).?.value);
+    try std.testing.expectEqual(Value{ .int_v = 11 }, xy_context.lookup_state(1).?.value);
+
+    contexts.restore(x_mark);
+    try std.testing.expectEqual(@as(u8, 1), x_context.state.?.count);
+    try std.testing.expectEqual(Value{ .int_v = 7 }, x_context.lookup_state(0).?.value);
+    try std.testing.expectEqual(@as(?StateContextValue, null), x_context.lookup_state(1));
+
+    contexts.restore(root);
+    try std.testing.expectEqual(@as(u8, 0), x_context.state.?.count);
+    try std.testing.expectEqual(@as(?StateContextValue, null), x_context.lookup_state(0));
 }
 
 test "large sets deduplicate without quadratic fallback" {

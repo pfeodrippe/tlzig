@@ -75,8 +75,14 @@ fn hash_value_inner(
     permutation: ?[]const u32,
 ) Fingerprint {
     var h = hash_init();
-    const function_is_tuple = v == .function_v and is_sequence_function(pool, v.function_v);
-    const tag = if (function_is_tuple) value_tag_tuple else @intFromEnum(v);
+    const sequence_layout = if (v == .function_v)
+        sequence_function_layout(pool, v.function_v)
+    else
+        SequenceLayout.not_sequence;
+    const tag = if (sequence_layout != .not_sequence)
+        value_tag_tuple
+    else
+        @intFromEnum(v);
     h = hash_byte(h, tag);
     switch (v) {
         .bool_v => |b| {
@@ -115,13 +121,35 @@ fn hash_value_inner(
             }
         },
         .function_v => |f| {
-            if (function_is_tuple) {
-                var i: u32 = 0;
-                while (i < f.len) : (i += 1) {
-                    const item = f.apply(
-                        pool,
-                        Value{ .int_v = @as(i64, @intCast(i)) + 1 },
-                    ) orelse unreachable;
+            if (sequence_layout != .not_sequence) {
+                const entries = f.entries(pool);
+                if (sequence_layout == .ordered) {
+                    for (entries) |item| {
+                        h = hash_byte(h, 0xab);
+                        h = hash_value_inner(pool, item, permutation) ^ h;
+                    }
+                    return h;
+                }
+                if (f.len <= 64) {
+                    var entry_indices: [64]u8 = undefined;
+                    for (f.domain.items(pool), 0..) |key, entry_index| {
+                        const sequence_index: usize = @intCast(
+                            (key.as_int() orelse unreachable) - 1,
+                        );
+                        entry_indices[sequence_index] = @intCast(entry_index);
+                    }
+                    for (entry_indices[0..f.len]) |entry_index| {
+                        const item = entries[entry_index];
+                        h = hash_byte(h, 0xab);
+                        h = hash_value_inner(pool, item, permutation) ^ h;
+                    }
+                    return h;
+                }
+                var sequence_index: u32 = 0;
+                while (sequence_index < f.len) : (sequence_index += 1) {
+                    const item = f.apply(pool, .{
+                        .int_v = @as(i64, @intCast(sequence_index)) + 1,
+                    }) orelse unreachable;
                     h = hash_byte(h, 0xab);
                     h = hash_value_inner(pool, item, permutation) ^ h;
                 }
@@ -232,16 +260,37 @@ fn hash_value_inner(
 
 const value_tag_tuple: u8 = @intFromEnum(@import("value.zig").ValueTag.tuple_v);
 
-fn is_sequence_function(pool: *const ValuePool, function: @import("value.zig").Function) bool {
-    if (function.domain.len != function.len) return false;
-    var i: u32 = 0;
-    while (i < function.len) : (i += 1) {
-        if (function.apply(
-            pool,
-            Value{ .int_v = @as(i64, @intCast(i)) + 1 },
-        ) == null) return false;
+const SequenceLayout = enum {
+    not_sequence,
+    ordered,
+    unordered,
+};
+
+fn sequence_function_layout(
+    pool: *const ValuePool,
+    function: @import("value.zig").Function,
+) SequenceLayout {
+    if (function.domain.len != function.len) return .not_sequence;
+    var ordered = true;
+    var seen: u64 = 0;
+    for (function.domain.items(pool), 0..) |key, storage_index| {
+        const raw_index = key.as_int() orelse return .not_sequence;
+        if (raw_index < 1 or
+            raw_index > @as(i64, @intCast(function.len)))
+        {
+            return .not_sequence;
+        }
+        if (raw_index != @as(i64, @intCast(storage_index + 1))) {
+            ordered = false;
+        }
+        if (function.len <= 64) {
+            const bit: u6 = @intCast(raw_index - 1);
+            const mask = @as(u64, 1) << bit;
+            if (seen & mask != 0) return .not_sequence;
+            seen |= mask;
+        }
     }
-    return true;
+    return if (ordered) .ordered else .unordered;
 }
 
 pub fn hash_value(pool: *const ValuePool, v: Value, fp: Fingerprint) Fingerprint {

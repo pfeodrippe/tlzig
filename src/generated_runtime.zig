@@ -8,7 +8,7 @@ const Function = @import("value.zig").Function;
 const State = @import("state.zig").StateStore.State;
 const Error = @import("err.zig").Error;
 
-pub const generated_model_abi_version: u32 = 1;
+pub const generated_model_abi_version: u32 = 2;
 
 pub const NamedValue = struct {
     name: []const u8,
@@ -52,6 +52,7 @@ pub const CallContext = struct {
     constant_slots: []const ?Value,
     generated_cache: []?Value,
     generated_cache_pool: *ValuePool,
+    generated_cache_frozen: bool,
     models: *const ModelTable,
     memo_context: ?*const anyopaque = null,
     cached_call: ?CachedCall = null,
@@ -59,6 +60,16 @@ pub const CallContext = struct {
     native_context: *const anyopaque,
     native_call: NativeCall,
     max_seq_len: u32,
+    materialized_variable_cache: [8]MaterializedVariableCacheEntry = undefined,
+    materialized_variable_cache_mask: u8 = 0,
+};
+
+const MaterializedVariableCacheEntry = struct {
+    value: Value,
+    value_count: u32,
+    string_count: u32,
+    variable_index: u32,
+    primed: bool,
 };
 
 pub fn cached_recursive_call(
@@ -121,12 +132,19 @@ pub const Operator = struct {
     name: []const u8,
     arity: u16,
     function: ?OperatorFn,
+    cacheable: bool = false,
+    eager_cache: bool = false,
+    cache_index: ?u32 = null,
+    state_memo_required: bool = false,
 };
 
 pub const Expression = struct {
     identity: u32,
     arg_names: []const []const u8,
+    arg_depths: []const u8 = &.{},
     arg_required: []const bool = &.{},
+    direct_arg_index: ?u8 = null,
+    direct_value: ?Value = null,
     uses_primed: bool = true,
     function: OperatorFn,
     boolean_function: ?OperatorBoolFn = null,
@@ -146,9 +164,45 @@ pub fn variable(context: *CallContext, index: u32) Error!Value {
 }
 
 fn current_variable(context: *CallContext, index: u32) Error!Value {
+    return materialized_variable(context, index, false);
+}
+
+fn materialized_variable(
+    context: *CallContext,
+    index: u32,
+    primed: bool,
+) Error!Value {
+    if (index >= 64) return Error.TypeError;
+    const slot: u3 = @truncate(index *% 2 + @intFromBool(primed));
+    const slot_bit = @as(u8, 1) << slot;
+    if (context.materialized_variable_cache_mask & slot_bit != 0) {
+        const entry = context.materialized_variable_cache[slot];
+        if (entry.variable_index == index and entry.primed == primed) {
+            std.debug.assert(entry.value_count <= context.eval_pool.value_count);
+            std.debug.assert(entry.string_count <= context.eval_pool.string_count);
+            return entry.value;
+        }
+    }
+
     var source_pool: *const ValuePool = context.eval_pool;
-    const value = try resolve_current_variable(context, index, &source_pool);
-    return value.clone(source_pool, context.eval_pool);
+    const value = if (primed)
+        try resolve_primed_variable(context, index, &source_pool)
+    else
+        try resolve_current_variable(context, index, &source_pool);
+    switch (value) {
+        .bool_v, .int_v, .model_v, .range_v => return value,
+        else => {},
+    }
+    const cloned = try value.clone(source_pool, context.eval_pool);
+    context.materialized_variable_cache[slot] = .{
+        .value = cloned,
+        .value_count = context.eval_pool.value_count,
+        .string_count = context.eval_pool.string_count,
+        .variable_index = index,
+        .primed = primed,
+    };
+    context.materialized_variable_cache_mask |= slot_bit;
+    return cloned;
 }
 
 fn resolve_current_variable(
@@ -175,9 +229,26 @@ fn resolve_current_variable(
 }
 
 pub fn primed_variable(context: *CallContext, index: u32) Error!Value {
-    var source_pool: *const ValuePool = context.eval_pool;
-    const value = try resolve_primed_variable(context, index, &source_pool);
-    return value.clone(source_pool, context.eval_pool);
+    return materialized_variable(context, index, true);
+}
+
+fn restore_eval_pool(
+    context: *CallContext,
+    snapshot: ValuePool.Snapshot,
+) void {
+    var valid = context.materialized_variable_cache_mask;
+    while (valid != 0) {
+        const slot: u3 = @truncate(@ctz(valid));
+        const slot_bit = @as(u8, 1) << slot;
+        valid &= ~slot_bit;
+        const entry = context.materialized_variable_cache[slot];
+        if (entry.value_count > snapshot.value_count or
+            entry.string_count > snapshot.string_count)
+        {
+            context.materialized_variable_cache_mask &= ~slot_bit;
+        }
+    }
+    context.eval_pool.restore(snapshot);
 }
 
 fn resolve_primed_variable(
@@ -222,6 +293,101 @@ pub fn variable_not_equal_bool(
     rhs: Value,
 ) Error!bool {
     return !try variable_equal_bool(context, index, rhs);
+}
+
+pub fn variables_equal_bool(
+    context: *CallContext,
+    left_index: u32,
+    right_index: u32,
+) Error!bool {
+    var left_pool: *const ValuePool = context.eval_pool;
+    const left = if (context.read_primed)
+        try resolve_primed_variable(context, left_index, &left_pool)
+    else
+        try resolve_current_variable(context, left_index, &left_pool);
+    var right_pool: *const ValuePool = context.eval_pool;
+    const right = if (context.read_primed)
+        try resolve_primed_variable(context, right_index, &right_pool)
+    else
+        try resolve_current_variable(context, right_index, &right_pool);
+    return Value.eql_cross_pool(left, left_pool, right, right_pool);
+}
+
+pub fn variables_not_equal_bool(
+    context: *CallContext,
+    left_index: u32,
+    right_index: u32,
+) Error!bool {
+    return !try variables_equal_bool(context, left_index, right_index);
+}
+
+pub fn variable_member_bool(
+    context: *CallContext,
+    index: u32,
+    set_value: Value,
+) Error!bool {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const value = if (context.read_primed)
+        try resolve_primed_variable(context, index, &source_pool)
+    else
+        try resolve_current_variable(context, index, &source_pool);
+    if (!set_value.is_set_like()) return Error.TypeError;
+    return set_value.member_cross_pool(
+        context.eval_pool,
+        value,
+        source_pool,
+    );
+}
+
+pub fn variable_not_member_bool(
+    context: *CallContext,
+    index: u32,
+    set_value: Value,
+) Error!bool {
+    return !try variable_member_bool(context, index, set_value);
+}
+
+pub fn variable_subset_equal_bool(
+    context: *CallContext,
+    index: u32,
+    right: Value,
+) Error!bool {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const left = if (context.read_primed)
+        try resolve_primed_variable(context, index, &source_pool)
+    else
+        try resolve_current_variable(context, index, &source_pool);
+    if (!left.is_set_like() or !right.is_set_like()) return Error.TypeError;
+    return switch (left) {
+        .set_v => |left_set| blk: {
+            for (left_set.items(source_pool)) |item| {
+                if (!right.member_cross_pool(
+                    context.eval_pool,
+                    item,
+                    source_pool,
+                )) break :blk false;
+            }
+            break :blk true;
+        },
+        .range_v => |left_range| blk: {
+            if (left_range.hi < left_range.lo) break :blk true;
+            var item = left_range.lo;
+            while (true) {
+                if (!right.member(
+                    context.eval_pool,
+                    .{ .int_v = item },
+                )) break :blk false;
+                if (item == left_range.hi) break;
+                item += 1;
+            }
+            break :blk true;
+        },
+        else => subset_equal_bool(
+            context,
+            try left.clone(source_pool, context.eval_pool),
+            right,
+        ),
+    };
 }
 
 pub fn primed_variable_except_update_equal_bool(
@@ -444,6 +610,7 @@ pub fn cached_definition(
 ) Error!?Value {
     if (index >= context.generated_cache.len) return Error.TypeError;
     const value = context.generated_cache[index] orelse return null;
+    if (context.generated_cache_pool == context.eval_pool) return value;
     return try value.clone(context.generated_cache_pool, context.eval_pool);
 }
 
@@ -454,11 +621,211 @@ pub fn put_cached_definition(
 ) Error!Value {
     if (index >= context.generated_cache.len) return Error.TypeError;
     if (context.generated_cache[index]) |_| return value;
+    // Workers share one immutable cache populated by assumptions and Init.
+    // A cold definition remains valid after the cache is frozen; evaluate it
+    // in the caller's bounded scratch pool without mutating shared storage.
+    if (context.generated_cache_frozen) return value;
     context.generated_cache[index] = try value.clone(
         context.eval_pool,
         context.generated_cache_pool,
     );
     return value;
+}
+
+test "frozen generated cache leaves cold definitions uncached" {
+    const Arena = @import("arena.zig").Arena;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 64, 64);
+    var models = try ModelTable.init(&arena, 4);
+    var generated_cache = [_]?Value{null};
+    var context = CallContext{
+        .eval_pool = &pool,
+        .state_pool = &pool,
+        .state = null,
+        .next_state = null,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &pool,
+        .generated_cache_frozen = true,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+
+    const value = Value{ .int_v = 17 };
+    try std.testing.expectEqual(
+        value,
+        try put_cached_definition(&context, 0, value),
+    );
+    try std.testing.expectEqual(@as(?Value, null), generated_cache[0]);
+}
+
+pub fn cached_function_apply(
+    context: *CallContext,
+    index: u32,
+    args: []const Value,
+) Error!?Value {
+    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);
+    std.debug.assert(
+        context.generated_cache_pool.value_count <=
+            context.generated_cache_pool.value_cap,
+    );
+    if (index >= context.generated_cache.len) return Error.TypeError;
+    const function_value = context.generated_cache[index] orelse return null;
+    if (function_value != .function_v) return Error.AssertionFailed;
+    if (args.len == 0) return Error.TypeError;
+
+    const source_pool = context.generated_cache_pool;
+    const function_v = function_value.function_v;
+    const keys = function_v.domain.items(source_pool);
+    const entries = function_v.entries(source_pool);
+    std.debug.assert(keys.len == entries.len);
+
+    for (keys, entries) |key, entry| {
+        const matched = if (args.len == 1)
+            values_equal_cross_pool(
+                key,
+                source_pool,
+                args[0],
+                context.eval_pool,
+            )
+        else
+            function_key_matches_args(
+                key,
+                source_pool,
+                args,
+                context.eval_pool,
+            );
+        if (!matched) continue;
+        return try entry.clone(source_pool, context.eval_pool);
+    }
+    return Error.TypeError;
+}
+
+fn function_key_matches_args(
+    key: Value,
+    key_pool: *const ValuePool,
+    args: []const Value,
+    args_pool: *const ValuePool,
+) bool {
+    if (key != .tuple_v or key.tuple_v.len != args.len) return false;
+    for (key.tuple_v.items(key_pool), args) |key_item, arg| {
+        if (!values_equal_cross_pool(key_item, key_pool, arg, args_pool)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn values_equal_cross_pool(
+    left: Value,
+    left_pool: *const ValuePool,
+    right: Value,
+    right_pool: *const ValuePool,
+) bool {
+    return Value.eql_ordered_cross_pool(
+        left,
+        left_pool,
+        right,
+        right_pool,
+    ) or Value.eql_cross_pool(
+        left,
+        left_pool,
+        right,
+        right_pool,
+    );
+}
+
+test "cached functions apply across value pools without materializing functions" {
+    const Arena = @import("arena.zig").Arena;
+    var source_arena = try Arena.init(1024 * 1024);
+    defer source_arena.deinit();
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var source_pool = try ValuePool.init(&source_arena, 64, 256);
+    var eval_pool = try ValuePool.init(&eval_arena, 64, 256);
+    var models = try ModelTable.init(&source_arena, 4);
+
+    const source_key = Value{ .string_v = try source_pool.push_string("key") };
+    const source_result = Value{
+        .string_v = try source_pool.push_string("result"),
+    };
+    const keys_offset = try source_pool.push_values(&.{source_key});
+    const entries_offset = try source_pool.push_values(&.{source_result});
+    const unary = Value{ .function_v = .{
+        .domain = .{ .offset = keys_offset, .len = 1 },
+        .offset = entries_offset,
+        .len = 1,
+    } };
+
+    const tuple_items_offset = try source_pool.push_values(&.{
+        Value{ .int_v = 7 },
+        source_key,
+    });
+    const tuple_key = Value{ .tuple_v = .{
+        .offset = tuple_items_offset,
+        .len = 2,
+    } };
+    const tuple_keys_offset = try source_pool.push_values(&.{tuple_key});
+    const tuple_entries_offset = try source_pool.push_values(&.{
+        Value{ .int_v = 11 },
+    });
+    const binary = Value{ .function_v = .{
+        .domain = .{ .offset = tuple_keys_offset, .len = 1 },
+        .offset = tuple_entries_offset,
+        .len = 1,
+    } };
+
+    var generated_cache = [_]?Value{ unary, binary };
+    var context = CallContext{
+        .eval_pool = &eval_pool,
+        .state_pool = &source_pool,
+        .state = null,
+        .next_state = null,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &source_pool,
+        .generated_cache_frozen = true,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+
+    _ = try eval_pool.push_string("padding");
+    const eval_key = Value{ .string_v = try eval_pool.push_string("key") };
+    const unary_result = (try cached_function_apply(
+        &context,
+        0,
+        &.{eval_key},
+    )).?;
+    try std.testing.expectEqualStrings(
+        "result",
+        unary_result.string_v.slice(&eval_pool),
+    );
+
+    const binary_result = (try cached_function_apply(
+        &context,
+        1,
+        &.{ Value{ .int_v = 7 }, eval_key },
+    )).?;
+    try std.testing.expectEqual(@as(i64, 11), binary_result.int_v);
+    try std.testing.expectError(
+        Error.TypeError,
+        cached_function_apply(&context, 0, &.{.{ .int_v = 9 }}),
+    );
 }
 
 pub fn nat_set(_: *CallContext) Error!Value {
@@ -569,12 +936,13 @@ pub fn call(
 }
 
 pub inline fn force(context: *CallContext, value: Value) Error!Value {
-    if (value != .generated_operator_v or
-        value.generated_operator_v.arity != 0)
-    {
-        return value;
-    }
+    if (!requires_force(value)) return value;
     return call(context, value, &.{});
+}
+
+pub inline fn requires_force(value: Value) bool {
+    return value == .generated_operator_v and
+        value.generated_operator_v.arity == 0;
 }
 
 pub fn string(context: *CallContext, bytes: []const u8) Error!Value {
@@ -3151,6 +3519,391 @@ pub fn function_set(
     } };
 }
 
+/// Builds the symbolic union represented by
+/// `UNION {[1..n -> elements] : n \in lengths}`. Domains are shared by
+/// length and remain symbolic until a caller truly needs enumeration.
+pub fn bounded_sequence_union(
+    context: *CallContext,
+    element_set: Value,
+    length_domain: Value,
+) Error!Value {
+    if (!element_set.is_set_like() or !length_domain.is_set_like()) {
+        return Error.TypeError;
+    }
+    const lengths = try iterable_for_iteration(context, length_domain);
+    const length_count = try iterable_count(lengths);
+    var outer_count: u32 = 0;
+    var domain_value_count: u64 = 0;
+    var index: u32 = 0;
+    while (index < length_count) : (index += 1) {
+        const length = try normalized_sequence_length(
+            try iterable_value(context, lengths, index),
+        );
+        if (!try sequence_length_is_first(
+            context,
+            lengths,
+            index,
+            length,
+        )) continue;
+        outer_count = std.math.add(u32, outer_count, 1) catch
+            return Error.OutOfMemory;
+        domain_value_count = std.math.add(
+            u64,
+            domain_value_count,
+            length,
+        ) catch return Error.OutOfMemory;
+    }
+    const metadata_value_count = std.math.mul(
+        u64,
+        outer_count,
+        3,
+    ) catch return Error.OutOfMemory;
+    var required = std.math.add(
+        u64,
+        domain_value_count,
+        metadata_value_count,
+    ) catch return Error.OutOfMemory;
+    required = std.math.add(u64, required, 1) catch
+        return Error.OutOfMemory;
+    if (required > std.math.maxInt(u32)) return Error.OutOfMemory;
+    try context.eval_pool.ensure_value_capacity(required);
+
+    const outer_values = try context.eval_pool.alloc_values(outer_count);
+    const outer_offset = value_offset(context.eval_pool, outer_values.ptr);
+    var outer_index: u32 = 0;
+    index = 0;
+    while (index < length_count) : (index += 1) {
+        const length = try normalized_sequence_length(
+            try iterable_value(context, lengths, index),
+        );
+        if (!try sequence_length_is_first(
+            context,
+            lengths,
+            index,
+            length,
+        )) continue;
+        const keys = try context.eval_pool.alloc_values(length);
+        const keys_offset = value_offset(context.eval_pool, keys.ptr);
+        for (keys, 0..) |*key, key_index| {
+            key.* = .{ .int_v = @as(i64, @intCast(key_index)) + 1 };
+        }
+        const domain_offset = try context.eval_pool.push_value(.{
+            .set_v = .{ .offset = keys_offset, .len = length },
+        });
+        const codomain_offset = try context.eval_pool.push_value(element_set);
+        context.eval_pool.values[outer_offset + outer_index] = .{
+            .function_set_v = .{
+                .domain_offset = domain_offset,
+                .codomain_offset = codomain_offset,
+            },
+        };
+        outer_index += 1;
+    }
+    std.debug.assert(outer_index == outer_count);
+    const union_offset = try context.eval_pool.push_value(.{
+        .set_v = .{ .offset = outer_offset, .len = outer_count },
+    });
+    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);
+    return .{ .union_v = .{ .set_offset = union_offset } };
+}
+
+/// Generates exactly the nondecreasing sequences from a bounded sequence
+/// domain. It shares each `1..n` domain and writes result payloads directly
+/// into one pre-sized value pool, with no heap allocation in the generator.
+pub fn sorted_sequences(
+    context: *CallContext,
+    element_set: Value,
+    length_domain: Value,
+) Error!Value {
+    if (!element_set.is_set_like() or !length_domain.is_set_like()) {
+        return Error.TypeError;
+    }
+    const materialized_elements = try materialize_iterable(
+        context,
+        element_set,
+    );
+    const lengths = try iterable_for_iteration(context, length_domain);
+    const length_count = try iterable_count(lengths);
+    const element_count = materialized_elements.set_v.len;
+
+    var result_count: u64 = 0;
+    var entry_value_count: u64 = 0;
+    var domain_value_count: u64 = 0;
+    var index: u32 = 0;
+    while (index < length_count) : (index += 1) {
+        const length = try normalized_sequence_length(
+            try iterable_value(context, lengths, index),
+        );
+        if (!try sequence_length_is_first(
+            context,
+            lengths,
+            index,
+            length,
+        )) continue;
+        const count = try sorted_sequence_count(element_count, length);
+        result_count = std.math.add(u64, result_count, count) catch
+            return Error.OutOfMemory;
+        entry_value_count = std.math.add(
+            u64,
+            entry_value_count,
+            std.math.mul(u64, count, length) catch
+                return Error.OutOfMemory,
+        ) catch return Error.OutOfMemory;
+        if (count > 0) {
+            domain_value_count = std.math.add(
+                u64,
+                domain_value_count,
+                length,
+            ) catch return Error.OutOfMemory;
+        }
+        if (result_count > std.math.maxInt(u32)) return Error.OutOfMemory;
+    }
+
+    var required = std.math.add(
+        u64,
+        element_count,
+        result_count,
+    ) catch return Error.OutOfMemory;
+    required = std.math.add(u64, required, entry_value_count) catch
+        return Error.OutOfMemory;
+    required = std.math.add(u64, required, domain_value_count) catch
+        return Error.OutOfMemory;
+    if (required > std.math.maxInt(u32)) return Error.OutOfMemory;
+    try context.eval_pool.ensure_value_capacity(required);
+
+    const sorted_values = try context.eval_pool.alloc_values(element_count);
+    const sorted_offset = value_offset(context.eval_pool, sorted_values.ptr);
+    @memcpy(
+        sorted_values,
+        materialized_elements.set_v.items(context.eval_pool),
+    );
+    try sort_sequence_elements(context.eval_pool, sorted_offset, element_count);
+
+    const results = try context.eval_pool.alloc_values(@intCast(result_count));
+    const result_offset = value_offset(context.eval_pool, results.ptr);
+    var result_index: u32 = 0;
+    index = 0;
+    while (index < length_count) : (index += 1) {
+        const length = try normalized_sequence_length(
+            try iterable_value(context, lengths, index),
+        );
+        if (!try sequence_length_is_first(
+            context,
+            lengths,
+            index,
+            length,
+        )) continue;
+        const count = try sorted_sequence_count(element_count, length);
+        if (count == 0) continue;
+        const keys = try context.eval_pool.alloc_values(length);
+        const keys_offset = value_offset(context.eval_pool, keys.ptr);
+        for (keys, 0..) |*key, key_index| {
+            key.* = .{ .int_v = @as(i64, @intCast(key_index)) + 1 };
+        }
+        const sequence_domain = Set{ .offset = keys_offset, .len = length };
+        var ordinal: u64 = 0;
+        while (ordinal < count) : (ordinal += 1) {
+            const entries = try context.eval_pool.alloc_values(length);
+            const entries_offset = value_offset(context.eval_pool, entries.ptr);
+            try write_sorted_sequence(
+                context.eval_pool,
+                sorted_offset,
+                element_count,
+                entries_offset,
+                length,
+                ordinal,
+            );
+            context.eval_pool.values[result_offset + result_index] = .{
+                .function_v = .{
+                    .domain = sequence_domain,
+                    .offset = entries_offset,
+                    .len = length,
+                },
+            };
+            result_index += 1;
+        }
+    }
+    std.debug.assert(result_index == result_count);
+    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);
+    return .{ .set_v = .{
+        .offset = result_offset,
+        .len = @intCast(result_count),
+    } };
+}
+
+fn normalized_sequence_length(value: Value) Error!u32 {
+    const length = try integer(value);
+    if (length <= 0) return 0;
+    if (length > std.math.maxInt(u32)) return Error.OutOfMemory;
+    return @intCast(length);
+}
+
+fn sequence_length_is_first(
+    context: *CallContext,
+    lengths: Value,
+    index: u32,
+    length: u32,
+) Error!bool {
+    var prior: u32 = 0;
+    while (prior < index) : (prior += 1) {
+        if (try normalized_sequence_length(
+            try iterable_value(context, lengths, prior),
+        ) == length) return false;
+    }
+    return true;
+}
+
+fn sorted_sequence_count(
+    element_count: u32,
+    length: u32,
+) Error!u64 {
+    if (length == 0) return 1;
+    if (element_count == 0) return 0;
+    if (element_count == 1) return 1;
+    const total: u64 = @as(u64, element_count) + length - 1;
+    const selected: u64 = @min(length, element_count - 1);
+    var result: u128 = 1;
+    var factor: u64 = 1;
+    while (factor <= selected) : (factor += 1) {
+        result = result * (total - selected + factor) / factor;
+        if (result > std.math.maxInt(u32)) return Error.OutOfMemory;
+    }
+    return @intCast(result);
+}
+
+fn sort_sequence_elements(
+    pool: *ValuePool,
+    offset: u32,
+    count: u32,
+) Error!void {
+    var index: u32 = 1;
+    while (index < count) : (index += 1) {
+        const key = pool.values[offset + index];
+        var insertion = index;
+        while (insertion > 0) {
+            const order = pool.values[offset + insertion - 1].compare(
+                key,
+                pool,
+            ) orelse return Error.TypeError;
+            if (order <= 0) break;
+            pool.values[offset + insertion] =
+                pool.values[offset + insertion - 1];
+            insertion -= 1;
+        }
+        pool.values[offset + insertion] = key;
+    }
+}
+
+fn write_sorted_sequence(
+    pool: *ValuePool,
+    sorted_offset: u32,
+    element_count: u32,
+    entries_offset: u32,
+    length: u32,
+    ordinal: u64,
+) Error!void {
+    var remaining = ordinal;
+    var minimum_element: u32 = 0;
+    var position: u32 = 0;
+    while (position < length) : (position += 1) {
+        var selected = minimum_element;
+        while (selected < element_count) : (selected += 1) {
+            const suffix_count = try sorted_sequence_count(
+                element_count - selected,
+                length - position - 1,
+            );
+            if (remaining < suffix_count) break;
+            remaining -= suffix_count;
+        }
+        std.debug.assert(selected < element_count);
+        pool.values[entries_offset + position] =
+            pool.values[sorted_offset + selected];
+        minimum_element = selected;
+    }
+    std.debug.assert(remaining == 0);
+}
+
+test "bounded sorted sequences generate only canonical candidates" {
+    const Arena = @import("arena.zig").Arena;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 16, 64);
+    var models = try ModelTable.init(&arena, 4);
+    var generated_cache = [_]?Value{};
+    var context = CallContext{
+        .eval_pool = &pool,
+        .state_pool = &pool,
+        .state = null,
+        .next_state = null,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &pool,
+        .generated_cache_frozen = false,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+    const elements = try set(
+        &context,
+        &.{ .{ .int_v = 2 }, .{ .int_v = 1 } },
+    );
+    const lengths = try range(.{ .int_v = 1 }, .{ .int_v = 3 });
+    const bounded = try bounded_sequence_union(
+        &context,
+        elements,
+        lengths,
+    );
+    const ascending = try tuple(
+        &context,
+        &.{ .{ .int_v = 1 }, .{ .int_v = 2 } },
+    );
+    const descending = try tuple(
+        &context,
+        &.{ .{ .int_v = 2 }, .{ .int_v = 1 } },
+    );
+    const empty = try tuple(&context, &.{});
+    try std.testing.expect(bounded.member(&pool, ascending));
+    try std.testing.expect(bounded.member(&pool, descending));
+    try std.testing.expect(!bounded.member(&pool, empty));
+
+    const sorted = try sorted_sequences(&context, elements, lengths);
+    try std.testing.expectEqual(@as(u32, 9), sorted.set_v.len);
+    var counts_by_length = [_]u32{ 0, 0, 0, 0 };
+    for (sorted.set_v.items(&pool)) |sequence| {
+        try std.testing.expect(sequence == .function_v);
+        counts_by_length[sequence.function_v.len] += 1;
+        const entries = sequence.function_v.entries(&pool);
+        for (entries[1..], entries[0 .. entries.len - 1]) |right, left| {
+            try std.testing.expect(left.int_v <= right.int_v);
+        }
+    }
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{ 0, 2, 3, 4 },
+        &counts_by_length,
+    );
+    try std.testing.expect(sorted.member(&pool, ascending));
+    try std.testing.expect(!sorted.member(&pool, descending));
+
+    const nonpositive_lengths = try range(
+        .{ .int_v = -2 },
+        .{ .int_v = 1 },
+    );
+    const with_empty = try sorted_sequences(
+        &context,
+        elements,
+        nonpositive_lengths,
+    );
+    try std.testing.expectEqual(@as(u32, 3), with_empty.set_v.len);
+    try std.testing.expect(with_empty.member(&pool, empty));
+}
+
 pub fn record_set(
     context: *CallContext,
     fields: []const Value,
@@ -3516,15 +4269,15 @@ pub fn quantify_filtered_power_set(
                 predicate,
             ));
             if (kind == .exists and result) {
-                context.eval_pool.restore(iteration_snapshot);
+                restore_eval_pool(context, iteration_snapshot);
                 return .{ .bool_v = true };
             }
             if (kind == .forall and !result) {
-                context.eval_pool.restore(iteration_snapshot);
+                restore_eval_pool(context, iteration_snapshot);
                 return .{ .bool_v = false };
             }
         }
-        context.eval_pool.restore(iteration_snapshot);
+        restore_eval_pool(context, iteration_snapshot);
     }
     return .{ .bool_v = kind == .forall };
 }
@@ -3612,7 +4365,7 @@ pub fn exists_total_order_relation(
         }
     }
 
-    context.eval_pool.restore(iteration_snapshot);
+    restore_eval_pool(context, iteration_snapshot);
     return .{ .bool_v = found };
 }
 
@@ -3649,7 +4402,7 @@ fn test_total_order_relation(
         &.{relation},
         predicate,
     ));
-    context.eval_pool.restore(snapshot);
+    restore_eval_pool(context, snapshot);
     return result;
 }
 
@@ -3786,7 +4539,7 @@ fn filter_function_set(
             accepted_bits[word] |= @as(u64, 1) << bit;
             accepted_count += 1;
         }
-        context.eval_pool.restore(scratch);
+        restore_eval_pool(context, scratch);
     }
 
     try context.eval_pool.ensure_value_capacity(
@@ -3867,7 +4620,7 @@ pub fn map_set(
             mapped_values[mapped_count] = result;
             mapped_count += 1;
         } else {
-            context.eval_pool.restore(result_snapshot);
+            restore_eval_pool(context, result_snapshot);
         }
     }
     return .{ .set_v = .{
@@ -4181,6 +4934,40 @@ pub fn except_update(
     return except_recursive(
         context,
         original,
+        path,
+        0,
+        .{ .function = .{
+            .operator_args = operator_args,
+            .updater = updater,
+        } },
+    );
+}
+
+pub fn variable_except_update(
+    context: *CallContext,
+    operator_args: []const Value,
+    variable_index: u32,
+    path: []const Value,
+    updater: OperatorFn,
+) Error!Value {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const original = if (context.read_primed)
+        try resolve_primed_variable(context, variable_index, &source_pool)
+    else
+        try resolve_current_variable(context, variable_index, &source_pool);
+    if (source_pool == context.eval_pool) {
+        return except_update(
+            context,
+            operator_args,
+            original,
+            path,
+            updater,
+        );
+    }
+    return except_recursive_cross_pool(
+        context,
+        original,
+        source_pool,
         path,
         0,
         .{ .function = .{
@@ -4929,6 +5716,160 @@ fn except_recursive(
     };
 }
 
+fn except_recursive_cross_pool(
+    context: *CallContext,
+    original: Value,
+    source_pool: *const ValuePool,
+    path: []const Value,
+    depth: usize,
+    update: ExceptUpdate,
+) Error!Value {
+    if (depth == path.len) {
+        const original_local = try original.clone(
+            source_pool,
+            context.eval_pool,
+        );
+        return switch (update) {
+            .value => |replacement| replacement,
+            .function => |function| call_bound(
+                context,
+                function.operator_args,
+                &.{original_local},
+                function.updater,
+            ),
+        };
+    }
+
+    const key = path[depth];
+    return switch (original) {
+        .function_v => |function_value| blk: {
+            const source_keys = function_value.domain.items(source_pool);
+            const source_entries = function_value.entries(source_pool);
+            var selected: ?usize = null;
+            for (source_keys, 0..) |source_key, index| {
+                if (Value.eql_cross_pool(
+                    source_key,
+                    source_pool,
+                    key,
+                    context.eval_pool,
+                )) {
+                    selected = index;
+                    break;
+                }
+            }
+            const selected_index = selected orelse
+                return Error.IndexOutOfBounds;
+            const updated = try except_recursive_cross_pool(
+                context,
+                source_entries[selected_index],
+                source_pool,
+                path,
+                depth + 1,
+                update,
+            );
+
+            const keys = try context.eval_pool.alloc_values(function_value.len);
+            const keys_offset = value_offset(context.eval_pool, keys.ptr);
+            const entries = try context.eval_pool.alloc_values(function_value.len);
+            const entries_offset = value_offset(context.eval_pool, entries.ptr);
+            for (source_keys, 0..) |source_key, index| {
+                const cloned = try source_key.clone(
+                    source_pool,
+                    context.eval_pool,
+                );
+                context.eval_pool.values[keys_offset + index] = cloned;
+            }
+            for (source_entries, 0..) |source_entry, index| {
+                const cloned = if (index == selected_index)
+                    updated
+                else
+                    try source_entry.clone(source_pool, context.eval_pool);
+                context.eval_pool.values[entries_offset + index] = cloned;
+            }
+            break :blk .{ .function_v = .{
+                .domain = .{
+                    .offset = keys_offset,
+                    .len = function_value.len,
+                },
+                .offset = entries_offset,
+                .len = function_value.len,
+            } };
+        },
+        .tuple_v => |tuple_value| blk: {
+            const item_index = key.as_int() orelse return Error.TypeError;
+            if (item_index < 1 or item_index > tuple_value.len) {
+                return Error.IndexOutOfBounds;
+            }
+            const selected_index: usize = @intCast(item_index - 1);
+            const source_items = tuple_value.items(source_pool);
+            const updated = try except_recursive_cross_pool(
+                context,
+                source_items[selected_index],
+                source_pool,
+                path,
+                depth + 1,
+                update,
+            );
+
+            const items = try context.eval_pool.alloc_values(tuple_value.len);
+            const items_offset = value_offset(context.eval_pool, items.ptr);
+            for (source_items, 0..) |source_item, index| {
+                const cloned = if (index == selected_index)
+                    updated
+                else
+                    try source_item.clone(source_pool, context.eval_pool);
+                context.eval_pool.values[items_offset + index] = cloned;
+            }
+            break :blk .{ .tuple_v = .{
+                .offset = items_offset,
+                .len = tuple_value.len,
+            } };
+        },
+        .record_v => |record_value| blk: {
+            if (key != .string_v) return Error.TypeError;
+            const source_fields = record_value.fields(source_pool);
+            var selected: ?usize = null;
+            var field_index: usize = 0;
+            while (field_index < record_value.len) : (field_index += 1) {
+                if (std.mem.eql(
+                    u8,
+                    source_fields[field_index * 2].string_v.slice(source_pool),
+                    key.string_v.slice(context.eval_pool),
+                )) {
+                    selected = field_index;
+                    break;
+                }
+            }
+            const selected_index = selected orelse
+                return Error.UndefinedSymbol;
+            const selected_offset = selected_index * 2 + 1;
+            const updated = try except_recursive_cross_pool(
+                context,
+                source_fields[selected_offset],
+                source_pool,
+                path,
+                depth + 1,
+                update,
+            );
+
+            const fields = try context.eval_pool.alloc_values(record_value.len * 2);
+            const fields_offset = value_offset(context.eval_pool, fields.ptr);
+            for (source_fields, 0..) |source_field, index| {
+                const cloned = if (index == selected_offset)
+                    updated
+                else
+                    try source_field.clone(source_pool, context.eval_pool);
+                context.eval_pool.values[fields_offset + index] = cloned;
+            }
+            break :blk .{ .record_v = .{
+                .offset = fields_offset,
+                .len = record_value.len,
+            } };
+        },
+        else => Error.TypeError,
+    };
+}
+
 const ExceptUpdate = union(enum) {
     value: Value,
     function: struct {
@@ -5008,6 +5949,77 @@ fn iterable_value_from_pool(
     };
 }
 
+test "materialized variable cache follows value-pool restores" {
+    const Arena = @import("arena.zig").Arena;
+    var source_arena = try Arena.init(1024 * 1024);
+    defer source_arena.deinit();
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var source_pool = try ValuePool.init(&source_arena, 64, 64);
+    var eval_pool = try ValuePool.init(&eval_arena, 64, 64);
+    var models = try ModelTable.init(&source_arena, 4);
+    var generated_cache = [_]?Value{};
+
+    const status = Value{ .string_v = try source_pool.push_string("ready") };
+    const tuple_offset = try source_pool.push_values(&.{status});
+    var state_values = [_]Value{.{ .tuple_v = .{
+        .offset = tuple_offset,
+        .len = 1,
+    } }};
+    var current_state = State{
+        .level = 0,
+        .pred = 0,
+        .changed_mask = 0,
+        .borrowed_mask = 0,
+        .borrowed_pool = null,
+        .values = &state_values,
+    };
+    var context = CallContext{
+        .eval_pool = &eval_pool,
+        .state_pool = &source_pool,
+        .state = &current_state,
+        .next_state = null,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &eval_pool,
+        .generated_cache_frozen = false,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+
+    const empty = eval_pool.snapshot();
+    const first = try variable(&context, 0);
+    const cached = eval_pool.snapshot();
+    const second = try variable(&context, 0);
+    try std.testing.expect(value_same_representation(first, second));
+    try std.testing.expectEqual(cached, eval_pool.snapshot());
+
+    _ = try eval_pool.push_value(.{ .int_v = 7 });
+    restore_eval_pool(&context, cached);
+    try std.testing.expect(context.materialized_variable_cache_mask != 0);
+    _ = try variable(&context, 0);
+    try std.testing.expectEqual(cached, eval_pool.snapshot());
+
+    restore_eval_pool(&context, empty);
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        context.materialized_variable_cache_mask,
+    );
+    _ = try variable(&context, 0);
+    try std.testing.expectEqual(cached, eval_pool.snapshot());
+}
+
+fn value_same_representation(left: Value, right: Value) bool {
+    return @import("value.zig").same_repr(left, right);
+}
+
 test "generated finite values use only the value pool" {
     const Arena = @import("arena.zig").Arena;
     var arena = try Arena.init(1024 * 1024);
@@ -5028,6 +6040,7 @@ test "generated finite values use only the value pool" {
         .constant_slots = &.{},
         .generated_cache = &generated_cache,
         .generated_cache_pool = &pool,
+        .generated_cache_frozen = false,
         .models = &models,
         .native_context = undefined,
         .native_call = test_native_call,
@@ -5094,6 +6107,7 @@ test "generated finite values use only the value pool" {
         .constant_slots = &.{},
         .generated_cache = &source_generated_cache,
         .generated_cache_pool = &source_pool,
+        .generated_cache_frozen = false,
         .models = &source_models,
         .native_context = undefined,
         .native_call = test_native_call,

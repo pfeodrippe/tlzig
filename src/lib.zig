@@ -8,4 +8,6 @@ pub const generated_runtime = @import("generated_runtime.zig");
 pub const ir = @import("ir.zig");
 pub const ModuleLoader = @import("module_loader.zig").ModuleLoader;
 pub const overrides = @import("overrides.zig");
+pub const platform = @import("platform.zig");
+pub const state = @import("state.zig");
 pub const value = @import("value.zig");

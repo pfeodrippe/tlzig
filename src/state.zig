@@ -5,6 +5,25 @@ const value = @import("value.zig");
 const Value = value.Value;
 const ValuePool = value.ValuePool;
 
+pub fn canonical_value_capacity(
+    arena_bytes: u64,
+    max_states: u32,
+    values_per_state: u32,
+) u32 {
+    assert(arena_bytes > 0);
+    assert(max_states > 0);
+    assert(values_per_state > 0);
+
+    const requested = @as(u64, max_states) * values_per_state;
+    const arena_budget = arena_bytes / 2 / @sizeOf(Value);
+    const capacity = @min(
+        @max(requested, 1_000_000),
+        arena_budget,
+        std.math.maxInt(u32),
+    );
+    return @intCast(capacity);
+}
+
 pub const StateStore = struct {
     arena: *Arena,
     variable_names: []const []const u8,
@@ -119,3 +138,19 @@ pub const StateStore = struct {
         }
     }
 };
+
+test "canonical value capacity follows the arena budget" {
+    const gib: u64 = 1024 * 1024 * 1024;
+    const capacity = canonical_value_capacity(24 * gib, 18_000_000, 160);
+
+    try std.testing.expect(capacity > 192_000_000);
+    try std.testing.expectEqual(@as(u32, 402_653_184), capacity);
+}
+
+test "canonical value capacity remains bounded for smaller arenas" {
+    const gib: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(
+        @as(u32, 16_777_216),
+        canonical_value_capacity(gib, 18_000_000, 160),
+    );
+}

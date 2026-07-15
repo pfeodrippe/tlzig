@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const ast = @import("ast.zig");
 const value = @import("value.zig");
@@ -756,7 +757,7 @@ pub const Unchanged = struct {
 
 pub const CompiledExpr = struct {
     expr: *ast.Expr,
-    generated: ?generated_runtime.Expression,
+    generated: ?*const generated_runtime.Expression,
 };
 
 pub const MarkAction = struct {
@@ -953,12 +954,16 @@ pub const ActionCompiler = struct {
             );
             return Error.NotImplemented;
         }
-        var canonical_generated = generated;
-        if (canonical_generated) |*expression| {
-            expression.arg_names = try self.canonical_name_slice(
+        const canonical_generated = if (generated) |expression| generated: {
+            const canonical = try self.arena.alloc_object(
+                generated_runtime.Expression,
+            );
+            canonical.* = expression;
+            canonical.arg_names = try self.canonical_name_slice(
                 expression.arg_names,
             );
-        }
+            break :generated canonical;
+        } else null;
         return .{
             .expr = expr,
             .generated = canonical_generated,
@@ -992,9 +997,13 @@ pub const ActionCompiler = struct {
         return compiled;
     }
 
-    fn is_action_expr(self: ActionCompiler, expr: *ast.Expr) bool {
+    fn is_action_expr(
+        self: ActionCompiler,
+        expr: *ast.Expr,
+        is_init: bool,
+    ) bool {
         var path: [128]*ast.Expr = undefined;
-        return self.is_action_expr_inner(expr, &path, 0);
+        return self.is_action_expr_inner(expr, &path, 0, is_init);
     }
 
     fn is_init_action(self: ActionCompiler, expr: *ast.Expr) bool {
@@ -1019,6 +1028,7 @@ pub const ActionCompiler = struct {
         expr: *ast.Expr,
         path: *[128]*ast.Expr,
         depth: u8,
+        is_init: bool,
     ) bool {
         if (depth >= path.len) return false;
         for (path[0..depth]) |ancestor| {
@@ -1042,6 +1052,7 @@ pub const ActionCompiler = struct {
                         def.body,
                         path,
                         next_depth,
+                        is_init,
                     );
                 }
                 return false;
@@ -1051,25 +1062,30 @@ pub const ActionCompiler = struct {
                     b.left,
                     path,
                     next_depth,
+                    is_init,
                 ) or self.is_action_expr_inner(
                     b.right,
                     path,
                     next_depth,
-                ) or self.is_init_action(expr);
+                    is_init,
+                ) or (is_init and self.is_init_action(expr));
             },
             .let_in => |l| return self.is_action_expr_inner(
                 l.body,
                 path,
                 next_depth,
+                is_init,
             ),
             .if_then_else => |ite| return self.is_action_expr_inner(
                 ite.then_branch,
                 path,
                 next_depth,
+                is_init,
             ) or self.is_action_expr_inner(
                 ite.else_branch,
                 path,
                 next_depth,
+                is_init,
             ),
             .case_expr => |case| {
                 for (case.arms) |arm| {
@@ -1077,12 +1093,14 @@ pub const ActionCompiler = struct {
                         arm.value,
                         path,
                         next_depth,
+                        is_init,
                     )) return true;
                 }
                 if (case.otherwise) |otherwise| return self.is_action_expr_inner(
                     otherwise,
                     path,
                     next_depth,
+                    is_init,
                 );
                 return false;
             },
@@ -1094,11 +1112,13 @@ pub const ActionCompiler = struct {
                                 ap.args[0],
                                 path,
                                 next_depth,
+                                is_init,
                             ) and
                             self.is_action_expr_inner(
                                 ap.args[1],
                                 path,
                                 next_depth,
+                                is_init,
                             );
                     }
                     if (self.is_constant_replacement(ap.func.*.ident)) {
@@ -1112,6 +1132,7 @@ pub const ActionCompiler = struct {
                             def.body,
                             path,
                             next_depth,
+                            is_init,
                         );
                     }
                 }
@@ -1121,6 +1142,7 @@ pub const ActionCompiler = struct {
                 q.body,
                 path,
                 next_depth,
+                is_init,
             ),
             else => return false,
         }
@@ -1174,7 +1196,9 @@ pub const ActionCompiler = struct {
                     return;
                 }
                 if (b.op == .or_op) {
-                    if (self.is_action_expr(b.left) or self.is_action_expr(b.right)) {
+                    if (self.is_action_expr(b.left, is_init) or
+                        self.is_action_expr(b.right, is_init))
+                    {
                         var operands: [256]*ast.Expr = undefined;
                         var operand_count: usize = 0;
                         flatten_action_disjunction(
@@ -1182,6 +1206,7 @@ pub const ActionCompiler = struct {
                             expr,
                             &operands,
                             &operand_count,
+                            is_init,
                         );
                         var options = std.ArrayList([]const ActionStep).empty;
                         defer options.deinit(std.heap.page_allocator);
@@ -1277,7 +1302,10 @@ pub const ActionCompiler = struct {
                         @tagName(q.body.*),
                     });
                 }
-                if (q.kind == .exists and q.vars.len > 0) {
+                if (q.kind == .exists and
+                    q.vars.len > 0 and
+                    self.is_action_expr(q.body, is_init))
+                {
                     var body_steps = std.ArrayList(ActionStep).empty;
                     defer body_steps.deinit(std.heap.page_allocator);
                     try self.collect_steps(q.body, &body_steps, is_init);
@@ -1288,8 +1316,14 @@ pub const ActionCompiler = struct {
                 try steps.append(std.heap.page_allocator, ActionStep{ .condition = try self.compile_expr(expr) });
             },
             .if_then_else => |ite| {
-                const then_action = self.is_action_expr(ite.then_branch);
-                const else_action = self.is_action_expr(ite.else_branch);
+                const then_action = self.is_action_expr(
+                    ite.then_branch,
+                    is_init,
+                );
+                const else_action = self.is_action_expr(
+                    ite.else_branch,
+                    is_init,
+                );
                 if (then_action or else_action) {
                     var then_steps = std.ArrayList(ActionStep).empty;
                     defer then_steps.deinit(std.heap.page_allocator);
@@ -1307,7 +1341,7 @@ pub const ActionCompiler = struct {
                 try steps.append(std.heap.page_allocator, ActionStep{ .condition = try self.compile_expr(expr) });
             },
             .case_expr => |case| {
-                if (!self.is_action_expr(expr)) {
+                if (!self.is_action_expr(expr, is_init)) {
                     try steps.append(std.heap.page_allocator, ActionStep{ .condition = try self.compile_expr(expr) });
                     return;
                 }
@@ -1751,22 +1785,25 @@ fn flatten_action_disjunction(
     expr: *ast.Expr,
     operands: *[256]*ast.Expr,
     count: *usize,
+    is_init: bool,
 ) void {
     if (expr.* == .binary and
         expr.binary.op == .or_op and
-        compiler.is_action_expr(expr))
+        compiler.is_action_expr(expr, is_init))
     {
         flatten_action_disjunction(
             compiler,
             expr.binary.left,
             operands,
             count,
+            is_init,
         );
         flatten_action_disjunction(
             compiler,
             expr.binary.right,
             operands,
             count,
+            is_init,
         );
         return;
     }
@@ -1840,32 +1877,104 @@ pub const ActionExecutor = struct {
         try self.execute_steps(compiled.steps, null, Context.empty(), s0, out_states, false, 0);
     }
 
+    fn eval_direct_generated_expr(
+        self: *const ActionExecutor,
+        expression: *const generated_runtime.Expression,
+        context: Context,
+    ) Error!?Value {
+        _ = self;
+        if (expression.direct_value) |direct| return direct;
+        const index = expression.direct_arg_index orelse return null;
+        if (index >= expression.arg_names.len or
+            index >= expression.arg_depths.len)
+        {
+            return Error.TypeError;
+        }
+        const direct = context.lookup_value_at_depth(
+            expression.arg_names[index],
+            expression.arg_depths[index],
+        ) orelse return null;
+        if (generated_runtime.requires_force(direct)) return null;
+        return direct;
+    }
+
+    fn eval_generated_compiled_expr(
+        self: *const ActionExecutor,
+        generated: *const generated_runtime.Expression,
+        context: Context,
+        state: ?*StateStore.State,
+    ) !?Value {
+        return self.evaluator.eval_generated_expression_if_args_available(
+            generated,
+            context,
+            state,
+            self.eval_pool,
+            &self.source_state_store.values_pool,
+        ) catch |err| {
+            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                std.debug.print(
+                    "generated expression {d} failed with {any}; args={any}\n",
+                    .{ generated.identity, err, generated.arg_names },
+                );
+            }
+            return err;
+        };
+    }
+
+    fn eval_generated_compiled_bool(
+        self: *const ActionExecutor,
+        generated: *const generated_runtime.Expression,
+        context: Context,
+        state: ?*StateStore.State,
+    ) !?bool {
+        return self.evaluator.eval_generated_expression_bool_if_args_available(
+            generated,
+            context,
+            state,
+            self.eval_pool,
+            &self.source_state_store.values_pool,
+        ) catch |err| {
+            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                std.debug.print(
+                    "generated boolean expression {d} failed with {any}; args={any}\n",
+                    .{ generated.identity, err, generated.arg_names },
+                );
+            }
+            return err;
+        };
+    }
+
     fn eval_compiled_expr(
         self: *const ActionExecutor,
         compiled: CompiledExpr,
         context: Context,
         state: ?*StateStore.State,
     ) !Value {
-        self.evaluator.begin_state_evaluation(self.eval_pool);
-        defer self.evaluator.end_state_evaluation();
+        if (compiled.generated) |generated| {
+            if (try self.eval_direct_generated_expr(
+                generated,
+                context,
+            )) |direct| return direct;
+        }
         if (compiled.generated) |generated| generated: {
-            if (self.evaluator.eval_generated_expression_if_args_available(
+            const result = if (self.evaluator.generated_requires_state_memo()) result: {
+                self.evaluator.begin_state_evaluation(self.eval_pool);
+                defer self.evaluator.end_state_evaluation();
+                break :result try self.eval_generated_compiled_expr(
+                    generated,
+                    context,
+                    state,
+                );
+            } else try self.eval_generated_compiled_expr(
                 generated,
                 context,
                 state,
-                self.eval_pool,
-                &self.source_state_store.values_pool,
-            ) catch |err| {
-                if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
-                    std.debug.print(
-                        "generated expression {d} failed with {any}; args={any}\n",
-                        .{ generated.identity, err, generated.arg_names },
-                    );
-                }
-                return err;
-            }) |result| return result;
+            );
+            if (result) |value_v| return value_v;
             break :generated;
         }
+        self.evaluator.begin_state_evaluation(self.eval_pool);
+        defer self.evaluator.end_state_evaluation();
         return self.evaluator.eval_expr(
             compiled.expr,
             context,
@@ -1881,26 +1990,31 @@ pub const ActionExecutor = struct {
         context: Context,
         state: ?*StateStore.State,
     ) !bool {
-        self.evaluator.begin_state_evaluation(self.eval_pool);
-        defer self.evaluator.end_state_evaluation();
+        if (compiled.generated) |generated| {
+            if (try self.eval_direct_generated_expr(
+                generated,
+                context,
+            )) |direct| return try generated_runtime.boolean(direct);
+        }
         if (compiled.generated) |generated| generated: {
-            if (self.evaluator.eval_generated_expression_bool_if_args_available(
+            const result = if (self.evaluator.generated_requires_state_memo()) result: {
+                self.evaluator.begin_state_evaluation(self.eval_pool);
+                defer self.evaluator.end_state_evaluation();
+                break :result try self.eval_generated_compiled_bool(
+                    generated,
+                    context,
+                    state,
+                );
+            } else try self.eval_generated_compiled_bool(
                 generated,
                 context,
                 state,
-                self.eval_pool,
-                &self.source_state_store.values_pool,
-            ) catch |err| {
-                if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
-                    std.debug.print(
-                        "generated boolean expression {d} failed with {any}; args={any}\n",
-                        .{ generated.identity, err, generated.arg_names },
-                    );
-                }
-                return err;
-            }) |result| return result;
+            );
+            if (result) |value_b| return value_b;
             break :generated;
         }
+        self.evaluator.begin_state_evaluation(self.eval_pool);
+        defer self.evaluator.end_state_evaluation();
         const result = try self.evaluator.eval_expr(
             compiled.expr,
             context,
@@ -1964,7 +2078,7 @@ pub const ActionExecutor = struct {
                 if (current_cont) |next| {
                     if (next.return_context) |caller_context| {
                         current_ctx = caller_context.restore_locals(
-                            current_ctx.state_head,
+                            current_ctx,
                         );
                     }
                     current_steps = next.steps;
@@ -2612,14 +2726,12 @@ pub const ActionExecutor = struct {
             new_state.borrowed_pool = null;
         }
 
-        var assigned_mask: u64 = 0;
-        var binding = ctx.state_head;
-        while (binding) |assigned| : (binding = assigned.state_parent) {
-            const variable_index = assigned.variable_index.?;
+        var assignments = ctx.state_assignments();
+        while (assignments.next()) |indexed| {
+            const variable_index = indexed.variable_index;
+            const assigned = indexed.value;
             assert(variable_index < new_state.values.len);
             const variable_bit = @as(u64, 1) << @intCast(variable_index);
-            if (assigned_mask & variable_bit != 0) continue;
-            assigned_mask |= variable_bit;
             if (assigned.assignment != .changed) {
                 if (s0 != null) continue;
                 const source_pool = assigned.value_pool orelse self.eval_pool;
@@ -2641,7 +2753,7 @@ pub const ActionExecutor = struct {
                         variable_index,
                         &self.source_state_store.values_pool,
                     );
-                    if (Value.eql_cross_pool(
+                    if (Value.eql_ordered_cross_pool(
                         assigned.value,
                         source_pool,
                         parent.values[variable_index],
@@ -2655,12 +2767,14 @@ pub const ActionExecutor = struct {
                 source_pool,
                 &self.candidate_store.values_pool,
             );
-            assert(Value.eql_cross_pool(
-                assigned.value,
-                source_pool,
-                new_state.values[variable_index],
-                &self.candidate_store.values_pool,
-            ));
+            if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+                assert(Value.eql_cross_pool(
+                    assigned.value,
+                    source_pool,
+                    new_state.values[variable_index],
+                    &self.candidate_store.values_pool,
+                ));
+            }
         }
         if (self.edge_action_masks) |masks| {
             assert(out_states.items.len < masks.len);
@@ -2705,4 +2819,47 @@ test "action inlining avoids capture by nested function binders" {
         "n",
         inlined.function_literal.body.ident,
     );
+}
+
+test "action compiler branches only existential assignments" {
+    const parser = @import("parser.zig");
+    const overrides = @import("overrides.zig");
+    const source =
+        \\---------------- MODULE ExistentialActions ----------------
+        \\VARIABLE x
+        \\Pure == \E i \in {1, 2} : i = x
+        \\InitAction == \E i \in {1, 2} : x = i
+        \\NextAction == \E i \in {1, 2} : x' = i
+        \\=============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const evaluator = try Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    const compiler = try ActionCompiler.init(&arena, evaluator);
+
+    const pure = evaluator.find_definition("Pure").?;
+    const pure_init = try compiler.compile_init(pure.body);
+    try std.testing.expectEqual(@as(usize, 1), pure_init.steps.len);
+    try std.testing.expect(pure_init.steps[0] == .condition);
+
+    const init_action = evaluator.find_definition("InitAction").?;
+    const compiled_init = try compiler.compile_init(init_action.body);
+    try std.testing.expectEqual(@as(usize, 1), compiled_init.steps.len);
+    try std.testing.expect(compiled_init.steps[0] == .choose);
+
+    const pure_next = try compiler.compile_next(init_action.body);
+    try std.testing.expectEqual(@as(usize, 1), pure_next.steps.len);
+    try std.testing.expect(pure_next.steps[0] == .condition);
+
+    const next_action = evaluator.find_definition("NextAction").?;
+    const compiled_next = try compiler.compile_next(next_action.body);
+    try std.testing.expectEqual(@as(usize, 1), compiled_next.steps.len);
+    try std.testing.expect(compiled_next.steps[0] == .choose);
 }

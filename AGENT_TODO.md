@@ -2602,16 +2602,87 @@ allocation-free Zig operator overrides, and
   is disabled. CoffeeCan1000 is exact at `2,000,002/501,500` and improved from
   over `131s` to `6.878s`; CoffeeCan3000 is exact at
   `18,000,002/4,504,500` in `97.649s` versus TLC `156.464s`.
-- [x] Refresh `coverage_results/primary_final_clean.jsonl`: `156` exact, `24`
-  outcome-exact, `1` stochastic-outcome, `37` bounded, `60` TLC-invalid, and
+- [x] Refresh `coverage_results/primary_final_clean.jsonl`: `158` exact, `24`
+  outcome-exact, `1` stochastic-outcome, `35` bounded, `60` TLC-invalid, and
   `2` non-model rows, with zero hard gaps.
 - [x] Run TLC once per default benchmark model. Generated AOT rows are now
   tlzig-only and validate against the interpreted baseline; completed rows
   require exact configured counts, while first-error rows use deterministic
   one-worker count tolerances and all-core outcome equality. The full
   ReleaseFast benchmark exits `0`.
-- [ ] Move the remaining `37` bounded corpus rows to exact/outcome-exact with
+- [ ] Move the remaining `35` bounded corpus rows to exact/outcome-exact with
   opt-in long runs, prioritizing SlushMedium and EWD998.
 - [ ] Continue generic AOT work for the remaining performance gaps. Do not add
   model-specific runtime semantics; `src/overrides.zig` remains built-in and
   standard-module-only.
+- [x] Expose `--state-values-per-state` in the paired coverage auditor. Long
+  structured-state checks now configure both the per-state canonical budget
+  and `--arena-bytes`; increasing only `--max-states` can no longer hide the
+  fixed half-arena `Value` ceiling from the audit command.
+- [x] Remove the CLI's artificial 192-million canonical-value ceiling. The
+  generic state-capacity helper now uses the requested states, per-state value
+  budget, arena budget, and `u32` representation limit, with regressions above
+  the former cap. `MCKVSSafetyMedium` consequently completes with exact TLC
+  counts (`365609473/17220672`) in ReleaseFast: tlzig `103.64s` versus TLC
+  `173.982s` (`1.68x`). `MCKVSSafetySmall` is exact at
+  `56349379/3409605`, tlzig `21.516s` versus TLC `31.494s` (`1.46x`).
+
+## 2026-07-14 All-Core Generated Runtime Gate
+
+- [x] Record the measured architecture and optimization backlog in
+  `ALL_CORE_PERFORMANCE_ARCHITECTURE.md`, including accepted and rejected A/B
+  experiments, the exact correctness contract, typed/trail lowering, SIMD
+  prerequisites, TypeOK restrictions, and explicit ECS/GPU non-targets.
+- [x] Use all 16 logical cores for `--workers auto`; retain bounded worker-count
+  assertions and keep heavy one-worker rows opt-in.
+- [x] Stop copying generated expression descriptors through action plans.
+  `CompiledExpr` now points to one immutable startup-arena descriptor. Add
+  direct action-executor handling for captured arguments and Boolean/integer
+  literals before evaluator lifecycle work.
+- [x] Bump strict generated-model ABI to version `2` and emit compiler-derived
+  `state_memo_required` metadata. Nonrecursive generated models skip recursive
+  state-memo lifecycle; recursive models retain it. This is syntax-derived
+  generic metadata, not a user-spec override.
+- [x] Reject and remove eval/candidate string interning, alternate fingerprint
+  mixing, and literal path/field helper experiments after they increased
+  ReleaseFast instructions or cycles. Do not retain speculative hot-path code.
+- [x] Complete the decisive strict AOT all-core RC/snapshot exhaustive gate.
+  The regenerated model has `67` operators and `fallback_count = 0`; tlzig
+  completed exact `405005930/67629092` generated/distinct counts in `328.100s`,
+  with `57.138T` retired instructions and `26,281,590,784` bytes peak RSS.
+  This is `1.020x` faster than the pre-trail tlzig `334.557s`, `1.100x` faster
+  than the prior countered tlzig `360.86s`, `2.072x` faster than the original
+  tlzig `679.912s`, and `2.042x` faster than the retained TLC exact baseline
+  `669.976s`.
+- [x] Run the post-change default ReleaseFast benchmark, MDBTLA inventory,
+  generated-pattern, strict-artifact, and no-spec-override gates. The default
+  benchmark passed `56/56` build steps in `170.66s`; all 25 generated models
+  independently compile in ReleaseFast with ABI `2` and `fallback_count = 0`;
+  the MDBTLA audit classifies all `13` cfgs (`11` covered TLC-valid, `2`
+  TLC-invalid); and production source contains no audited model identifiers.
+- [ ] Refresh the full bounded primary-corpus manifest after these runtime
+  changes. The retained `primary_final_clean.jsonl` remains `158` exact, `24`
+  outcome-exact, `1` stochastic, `35` bounded, `60` TLC-invalid, and `2`
+  non-model rows with zero hard gaps; do not present the 35 bounded rows as
+  exhaustive evidence.
+- [x] Remove the default generated benchmark's dependency on untracked local
+  tlzig baseline files. The base runner skips generated-preferred models and
+  every generated row now compares one TLC-auto run directly with one strict
+  tlzig-AOT-auto run. `--tlzig-only` remains an explicit runner option, but is
+  not the clean-workspace default.
+- [x] Replace linked state assignments with a bounded 64-variable mutable
+  trail behind exact differential tests. State/local extension is split,
+  state lookup is O(1), state columns use SoA storage, generated calls borrow
+  contiguous value/pool slices, and `Context` remains 32 bytes. Repeated
+  assignment, rollback, nested capture, all tests, the default benchmark, and
+  exhaustive RC/snapshot parity pass. The normalized 3M probe improved from
+  `126.442K` to `121.15-121.92K` instructions per generated candidate.
+- [ ] Flatten the remaining linked lexical bindings into bounded frames using
+  generated capture-depth metadata. Preserve lazy LET/operator scope and reject
+  the change unless differential tests and ReleaseFast counters improve.
+- [ ] Lower the highest-volume generic generated patterns without model-name
+  dispatch: `25,472` nested helper chains, `5,068` variable paths, `1,231`
+  whole-root primed comparisons, `555` mapped sets, `435` unchanged
+  expressions, `234` EXCEPT reconstructions, and `176` function ranges. Start
+  with borrowed path reads and patch-based EXCEPT because clone/fingerprint/
+  action work dominates the final profile; measure before adding SIMD.

@@ -99,10 +99,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         } else if (std.mem.eql(u8, arg, "--workers")) {
             if (it.next()) |v| {
                 if (std.mem.eql(u8, v, "auto")) {
-                    worker_count = @intCast(@min(
-                        std.Thread.getCpuCount() catch 1,
-                        std.math.maxInt(u16),
-                    ));
+                    worker_count = tlzig.platform.auto_worker_count();
                 } else {
                     worker_count = std.fmt.parseInt(u16, v, 10) catch 1;
                 }
@@ -315,14 +312,11 @@ pub fn main(init: std.process.Init.Minimal) void {
         @max(state_values_per_state, 160)
     else
         state_values_per_state;
-    const canonical_value_budget = arena_bytes / 2 / @sizeOf(tlzig.value.Value);
-    const state_value_cap = cap_u32(@min(
-        @max(
-            @as(u64, max_states) * effective_values_per_state,
-            1_000_000,
-        ),
-        @min(192_000_000, canonical_value_budget),
-    ));
+    const state_value_cap = tlzig.state.canonical_value_capacity(
+        arena_bytes,
+        max_states,
+        effective_values_per_state,
+    );
     const state_string_cap = cap_u32(@min(
         @max(@as(u64, max_states) * 4, 500_000),
         8_000_000,
@@ -348,6 +342,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     };
     defer ch.deinit();
+    ch.set_scratch_growable(unlimited_memory);
     ch.set_progress_interval(progress_interval_states);
 
     const result = ch.check() catch |err| {

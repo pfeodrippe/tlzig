@@ -1,5 +1,6 @@
 const std = @import("std");
 const Arena = @import("arena.zig").Arena;
+const ast = @import("ast.zig");
 const parser = @import("parser.zig");
 const ModuleLoader = @import("module_loader.zig").ModuleLoader;
 const eval = @import("eval.zig");
@@ -959,9 +960,9 @@ test "weak fairness does not count a matching stuttering action" {
         \\EXTENDS Naturals
         \\VARIABLE x
         \\Init == x = 0
-        \\Next == x' = 1
+        \\Step == x' = 1
         \\vars == <<x>>
-        \\Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+        \\Spec == Init /\ [][Step]_vars /\ WF_vars(Step)
         \\Prop == (x = 0) ~> (x = 1)
         \\==============================================================
         \\
@@ -997,6 +998,53 @@ test "weak fairness does not count a matching stuttering action" {
     defer model_checker.deinit();
     const result = try model_checker.check();
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "temporal prefixes do not consume following conjunctions" {
+    const source =
+        \\---- MODULE TestTemporalPrefixPrecedence ----
+        \\Boxed == []P /\ Q
+        \\Eventually == <>P /\ Q
+        \\BoxedList == [] /\ P
+        \\                  /\ Q
+        \\EventuallyList == <> \/ P
+        \\                     \/ Q
+        \\==============================================
+        \\
+    ;
+    var arena = try Arena.init(4096);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    try std.testing.expectEqual(@as(usize, 4), module.definitions.len);
+
+    for (module.definitions[0..2], &[_]ast.UnaryOp{
+        .temporal_box,
+        .temporal_diamond,
+    }) |definition, expected_op| {
+        try std.testing.expect(definition.body.* == .binary);
+        const conjunction = definition.body.binary;
+        try std.testing.expectEqual(ast.BinaryOp.and_op, conjunction.op);
+        try std.testing.expect(conjunction.left.* == .unary);
+        try std.testing.expectEqual(expected_op, conjunction.left.unary.op);
+        try std.testing.expect(conjunction.left.unary.operand.* == .ident);
+        try std.testing.expectEqualStrings(
+            "P",
+            conjunction.left.unary.operand.ident,
+        );
+        try std.testing.expect(conjunction.right.* == .ident);
+        try std.testing.expectEqualStrings("Q", conjunction.right.ident);
+    }
+
+    for (module.definitions[2..], &[_]ast.BinaryOp{
+        .and_op,
+        .or_op,
+    }) |definition, expected_op| {
+        try std.testing.expect(definition.body.* == .unary);
+        const operand = definition.body.unary.operand;
+        try std.testing.expect(operand.* == .binary);
+        try std.testing.expectEqual(expected_op, operand.binary.op);
+    }
 }
 
 test "liveness resolves fairness through a specification alias" {

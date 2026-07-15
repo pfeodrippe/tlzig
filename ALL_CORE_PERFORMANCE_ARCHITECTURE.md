@@ -36,14 +36,19 @@ The decisive MultiShardTxn workload is `RC/snapshot exhaustive`:
 | Prior accepted tlzig exact | 405,005,930 | 67,629,092 | 360.86s | 63.56T | 26,015,973,376 B |
 | Pre-trail tlzig exact | 405,005,930 | 67,629,092 | 334.557s | - | - |
 | Initial compact-trail exact | 405,005,930 | 67,629,092 | 335.834s | 59.310T | 30,868,815,872 B |
-| Current tlzig exact | 405,005,930 | 67,629,092 | 328.100s | 57.138T | 26,281,590,784 B |
+| Refined trail before body inlining | 405,005,930 | 67,629,092 | 328.100s | 57.138T | 26,281,590,784 B |
+| Current tlzig exact | 405,005,930 | 67,629,092 | 318.628s | 54.658T | 29,406,117,888 B |
 
-The current exact run is `1.020x` faster than the pre-trail `334.557s` run,
-`1.100x` faster than the prior countered `360.86s` run, `2.072x` faster than
-the original `679.912s` tlzig baseline, and `2.042x` faster than the retained
-`669.976s` TLC baseline. Retired instructions are 10.1% below the older
-`63.56T` exact measurement. This is a measured generic improvement, not a 10x
-claim.
+The current exact run is `1.030x` faster than the preceding `328.100s` run,
+`1.050x` faster than the pre-trail `334.557s` run, `1.133x` faster than the
+prior countered `360.86s` run, `2.134x` faster than the original `679.912s`
+tlzig baseline, and `2.103x` faster than the retained `669.976s` TLC baseline.
+Retired instructions are 4.34% below the preceding exact run and 14.0% below
+the older `63.56T` measurement. Observed exact-run peak RSS rose 11.9% from
+`26.28GB` to `29.41GB`; capped-probe RSS was unchanged, so one run does not
+establish the cause. The memory delta remains an explicit regression risk and
+follow-up measurement rather than being hidden. This is a measured generic
+improvement, not a 10x claim.
 
 The bounded 3-million-distinct probe recorded this normalized progression.
 Generated-candidate counts vary slightly with parallel frontier scheduling, so
@@ -59,11 +64,13 @@ instructions per generated candidate are the comparison column:
 | Structure-of-arrays state trail | 122.402-122.500K |
 | ReleaseFast rollback without stale-slot poisoning | 122.04-122.20K |
 | Inline evaluator extension wrappers | 121.15-121.92K |
+| Inline private state/local extension bodies | 116.05-116.09K |
 
-The final three probes retired `1.8300T` instructions for `15,010,655`
-generated candidates, `1.8173T` for `15,000,524`, and `1.8208T` for
-`15,027,400`; the best wall time was `10.10s`. Normalized instruction work is
-about 3.6-4.2% below the fresh pre-trail baseline.
+The body-inlining control retired `1.81844T` instructions for `15,016,404`
+generated candidates (`121.097K` each) in `10.36s`. The two changed runs
+retired `1.74174T` for `15,008,820` (`116.048K`) and `1.74450T` for
+`15,027,062` (`116.091K`) in `10.13s` and `9.98s`. Normalized work is 4.13-4.17%
+below that control and about 8.2% below the fresh pre-trail baseline.
 
 ## Accepted Changes
 
@@ -110,6 +117,9 @@ These changes are generic and survived ReleaseFast A/B measurements:
     slot clearing and assertions.
 12. Small context-extension wrappers are forced inline. Their bounds and
     ownership assertions remain active in assertion-enabled builds.
+13. The private state/local extension bodies are also forced inline. This lets
+    ReleaseFast specialize the distinct state/local paths and removed another
+    4.13-4.17% of normalized probe instructions without weakening assertions.
 
 ## Rejected Experiments
 
@@ -271,9 +281,9 @@ Every accepted structural change must pass, in this order:
 - Runtime override audit: MDBTLA, MultiShardTxn, MCBinarySearch, and EWD998
   identifiers occur under `src` only in parser tests. Production overrides are
   TLA+/TLC built-ins and standard-module operators.
-- Decisive exhaustive result: exact `405,005,930/67,629,092` in `328.100s`,
-  `57.138T` retired instructions, and `26,281,590,784` bytes peak RSS.
-- Default ReleaseFast benchmark: `56/56` build steps passed in `170.66s`. It
+- Decisive exhaustive result: exact `405,005,930/67,629,092` in `318.628s`,
+  `54.658T` retired instructions, and `29,406,117,888` bytes peak RSS.
+- Default ReleaseFast benchmark: `56/56` build steps passed in `160.18s`. It
   contains no heavy one-worker rows and includes strict representative AOT
   models such as Slush Medium, MCBinarySearch, and MDBTLA.
 

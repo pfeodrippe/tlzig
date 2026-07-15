@@ -2648,15 +2648,16 @@ allocation-free Zig operator overrides, and
   ReleaseFast instructions or cycles. Do not retain speculative hot-path code.
 - [x] Complete the decisive strict AOT all-core RC/snapshot exhaustive gate.
   The regenerated model has `67` operators and `fallback_count = 0`; tlzig
-  completed exact `405005930/67629092` generated/distinct counts in `328.100s`,
-  with `57.138T` retired instructions and `26,281,590,784` bytes peak RSS.
-  This is `1.020x` faster than the pre-trail tlzig `334.557s`, `1.100x` faster
-  than the prior countered tlzig `360.86s`, `2.072x` faster than the original
-  tlzig `679.912s`, and `2.042x` faster than the retained TLC exact baseline
-  `669.976s`.
+  completed exact `405005930/67629092` generated/distinct counts in `318.628s`,
+  with `54.658T` retired instructions and `29,406,117,888` bytes peak RSS.
+  This is `1.030x` faster than the preceding tlzig `328.100s`, `1.133x` faster
+  than the prior countered tlzig `360.86s`, `2.134x` faster than the original
+  tlzig `679.912s`, and `2.103x` faster than the retained TLC exact baseline
+  `669.976s`. Exact-run RSS was 11.9% above the preceding observation; capped
+  RSS was unchanged, so keep memory as an explicit follow-up measurement.
 - [x] Run the post-change default ReleaseFast benchmark, MDBTLA inventory,
   generated-pattern, strict-artifact, and no-spec-override gates. The default
-  benchmark passed `56/56` build steps in `170.66s`; all 25 generated models
+  benchmark passed `56/56` build steps in `160.18s`; all 25 generated models
   independently compile in ReleaseFast with ABI `2` and `fallback_count = 0`;
   the MDBTLA audit classifies all `13` cfgs (`11` covered TLC-valid, `2`
   TLC-invalid); and production source contains no audited model identifiers.
@@ -2676,7 +2677,8 @@ allocation-free Zig operator overrides, and
   contiguous value/pool slices, and `Context` remains 32 bytes. Repeated
   assignment, rollback, nested capture, all tests, the default benchmark, and
   exhaustive RC/snapshot parity pass. The normalized 3M probe improved from
-  `126.442K` to `121.15-121.92K` instructions per generated candidate.
+  `126.442K` to `116.05-116.09K` instructions per generated candidate after
+  forcing both public wrappers and private state/local extension bodies inline.
 - [ ] Flatten the remaining linked lexical bindings into bounded frames using
   generated capture-depth metadata. Preserve lazy LET/operator scope and reject
   the change unless differential tests and ReleaseFast counters improve.

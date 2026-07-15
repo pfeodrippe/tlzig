@@ -1614,16 +1614,7 @@ pub const Parser = struct {
             self.* = saved;
         }
         if (self.match(.not)) {
-            // A prefix ~ can apply to a bulleted conjunction/disjunction, e.g.
-            //   ~ /\ A /\ B
-            if ((self.current.kind == .and_op or self.current.kind == .or_op) and
-                !self.has_active_list_col(self.current.col))
-            {
-                const op: ast.BinaryOp = if (self.current.kind == .and_op) .and_op else .or_op;
-                const operand = try self.parse_item_list(op, false);
-                return try self.expr_unary(.not, operand);
-            }
-            return try self.expr_unary(.not, try self.parse_unary());
+            return try self.expr_unary(.not, try self.parse_prefix_operand());
         }
         if (self.match(.minus)) return try self.expr_unary(.neg, try self.parse_unary());
         if (self.match(.keyword_subset)) return try self.expr_unary(.subset, try self.parse_unary());
@@ -1631,9 +1622,24 @@ pub const Parser = struct {
         if (self.match(.keyword_domain)) return try self.expr_unary(.domain, try self.parse_unary());
         if (self.current.kind == .ident and std.mem.eql(u8, self.current.text, "ENABLED")) {
             self.advance();
-            return try self.expr_unary(.enabled, try self.parse_unary());
+            return try self.expr_unary(.enabled, try self.parse_prefix_operand());
         }
         return try self.parse_primary();
+    }
+
+    fn parse_prefix_operand(self: *Parser) !*ast.Expr {
+        // Prefix operators can apply to a bulleted conjunction/disjunction,
+        // even though the first bullet is otherwise an infix token.
+        if ((self.current.kind == .and_op or self.current.kind == .or_op) and
+            !self.has_active_list_col(self.current.col))
+        {
+            const op: ast.BinaryOp = if (self.current.kind == .and_op)
+                .and_op
+            else
+                .or_op;
+            return self.parse_item_list(op, false);
+        }
+        return self.parse_unary();
     }
 
     fn parse_primary(self: *Parser) anyerror!*ast.Expr {
@@ -1697,7 +1703,9 @@ pub const Parser = struct {
                 if (self.next.kind == .rbracket) {
                     self.advance();
                     self.advance();
-                    const operand = try self.parse_expr();
+                    // TLC assigns [] prefix precedence 40..150. A following
+                    // conjunction is outside the temporal operand.
+                    const operand = try self.parse_prefix_operand();
                     const u = try self.arena.alloc(ast.Unary, 1);
                     u[0] = .{ .op = .temporal_box, .operand = operand };
                     const ptr = try self.arena.alloc(ast.Expr, 1);
@@ -1734,7 +1742,8 @@ pub const Parser = struct {
             .keyword_lambda => return try self.parse_lambda(),
             .diamond => {
                 self.advance();
-                const operand = try self.parse_expr();
+                // TLC assigns <> the same prefix precedence as [].
+                const operand = try self.parse_prefix_operand();
                 const u = try self.arena.alloc(ast.Unary, 1);
                 u[0] = .{ .op = .temporal_diamond, .operand = operand };
                 const ptr = try self.arena.alloc(ast.Expr, 1);

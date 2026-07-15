@@ -942,7 +942,17 @@ pub const Checker = struct {
             break :blk try expr_ident(arena, fallback);
         };
 
-        if ((init_name_v == null) != (next_expr_v == null)) return Error.ConfigError;
+        if ((init_name_v == null) != (next_expr_v == null)) {
+            std.debug.print(
+                "configuration behavior is incomplete: specification={s} init={s} next_present={}\n",
+                .{
+                    spec_name_v orelse "<none>",
+                    init_name_v orelse "<none>",
+                    next_expr_v != null,
+                },
+            );
+            return Error.ConfigError;
+        }
         const compiled_init: ?action.CompiledInit = if (init_name_v) |name| blk: {
             const resolved_name = evaluator.resolve_alias(name);
             const init_def = evaluator.find_definition(resolved_name) orelse {

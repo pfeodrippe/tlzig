@@ -109,7 +109,7 @@ the long rows, including:
 | RC/no-prepare-block exhaustive | 17,057,584 | 172.084s | 86.18s | 2.00x |
 | RC/no-prepare-block-or-ww exhaustive | 18,764,120 | 191.966s | 91.94s | 2.09x |
 | RC/with-prepare-block exhaustive | 15,738,792 | 155.452s | 75.65s | 2.05x |
-| RC/snapshot exhaustive | 67,629,092 | 669.976s | 328.100s | 2.042x |
+| RC/snapshot exhaustive | 67,629,092 | 669.976s | 318.628s | 2.103x |
 | SingleLog MCMDBProps | 269,881 | 1,434.504s | 99.42s | 14.4x |
 | SingleShardTxn ShardTxn | 5,502,547 | 179.117s | 24.286s | 7.38x |
 
@@ -124,21 +124,23 @@ The RC/snapshot entry was refreshed on 2026-07-14 after generic ABI-2 generated
 expression and bounded-state-trail changes. The strict generated model reported
 `67` operators and `fallback_count = 0`; the all-core ReleaseFast run again
 completed exact `405,005,930/67,629,092` generated/distinct parity in
-`328.100s`, with `57.138T` retired instructions and `26,281,590,784` bytes peak
-RSS. This is `1.020x` faster than the immediately preceding `334.557s` tlzig
-run and `2.042x` faster than the retained exact TLC baseline. No Java process
+`318.628s`, with `54.658T` retired instructions and `29,406,117,888` bytes peak
+RSS. This is `1.030x` faster than the immediately preceding `328.100s` tlzig
+run and `2.103x` faster than the retained exact TLC baseline. Peak RSS was
+11.9% above the preceding exact observation while capped-probe RSS was
+unchanged; memory remains an explicit follow-up measurement. No Java process
 was rerun for this tlzig-only AOT gate.
 
 The default ReleaseFast benchmark keeps heavy exhaustive rows opt-in. The base
 runner skips generated-preferred models; each strict zero-fallback AOT row runs
 TLC-auto once and tlzig-AOT-auto once in the same comparison, so there is no
 interpreted tlzig duplicate and no dependency on an untracked baseline file.
-The latest completed run passed all `56/56` build steps in `170.66s`, including
+The latest completed run passed all `56/56` build steps in `160.18s`, including
 generation and compilation. TLC-auto versus tlzig-AOT-auto was ClientCentric
-`2.503s` vs `1.141s`, Storage `1.471s` vs `0.197s`, RC/snapshot `2.278s` vs
-`0.256s`, SingleShardTxn/small `2.628s` vs `0.099s`, SingleLog
-MDBLinearizability `2.037s` vs `0.761s`, MCBinarySearch `2.229s` vs `0.855s`,
-and Slush Medium `23.267s` vs `16.031s`. Completed rows retain exact distinct
+`2.375s` vs `1.092s`, Storage `1.357s` vs `0.208s`, RC/snapshot `2.337s` vs
+`0.219s`, SingleShardTxn/small `2.471s` vs `0.106s`, SingleLog
+MDBLinearizability `2.030s` vs `0.746s`, MCBinarySearch `2.043s` vs `0.710s`,
+and Slush Medium `22.788s` vs `16.717s`. Completed rows retain exact distinct
 counts. Configured first-error rows compare semantic outcome because parallel
 frontier order can reach different valid witnesses and partial state counts.
 

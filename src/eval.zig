@@ -527,7 +527,7 @@ const ContextPool = struct {
         return @as(u64, state_count) << 32 | local;
     }
 
-    fn extend_state(
+    inline fn extend_state(
         self: *ContextPool,
         context: Context,
         name: []const u8,
@@ -572,7 +572,7 @@ const ContextPool = struct {
         };
     }
 
-    fn extend_local(
+    inline fn extend_local(
         self: *ContextPool,
         context: Context,
         name: []const u8,
@@ -7652,7 +7652,15 @@ test "state context trail restores bounded slots" {
         null,
         .changed,
     );
-    const x_mark = contexts.snapshot();
+    try std.testing.expectError(Error.TypeError, contexts.extend_state(
+        x_context,
+        "x",
+        0,
+        .{ .int_v = 8 },
+        null,
+        .changed,
+    ));
+    const previous_floor = contexts.pin();
     const xy_context = try contexts.extend_state(
         x_context,
         "y",
@@ -7665,11 +7673,12 @@ test "state context trail restores bounded slots" {
     try std.testing.expectEqual(Value{ .int_v = 7 }, xy_context.lookup_state(0).?.value);
     try std.testing.expectEqual(Value{ .int_v = 11 }, xy_context.lookup_state(1).?.value);
 
-    contexts.restore(x_mark);
+    contexts.restore(root);
     try std.testing.expectEqual(@as(u8, 1), x_context.state.?.count);
     try std.testing.expectEqual(Value{ .int_v = 7 }, x_context.lookup_state(0).?.value);
     try std.testing.expectEqual(@as(?StateContextValue, null), x_context.lookup_state(1));
 
+    contexts.unpin(previous_floor);
     contexts.restore(root);
     try std.testing.expectEqual(@as(u8, 0), x_context.state.?.count);
     try std.testing.expectEqual(@as(?StateContextValue, null), x_context.lookup_state(0));

@@ -48,6 +48,7 @@ pub const CallContext = struct {
     partial_values: []const Value,
     partial_value_pools: []const ?*const ValuePool,
     read_primed: bool,
+    enabled_result: ?bool = null,
     constants: []const NamedValue,
     constant_slots: []const ?Value,
     generated_cache: []?Value,
@@ -57,12 +58,22 @@ pub const CallContext = struct {
     memo_context: ?*const anyopaque = null,
     cached_call: ?CachedCall = null,
     put_cached_call: ?PutCachedCall = null,
+    cached_stable_call: ?CachedCall = null,
+    put_cached_stable_call: ?PutCachedCall = null,
     native_context: *const anyopaque,
     native_call: NativeCall,
     max_seq_len: u32,
     materialized_variable_cache: [8]MaterializedVariableCacheEntry = undefined,
     materialized_variable_cache_mask: u8 = 0,
 };
+
+pub inline fn enabled_bool(context: *const CallContext) bool {
+    return context.enabled_result orelse true;
+}
+
+pub inline fn enabled(context: *const CallContext) Value {
+    return .{ .bool_v = enabled_bool(context) };
+}
 
 const MaterializedVariableCacheEntry = struct {
     value: Value,
@@ -110,11 +121,60 @@ pub fn put_cached_recursive_call(
     return result;
 }
 
+pub fn cached_stable_call(
+    context: *CallContext,
+    name: []const u8,
+    args: []const Value,
+) Error!?Value {
+    const callback = context.cached_stable_call orelse return null;
+    return callback(
+        context.memo_context orelse return null,
+        name,
+        args,
+        context.eval_pool,
+        context.state,
+        context.next_state,
+    );
+}
+
+pub fn put_cached_stable_call(
+    context: *CallContext,
+    name: []const u8,
+    args: []const Value,
+    result: Value,
+) Error!Value {
+    if (context.put_cached_stable_call) |callback| {
+        if (context.memo_context) |memo_context| {
+            try callback(
+                memo_context,
+                name,
+                args,
+                result,
+                context.eval_pool,
+                context.state,
+                context.next_state,
+            );
+        }
+    }
+    return result;
+}
+
 pub const OperatorFn = *const fn (*CallContext, []const Value) Error!Value;
 pub const OperatorBoolFn = *const fn (*CallContext, []const Value) Error!bool;
 
 pub const PathKey = union(enum) {
     value: Value,
+    field: []const u8,
+};
+
+pub const ResolvedPath = struct {
+    value: Value,
+    source_pool: *const ValuePool,
+};
+
+pub const FilterPathKey = union(enum) {
+    argument: u8,
+    bound,
     field: []const u8,
 };
 
@@ -126,6 +186,7 @@ pub const QuantifierKind = enum {
 pub const LetDefinition = struct {
     function: OperatorFn,
     arity: u16,
+    recursive: bool = false,
 };
 
 pub const Operator = struct {
@@ -332,11 +393,7 @@ pub fn variable_member_bool(
     else
         try resolve_current_variable(context, index, &source_pool);
     if (!set_value.is_set_like()) return Error.TypeError;
-    return set_value.member_cross_pool(
-        context.eval_pool,
-        value,
-        source_pool,
-    );
+    return member_cross_pool(context, set_value, value, source_pool);
 }
 
 pub fn variable_not_member_bool(
@@ -597,10 +654,23 @@ pub fn constant_at(
     index: u32,
 ) Error!Value {
     if (index >= context.constant_slots.len) {
+        if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            std.debug.print(
+                "generated constant slot out of bounds: index={d} slots={d}\n",
+                .{ index, context.constant_slots.len },
+            );
+        }
         return Error.UndefinedSymbol;
     }
-    const value = context.constant_slots[index] orelse
+    const value = context.constant_slots[index] orelse {
+        if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            std.debug.print(
+                "generated constant slot is unset: index={d} slots={d}\n",
+                .{ index, context.constant_slots.len },
+            );
+        }
         return Error.UndefinedSymbol;
+    };
     return value.clone(context.state_pool, context.eval_pool);
 }
 
@@ -876,6 +946,30 @@ pub fn native_binary(
     return native(context, name, &args);
 }
 
+pub fn is_finite_set(
+    _: *CallContext,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 1) return Error.TypeError;
+    return .{ .bool_v = is_finite_set_bool(args[0]) };
+}
+
+pub inline fn is_finite_set_bool(_: Value) bool {
+    return true;
+}
+
+pub fn constant_is_finite_set_at(
+    context: *CallContext,
+    index: u32,
+) Error!bool {
+    if (index >= context.constant_slots.len or
+        context.constant_slots[index] == null)
+    {
+        return Error.UndefinedSymbol;
+    }
+    return true;
+}
+
 pub fn operator(
     context: *CallContext,
     function: OperatorFn,
@@ -900,6 +994,157 @@ pub fn operator(
         ),
         .captured_len = @intCast(captured.len),
     } };
+}
+
+fn StateReference(
+    comptime variable_index: u32,
+    comptime primed: bool,
+) type {
+    return struct {
+        fn resolve(
+            context: *CallContext,
+            args: []const Value,
+        ) Error!Value {
+            std.debug.assert(args.len == 0);
+            return if (primed)
+                primed_variable(context, variable_index)
+            else
+                variable(context, variable_index);
+        }
+    };
+}
+
+pub fn state_reference(
+    variable_index: u32,
+    primed: bool,
+) Error!Value {
+    if (variable_index >= 64) return Error.TypeError;
+    const function: OperatorFn = switch (variable_index) {
+        inline 0...63 => |index| if (primed)
+            StateReference(index, true).resolve
+        else
+            StateReference(index, false).resolve,
+        else => unreachable,
+    };
+    return .{ .generated_operator_v = .{
+        .function_address = @intFromPtr(function),
+        .arity = 0,
+        .captured_offset = 0,
+        .captured_len = 0,
+    } };
+}
+
+pub fn state_path_operator(
+    context: *CallContext,
+    variable_index: u32,
+    prefix_keys: []const Value,
+    arity: u16,
+) Error!Value {
+    if (variable_index >= 64 or arity == 0) return Error.TypeError;
+    if (prefix_keys.len + 3 + arity > 64) return Error.NotImplemented;
+    var captures: [64]Value = undefined;
+    captures[0] = .{ .int_v = variable_index };
+    captures[1] = .{ .int_v = @intCast(prefix_keys.len) };
+    captures[2] = .{ .int_v = arity };
+    @memcpy(captures[3..][0..prefix_keys.len], prefix_keys);
+    return operator(
+        context,
+        state_path_operator_call,
+        arity,
+        captures[0 .. prefix_keys.len + 3],
+    );
+}
+
+fn state_path_operator_call(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const result = try resolve_state_path_operator_call(
+        context,
+        args,
+        &source_pool,
+    );
+    return result.clone(source_pool, context.eval_pool);
+}
+
+fn resolve_state_path_operator_call(
+    context: *CallContext,
+    args: []const Value,
+    source_pool: **const ValuePool,
+) Error!Value {
+    if (args.len < 4) return Error.TypeError;
+    const variable_index = args[0].as_int() orelse return Error.TypeError;
+    const prefix_count = args[1].as_int() orelse return Error.TypeError;
+    const arity = args[2].as_int() orelse return Error.TypeError;
+    if (variable_index < 0 or variable_index >= 64 or
+        prefix_count < 0 or arity <= 0)
+    {
+        return Error.TypeError;
+    }
+    const prefix_len: usize = @intCast(prefix_count);
+    const call_arity: usize = @intCast(arity);
+    if (args.len != 3 + prefix_len + call_arity) {
+        return Error.TypeError;
+    }
+
+    var keys: [64]Value = undefined;
+    @memcpy(keys[0..prefix_len], args[3..][0..prefix_len]);
+    const call_args = args[3 + prefix_len ..];
+    keys[prefix_len] = if (call_args.len == 1)
+        call_args[0]
+    else
+        try tuple(context, call_args);
+
+    return resolve_path(
+        context,
+        @intCast(variable_index),
+        keys[0 .. prefix_len + 1],
+        source_pool,
+    );
+}
+
+pub fn arguments_contain_state_path_operator(
+    args: []const Value,
+) bool {
+    const path_operator_address = @intFromPtr(
+        @as(OperatorFn, state_path_operator_call),
+    );
+    for (args) |argument| {
+        if (argument == .generated_operator_v and
+            argument.generated_operator_v.function_address ==
+                path_operator_address)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn recursive_operator(
+    context: *CallContext,
+    function: OperatorFn,
+    arity: u16,
+    captures: []const Value,
+) Error!Value {
+    if (captures.len >= std.math.maxInt(u16)) return Error.NotImplemented;
+    const source_offset = pool_slice_offset(context.eval_pool, captures);
+    const captured = try context.eval_pool.alloc_values(
+        @intCast(captures.len + 1),
+    );
+    const source = if (source_offset) |offset|
+        context.eval_pool.values[offset..][0..captures.len]
+    else
+        captures;
+    @memcpy(captured[0..captures.len], source);
+    const result = Value{ .generated_operator_v = .{
+        .function_address = @intFromPtr(function),
+        .arity = arity,
+        .captured_offset = value_offset(context.eval_pool, captured.ptr),
+        .captured_len = @intCast(captured.len),
+    } };
+    captured[captures.len] = result;
+    return result;
 }
 
 pub fn call(
@@ -955,18 +1200,94 @@ pub fn field(
     name: []const u8,
 ) Error!Value {
     if (record_value == .generated_operator_v) {
-        if (record_value.generated_operator_v.arity != 0) return Error.TypeError;
-        return try field(context, try call(context, record_value, &.{}), name);
+        if (record_value.generated_operator_v.arity != 0) {
+            return Error.TypeError;
+        }
+        return field(context, try call(context, record_value, &.{}), name);
     }
+    return record_field(context.eval_pool, record_value, name);
+}
+
+pub inline fn call_field(
+    context: *CallContext,
+    function: Value,
+    args: []const Value,
+    name: []const u8,
+) Error!Value {
+    return call_field_path(context, function, args, &.{name});
+}
+
+pub inline fn call_field_path(
+    context: *CallContext,
+    function: Value,
+    args: []const Value,
+    names: []const []const u8,
+) Error!Value {
+    std.debug.assert(names.len > 0);
+    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);
+    if (function == .generated_operator_v and
+        function.generated_operator_v.function_address ==
+            @intFromPtr(@as(OperatorFn, state_path_operator_call)))
+    {
+        const operator_value = function.generated_operator_v;
+        if (args.len != operator_value.arity) return Error.TypeError;
+        if (operator_value.captured_len + args.len > 64) {
+            return Error.NotImplemented;
+        }
+        const captured = context.eval_pool.values[operator_value.captured_offset..][0..operator_value.captured_len];
+        var combined: [64]Value = undefined;
+        @memcpy(combined[0..captured.len], captured);
+        @memcpy(combined[captured.len..][0..args.len], args);
+
+        var source_pool: *const ValuePool = context.eval_pool;
+        var value = try resolve_state_path_operator_call(
+            context,
+            combined[0 .. captured.len + args.len],
+            &source_pool,
+        );
+        for (names) |name| {
+            value = try record_field(source_pool, value, name);
+        }
+        return value.clone(source_pool, context.eval_pool);
+    }
+
+    var value = try call(context, function, args);
+    for (names) |name| {
+        value = try record_field(context.eval_pool, value, name);
+    }
+    return value;
+}
+
+inline fn record_field(
+    pool: *const ValuePool,
+    record_value: Value,
+    name: []const u8,
+) Error!Value {
     if (record_value != .record_v) return Error.TypeError;
-    const fields = record_value.record_v.fields(context.eval_pool);
+    const fields = record_value.record_v.fields(pool);
     var index: u32 = 0;
     while (index < record_value.record_v.len) : (index += 1) {
+        const field_name = fields[index * 2];
+        if (field_name != .string_v) return Error.TypeError;
         if (std.mem.eql(
             u8,
-            fields[index * 2].string_v.slice(context.eval_pool),
+            field_name.string_v.slice(pool),
             name,
         )) return fields[index * 2 + 1];
+    }
+    if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+        std.debug.print(
+            "generated record field is missing: requested={s} fields=",
+            .{name},
+        );
+        for (0..record_value.record_v.len) |field_index| {
+            if (field_index != 0) std.debug.print(",", .{});
+            std.debug.print(
+                "{s}",
+                .{fields[field_index * 2].string_v.slice(pool)},
+            );
+        }
+        std.debug.print("\n", .{});
     }
     return Error.UndefinedSymbol;
 }
@@ -1019,6 +1340,53 @@ pub fn variable_path_boolean(
     const value = try resolve_path(context, index, keys, &source_pool);
     if (value != .bool_v) return Error.TypeError;
     return value.bool_v;
+}
+
+pub fn variable_path_literal_string(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    literal: []const u8,
+) Error!Value {
+    const resolved = try resolve_path_literal_string(
+        context,
+        index,
+        keys,
+        literal,
+    );
+    return resolved.value.clone(resolved.source_pool, context.eval_pool);
+}
+
+pub fn variable_path_literal_string_boolean(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    literal: []const u8,
+) Error!bool {
+    const resolved = try resolve_path_literal_string(
+        context,
+        index,
+        keys,
+        literal,
+    );
+    if (resolved.value != .bool_v) return Error.TypeError;
+    return resolved.value.bool_v;
+}
+
+inline fn resolve_path_literal_string(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    literal: []const u8,
+) Error!ResolvedPath {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const parent = try resolve_path(context, index, keys, &source_pool);
+    const value = try apply_literal_string_cross_pool(
+        parent,
+        source_pool,
+        literal,
+    );
+    return .{ .value = value, .source_pool = source_pool };
 }
 
 pub const CompareOp = enum {
@@ -1075,6 +1443,80 @@ pub fn variable_path_not_equal_bool(
     return !try variable_path_equal_bool(context, index, keys, rhs);
 }
 
+pub fn variable_path_literal_string_equal_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    literal: []const u8,
+    rhs: Value,
+) Error!bool {
+    const resolved = try resolve_path_literal_string(
+        context,
+        index,
+        keys,
+        literal,
+    );
+    return Value.eql_cross_pool(
+        resolved.value,
+        resolved.source_pool,
+        rhs,
+        context.eval_pool,
+    );
+}
+
+pub fn variable_path_literal_string_not_equal_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    literal: []const u8,
+    rhs: Value,
+) Error!bool {
+    return !try variable_path_literal_string_equal_bool(
+        context,
+        index,
+        keys,
+        literal,
+        rhs,
+    );
+}
+
+pub fn variable_path_literal_string_equal_string_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    literal: []const u8,
+    rhs_literal: []const u8,
+) Error!bool {
+    const resolved = try resolve_path_literal_string(
+        context,
+        index,
+        keys,
+        literal,
+    );
+    if (resolved.value != .string_v) return false;
+    return std.mem.eql(
+        u8,
+        resolved.value.string_v.slice(resolved.source_pool),
+        rhs_literal,
+    );
+}
+
+pub fn variable_path_literal_string_not_equal_string_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    literal: []const u8,
+    rhs_literal: []const u8,
+) Error!bool {
+    return !try variable_path_literal_string_equal_string_bool(
+        context,
+        index,
+        keys,
+        literal,
+        rhs_literal,
+    );
+}
+
 pub fn variable_path_member_bool(
     context: *CallContext,
     index: u32,
@@ -1105,6 +1547,43 @@ pub fn variable_path_not_member_bool(
     );
 }
 
+pub fn variable_path_literal_string_member_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    literal: []const u8,
+    element: Value,
+) Error!bool {
+    const resolved = try resolve_path_literal_string(
+        context,
+        index,
+        keys,
+        literal,
+    );
+    return set_member_cross_pool(
+        resolved.value,
+        resolved.source_pool,
+        element,
+        context.eval_pool,
+    );
+}
+
+pub fn variable_path_literal_string_not_member_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    literal: []const u8,
+    element: Value,
+) Error!bool {
+    return !try variable_path_literal_string_member_bool(
+        context,
+        index,
+        keys,
+        literal,
+        element,
+    );
+}
+
 pub fn variable_path_field_equal_bool(
     context: *CallContext,
     index: u32,
@@ -1120,6 +1599,274 @@ pub fn variable_path_field_equal_bool(
     return Value.eql_cross_pool(
         field_value,
         source_pool,
+        rhs,
+        context.eval_pool,
+    );
+}
+
+fn domain_contains_string_literal(
+    context: *CallContext,
+    value: Value,
+    source_pool: *const ValuePool,
+    literal: []const u8,
+) Error!bool {
+    return switch (value) {
+        .generated_operator_v => |operator_value| blk: {
+            if (operator_value.arity != 0 or source_pool != context.eval_pool) {
+                return Error.TypeError;
+            }
+            break :blk try domain_contains_string_literal(
+                context,
+                try call(context, value, &.{}),
+                context.eval_pool,
+                literal,
+            );
+        },
+        .function_v => |function| blk: {
+            for (function.domain.items(source_pool)) |key| {
+                if (key == .string_v and std.mem.eql(
+                    u8,
+                    key.string_v.slice(source_pool),
+                    literal,
+                )) break :blk true;
+            }
+            break :blk false;
+        },
+        .tuple_v => false,
+        .record_v => |record_value| record_value.lookup(
+            source_pool,
+            literal,
+        ) != null,
+        else => Error.TypeError,
+    };
+}
+
+fn domain_member_cross_pool(
+    context: *CallContext,
+    value: Value,
+    source_pool: *const ValuePool,
+    element: Value,
+    element_pool: *const ValuePool,
+) Error!bool {
+    return switch (value) {
+        .generated_operator_v => |operator_value| blk: {
+            if (operator_value.arity != 0 or source_pool != context.eval_pool) {
+                return Error.TypeError;
+            }
+            break :blk try domain_member_cross_pool(
+                context,
+                try call(context, value, &.{}),
+                context.eval_pool,
+                element,
+                element_pool,
+            );
+        },
+        .function_v => |function| set_member_cross_pool(
+            .{ .set_v = function.domain },
+            source_pool,
+            element,
+            element_pool,
+        ),
+        .tuple_v => |tuple_value| blk: {
+            const index = element.as_int() orelse break :blk false;
+            break :blk index >= 1 and index <= tuple_value.len;
+        },
+        .record_v => |record_value| blk: {
+            if (element != .string_v) break :blk false;
+            break :blk record_value.lookup(
+                source_pool,
+                element.string_v.slice(element_pool),
+            ) != null;
+        },
+        else => Error.TypeError,
+    };
+}
+
+pub fn resolve_variable_path(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+) Error!ResolvedPath {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const value = try resolve_path(context, index, keys, &source_pool);
+    return .{ .value = value, .source_pool = source_pool };
+}
+
+pub fn resolved_path_field(
+    context: *CallContext,
+    resolved: ResolvedPath,
+    field_name: []const u8,
+) Error!Value {
+    if (resolved.value != .record_v) return Error.TypeError;
+    const field_value = resolved.value.record_v.lookup(
+        resolved.source_pool,
+        field_name,
+    ) orelse return Error.UndefinedSymbol;
+    return field_value.clone(resolved.source_pool, context.eval_pool);
+}
+
+pub fn resolved_path_field_domain_member_bool(
+    context: *CallContext,
+    resolved: ResolvedPath,
+    field_name: []const u8,
+    element: Value,
+) Error!bool {
+    if (resolved.value != .record_v) return Error.TypeError;
+    const field_value = resolved.value.record_v.lookup(
+        resolved.source_pool,
+        field_name,
+    ) orelse return Error.UndefinedSymbol;
+    return domain_member_cross_pool(
+        context,
+        field_value,
+        resolved.source_pool,
+        element,
+        context.eval_pool,
+    );
+}
+
+pub fn resolved_path_field_domain_not_member_bool(
+    context: *CallContext,
+    resolved: ResolvedPath,
+    field_name: []const u8,
+    element: Value,
+) Error!bool {
+    return !try resolved_path_field_domain_member_bool(
+        context,
+        resolved,
+        field_name,
+        element,
+    );
+}
+
+pub fn variable_path_domain_member_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    element: Value,
+) Error!bool {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const value = try resolve_path(context, index, keys, &source_pool);
+    return domain_member_cross_pool(
+        context,
+        value,
+        source_pool,
+        element,
+        context.eval_pool,
+    );
+}
+
+pub fn variable_path_domain_not_member_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    element: Value,
+) Error!bool {
+    return !try variable_path_domain_member_bool(
+        context,
+        index,
+        keys,
+        element,
+    );
+}
+
+pub fn variable_path_field_domain_member_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    field_name: []const u8,
+    element: Value,
+) Error!bool {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const value = try resolve_path(context, index, keys, &source_pool);
+    if (value != .record_v) return Error.TypeError;
+    const field_value = value.record_v.lookup(source_pool, field_name) orelse
+        return Error.UndefinedSymbol;
+    return domain_member_cross_pool(
+        context,
+        field_value,
+        source_pool,
+        element,
+        context.eval_pool,
+    );
+}
+
+pub fn variable_path_field_domain_not_member_bool(
+    context: *CallContext,
+    index: u32,
+    keys: []const Value,
+    field_name: []const u8,
+    element: Value,
+) Error!bool {
+    return !try variable_path_field_domain_member_bool(
+        context,
+        index,
+        keys,
+        field_name,
+        element,
+    );
+}
+
+pub fn variable_path_domain_literal_member_field_argument_equal_bool(
+    context: *CallContext,
+    operator_args: []const Value,
+    index: u32,
+    keys: []const Value,
+    domain_literal: []const u8,
+    field_name: []const u8,
+    rhs_argument: u8,
+) Error!bool {
+    std.debug.assert(rhs_argument < operator_args.len);
+    if (rhs_argument >= operator_args.len) return Error.TypeError;
+
+    var source_pool: *const ValuePool = context.eval_pool;
+    const value = try resolve_path(context, index, keys, &source_pool);
+    if (!try domain_contains_string_literal(
+        context,
+        value,
+        source_pool,
+        domain_literal,
+    )) return false;
+
+    if (value != .record_v) return Error.TypeError;
+    const field_value = value.record_v.lookup(source_pool, field_name) orelse
+        return Error.UndefinedSymbol;
+    const rhs = try force(context, operator_args[rhs_argument]);
+    return Value.eql_cross_pool(
+        field_value,
+        source_pool,
+        rhs,
+        context.eval_pool,
+    );
+}
+
+pub fn resolved_path_domain_literal_member_field_argument_equal_bool(
+    context: *CallContext,
+    operator_args: []const Value,
+    resolved: ResolvedPath,
+    domain_literal: []const u8,
+    field_name: []const u8,
+    rhs_argument: u8,
+) Error!bool {
+    std.debug.assert(rhs_argument < operator_args.len);
+    if (rhs_argument >= operator_args.len) return Error.TypeError;
+
+    if (!try domain_contains_string_literal(
+        context,
+        resolved.value,
+        resolved.source_pool,
+        domain_literal,
+    )) return false;
+
+    if (resolved.value != .record_v) return Error.TypeError;
+    const field_value = resolved.value.record_v.lookup(
+        resolved.source_pool,
+        field_name,
+    ) orelse return Error.UndefinedSymbol;
+    const rhs = try force(context, operator_args[rhs_argument]);
+    return Value.eql_cross_pool(
+        field_value,
+        resolved.source_pool,
         rhs,
         context.eval_pool,
     );
@@ -1281,9 +2028,24 @@ fn member_cross_pool(
     value: Value,
     value_pool: *const ValuePool,
 ) Error!bool {
-    const materialized = try materialize_iterable(context, set_value);
-    if (materialized != .set_v) return Error.TypeError;
-    const items = materialized.set_v.items(context.eval_pool);
+    if (!set_value.is_set_like()) return Error.TypeError;
+    if (set_value == .power_set_v) {
+        if (!value.is_set_like()) return false;
+        return subset_cross_pool(
+            context,
+            value,
+            value_pool,
+            set_value.power_set_v.set(context.eval_pool),
+        );
+    }
+    if (set_value != .set_v) {
+        return set_value.member_cross_pool(
+            context.eval_pool,
+            value,
+            value_pool,
+        );
+    }
+    const items = set_value.set_v.items(context.eval_pool);
     if (dense_set_contains_probe(
         items,
         context.eval_pool,
@@ -1301,6 +2063,50 @@ fn member_cross_pool(
         )) return true;
     }
     return false;
+}
+
+fn subset_cross_pool(
+    context: *CallContext,
+    left: Value,
+    left_pool: *const ValuePool,
+    right: Value,
+) Error!bool {
+    std.debug.assert(left.is_set_like());
+    std.debug.assert(right.is_set_like());
+    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);
+    if (left_pool == context.eval_pool) {
+        return subset_equal_bool(context, left, right);
+    }
+    return switch (left) {
+        .set_v => |left_set| blk: {
+            for (left_set.items(left_pool)) |item| {
+                if (!right.member_cross_pool(
+                    context.eval_pool,
+                    item,
+                    left_pool,
+                )) break :blk false;
+            }
+            break :blk true;
+        },
+        .range_v => |left_range| blk: {
+            if (left_range.hi < left_range.lo) break :blk true;
+            var item = left_range.lo;
+            while (true) {
+                if (!right.member(
+                    context.eval_pool,
+                    .{ .int_v = item },
+                )) break :blk false;
+                if (item == left_range.hi) break;
+                item += 1;
+            }
+            break :blk true;
+        },
+        else => subset_equal_bool(
+            context,
+            try left.clone(left_pool, context.eval_pool),
+            right,
+        ),
+    };
 }
 
 fn set_member_cross_pool(
@@ -1351,10 +2157,15 @@ fn equal_except_update_path(
     updater: OperatorFn,
 ) Error!bool {
     if (path_index == path.len) {
+        const current_local = try localize_updater_input(
+            context,
+            current,
+            current_pool,
+        );
         const replacement = try call_bound(
             context,
             operator_args,
-            &.{current},
+            &.{current_local},
             updater,
         );
         return Value.eql_cross_pool(
@@ -1505,10 +2316,15 @@ fn equal_double_except_update_path(
     if (path_index_a) |index_a| {
         if (index_a == path_a.len) {
             if (active_b) return Error.NotImplemented;
+            const current_local = try localize_updater_input(
+                context,
+                current,
+                current_pool,
+            );
             const replacement = try call_bound(
                 context,
                 operator_args,
-                &.{current},
+                &.{current_local},
                 updater_a,
             );
             return Value.eql_cross_pool(
@@ -1522,10 +2338,15 @@ fn equal_double_except_update_path(
     if (path_index_b) |index_b| {
         if (index_b == path_b.len) {
             if (active_a) return Error.NotImplemented;
+            const current_local = try localize_updater_input(
+                context,
+                current,
+                current_pool,
+            );
             const replacement = try call_bound(
                 context,
                 operator_args,
-                &.{current},
+                &.{current_local},
                 updater_b,
             );
             return Value.eql_cross_pool(
@@ -1734,10 +2555,15 @@ fn equal_except_update_path_keys(
     std.debug.assert(path_index <= path.len);
 
     if (path_index == path.len) {
+        const current_local = try localize_updater_input(
+            context,
+            current,
+            current_pool,
+        );
         const replacement = try call_bound(
             context,
             operator_args,
-            &.{current},
+            &.{current_local},
             updater,
         );
         return Value.eql_cross_pool(
@@ -1886,10 +2712,15 @@ fn equal_double_except_update_path_keys(
         std.debug.assert(index_a <= path_a.len);
         if (index_a == path_a.len) {
             if (active_b) return Error.NotImplemented;
+            const current_local = try localize_updater_input(
+                context,
+                current,
+                current_pool,
+            );
             const replacement = try call_bound(
                 context,
                 operator_args,
-                &.{current},
+                &.{current_local},
                 updater_a,
             );
             return Value.eql_cross_pool(
@@ -1904,10 +2735,15 @@ fn equal_double_except_update_path_keys(
         std.debug.assert(index_b <= path_b.len);
         if (index_b == path_b.len) {
             if (active_a) return Error.NotImplemented;
+            const current_local = try localize_updater_input(
+                context,
+                current,
+                current_pool,
+            );
             const replacement = try call_bound(
                 context,
                 operator_args,
-                &.{current},
+                &.{current_local},
                 updater_b,
             );
             return Value.eql_cross_pool(
@@ -2100,6 +2936,15 @@ fn equal_double_except_update_path_keys(
     }
 }
 
+fn localize_updater_input(
+    context: *CallContext,
+    value: Value,
+    value_pool: *const ValuePool,
+) Error!Value {
+    if (value_pool == context.eval_pool) return value;
+    return value.clone(value_pool, context.eval_pool);
+}
+
 fn path_key_matches_value(
     key: PathKey,
     value: Value,
@@ -2146,9 +2991,7 @@ fn function_lookup_cross_pool(
     if (function_dense_entry_probe(
         keys,
         entries,
-        function_pool,
         key,
-        key_pool,
     )) |entry| {
         return entry;
     }
@@ -2179,46 +3022,13 @@ pub fn variable_path_sequence_head_field_not_equal_bool(
     );
 }
 
-fn resolve_path(
+inline fn resolve_path(
     context: *CallContext,
     index: u32,
     keys: []const Value,
     source_pool: **const ValuePool,
 ) Error!Value {
-    source_pool.* = context.eval_pool;
-    var value: Value = undefined;
-
-    if (context.read_primed) {
-        if (index < context.partial_values.len and
-            context.partial_mask & (@as(u64, 1) << @intCast(index)) != 0)
-        {
-            value = context.partial_values[index];
-            if (index < context.partial_value_pools.len) {
-                source_pool.* = context.partial_value_pools[index] orelse
-                    context.eval_pool;
-            }
-        } else if (context.next_state) |next| {
-            if (index >= next.values.len) return Error.TypeError;
-            value = next.values[index];
-            source_pool.* = next.value_pool(index, context.state_pool);
-        } else if (context.state) |current| {
-            if (index >= current.values.len) return Error.TypeError;
-            value = current.values[index];
-            source_pool.* = current.value_pool(index, context.state_pool);
-        } else {
-            return Error.TypeError;
-        }
-    } else if (context.state) |current| {
-        if (index >= current.values.len) return Error.TypeError;
-        value = current.values[index];
-        source_pool.* = current.value_pool(index, context.state_pool);
-    } else {
-        var partial_value = try current_variable(context, index);
-        for (keys) |key| partial_value = try apply(context, partial_value, key);
-        source_pool.* = context.eval_pool;
-        return partial_value;
-    }
-
+    var value = try resolve_variable(context, index, source_pool);
     for (keys) |key| {
         value = try apply_cross_pool(
             value,
@@ -2228,6 +3038,43 @@ fn resolve_path(
         );
     }
     return value;
+}
+
+fn resolve_variable(
+    context: *CallContext,
+    index: u32,
+    source_pool: **const ValuePool,
+) Error!Value {
+    source_pool.* = context.eval_pool;
+
+    if (context.read_primed) {
+        if (index < context.partial_values.len and
+            context.partial_mask & (@as(u64, 1) << @intCast(index)) != 0)
+        {
+            const value = context.partial_values[index];
+            if (index < context.partial_value_pools.len) {
+                source_pool.* = context.partial_value_pools[index] orelse
+                    context.eval_pool;
+            }
+            return value;
+        } else if (context.next_state) |next| {
+            if (index >= next.values.len) return Error.TypeError;
+            source_pool.* = next.value_pool(index, context.state_pool);
+            return next.values[index];
+        } else if (context.state) |current| {
+            if (index >= current.values.len) return Error.TypeError;
+            source_pool.* = current.value_pool(index, context.state_pool);
+            return current.values[index];
+        } else {
+            return Error.TypeError;
+        }
+    } else if (context.state) |current| {
+        if (index >= current.values.len) return Error.TypeError;
+        source_pool.* = current.value_pool(index, context.state_pool);
+        return current.values[index];
+    } else {
+        return current_variable(context, index);
+    }
 }
 
 fn sequence_head_cross_pool(
@@ -2251,7 +3098,7 @@ fn sequence_head_cross_pool(
     };
 }
 
-fn apply_cross_pool(
+inline fn apply_cross_pool(
     function: Value,
     function_pool: *const ValuePool,
     key: Value,
@@ -2265,9 +3112,7 @@ fn apply_cross_pool(
             if (function_dense_entry_probe(
                 domain_values,
                 entries,
-                function_pool,
                 key,
-                key_pool,
             )) |entry| {
                 break :blk entry;
             }
@@ -2300,12 +3145,36 @@ fn apply_cross_pool(
     };
 }
 
+inline fn apply_literal_string_cross_pool(
+    function: Value,
+    function_pool: *const ValuePool,
+    key: []const u8,
+) Error!Value {
+    return switch (function) {
+        .function_v => |function_value| blk: {
+            const keys = function_value.domain.items(function_pool);
+            const entries = function_value.entries(function_pool);
+            for (keys, entries) |candidate, entry| {
+                if (candidate == .string_v and std.mem.eql(
+                    u8,
+                    candidate.string_v.slice(function_pool),
+                    key,
+                )) break :blk entry;
+            }
+            return Error.IndexOutOfBounds;
+        },
+        .record_v => |record_value| record_value.lookup(
+            function_pool,
+            key,
+        ) orelse Error.UndefinedSymbol,
+        else => Error.TypeError,
+    };
+}
+
 fn function_dense_entry_probe(
     keys: []const Value,
     entries: []const Value,
-    function_pool: *const ValuePool,
     key: Value,
-    key_pool: *const ValuePool,
 ) ?Value {
     std.debug.assert(keys.len == entries.len);
     if (keys.len == 0) return null;
@@ -2327,10 +3196,57 @@ fn function_dense_entry_probe(
     };
     if (index >= keys.len) return null;
     const index_u: usize = @intCast(index);
-    if (!cross_pool_equal(keys[index_u], function_pool, key, key_pool)) {
-        return null;
+    switch (key) {
+        .int_v => |key_int| if (keys[index_u] != .int_v or
+            keys[index_u].int_v != key_int) return null,
+        .model_v => |key_model| if (keys[index_u] != .model_v or
+            keys[index_u].model_v != key_model) return null,
+        else => unreachable,
     }
     return entries[index_u];
+}
+
+test "dense function probe rejects holes without cross-pool dispatch" {
+    const entries = [_]Value{
+        .{ .string_v = .{ .offset = 0, .len = 0 } },
+        .{ .bool_v = true },
+    };
+    const dense_int_keys = [_]Value{
+        .{ .int_v = 1 },
+        .{ .int_v = 2 },
+    };
+    try std.testing.expectEqual(
+        entries[1],
+        function_dense_entry_probe(
+            &dense_int_keys,
+            &entries,
+            .{ .int_v = 2 },
+        ).?,
+    );
+    const sparse_int_keys = [_]Value{
+        .{ .int_v = 1 },
+        .{ .int_v = 3 },
+    };
+    try std.testing.expectEqual(
+        @as(?Value, null),
+        function_dense_entry_probe(
+            &sparse_int_keys,
+            &entries,
+            .{ .int_v = 2 },
+        ),
+    );
+    const dense_model_keys = [_]Value{
+        .{ .model_v = 7 },
+        .{ .model_v = 8 },
+    };
+    try std.testing.expectEqual(
+        entries[1],
+        function_dense_entry_probe(
+            &dense_model_keys,
+            &entries,
+            .{ .model_v = 8 },
+        ).?,
+    );
 }
 
 fn dense_set_contains_probe(
@@ -2518,8 +3434,8 @@ pub fn set_union(
     left: Value,
     right: Value,
 ) Error!Value {
-    if (contains_unmaterializable_range(context, left, 0) or
-        contains_unmaterializable_range(context, right, 0))
+    if (requires_lazy_set_operation(context, left, 0) or
+        requires_lazy_set_operation(context, right, 0))
     {
         return binary_set(context, left, right, .cup);
     }
@@ -2531,8 +3447,8 @@ pub fn set_intersection(
     left: Value,
     right: Value,
 ) Error!Value {
-    if (contains_unmaterializable_range(context, left, 0) or
-        contains_unmaterializable_range(context, right, 0))
+    if (requires_lazy_set_operation(context, left, 0) or
+        requires_lazy_set_operation(context, right, 0))
     {
         return binary_set(context, left, right, .cap);
     }
@@ -2544,15 +3460,15 @@ pub fn set_difference(
     left: Value,
     right: Value,
 ) Error!Value {
-    if (contains_unmaterializable_range(context, left, 0) or
-        contains_unmaterializable_range(context, right, 0))
+    if (requires_lazy_set_operation(context, left, 0) or
+        requires_lazy_set_operation(context, right, 0))
     {
         return binary_set(context, left, right, .diff);
     }
     return materialize_binary_set(context, left, right, .diff);
 }
 
-fn contains_unmaterializable_range(
+fn requires_lazy_set_operation(
     context: *const CallContext,
     value: Value,
     depth: u8,
@@ -2565,22 +3481,67 @@ fn contains_unmaterializable_range(
                 @as(i128, range_value.lo) + 1;
             break :blk length > std.math.maxInt(u32);
         },
+        // Record-set unions are usually consumed by membership predicates.
+        // Keeping their constructors symbolic avoids enumerating every record;
+        // iteration and cardinality materialize the union on demand.
+        .record_set_v => true,
+        .tuple_set_v => |tuple_set_value| blk: {
+            for (tuple_set_value.sets(context.eval_pool)) |component| {
+                if (requires_lazy_set_operation(
+                    context,
+                    component,
+                    depth + 1,
+                )) break :blk true;
+            }
+            break :blk false;
+        },
+        .function_set_v => |function_set_value| blk: {
+            break :blk requires_lazy_set_operation(
+                context,
+                function_set_value.domain(context.eval_pool),
+                depth + 1,
+            ) or requires_lazy_set_operation(
+                context,
+                function_set_value.codomain(context.eval_pool),
+                depth + 1,
+            );
+        },
+        // Seq(S) contains sequences of arbitrary finite length and cannot be
+        // enumerated as one finite set, even when S itself is finite.
+        .seq_set_v => true,
+        .power_set_v => |power_set_value| requires_lazy_set_operation(
+            context,
+            power_set_value.set(context.eval_pool),
+            depth + 1,
+        ),
         .cup_v, .cap_v, .diff_v => |binary| blk: {
-            break :blk contains_unmaterializable_range(
+            break :blk requires_lazy_set_operation(
                 context,
                 binary.left(context.eval_pool),
                 depth + 1,
-            ) or contains_unmaterializable_range(
+            ) or requires_lazy_set_operation(
                 context,
                 binary.right(context.eval_pool),
                 depth + 1,
             );
         },
-        .union_v => |union_value| contains_unmaterializable_range(
-            context,
-            union_value.set(context.eval_pool),
-            depth + 1,
-        ),
+        .union_v => |union_value| blk: {
+            const outer = union_value.set(context.eval_pool);
+            if (requires_lazy_set_operation(
+                context,
+                outer,
+                depth + 1,
+            )) break :blk true;
+            if (outer != .set_v) break :blk false;
+            for (outer.set_v.items(context.eval_pool)) |nested| {
+                if (nested.is_set_like() and requires_lazy_set_operation(
+                    context,
+                    nested,
+                    depth + 1,
+                )) break :blk true;
+            }
+            break :blk false;
+        },
         else => false,
     };
 }
@@ -4456,23 +5417,280 @@ pub fn filter_at(
         );
         if (try boolean(result)) {
             const accepted_values = context.eval_pool.values[accepted_offset..][0..count];
-            var duplicate = false;
-            for (accepted_values[0..accepted_count]) |existing| {
-                if (existing.eql(candidate, context.eval_pool)) {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if (!duplicate) {
-                accepted_values[accepted_count] = candidate;
-                accepted_count += 1;
-            }
+            accepted_values[accepted_count] = candidate;
+            accepted_count += 1;
+            std.debug.assert(accepted_count <= count);
         }
     }
     return .{ .set_v = .{
         .offset = accepted_offset,
         .len = accepted_count,
     } };
+}
+
+pub fn filter_variable_path_boolean(
+    context: *CallContext,
+    operator_args: []const Value,
+    domain_value: Value,
+    variable_index: u32,
+    path: []const FilterPathKey,
+) Error!Value {
+    var bound_index: ?usize = null;
+    for (path, 0..) |key, index| {
+        switch (key) {
+            .argument => |argument_index| {
+                if (argument_index >= operator_args.len) return Error.TypeError;
+            },
+            .bound => {
+                if (bound_index != null) return Error.TypeError;
+                bound_index = index;
+            },
+            .field => {},
+        }
+    }
+    const candidate_path_index = bound_index orelse return Error.TypeError;
+
+    var source_pool: *const ValuePool = context.eval_pool;
+    var prefix = try resolve_variable(
+        context,
+        variable_index,
+        &source_pool,
+    );
+    for (path[0..candidate_path_index]) |key| {
+        prefix = switch (key) {
+            .argument => |argument_index| try apply_cross_pool(
+                prefix,
+                source_pool,
+                try force(context, operator_args[argument_index]),
+                context.eval_pool,
+            ),
+            .field => |field_name| try apply_literal_string_cross_pool(
+                prefix,
+                source_pool,
+                field_name,
+            ),
+            .bound => unreachable,
+        };
+    }
+
+    const iterable = try iterable_for_iteration(context, domain_value);
+    const count = try iterable_count(iterable);
+    const accepted = try context.eval_pool.alloc_values(count);
+    const accepted_offset = value_offset(context.eval_pool, accepted.ptr);
+    var accepted_count: u32 = 0;
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const candidate = try iterable_value(context, iterable, index);
+        var value = try apply_cross_pool(
+            prefix,
+            source_pool,
+            candidate,
+            context.eval_pool,
+        );
+        for (path[candidate_path_index + 1 ..]) |key| {
+            value = switch (key) {
+                .field => |field_name| try apply_literal_string_cross_pool(
+                    value,
+                    source_pool,
+                    field_name,
+                ),
+                .argument, .bound => return Error.TypeError,
+            };
+        }
+        if (value != .bool_v) return Error.TypeError;
+        if (value.bool_v) {
+            const accepted_values = context.eval_pool.values[accepted_offset..][0..count];
+            accepted_values[accepted_count] = candidate;
+            accepted_count += 1;
+            std.debug.assert(accepted_count <= count);
+        }
+    }
+    return .{ .set_v = .{
+        .offset = accepted_offset,
+        .len = accepted_count,
+    } };
+}
+
+/// Computes the structurally recognized recursive relation closure without
+/// callbacks, temporary tuples, or one allocation per recursion level.
+pub fn relation_descendants(
+    context: *CallContext,
+    vertices_value: Value,
+    edges_value: Value,
+    initial_frontier_value: Value,
+) Error!Value {
+    const vertices = try materialize_iterable(context, vertices_value);
+    const edges = try materialize_iterable(context, edges_value);
+    const initial_frontier = try materialize_iterable(
+        context,
+        initial_frontier_value,
+    );
+    std.debug.assert(vertices == .set_v);
+    std.debug.assert(edges == .set_v);
+    std.debug.assert(initial_frontier == .set_v);
+
+    const vertices_count = vertices.set_v.len;
+    const frontier_cap = @max(vertices_count, initial_frontier.set_v.len);
+    const result_values = try context.eval_pool.alloc_values(vertices_count);
+    const result_offset = value_offset(context.eval_pool, result_values.ptr);
+    const frontier_a_values = try context.eval_pool.alloc_values(frontier_cap);
+    const frontier_a_offset = value_offset(
+        context.eval_pool,
+        frontier_a_values.ptr,
+    );
+    const frontier_b_values = try context.eval_pool.alloc_values(frontier_cap);
+    const frontier_b_offset = value_offset(
+        context.eval_pool,
+        frontier_b_values.ptr,
+    );
+    std.debug.assert(result_offset + vertices_count <= context.eval_pool.value_count);
+    std.debug.assert(frontier_a_offset + frontier_cap <= context.eval_pool.value_count);
+    std.debug.assert(frontier_b_offset + frontier_cap <= context.eval_pool.value_count);
+
+    @memcpy(
+        context.eval_pool.values[frontier_a_offset..][0..initial_frontier.set_v.len],
+        initial_frontier.set_v.items(context.eval_pool),
+    );
+    var frontier_offset = frontier_a_offset;
+    var next_offset = frontier_b_offset;
+    var frontier_count = initial_frontier.set_v.len;
+    var result_count: u32 = 0;
+
+    while (frontier_count > 0) {
+        const frontier = Set{
+            .offset = frontier_offset,
+            .len = frontier_count,
+        };
+        var next_count: u32 = 0;
+        for (vertices.set_v.items(context.eval_pool)) |candidate| {
+            var reachable = false;
+            for (edges.set_v.items(context.eval_pool)) |edge| {
+                const pair = relation_pair(context.eval_pool, edge) orelse
+                    continue;
+                if (pair[1].eql(candidate, context.eval_pool) and
+                    frontier.contains(context.eval_pool, pair[0]))
+                {
+                    reachable = true;
+                    break;
+                }
+            }
+            if (!reachable) continue;
+
+            context.eval_pool.values[next_offset + next_count] = candidate;
+            next_count += 1;
+            std.debug.assert(next_count <= vertices_count);
+
+            const result = Set{
+                .offset = result_offset,
+                .len = result_count,
+            };
+            if (!result.contains(context.eval_pool, candidate)) {
+                context.eval_pool.values[result_offset + result_count] = candidate;
+                result_count += 1;
+                std.debug.assert(result_count <= vertices_count);
+            }
+        }
+        const old_frontier_offset = frontier_offset;
+        frontier_offset = next_offset;
+        next_offset = old_frontier_offset;
+        frontier_count = next_count;
+    }
+    return .{ .set_v = .{
+        .offset = result_offset,
+        .len = result_count,
+    } };
+}
+
+fn relation_pair(pool: *const ValuePool, value: Value) ?[2]Value {
+    return switch (value) {
+        .tuple_v => |tuple_value| blk: {
+            if (tuple_value.len != 2) break :blk null;
+            const items = tuple_value.items(pool);
+            break :blk .{ items[0], items[1] };
+        },
+        .function_v => |function_value| blk: {
+            if (function_value.len != 2) break :blk null;
+            const first = function_value.apply(pool, .{ .int_v = 1 }) orelse
+                break :blk null;
+            const second = function_value.apply(pool, .{ .int_v = 2 }) orelse
+                break :blk null;
+            break :blk .{ first, second };
+        },
+        else => null,
+    };
+}
+
+test "relation descendants uses iterative breadth-first set semantics" {
+    const Arena = @import("arena.zig").Arena;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 128, 64);
+    var models = try ModelTable.init(&arena, 4);
+    var generated_cache = [_]?Value{};
+    var context = CallContext{
+        .eval_pool = &pool,
+        .state_pool = &pool,
+        .state = null,
+        .next_state = null,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &pool,
+        .generated_cache_frozen = false,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+
+    const edge_12 = try tuple(
+        &context,
+        &.{ .{ .int_v = 1 }, .{ .int_v = 2 } },
+    );
+    const edge_23 = try tuple(
+        &context,
+        &.{ .{ .int_v = 2 }, .{ .int_v = 3 } },
+    );
+    const edge_14 = try tuple(
+        &context,
+        &.{ .{ .int_v = 1 }, .{ .int_v = 4 } },
+    );
+    const vertices = try set(
+        &context,
+        &.{
+            .{ .int_v = 1 },
+            .{ .int_v = 2 },
+            .{ .int_v = 3 },
+            .{ .int_v = 4 },
+        },
+    );
+    const edges = try set(&context, &.{ edge_12, edge_23, edge_14 });
+    const initial = try set(&context, &.{.{ .int_v = 1 }});
+    const descendants = try relation_descendants(
+        &context,
+        vertices,
+        edges,
+        initial,
+    );
+    try std.testing.expectEqual(@as(u32, 3), descendants.set_v.len);
+    try std.testing.expectEqualSlices(
+        Value,
+        &.{ .{ .int_v = 2 }, .{ .int_v = 4 }, .{ .int_v = 3 } },
+        descendants.set_v.items(&pool),
+    );
+
+    const empty = try set(&context, &.{});
+    const empty_descendants = try relation_descendants(
+        &context,
+        vertices,
+        edges,
+        empty,
+    );
+    try std.testing.expectEqual(@as(u32, 0), empty_descendants.set_v.len);
 }
 
 fn filter_function_set(
@@ -4629,6 +5847,104 @@ pub fn map_set(
     } };
 }
 
+pub fn map_set_multi(
+    context: *CallContext,
+    operator_args: []const Value,
+    domain_values: []const Value,
+    mapper: OperatorFn,
+) Error!Value {
+    if (domain_values.len < 2 or
+        domain_values.len > 16 or
+        operator_args.len + domain_values.len > 64)
+    {
+        return Error.NotImplemented;
+    }
+    var domains: [16]Value = undefined;
+    var mapped_capacity: u64 = 1;
+    for (domain_values, 0..) |domain_value, index| {
+        domains[index] = try iterable_for_iteration(context, domain_value);
+        mapped_capacity = std.math.mul(
+            u64,
+            mapped_capacity,
+            try iterable_count(domains[index]),
+        ) catch return Error.OutOfMemory;
+        if (mapped_capacity > std.math.maxInt(u32)) {
+            return Error.OutOfMemory;
+        }
+    }
+    const mapped = try context.eval_pool.alloc_values(
+        @intCast(mapped_capacity),
+    );
+    const mapped_offset = value_offset(context.eval_pool, mapped.ptr);
+    var mapped_count: u32 = 0;
+    var bound: [16]Value = undefined;
+    try map_set_multi_recursive(
+        context,
+        operator_args,
+        domains[0..domain_values.len],
+        mapper,
+        bound[0..domain_values.len],
+        0,
+        mapped_offset,
+        @intCast(mapped_capacity),
+        &mapped_count,
+    );
+    std.debug.assert(mapped_count <= mapped_capacity);
+    return .{ .set_v = .{
+        .offset = mapped_offset,
+        .len = mapped_count,
+    } };
+}
+
+fn map_set_multi_recursive(
+    context: *CallContext,
+    operator_args: []const Value,
+    domains: []const Value,
+    mapper: OperatorFn,
+    bound: []Value,
+    depth: usize,
+    mapped_offset: u32,
+    mapped_capacity: u32,
+    mapped_count: *u32,
+) Error!void {
+    if (depth == domains.len) {
+        const result_snapshot = context.eval_pool.snapshot();
+        const result = try call_bound(
+            context,
+            operator_args,
+            bound,
+            mapper,
+        );
+        const mapped_values = context.eval_pool.values[mapped_offset..][0..mapped_capacity];
+        for (mapped_values[0..mapped_count.*]) |existing| {
+            if (existing.eql(result, context.eval_pool)) {
+                restore_eval_pool(context, result_snapshot);
+                return;
+            }
+        }
+        std.debug.assert(mapped_count.* < mapped_capacity);
+        mapped_values[mapped_count.*] = result;
+        mapped_count.* += 1;
+        return;
+    }
+    const count = try iterable_count(domains[depth]);
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        bound[depth] = try iterable_value(context, domains[depth], index);
+        try map_set_multi_recursive(
+            context,
+            operator_args,
+            domains,
+            mapper,
+            bound,
+            depth + 1,
+            mapped_offset,
+            mapped_capacity,
+            mapped_count,
+        );
+    }
+}
+
 pub fn function_map(
     context: *CallContext,
     operator_args: []const Value,
@@ -4721,12 +6037,21 @@ pub fn let_expression(
     @memcpy(values[0..operator_args.len], operator_args);
     for (definitions, 0..) |definition, index| {
         const captures = values[0 .. operator_args.len + index];
-        values[operator_args.len + index] = try operator(
-            context,
-            definition.function,
-            definition.arity,
-            captures,
-        );
+        std.debug.assert(!definition.recursive or definition.arity > 0);
+        values[operator_args.len + index] = if (definition.recursive)
+            try recursive_operator(
+                context,
+                definition.function,
+                definition.arity,
+                captures,
+            )
+        else
+            try operator(
+                context,
+                definition.function,
+                definition.arity,
+                captures,
+            );
     }
     return body(
         context,
@@ -4863,6 +6188,109 @@ pub fn reduce_sequence(
     return accumulator;
 }
 
+pub fn fold_function_on_set(
+    context: *CallContext,
+    operator_args: []const Value,
+    initial: Value,
+    function: Value,
+    indices_value: Value,
+    reducer: OperatorFn,
+) Error!Value {
+    const indices = try iterable_for_iteration(context, indices_value);
+    const count = try iterable_count(indices);
+    var accumulator = initial;
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const function_index = try iterable_value(context, indices, index);
+        const mapped = try call(context, function, &.{function_index});
+        accumulator = try call_bound(
+            context,
+            operator_args,
+            &.{ mapped, accumulator },
+            reducer,
+        );
+    }
+    return accumulator;
+}
+
+pub fn sum_function_on_set(
+    context: *CallContext,
+    function: Value,
+    indices_value: Value,
+) Error!Value {
+    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);
+    const indices = try iterable_for_iteration(context, indices_value);
+    const count = try iterable_count(indices);
+    var accumulator: i64 = 0;
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const function_index = try iterable_value(context, indices, index);
+        const mapped = try call(context, function, &.{function_index});
+        accumulator += try integer(mapped);
+    }
+    return .{ .int_v = accumulator };
+}
+
+test "function set fold iterates range indices without pool allocation" {
+    const Arena = @import("arena.zig").Arena;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 64, 64);
+    var models = try ModelTable.init(&arena, 4);
+    var generated_cache = [_]?Value{};
+    var context = CallContext{
+        .eval_pool = &pool,
+        .state_pool = &pool,
+        .state = null,
+        .next_state = null,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &pool,
+        .generated_cache_frozen = false,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+
+    const function_domain = try set(
+        &context,
+        &.{ .{ .int_v = 0 }, .{ .int_v = 1 }, .{ .int_v = 2 } },
+    );
+    const entries_offset = try pool.push_values(
+        &.{ .{ .int_v = 2 }, .{ .int_v = 3 }, .{ .int_v = 4 } },
+    );
+    const function = Value{ .function_v = .{
+        .domain = function_domain.set_v,
+        .offset = entries_offset,
+        .len = 3,
+    } };
+    const before = pool.snapshot();
+    const result = try fold_function_on_set(
+        &context,
+        &.{},
+        .{ .int_v = 0 },
+        function,
+        .{ .range_v = .{ .lo = 0, .hi = 2 } },
+        test_add_reducer,
+    );
+    try std.testing.expectEqual(@as(i64, 9), result.int_v);
+    try std.testing.expectEqual(before, pool.snapshot());
+
+    const sum_result = try sum_function_on_set(
+        &context,
+        function,
+        .{ .range_v = .{ .lo = 0, .hi = 2 } },
+    );
+    try std.testing.expectEqual(@as(i64, 9), sum_result.int_v);
+    try std.testing.expectEqual(before, pool.snapshot());
+}
+
 pub fn select_sequence(
     context: *CallContext,
     operator_args: []const Value,
@@ -4989,8 +6417,12 @@ pub fn member(
     element: Value,
     set_value: Value,
 ) Error!Value {
-    if (!set_value.is_set_like()) return Error.TypeError;
-    return .{ .bool_v = set_value.member(context.eval_pool, element) };
+    return .{ .bool_v = try member_cross_pool(
+        context,
+        set_value,
+        element,
+        context.eval_pool,
+    ) };
 }
 
 pub fn member_bool(
@@ -4998,8 +6430,12 @@ pub fn member_bool(
     element: Value,
     set_value: Value,
 ) Error!bool {
-    if (!set_value.is_set_like()) return Error.TypeError;
-    return set_value.member(context.eval_pool, element);
+    return member_cross_pool(
+        context,
+        set_value,
+        element,
+        context.eval_pool,
+    );
 }
 
 pub fn not_member(
@@ -6016,6 +7452,420 @@ test "materialized variable cache follows value-pool restores" {
     try std.testing.expectEqual(cached, eval_pool.snapshot());
 }
 
+test "state path operators apply without cloning intermediate functions" {
+    const Arena = @import("arena.zig").Arena;
+    var source_arena = try Arena.init(1024 * 1024);
+    defer source_arena.deinit();
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var source_pool = try ValuePool.init(&source_arena, 64, 64);
+    var eval_pool = try ValuePool.init(&eval_arena, 64, 64);
+    var models = try ModelTable.init(&source_arena, 4);
+    var generated_cache = [_]?Value{};
+
+    const inner_domain = try source_pool.push_values(&.{.{ .int_v = 2 }});
+    const inner_entries = try source_pool.push_values(&.{.{ .int_v = 99 }});
+    const inner = Value{ .function_v = .{
+        .domain = .{ .offset = inner_domain, .len = 1 },
+        .offset = inner_entries,
+        .len = 1,
+    } };
+    const outer_domain = try source_pool.push_values(&.{.{ .int_v = 1 }});
+    const outer_entries = try source_pool.push_values(&.{inner});
+    const type_name = Value{
+        .string_v = try source_pool.push_string("type"),
+    };
+    const type_value = Value{
+        .string_v = try source_pool.push_string("open"),
+    };
+    const block_fields = try source_pool.push_values(&.{
+        type_name,
+        type_value,
+    });
+    const block = Value{ .record_v = .{
+        .offset = block_fields,
+        .len = 1,
+    } };
+    const block_name = Value{
+        .string_v = try source_pool.push_string("block"),
+    };
+    const signed_fields = try source_pool.push_values(&.{
+        block_name,
+        block,
+    });
+    const signed = Value{ .record_v = .{
+        .offset = signed_fields,
+        .len = 1,
+    } };
+    const signed_domain = try source_pool.push_values(&.{.{ .int_v = 1 }});
+    const signed_entries = try source_pool.push_values(&.{signed});
+    var state_values = [_]Value{
+        .{ .function_v = .{
+            .domain = .{ .offset = outer_domain, .len = 1 },
+            .offset = outer_entries,
+            .len = 1,
+        } },
+        .{ .function_v = .{
+            .domain = .{ .offset = signed_domain, .len = 1 },
+            .offset = signed_entries,
+            .len = 1,
+        } },
+    };
+    var current_state = State{
+        .level = 0,
+        .pred = 0,
+        .changed_mask = 0,
+        .borrowed_mask = 0,
+        .borrowed_pool = null,
+        .values = &state_values,
+    };
+    var context = CallContext{
+        .eval_pool = &eval_pool,
+        .state_pool = &source_pool,
+        .state = &current_state,
+        .next_state = null,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &eval_pool,
+        .generated_cache_frozen = false,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+
+    const path = try state_path_operator(
+        &context,
+        0,
+        &.{.{ .int_v = 1 }},
+        1,
+    );
+    try std.testing.expect(
+        arguments_contain_state_path_operator(&.{path}),
+    );
+    try std.testing.expect(
+        !arguments_contain_state_path_operator(&.{.{ .int_v = 1 }}),
+    );
+    try std.testing.expectEqual(@as(u32, 4), eval_pool.value_count);
+    try std.testing.expectEqual(
+        Value{ .int_v = 99 },
+        try call(&context, path, &.{.{ .int_v = 2 }}),
+    );
+    try std.testing.expectEqual(@as(u32, 4), eval_pool.value_count);
+
+    const record_path = try state_path_operator(&context, 1, &.{}, 1);
+    const before_projection = eval_pool.snapshot();
+    const projected = try call_field_path(
+        &context,
+        record_path,
+        &.{.{ .int_v = 1 }},
+        &.{ "block", "type" },
+    );
+    try std.testing.expectEqualStrings(
+        "open",
+        projected.string_v.slice(&eval_pool),
+    );
+    try std.testing.expectEqual(
+        before_projection.value_count,
+        eval_pool.value_count,
+    );
+}
+
+test "power set membership accepts symbolic range state values across pools" {
+    const Arena = @import("arena.zig").Arena;
+    var state_arena = try Arena.init(1024 * 1024);
+    defer state_arena.deinit();
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var state_pool = try ValuePool.init(&state_arena, 64, 64);
+    var eval_pool = try ValuePool.init(&eval_arena, 64, 64);
+    var models = try ModelTable.init(&state_arena, 4);
+    var generated_cache = [_]?Value{};
+
+    var state_values = [_]Value{Value{ .range_v = .{ .lo = 1, .hi = 4 } }};
+    var current_state = State{
+        .level = 0,
+        .pred = 0,
+        .changed_mask = 0,
+        .borrowed_mask = 0,
+        .borrowed_pool = null,
+        .values = &state_values,
+    };
+    var context = CallContext{
+        .eval_pool = &eval_pool,
+        .state_pool = &state_pool,
+        .state = &current_state,
+        .next_state = null,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &eval_pool,
+        .generated_cache_frozen = false,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+
+    const base = Value{ .range_v = .{ .lo = 1, .hi = 4 } };
+    const subsets = try power_set(&context, base);
+    try std.testing.expect(try variable_member_bool(&context, 0, subsets));
+    try std.testing.expect(try member_bool(
+        &context,
+        Value{ .range_v = .{ .lo = 2, .hi = 3 } },
+        subsets,
+    ));
+    try std.testing.expect(!try member_bool(
+        &context,
+        Value{ .range_v = .{ .lo = 0, .hi = 3 } },
+        subsets,
+    ));
+}
+
+test "set union preserves record sets with unbounded nested domains" {
+    const Arena = @import("arena.zig").Arena;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 256, 256);
+    var models = try ModelTable.init(&arena, 4);
+    var generated_cache = [_]?Value{};
+    var context = CallContext{
+        .eval_pool = &pool,
+        .state_pool = &pool,
+        .state = null,
+        .next_state = null,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &pool,
+        .generated_cache_frozen = false,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+
+    const token_messages = try record_set(&context, &.{
+        try string(&context, "type"),
+        try set(&context, &.{try string(&context, "tok")}),
+        try string(&context, "q"),
+        try int_set(&context),
+    });
+    const basic_messages = try record_set(&context, &.{
+        try string(&context, "type"),
+        try set(&context, &.{try string(&context, "pl")}),
+    });
+    const messages = try set_union(
+        &context,
+        token_messages,
+        basic_messages,
+    );
+    try std.testing.expect(messages == .cup_v);
+
+    const token = try record_static(
+        &context,
+        &.{ "type", "q" },
+        &.{ try string(&context, "tok"), .{ .int_v = 42 } },
+    );
+    const basic = try record_static(
+        &context,
+        &.{"type"},
+        &.{try string(&context, "pl")},
+    );
+    const invalid = try record_static(
+        &context,
+        &.{"type"},
+        &.{try string(&context, "other")},
+    );
+    try std.testing.expect(try member_bool(&context, token, messages));
+    try std.testing.expect(try member_bool(&context, basic, messages));
+    try std.testing.expect(!try member_bool(&context, invalid, messages));
+}
+
+test "set union materializes finite record sets on demand" {
+    const Arena = @import("arena.zig").Arena;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 512, 512);
+    var models = try ModelTable.init(&arena, 4);
+    var generated_cache = [_]?Value{};
+    var context = CallContext{
+        .eval_pool = &pool,
+        .state_pool = &pool,
+        .state = null,
+        .next_state = null,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &pool,
+        .generated_cache_frozen = false,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+
+    const left = try record_set(&context, &.{
+        try string(&context, "type"),
+        try set(&context, &.{try string(&context, "left")}),
+        try string(&context, "id"),
+        Value{ .range_v = .{ .lo = 1, .hi = 2 } },
+    });
+    const right = try record_set(&context, &.{
+        try string(&context, "type"),
+        try set(&context, &.{try string(&context, "right")}),
+    });
+    const union_value = try set_union(&context, left, right);
+    try std.testing.expect(union_value == .cup_v);
+
+    const left_member = try record_static(
+        &context,
+        &.{ "type", "id" },
+        &.{ try string(&context, "left"), .{ .int_v = 2 } },
+    );
+    const right_member = try record_static(
+        &context,
+        &.{"type"},
+        &.{try string(&context, "right")},
+    );
+    try std.testing.expect(try member_bool(&context, left_member, union_value));
+    try std.testing.expect(try member_bool(&context, right_member, union_value));
+    try std.testing.expectEqual(
+        Value{ .int_v = 3 },
+        try cardinality(&context, &.{union_value}),
+    );
+}
+
+test "fused EXCEPT equality localizes nested updater operands" {
+    const Arena = @import("arena.zig").Arena;
+    var state_arena = try Arena.init(1024 * 1024);
+    defer state_arena.deinit();
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var state_pool = try ValuePool.init(&state_arena, 128, 64);
+    var eval_pool = try ValuePool.init(&eval_arena, 128, 64);
+    var models = try ModelTable.init(&state_arena, 4);
+    var generated_cache = [_]?Value{};
+
+    const person = Value{ .model_v = try models.intern("person") };
+    const waiting_name = Value{
+        .string_v = try state_pool.push_string("waiting"),
+    };
+    const current_fields_offset = try state_pool.push_values(&.{
+        waiting_name,
+        .{ .bool_v = false },
+    });
+    const next_fields_offset = try state_pool.push_values(&.{
+        waiting_name,
+        .{ .bool_v = true },
+    });
+    const current_record = Value{ .record_v = .{
+        .offset = current_fields_offset,
+        .len = 1,
+    } };
+    const next_record = Value{ .record_v = .{
+        .offset = next_fields_offset,
+        .len = 1,
+    } };
+    const domain_offset = try state_pool.push_values(&.{person});
+    const current_entries_offset = try state_pool.push_values(&.{current_record});
+    const next_entries_offset = try state_pool.push_values(&.{next_record});
+    const function_domain = Set{ .offset = domain_offset, .len = 1 };
+
+    var current_values = [_]Value{.{ .function_v = .{
+        .domain = function_domain,
+        .offset = current_entries_offset,
+        .len = 1,
+    } }};
+    var next_values = [_]Value{.{ .function_v = .{
+        .domain = function_domain,
+        .offset = next_entries_offset,
+        .len = 1,
+    } }};
+    var current_state = State{
+        .level = 0,
+        .pred = 0,
+        .changed_mask = 0,
+        .borrowed_mask = 0,
+        .borrowed_pool = null,
+        .values = &current_values,
+    };
+    var next_state = State{
+        .level = 1,
+        .pred = 0,
+        .changed_mask = 1,
+        .borrowed_mask = 0,
+        .borrowed_pool = null,
+        .values = &next_values,
+    };
+    var context = CallContext{
+        .eval_pool = &eval_pool,
+        .state_pool = &state_pool,
+        .state = &current_state,
+        .next_state = &next_state,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &eval_pool,
+        .generated_cache_frozen = false,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+
+    try std.testing.expect(try primed_variable_except_update_path_equal_bool(
+        &context,
+        &.{person},
+        0,
+        &.{.{ .value = person }},
+        test_nested_record_updater,
+    ));
+}
+
+fn test_nested_record_updater(
+    context: *CallContext,
+    args: []const Value,
+) Error!Value {
+    std.debug.assert(args.len == 2);
+    return except_update(
+        context,
+        args,
+        args[1],
+        &.{try string(context, "waiting")},
+        test_waiting_true_updater,
+    );
+}
+
+fn test_waiting_true_updater(
+    _: *CallContext,
+    args: []const Value,
+) Error!Value {
+    std.debug.assert(args.len == 3);
+    return .{ .bool_v = true };
+}
+
 fn value_same_representation(left: Value, right: Value) bool {
     return @import("value.zig").same_repr(left, right);
 }
@@ -6305,6 +8155,11 @@ fn duplicate_tuple_mapper(
 ) Error!Value {
     std.debug.assert(args.len == 1);
     return tuple(context, &.{.{ .int_v = 9 }});
+}
+
+fn test_add_reducer(_: *CallContext, args: []const Value) Error!Value {
+    std.debug.assert(args.len == 2);
+    return add(args[0], args[1]);
 }
 
 fn test_native_call(

@@ -69,11 +69,35 @@ fn unordered_hash_finish(hash: UnorderedHash) Fingerprint {
     return result;
 }
 
+const BoundedHashState = struct {
+    remaining_nodes: u32,
+    valid: bool = true,
+};
+
 fn hash_value_inner(
     pool: *const ValuePool,
     v: Value,
     permutation: ?[]const u32,
 ) Fingerprint {
+    var unused: BoundedHashState = undefined;
+    return hash_value_inner_impl(false, pool, v, permutation, &unused);
+}
+
+fn hash_value_inner_impl(
+    comptime bounded: bool,
+    pool: *const ValuePool,
+    v: Value,
+    permutation: ?[]const u32,
+    bounded_state: *BoundedHashState,
+) Fingerprint {
+    if (bounded) {
+        if (!bounded_state.valid) return 0;
+        if (bounded_state.remaining_nodes == 0) {
+            bounded_state.valid = false;
+            return 0;
+        }
+        bounded_state.remaining_nodes -= 1;
+    }
     var h = hash_init();
     const sequence_layout = if (v == .function_v)
         sequence_function_layout(pool, v.function_v)
@@ -82,7 +106,7 @@ fn hash_value_inner(
     const tag = if (sequence_layout != .not_sequence)
         value_tag_tuple
     else
-        @intFromEnum(v);
+        @backingInt(v);
     h = hash_byte(h, tag);
     switch (v) {
         .bool_v => |b| {
@@ -101,6 +125,10 @@ fn hash_value_inner(
             h = hash_bytes(h, &bytes);
         },
         .string_v => |s| {
+            if (bounded and s.len > 128) {
+                bounded_state.valid = false;
+                return 0;
+            }
             h = hash_bytes(h, s.slice(pool));
         },
         .set_v => |s| {
@@ -108,25 +136,47 @@ fn hash_value_inner(
             for (s.items(pool)) |it| {
                 unordered_hash_add(
                     &unordered,
-                    hash_value_inner(pool, it, permutation),
+                    hash_value_inner_impl(
+                        bounded,
+                        pool,
+                        it,
+                        permutation,
+                        bounded_state,
+                    ),
                 );
             }
             h = hash_combine(h, unordered_hash_finish(unordered));
         },
         .tuple_v => |t| {
             const items = t.items(pool);
-            for (items) |it| {
-                h = hash_byte(h, 0xab);
-                h = hash_value_inner(pool, it, permutation) ^ h;
+            for (items, 0..) |it, item_index| {
+                h +%= state_component_from_value_hash(
+                    hash_value_inner_impl(
+                        bounded,
+                        pool,
+                        it,
+                        permutation,
+                        bounded_state,
+                    ),
+                    @intCast(item_index),
+                );
             }
         },
         .function_v => |f| {
             if (sequence_layout != .not_sequence) {
                 const entries = f.entries(pool);
                 if (sequence_layout == .ordered) {
-                    for (entries) |item| {
-                        h = hash_byte(h, 0xab);
-                        h = hash_value_inner(pool, item, permutation) ^ h;
+                    for (entries, 0..) |item, item_index| {
+                        h +%= state_component_from_value_hash(
+                            hash_value_inner_impl(
+                                bounded,
+                                pool,
+                                item,
+                                permutation,
+                                bounded_state,
+                            ),
+                            @intCast(item_index),
+                        );
                     }
                     return h;
                 }
@@ -138,10 +188,18 @@ fn hash_value_inner(
                         );
                         entry_indices[sequence_index] = @intCast(entry_index);
                     }
-                    for (entry_indices[0..f.len]) |entry_index| {
+                    for (entry_indices[0..f.len], 0..) |entry_index, item_index| {
                         const item = entries[entry_index];
-                        h = hash_byte(h, 0xab);
-                        h = hash_value_inner(pool, item, permutation) ^ h;
+                        h +%= state_component_from_value_hash(
+                            hash_value_inner_impl(
+                                bounded,
+                                pool,
+                                item,
+                                permutation,
+                                bounded_state,
+                            ),
+                            @intCast(item_index),
+                        );
                     }
                     return h;
                 }
@@ -150,8 +208,16 @@ fn hash_value_inner(
                     const item = f.apply(pool, .{
                         .int_v = @as(i64, @intCast(sequence_index)) + 1,
                     }) orelse unreachable;
-                    h = hash_byte(h, 0xab);
-                    h = hash_value_inner(pool, item, permutation) ^ h;
+                    h +%= state_component_from_value_hash(
+                        hash_value_inner_impl(
+                            bounded,
+                            pool,
+                            item,
+                            permutation,
+                            bounded_state,
+                        ),
+                        sequence_index,
+                    );
                 }
                 return h;
             }
@@ -159,9 +225,21 @@ fn hash_value_inner(
             const vals = f.entries(pool);
             var unordered = unordered_hash_init();
             for (keys, vals) |k, val| {
-                var entry_hash = hash_value_inner(pool, k, permutation);
+                var entry_hash = hash_value_inner_impl(
+                    bounded,
+                    pool,
+                    k,
+                    permutation,
+                    bounded_state,
+                );
                 entry_hash = hash_byte(entry_hash, 0xcd);
-                entry_hash = hash_value_inner(pool, val, permutation) ^ entry_hash;
+                entry_hash = hash_value_inner_impl(
+                    bounded,
+                    pool,
+                    val,
+                    permutation,
+                    bounded_state,
+                ) ^ entry_hash;
                 unordered_hash_add(&unordered, entry_hash);
             }
             h = hash_combine(h, unordered_hash_finish(unordered));
@@ -171,43 +249,77 @@ fn hash_value_inner(
             var i: u32 = 0;
             var unordered = unordered_hash_init();
             while (i < r.len) : (i += 1) {
-                var field_hash = hash_value_inner(
+                var field_hash = hash_value_inner_impl(
+                    bounded,
                     pool,
                     fs[i * 2],
                     permutation,
+                    bounded_state,
                 );
                 field_hash = hash_byte(field_hash, 0xef);
                 field_hash = hash_combine(
                     field_hash,
-                    hash_value_inner(pool, fs[i * 2 + 1], permutation),
+                    hash_value_inner_impl(
+                        bounded,
+                        pool,
+                        fs[i * 2 + 1],
+                        permutation,
+                        bounded_state,
+                    ),
                 );
                 unordered_hash_add(&unordered, field_hash);
             }
             h = hash_combine(h, unordered_hash_finish(unordered));
         },
-        .lambda_v => @panic("lambda values cannot be fingerprinted"),
-        .generated_operator_v => @panic(
-            "generated operator values cannot be fingerprinted",
-        ),
+        .lambda_v => if (bounded) {
+            bounded_state.valid = false;
+        } else {
+            @panic("lambda values cannot be fingerprinted");
+        },
+        .generated_operator_v => if (bounded) {
+            bounded_state.valid = false;
+        } else {
+            @panic("generated operator values cannot be fingerprinted");
+        },
         .function_set_v => |fs| {
             h = hash_byte(h, 0x10);
-            h = hash_combine(h, hash_value_inner(pool, fs.domain(pool), permutation));
-            h = hash_combine(h, hash_value_inner(pool, fs.codomain(pool), permutation));
+            h = hash_combine(h, hash_value_inner_impl(
+                bounded,
+                pool,
+                fs.domain(pool),
+                permutation,
+                bounded_state,
+            ));
+            h = hash_combine(h, hash_value_inner_impl(
+                bounded,
+                pool,
+                fs.codomain(pool),
+                permutation,
+                bounded_state,
+            ));
         },
         .record_set_v => |rs| {
             h = hash_byte(h, 0x11);
             var unordered = unordered_hash_init();
             var i: u32 = 0;
             while (i < rs.len) : (i += 1) {
-                var field_hash = hash_value_inner(
+                var field_hash = hash_value_inner_impl(
+                    bounded,
                     pool,
                     Value{ .string_v = rs.field_name(pool, i) },
                     permutation,
+                    bounded_state,
                 );
                 field_hash = hash_byte(field_hash, 0xee);
                 field_hash = hash_combine(
                     field_hash,
-                    hash_value_inner(pool, rs.field_domain(pool, i), permutation),
+                    hash_value_inner_impl(
+                        bounded,
+                        pool,
+                        rs.field_domain(pool, i),
+                        permutation,
+                        bounded_state,
+                    ),
                 );
                 unordered_hash_add(&unordered, field_hash);
             }
@@ -217,27 +329,75 @@ fn hash_value_inner(
             h = hash_byte(h, 0x12);
             const ss = ts.sets(pool);
             for (ss) |s| {
-                h = hash_combine(h, hash_value_inner(pool, s, permutation));
+                h = hash_combine(h, hash_value_inner_impl(
+                    bounded,
+                    pool,
+                    s,
+                    permutation,
+                    bounded_state,
+                ));
             }
         },
         .union_v => |u| {
             h = hash_byte(h, 0x13);
-            h = hash_combine(h, hash_value_inner(pool, u.set(pool), permutation));
+            h = hash_combine(h, hash_value_inner_impl(
+                bounded,
+                pool,
+                u.set(pool),
+                permutation,
+                bounded_state,
+            ));
         },
         .cup_v => |bs| {
             h = hash_byte(h, 0x14);
-            h = hash_combine(h, hash_value_inner(pool, bs.left(pool), permutation));
-            h = hash_combine(h, hash_value_inner(pool, bs.right(pool), permutation));
+            h = hash_combine(h, hash_value_inner_impl(
+                bounded,
+                pool,
+                bs.left(pool),
+                permutation,
+                bounded_state,
+            ));
+            h = hash_combine(h, hash_value_inner_impl(
+                bounded,
+                pool,
+                bs.right(pool),
+                permutation,
+                bounded_state,
+            ));
         },
         .cap_v => |bs| {
             h = hash_byte(h, 0x15);
-            h = hash_combine(h, hash_value_inner(pool, bs.left(pool), permutation));
-            h = hash_combine(h, hash_value_inner(pool, bs.right(pool), permutation));
+            h = hash_combine(h, hash_value_inner_impl(
+                bounded,
+                pool,
+                bs.left(pool),
+                permutation,
+                bounded_state,
+            ));
+            h = hash_combine(h, hash_value_inner_impl(
+                bounded,
+                pool,
+                bs.right(pool),
+                permutation,
+                bounded_state,
+            ));
         },
         .diff_v => |bs| {
             h = hash_byte(h, 0x16);
-            h = hash_combine(h, hash_value_inner(pool, bs.left(pool), permutation));
-            h = hash_combine(h, hash_value_inner(pool, bs.right(pool), permutation));
+            h = hash_combine(h, hash_value_inner_impl(
+                bounded,
+                pool,
+                bs.left(pool),
+                permutation,
+                bounded_state,
+            ));
+            h = hash_combine(h, hash_value_inner_impl(
+                bounded,
+                pool,
+                bs.right(pool),
+                permutation,
+                bounded_state,
+            ));
         },
         .range_v => |r| {
             h = hash_byte(h, 0x17);
@@ -248,17 +408,48 @@ fn hash_value_inner(
         },
         .seq_set_v => |ss| {
             h = hash_byte(h, 0x18);
-            h = hash_combine(h, hash_value_inner(pool, ss.element_set(pool), permutation));
+            h = hash_combine(h, hash_value_inner_impl(
+                bounded,
+                pool,
+                ss.element_set(pool),
+                permutation,
+                bounded_state,
+            ));
         },
         .power_set_v => |ps| {
             h = hash_byte(h, 0x19);
-            h = hash_combine(h, hash_value_inner(pool, ps.set(pool), permutation));
+            h = hash_combine(h, hash_value_inner_impl(
+                bounded,
+                pool,
+                ps.set(pool),
+                permutation,
+                bounded_state,
+            ));
         },
     }
     return h;
 }
 
-const value_tag_tuple: u8 = @intFromEnum(@import("value.zig").ValueTag.tuple_v);
+pub fn hash_value_unseeded_bounded(
+    pool: *const ValuePool,
+    value: Value,
+    remaining_nodes: *u32,
+) ?Fingerprint {
+    var bounded_state = BoundedHashState{
+        .remaining_nodes = remaining_nodes.*,
+    };
+    const hash = hash_value_inner_impl(
+        true,
+        pool,
+        value,
+        null,
+        &bounded_state,
+    );
+    remaining_nodes.* = bounded_state.remaining_nodes;
+    return if (bounded_state.valid) hash else null;
+}
+
+const value_tag_tuple: u8 = @backingInt(@import("value.zig").ValueTag.tuple_v);
 
 const SequenceLayout = enum {
     not_sequence,
@@ -291,6 +482,21 @@ fn sequence_function_layout(
         }
     }
     return if (ordered) .ordered else .unordered;
+}
+
+/// Operator values are executable closures, not mathematical values with a
+/// stable fingerprint. Callers using fingerprints as optional cache keys must
+/// reject them even when they are nested inside another value.
+pub fn value_is_hashable_bounded(
+    pool: *const ValuePool,
+    value: Value,
+    remaining_nodes: *u32,
+) bool {
+    return hash_value_unseeded_bounded(
+        pool,
+        value,
+        remaining_nodes,
+    ) != null;
 }
 
 pub fn hash_value(pool: *const ValuePool, v: Value, fp: Fingerprint) Fingerprint {
@@ -367,6 +573,28 @@ pub fn hash_value_permuted(
     return hash_value_inner(pool, v, permutation);
 }
 
+pub fn hash_state_tuple_projection(
+    default_pool: *const ValuePool,
+    state: anytype,
+    variable_indices: []const u16,
+    permutation: ?[]const u32,
+) Fingerprint {
+    assert(default_pool.value_count <= default_pool.value_cap);
+    var hash = hash_byte(hash_init(), value_tag_tuple);
+    for (variable_indices, 0..) |variable_index, item_index| {
+        assert(variable_index < state.values.len);
+        hash +%= state_component_from_value_hash(
+            hash_value_inner(
+                state.value_pool(variable_index, default_pool),
+                state.values[variable_index],
+                permutation,
+            ),
+            @intCast(item_index),
+        );
+    }
+    return hash;
+}
+
 pub fn hash_state(pool: *const ValuePool, values: []const Value) Fingerprint {
     assert(pool.value_count <= pool.value_cap);
     var h = hash_init();
@@ -386,4 +614,132 @@ pub fn hash_state_permuted(
         h = hash_combine(h, hash_value_inner(pool, v, permutation));
     }
     return h;
+}
+
+test "bounded value hashing matches the canonical fingerprint in one pass" {
+    const Arena = @import("arena.zig").Arena;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 64, 64);
+    const tuple_offset = try pool.push_values(&.{
+        .{ .int_v = 1 },
+        .{ .int_v = 2 },
+    });
+    const set_offset = try pool.push_values(&.{
+        .{ .tuple_v = .{ .offset = tuple_offset, .len = 2 } },
+        .{ .bool_v = true },
+    });
+    const aggregate = Value{ .set_v = .{
+        .offset = set_offset,
+        .len = 2,
+    } };
+
+    var sufficient_nodes: u32 = 8;
+    try std.testing.expectEqual(
+        hash_value_unseeded(&pool, aggregate),
+        hash_value_unseeded_bounded(
+            &pool,
+            aggregate,
+            &sufficient_nodes,
+        ).?,
+    );
+    try std.testing.expectEqual(@as(u32, 3), sufficient_nodes);
+
+    var insufficient_nodes: u32 = 4;
+    try std.testing.expectEqual(
+        @as(?Fingerprint, null),
+        hash_value_unseeded_bounded(
+            &pool,
+            aggregate,
+            &insufficient_nodes,
+        ),
+    );
+}
+
+test "state tuple projection hashes values from mixed pools without cloning" {
+    const Arena = @import("arena.zig").Arena;
+    const MixedState = struct {
+        values: []const Value,
+        borrowed_pool: *const ValuePool,
+
+        fn value_pool(
+            self: *const @This(),
+            variable_index: u32,
+            default_pool: *const ValuePool,
+        ) *const ValuePool {
+            return if (variable_index == 1)
+                self.borrowed_pool
+            else
+                default_pool;
+        }
+    };
+
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var default_pool = try ValuePool.init(&arena, 64, 64);
+    var borrowed_pool = try ValuePool.init(&arena, 64, 64);
+    var materialized_pool = try ValuePool.init(&arena, 64, 64);
+
+    const default_value = Value{
+        .string_v = try default_pool.push_string("default"),
+    };
+    const borrowed_value = Value{
+        .string_v = try borrowed_pool.push_string("borrowed"),
+    };
+    const values = [_]Value{ default_value, borrowed_value };
+    const state = MixedState{
+        .values = &values,
+        .borrowed_pool = &borrowed_pool,
+    };
+
+    const materialized_values = [_]Value{
+        try default_value.clone(&default_pool, &materialized_pool),
+        try borrowed_value.clone(&borrowed_pool, &materialized_pool),
+    };
+    const tuple_offset = try materialized_pool.push_values(
+        &materialized_values,
+    );
+    const materialized_tuple = Value{ .tuple_v = .{
+        .offset = tuple_offset,
+        .len = materialized_values.len,
+    } };
+
+    try std.testing.expectEqual(
+        hash_value_unseeded(&materialized_pool, materialized_tuple),
+        hash_state_tuple_projection(
+            &default_pool,
+            &state,
+            &.{ 0, 1 },
+            null,
+        ),
+    );
+
+    const replacement_value = Value{
+        .string_v = try borrowed_pool.push_string("replacement"),
+    };
+    const replacement_values = [_]Value{ default_value, replacement_value };
+    const replacement_state = MixedState{
+        .values = &replacement_values,
+        .borrowed_pool = &borrowed_pool,
+    };
+    const incremental = replace_state_value_hashes(
+        hash_state_tuple_projection(
+            &default_pool,
+            &state,
+            &.{ 0, 1 },
+            null,
+        ),
+        1,
+        hash_value_unseeded(&borrowed_pool, borrowed_value),
+        hash_value_unseeded(&borrowed_pool, replacement_value),
+    );
+    try std.testing.expectEqual(
+        hash_state_tuple_projection(
+            &default_pool,
+            &replacement_state,
+            &.{ 0, 1 },
+            null,
+        ),
+        incremental,
+    );
 }

@@ -78,6 +78,67 @@ test "bounded operator declaration accepts a shared domain" {
     try std.testing.expectEqual(@as(i64, 2), result.int_v);
 }
 
+test "state-independent aggregate calls persist across evaluations" {
+    const source =
+        \\---------------------- MODULE TestPersistentCall ----------------------
+        \\Build(S) == {<<x, x>> : x \in S}
+        \\Result == Build(1..3)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    var evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var pool = try value.ValuePool.init(&eval_arena, 1024, 256);
+
+    _ = try evaluator.eval_named_zero(
+        "Result",
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expectEqual(
+        @as(u16, 1),
+        evaluator.persistent_call_memo.count,
+    );
+    const cached_values = evaluator.persistent_call_pool.value_count;
+
+    _ = try evaluator.eval_named_zero(
+        "Result",
+        eval.Context.empty(),
+        null,
+        &pool,
+        &pool,
+    );
+    try std.testing.expectEqual(
+        cached_values,
+        evaluator.persistent_call_pool.value_count,
+    );
+    try std.testing.expectEqual(
+        @as(u16, 1),
+        evaluator.persistent_call_memo.count,
+    );
+
+    evaluator.set_constants(&.{});
+    try std.testing.expectEqual(
+        @as(u16, 0),
+        evaluator.persistent_call_memo.count,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        evaluator.persistent_call_pool.value_count,
+    );
+}
+
 test "module loader preserves custom infix definitions" {
     var arena = try Arena.init(16 * 1024 * 1024);
     defer arena.deinit();
@@ -331,6 +392,51 @@ test "hereditary power-set filter lowers before outer enumeration" {
         &pool,
     );
     try std.testing.expect(result.is_truthy());
+}
+
+test "hereditary power-set membership streams initial states" {
+    const source =
+        \\---------------------- MODULE TestPowerSetInit ----------------------
+        \\EXTENDS Naturals, FiniteSets
+        \\VARIABLE Edges
+        \\Init ==
+        \\    Edges \in {E \in SUBSET (SUBSET (1..5)) :
+        \\        \A e \in E : Cardinality(e) = 2}
+        \\Next == FALSE
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = null,
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        2048,
+        32 * 1024,
+        256,
+        64 * 1024,
+        1024,
+        8 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 1024), result.distinct);
 }
 
 test "parse SimpleRegular-style Init" {
@@ -1139,6 +1245,107 @@ test "liveness supports tuple-subscript weak fairness" {
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
 }
 
+test "liveness expands fairness over symbolic record sets" {
+    const source =
+        \\---------------------- MODULE TestRecordSetFairness ----------------------
+        \\VARIABLE x
+        \\Calls == [floor : {1, 2}, direction : {"Up", "Down"}]
+        \\Init == x = 0
+        \\Step(call) == x' = x
+        \\Next == \E call \in Calls : Step(call)
+        \\Spec ==
+        \\    /\ Init
+        \\    /\ [][Next]_x
+        \\    /\ \A call \in Calls : WF_x(Step(call))
+        \\Prop == <>TRUE
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Prop"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expectEqual(@as(usize, 4), model_checker.fairness.len);
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 1), result.distinct);
+}
+
+test "weak fairness evaluates conjunctive action semantics on graph edges" {
+    const source =
+        \\---------------------- MODULE TestConjunctiveFairness ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Advance == (x = 0) /\ (x' = 1)
+        \\Idle == x' = x
+        \\Next == Advance \/ Idle
+        \\FairAction == Advance /\ (x' = 1)
+        \\Spec ==
+        \\    /\ Init
+        \\    /\ [][Next]_x
+        \\    /\ WF_x(FairAction)
+        \\Prop == <>(x = 1)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{"Prop"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
 test "eventually detects an avoiding cycle inside a larger SCC" {
     const source =
         \\---------------------- MODULE TestInducedLivenessScc ----------------------
@@ -1670,6 +1877,52 @@ test "parallel exploration preserves branching temporal state space" {
     try std.testing.expectEqual(@as(u64, 9), result.distinct);
 }
 
+test "parallel temporal evaluation checks every boxed action edge" {
+    const source =
+        \\---------------------- MODULE TestParallelTemporal ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Advance == x' = IF x = 255 THEN 0 ELSE x + 1
+        \\Next == Advance
+        \\Spec == Init /\\ [][Next]_x
+        \\Refinement == [][Advance]_x
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(32 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Refinement"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        512,
+        16_384,
+        4096,
+        16_384,
+        4096,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        4,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 256), result.distinct);
+}
+
 test "action constraints filter transitions but not initial states" {
     const source =
         \\---------------------- MODULE TestActionConstraint ----------------------
@@ -2034,6 +2287,183 @@ test "recursive function definition accepts multiple bounded arguments" {
     const ok = evaluator.find_definition("Ok") orelse return error.UndefinedSymbol;
     const result = try evaluator.eval_expr(ok.body, eval.Context.empty(), null, &pool, &state_pool);
     try std.testing.expect(result.is_truthy());
+}
+
+test "tuple-bound function domain is not multiplied by tuple arity" {
+    const source =
+        \\---------------------- MODULE TestTupleFunction ----------------------
+        \\EXTENDS Naturals
+        \\F[<<x, y>> \in {1, 2} \X {3, 4}] == x + y
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    try std.testing.expectEqual(@as(usize, 1), module.definitions.len);
+
+    const definition = module.definitions[0];
+    try std.testing.expect(definition.is_function);
+    try std.testing.expectEqual(@as(usize, 2), definition.function_vars.len);
+    const domain = definition.function_domain orelse return error.TestUnexpectedResult;
+    const product = switch (domain.*) {
+        .set_binary => |set_binary| set_binary,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(ast.SetBinaryOp.cartesian_op, product.op);
+    try std.testing.expect(product.left.* == .set_enum);
+    try std.testing.expect(product.right.* == .set_enum);
+}
+
+test "function-set initial assignments stream without materializing the set" {
+    const source =
+        \\---------------------- MODULE TestFunctionSetInit ----------------------
+        \\EXTENDS Integers
+        \\VARIABLE f
+        \\Init == f \in [1..8 -> BOOLEAN]
+        \\Next == UNCHANGED f
+        \\Spec == Init /\ [][Next]_f
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init_generated_with_successor_limit(
+        &arena,
+        module,
+        cfg,
+        256,
+        8,
+        1024,
+        256,
+        8192,
+        256,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+        &.{},
+        &.{},
+    );
+    defer model_checker.deinit();
+    model_checker.set_scratch_growable(false);
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 512), result.generated);
+    try std.testing.expectEqual(@as(u64, 256), result.distinct);
+}
+
+test "filtered record-set initial assignments stream with fixed scratch" {
+    const source =
+        \\---------------------- MODULE TestFilteredRecordSetInit ----------------------
+        \\EXTENDS Integers
+        \\VARIABLE can
+        \\Can == [left : 0..31, right : 0..63]
+        \\Init == can \in {c \in Can : c.left = 0}
+        \\Next == UNCHANGED can
+        \\Spec == Init /\ [][Next]_can
+        \\TypeOK == can \in Can
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{"TypeOK"},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init_generated_with_successor_limit(
+        &arena,
+        module,
+        cfg,
+        128,
+        32,
+        256,
+        256,
+        4096,
+        256,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+        &.{},
+        &.{},
+    );
+    defer model_checker.deinit();
+    model_checker.set_scratch_growable(false);
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 128), result.generated);
+    try std.testing.expectEqual(@as(u64, 64), result.distinct);
+}
+
+test "canonical value cache saturation keeps aggregate initial states exact" {
+    const source =
+        \\---------------------- MODULE TestCanonicalSaturation ----------------------
+        \\EXTENDS Integers
+        \\VARIABLE record
+        \\Records == [left : 0..31, right : 0..31]
+        \\Init == record \in Records
+        \\Next == UNCHANGED record
+        \\Spec == Init /\ [][Next]_record
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(32 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init_generated_with_successor_limit(
+        &arena,
+        module,
+        cfg,
+        1024,
+        64,
+        8192,
+        256,
+        8192,
+        256,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+        &.{},
+        &.{},
+    );
+    defer model_checker.deinit();
+    model_checker.set_scratch_growable(false);
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2048), result.generated);
+    try std.testing.expectEqual(@as(u64, 1024), result.distinct);
 }
 
 test "UNCHANGED accepts an instance-qualified tuple name" {
@@ -3038,6 +3468,86 @@ test "action composition publishes only the second action result" {
     defer model_checker.deinit();
     const result = try model_checker.check();
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "parallel VIEW keeps the earliest BFS representative" {
+    const source =
+        \\---------------------- MODULE TestParallelView ----------------------
+        \\EXTENDS Naturals, FiniteSets
+        \\VARIABLES phase, parent, hidden, output
+        \\Vars == <<phase, parent, hidden, output>>
+        \\View == <<phase, parent, output>>
+        \\Init ==
+        \\    /\ phase = 0
+        \\    /\ parent = 0
+        \\    /\ hidden = 0
+        \\    /\ output = 0
+        \\Slow ==
+        \\    \A subset \in SUBSET (1..14) : subset \subseteq 1..14
+        \\Spawn ==
+        \\    /\ phase = 0
+        \\    /\ parent' \in 0..15
+        \\    /\ hidden' = parent'
+        \\    /\ output' = 0
+        \\    /\ phase' = 1
+        \\Collapse ==
+        \\    /\ phase = 1
+        \\    /\ IF parent = 0 THEN Slow ELSE TRUE
+        \\    /\ phase' = 2
+        \\    /\ parent' = 0
+        \\    /\ hidden' = parent
+        \\    /\ output' = 0
+        \\Reveal ==
+        \\    /\ phase = 2
+        \\    /\ phase' = 3
+        \\    /\ parent' = 0
+        \\    /\ hidden' = hidden
+        \\    /\ output' = hidden
+        \\Stop ==
+        \\    /\ phase = 3
+        \\    /\ UNCHANGED Vars
+        \\Next == Spawn \/ Collapse \/ Reveal \/ Stop
+        \\Spec == Init /\ [][Next]_Vars
+        \\Canonical == phase /= 2 \/ hidden = 0
+        \\Winner == phase /= 3 \/ output = 0
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(64 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{ "Canonical", "Winner" },
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .view_name = "View",
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init_generated_with_successor_limit(
+        &arena,
+        module,
+        cfg,
+        64,
+        64,
+        1_048_576,
+        4096,
+        65_536,
+        4096,
+        8 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        4,
+        &.{},
+        &.{},
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 19), result.distinct);
 }
 
 test "FALSE operator substitution does not suppress other Next branches" {

@@ -16,13 +16,15 @@ pub const Module = struct {
 };
 
 pub const ConfigReplacement = struct {
+    pub const Kind = enum(u8) {
+        alias,
+        constant,
+    };
+
     name: []const u8,
     value: []const u8,
     is_substitution: bool = false,
-    kind: enum(u8) {
-        alias,
-        constant,
-    },
+    kind: Kind,
 };
 
 pub const Instance = struct {

@@ -1,6 +1,6 @@
 # All-Core Performance Architecture
 
-Date: 2026-07-14
+Date: 2026-07-16
 
 This document is the measured plan for making tlzig faster without weakening
 TLA+ semantics or encoding user specifications in the runtime. Correctness is
@@ -31,24 +31,26 @@ The decisive MultiShardTxn workload is `RC/snapshot exhaustive`:
 
 | Measurement | Generated | Distinct | Wall time | Instructions | Peak RSS |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| TLC all-core exact baseline | 405,005,930 | 67,629,092 | 669.976s | - | - |
+| Retained TLC all-core exact baseline | 405,005,930 | 67,629,092 | 669.976s | - | - |
+| Fresh paired TLC all-core | 405,005,930 | 67,629,092 | 697.495s | - | - |
 | Original tlzig exact baseline | 405,005,930 | 67,629,092 | 679.912s | - | - |
 | Prior accepted tlzig exact | 405,005,930 | 67,629,092 | 360.86s | 63.56T | 26,015,973,376 B |
 | Pre-trail tlzig exact | 405,005,930 | 67,629,092 | 334.557s | - | - |
 | Initial compact-trail exact | 405,005,930 | 67,629,092 | 335.834s | 59.310T | 30,868,815,872 B |
 | Refined trail before body inlining | 405,005,930 | 67,629,092 | 328.100s | 57.138T | 26,281,590,784 B |
-| Current tlzig exact | 405,005,930 | 67,629,092 | 318.628s | 54.658T | 29,406,117,888 B |
+| Prior countered tlzig exact | 405,005,930 | 67,629,092 | 318.628s | 54.658T | 29,406,117,888 B |
+| Current tlzig exact | 405,005,930 | 67,629,092 | 314.422s | - | - |
 
-The current exact run is `1.030x` faster than the preceding `328.100s` run,
-`1.050x` faster than the pre-trail `334.557s` run, `1.133x` faster than the
-prior countered `360.86s` run, `2.134x` faster than the original `679.912s`
-tlzig baseline, and `2.103x` faster than the retained `669.976s` TLC baseline.
-Retired instructions are 4.34% below the preceding exact run and 14.0% below
-the older `63.56T` measurement. Observed exact-run peak RSS rose 11.9% from
-`26.28GB` to `29.41GB`; capped-probe RSS was unchanged, so one run does not
-establish the cause. The memory delta remains an explicit regression risk and
-follow-up measurement rather than being hidden. This is a measured generic
-improvement, not a 10x claim.
+The current exact run is `1.013x` faster than the preceding `318.628s` run,
+`1.064x` faster than the pre-trail `334.557s` run, `1.148x` faster than the
+prior countered `360.86s` run, `2.162x` faster than the original `679.912s`
+tlzig baseline, and `2.218x` faster than the fresh paired `697.495s` TLC run.
+The fresh pair did not collect hardware counters. The preceding `318.628s`
+run remains the latest countered observation: retired instructions were 4.34%
+below its predecessor and 14.0% below the older `63.56T` measurement. Its peak
+RSS was 11.9% above the preceding observation; capped-probe RSS was unchanged,
+so memory remains an explicit follow-up rather than a hidden regression. This
+is a measured generic improvement, not a 10x claim.
 
 The bounded 3-million-distinct probe recorded this normalized progression.
 Generated-candidate counts vary slightly with parallel frontier scheduling, so
@@ -120,6 +122,30 @@ These changes are generic and survived ReleaseFast A/B measurements:
 13. The private state/local extension bodies are also forced inline. This lets
     ReleaseFast specialize the distinct state/local paths and removed another
     4.13-4.17% of normalized probe instructions without weakening assertions.
+14. Tuple-destructuring function binders retain their single declared domain,
+    and multi-bound set maps iterate domains directly without allocating an
+    intermediate Cartesian product. Symbolic function-set assignments stream
+    one candidate at a time, with candidate storage pre-sized from the existing
+    checker budget.
+15. Recursive-call memo keys have a fixed 16-node admission budget and reject
+    executable values. Large aggregate arguments bypass the optional cache
+    before recursive hashing/cloning; compact recursive states still use it.
+    On GameOfLife this reduced strict AOT from `2.575s` to `0.794s` while
+    retaining exact `131,072/65,536` counts.
+16. The fixed root hash cache avalanches aggregate identity and pool identity
+    before applying its direct-map mask. Aggregate offsets are stored in the
+    high 32 bits; using only low identity bits caused systematic collisions
+    between equal-length sets, tuples, and records. Alternating exact Storage
+    runs improved from a `14.215s` control mean to `14.041s` without changing
+    capacity or allocating.
+17. The generator recognizes one-bound-variable filters whose predicate is a
+    direct Boolean state path and emits numeric variable/argument slots plus
+    literal field descriptors. The generated runtime resolves the invariant
+    prefix once and streams candidates through one loop, avoiding callback,
+    lexical-binding, and temporary string-value work. This is syntax-directed
+    and contains no user-spec dispatch. Exhaustive Storage retained exact
+    `8,723,634/1,078,623` counts and improved from `14.606s` to `11.965s`,
+    versus paired TLC-auto `36.979s`; an exact repeat completed in `12.095s`.
 
 ## Rejected Experiments
 
@@ -143,6 +169,11 @@ prevents repeating attractive but slower changes.
 | Pointer-only duplicate lookup pass | 12.13-12.29s probe | Removed |
 | Structure-of-arrays canonical hash table | 11.36-12.31s probe | Removed |
 | ABI-3 static string literals, prelocalized record keys, and direct hash-slot lookup | 1.8976-1.9033T instructions, 0.04-0.06% worse normalized | Removed; ABI remains 2 |
+| Generation-scoped recursive value-hash memoization | NanoMedium regressed from 1.118s to 1.186s; Storage exhaustive regressed from 14.606s to 16.314s with exact counts | Removed; cache probes cost more than shared-subtree reuse saved |
+| Native-Boolean set-filter callbacks | NanoMedium was 1.172s; Storage exhaustive regressed from 14.606s to 16.221s with exact counts | Removed; filter result boxing is not a decisive cost |
+| Per-filter validated record-slot caches | Index-cache exact runs were 12.103s, 12.093s, and 12.358s; interned-token-cache repeats were 12.994s and 13.439s, versus the retained 11.965-12.095s direct-filter range | Removed; validation and cache state outweighed shorter field scans; revisit only with a proven typed slot |
+| Candidate clone-and-fingerprint fusion | Exact five-run Storage median regressed from 11.668s to 11.823s and mean from 11.455s to 11.568s; won 2/5 pairs | Removed completely; inline hash work and cache insertion outweighed the later traversal saved |
+| Whole direct-filter force-inlining | Exact five-run Storage median was effectively flat at 10.859s to 10.849s, but mean regressed from 10.694s to 10.887s and it won 2/5 pairs | Removed; specialize the post-bound field access without duplicating the entire loop |
 
 ## Current Hot Path
 
@@ -162,6 +193,17 @@ The final sample still shows the largest generic costs in this order:
 - generated path resolution and expression dispatch;
 - recursive `EXCEPT` reconstruction.
 
+The 2026-08-03 exact Storage sample, taken from the strict ReleaseFast AOT
+binary, confirms the same structural boundary after the direct filter
+lowering. Aggregated top-of-stack samples were led by recursive value
+fingerprinting (`17,203`), cross-pool path application (`5,229`), value clone
+(`4,159`), equality/memmove, and then the new direct filter loop (`2,267`).
+The sample run retained exact `8,723,634/1,078,623` counts and about 1 GiB
+physical footprint. Its profiler-inflated wall time is not used as benchmark
+evidence. Two validated field-slot-cache designs were slower and removed.
+The next high-leverage change is therefore patch-aware clone/fingerprint work,
+not another lookup cache around the recursive `Value` representation.
+
 Depth-indexed lexical lookup samples fell materially after removing the dead
 source-pool path, and extension wrappers are now inlined. Invariant-loop samples
 are small on RC/snapshot; most time is spent generating, cloning, hashing, and
@@ -173,6 +215,16 @@ children are addressed through pool offsets. That representation is not a
 useful direct SIMD target: traversal has irregular tags, lengths, branches, and
 dependent loads. Applying `@Vector` to this layer would add packing work while
 leaving the dominant clone/path operations intact.
+
+The focused GameOfLife profile exposed a different, workload-specific generic
+cost before the bounded memo admission change: `37.235` aggregate CPU-seconds,
+of which about `15.3` seconds were recursive-call memo lookup/insert work and
+`4.2` seconds were the old hashability prewalk. `Sum(sc, points)` is linear
+recursion over large function/set arguments, so caching cost exceeded
+recomputation. Rejecting the large key before traversal cut all-core
+ReleaseFast wall time from `2.575s` to `0.794s`; a fresh paired TLC run took
+`1.624s`. This is a shape/cost policy derived from bounded value size, not from
+the model or operator name.
 
 ## Structural Work, In Order
 
@@ -269,10 +321,10 @@ Every accepted structural change must pass, in this order:
 6. The primary-corpus audit. Bounded rows remain explicitly bounded and are not
    counted as exhaustive compatibility.
 
-## 2026-07-14 Gate Results
+## 2026-07-16 Gate Results
 
-- Assertion-enabled tests: `176/176` passed.
-- Strict artifacts: all 25 checked-in generated Zig models independently
+- Assertion-enabled tests: `186/186` passed.
+- Strict artifacts: all 28 stored generated Zig models independently
   compiled in ReleaseFast; every artifact declares ABI `2` and
   `fallback_count = 0`.
 - MDBTLA inventory: all 13 upstream configurations are classified; 11
@@ -281,19 +333,216 @@ Every accepted structural change must pass, in this order:
 - Runtime override audit: MDBTLA, MultiShardTxn, MCBinarySearch, and EWD998
   identifiers occur under `src` only in parser tests. Production overrides are
   TLA+/TLC built-ins and standard-module operators.
-- Decisive exhaustive result: exact `405,005,930/67,629,092` in `318.628s`,
-  `54.658T` retired instructions, and `29,406,117,888` bytes peak RSS.
-- Default ReleaseFast benchmark: `56/56` build steps passed in `160.18s`. It
-  contains no heavy one-worker rows and includes strict representative AOT
-  models such as Slush Medium, MCBinarySearch, and MDBTLA.
+- Decisive exhaustive result: fresh exact paired
+  `405,005,930/67,629,092`; TLC `697.495s`, tlzig `314.422s` (`2.218x`).
+- Primary corpus: all 280 configurations classified with zero hard gaps and
+  zero completed count mismatches (`151` exact, `24` outcome-exact, `1`
+  stochastic, `42` bounded, `60` TLC-invalid, `2` non-model harnesses).
+- Default ReleaseFast benchmark passed and contains no heavy one-worker rows.
+  Strict exact rows include Slush Medium (`21.109s/16.541s`), MCBinarySearch
+  (`2.001s/0.714s`), GameOfLife (`1.498s/0.778s`), ClientCentric
+  (`2.334s/1.052s`), and SingleLog MDBLinearizability (`2.013s/0.746s`),
+  reported as TLC/tlzig.
 
-The generated-pattern audit now provides a concrete compiler backlog across 25
-artifacts: 25,472 nested runtime-helper chains, 5,068 generic variable paths,
-1,231 whole-root primed comparisons, 555 generic mapped-set constructions, 435
-generic `UNCHANGED` expressions, 234 generic `EXCEPT` reconstructions, and 176
+Large initial-state products now stream through fixed-size candidate batches.
+Filtered record sets iterate their original domains directly, repeated strings
+are interned in resettable/canonical pools, and canonical aggregate caching
+stops inserting at 75% occupancy with a hard 64-probe bound. This removes an
+unbounded open-addressing failure mode without model-specific dispatch.
+CoffeeCan1000 is exact at `2,000,002/501,500`, TLC/tlzig
+`13.082s/2.081s` (`6.29x`). The opt-in CoffeeCan3000 row is exact at
+`18,000,002/4,504,500`, `131.203s/18.600s` (`7.05x`); current tlzig is `5.25x`
+faster than its prior `97.649s` baseline.
+
+The generated-pattern audit now provides a concrete compiler backlog across 28
+artifacts: 25,684 nested runtime-helper chains, 5,073 generic variable paths,
+1,237 whole-root primed comparisons, 557 generic mapped-set constructions, 435
+generic `UNCHANGED` expressions, 236 generic `EXCEPT` reconstructions, and 176
 materialized function ranges. Counts are syntactic opportunities, not assumed
 speedups; each lowering still requires differential tests and ReleaseFast A/B
 evidence.
 
 References: [TigerBeetle TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md)
 and [Zig vectors](https://ziglang.org/documentation/master/#Vectors).
+
+## 2026-07-28 Structural Gate
+
+- Action-local memoization now rejects large aggregate keys after a bounded
+  structural walk and returns immediately for an empty table.
+- Recursive finite-set sums lower to a contiguous iterator loop with a scalar
+  accumulator; no intermediate set difference or recursive memo key is built.
+- Generated lazy closures use required-capture masks, preserving stable
+  argument layouts without forcing unused LET definitions.
+- Standard finite-set predicates use direct calls and constant-slot metadata;
+  generated artifacts contain no string-based native dispatch.
+- Strict linked models always enable their complete generated expression table;
+  there is no benchmark feature flag selecting the fast path. Benchmark
+  binaries compile-fail when `fallback_count` is nonzero.
+- Exact ReleaseFast results: GameOfLife `2.573s/0.788s` and BTree
+  `4.066s/0.954s` (TLC/tlzig). All default strict rows remain faster than TLC,
+  all 40 stored artifacts compile, and every artifact has zero fallback.
+
+## 2026-08-03 Shared State-Path Predicate Gate
+
+Generated conjunctions now recognize a deliberately narrow structural pair:
+a string-literal membership in `DOMAIN state_path`, immediately followed by a
+field equality on the same path against an operator argument. The generated
+runtime resolves the path once, checks the record/function domain without
+building a set, and forces the equality argument only after membership passes.
+This preserves TLA+ short-circuit/error order and allocates nothing on the hot
+path. The matcher uses AST identity and parameter slots only; no user operator,
+field name, or model name selects the optimization.
+
+Storage exhaustive remains exact at `1,078,623` distinct states. Fresh paired
+ReleaseFast all-core measurements are TLC `32.385s` and tlzig `10.529s`, with
+a tlzig repeat of `10.579s`. The accepted change improves the preceding
+`11.965-12.095s` tlzig range by `12-13%` and the earlier `14.606s` baseline by
+`27.9%`. All 221 assertion-enabled tests and the complete default ReleaseFast
+benchmark pass; regenerated artifacts have zero fallback and no generated
+`runtime.native` dispatch.
+
+Replacing primitive FNV leaf hashing with scalar mixing and Wyhash was tested
+and removed. It retained exact counts but produced `10.766s`, `10.796s`, and
+`11.123s` Storage runs, all slower than the accepted `10.529-10.579s` range.
+Reducing leaf rounds does not compensate for the added code/setup cost; future
+hash work must remove recursive aggregate traversals instead.
+
+Generic membership in `DOMAIN state_path` and
+`DOMAIN state_path.record_field` now resolves the path once and checks function,
+tuple, or record domains without materializing a set. Exact Storage exhaustive
+improved again to a paired `10.162s`, with isolated repeats of `10.016s` and
+`10.496s`; both engines retain `1,078,623` distinct states. All 222 tests and
+the default ReleaseFast corpus pass with zero generated fallback.
+
+A narrower string-literal domain API was measured and removed. Its isolated
+A/B results were `10.365s/10.836s` versus `9.971s/10.003s` for the generic
+direct-domain binary, despite one noisy paired result of `9.654s`. Keeping the
+element as the ordinary generated expression gives less code and better stable
+performance.
+
+The remaining reconstruct/clone/fingerprint duplication needs a lifetime
+change, not an early write into candidate storage. Candidate pools are
+append-only while failed action branches roll back evaluator pools; writing
+partial results there would leak bounded capacity. A future typed patch/trail
+must define rollback and primed-read semantics before it can replace those
+traversals.
+
+The 2026-08-03 current-binary sample still identifies recursive value
+fingerprinting as the dominant top-of-stack cost (`9,304` samples), followed
+by cross-pool path application (`3,818`), cloning, and byte comparison. A
+standalone disjoint-`EXCEPT` constructor was measured and removed: Storage
+already takes the fused primed-variable comparison path, while the extra
+constructor regressed three exact isolated runs to
+`10.513s/10.920s/10.881s`. Reverted runs under the same load were
+`10.396s/10.436s/10.886s`.
+
+Repeated state paths in flattened short-circuit conjunctions now use an
+allocation-free `ResolvedPath` view after their first fused domain/field
+guard. The compiler matches AST structure and numeric state/argument slots;
+the runtime contains no model, operator, or field-name dispatch. Resolution
+is kept at the original guard position, so earlier false predicates and error
+order remain unchanged. Later field comparisons and field-domain membership
+reuse `(Value, source_pool)` instead of traversing the same function path.
+Five alternating exact Storage runs improved median all-core time from
+`10.761s` to `10.413s` and mean from `10.606s` to `10.449s`, winning four of
+five paired positions. Exact `8,723,634/1,078,623` counts, all `223` tests,
+the complete default ReleaseFast corpus, and zero-fallback generation remain
+intact.
+
+Capturing a second repeated path while evaluating the right side of an ordered
+field comparison was also tested and removed. Although it eliminated another
+path traversal without changing left-to-right error order, the larger helper
+regressed five-run Storage median from `10.831s` to `11.066s` and mean from
+`10.805s` to `10.940s`; only one paired position improved. Path reuse remains
+limited to views established by the existing fused guard, where the measured
+code-size/work tradeoff is positive.
+
+A generic clone-and-fingerprint walk was implemented for every hashable
+`Value` variant and measured with matched ReleaseFast binaries. Exact Storage
+counts held, but five alternating runs regressed median from `11.668s` to
+`11.823s` and mean from `11.455s` to `11.568s`; only two pairs improved. The
+implementation and its cache relocation were removed. This confirms that a
+future candidate optimization must avoid materialization or retain old-root
+sharing, not only merge two existing recursive walks.
+
+Dense integer/model function lookup now validates the computed slot with a
+direct tag and scalar comparison instead of calling the generic cross-pool
+equality dispatcher. Sparse domains still fall back to the linear semantic
+lookup. Five alternating exact Storage runs improved median from `11.711s` to
+`11.386s` and mean from `11.527s` to `11.369s`, winning four of five pairs;
+all ten runs retained `8,723,634/1,078,623` counts. The post-change corpus has
+`224` passing tests, complete coverage of all 11 TLC-valid MDBTLA configs,
+zero generated fallback, and every default AOT row faster than TLC-auto.
+
+Generic cross-pool application is now force-inlined into path resolution.
+This exposes integer/model dense probes and tuple indexing to each AOT caller
+without adding a new runtime representation or model-specific dispatch. Eight
+alternating and reverse-order exact Storage runs improved aggregate median
+from `12.385s` to `11.543s` and mean from `12.264s` to `11.757s`; pairwise
+wins were 4/8 because machine load varied sharply, but the generated binary
+also became `17,152` bytes smaller. A fresh CPU sample no longer contains an
+out-of-line `apply_cross_pool` hotspot; the inlined work is correctly charged
+to `resolve_path`. A second complete default ReleaseFast corpus passed with
+zero fallback, exact exhaustive counts, and every AOT row faster than
+TLC-auto.
+
+Path resolution itself is now force-inlined into generated AOT callers. Eight
+alternating and reverse-order exact Storage runs improved aggregate median
+from `10.387s` to `10.118s` and mean from `10.439s` to `10.305s`, winning
+seven of eight pairs. The generated executable grew by `17,536` bytes, a
+bounded code-size cost for the measured reduction in dispatch and call
+overhead. Literal-string cross-pool application is also force-inlined. Six
+fully recorded exact pairs improved median from `10.354s` to `10.012s` and
+mean from `10.537s` to `9.965s`, winning all six; this second change reduced
+the executable by `128` bytes relative to the path-inline control.
+
+The accepted build passes formatting, all `224` tests, ReleaseFast
+compilation, complete coverage of all 11 TLC-valid MDBTLA configurations, and
+the default ReleaseFast benchmark. Every strict generated artifact has zero
+fallbacks and every AOT row is faster than TLC-auto. The exhaustive Storage
+A/B runs retain exactly `8,723,634/1,078,623` generated/distinct states.
+
+A fresh accepted-build sample confirms that both newly inlined helpers have
+disappeared as standalone hotspots. Top-of-stack work is now recursive value
+fingerprinting (`13,990` samples), direct state-path filtering (`3,836`), byte
+equality (`2,905`), action-step execution (`2,423`), recursive cloning
+(`2,283`), and aggregate moves (`1,251`). The sample retained exact Storage
+counts; its profiler-inflated wall time is not benchmark evidence.
+
+Generated state paths with a final literal-string key now pass that literal
+directly after resolving the prefix. This is not a record-layout assumption:
+the generic helper preserves record and string-keyed function application and
+the same errors for missing keys or invalid operands. It removes temporary
+string interning and generic final-key dispatch. Ten exact all-core Storage
+pairs won seven positions, with aggregate median `10.768s` to `10.729s` and
+mean `10.972s` to `10.848s`. Three paired hardware-counter runs were more
+stable: retired instructions fell by `0.450%`, `0.440%`, and `0.528%`, a mean
+reduction from `1.962156T` to `1.952880T` (`0.473%`). Code size increased by
+`144` bytes. The post-change gate has `225` passing tests, complete MDBTLA
+coverage, zero generated fallback, and every default AOT row faster than
+TLC-auto.
+
+Any future lazy EXCEPT patch must satisfy a stricter ownership contract than
+the current evaluator representation:
+
+1. The base root and its pool must outlive action-branch rollback; no patch may
+   retain a value owned only by the rollbackable evaluator pool.
+2. Replacement values and dynamic path components must be copied into bounded
+   patch scratch or be proven candidate-owned scalars before the evaluator
+   mark is restored.
+3. Rejected branches must leave persistent candidate capacity unchanged.
+   Publication may happen only after the action predicate succeeds.
+4. Primed reads during the same action must resolve through the patch overlay,
+   including nested reads and multiple updates to the same path.
+5. Repeated, overlapping, and nested EXCEPT paths must preserve TLA+ left-to-
+   right update and `@` semantics.
+6. Equality, fingerprinting, canonicalization, and eventual materialization
+   must describe the same value without pointer identity or profile-derived
+   assumptions.
+7. Capacity must be preflighted from bounded path/update counts so failure is
+   explicit and no hot-path allocator fallback is introduced.
+
+Until all seven conditions are implemented together, eager localization and
+materialization remain the correct ownership boundary. A partial patch would
+trade measured CPU work for dangling references, stale primed reads, or
+candidate-pool leakage and is therefore not an acceptable optimization.

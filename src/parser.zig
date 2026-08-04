@@ -924,7 +924,9 @@ pub const Parser = struct {
             var binder_count: u32 = 0;
             while (true) {
                 var binder_vars: u32 = 0;
+                var tuple_binder = false;
                 if (self.match(.langle)) {
+                    tuple_binder = true;
                     while (true) {
                         try function_vars.append(
                             std.heap.page_allocator,
@@ -955,7 +957,8 @@ pub const Parser = struct {
                 try self.expect(.in);
                 const binder_domain = try self.parse_expr();
                 var binder_index: u32 = 0;
-                while (binder_index < binder_vars) : (binder_index += 1) {
+                const domain_factor_count = if (tuple_binder) 1 else binder_vars;
+                while (binder_index < domain_factor_count) : (binder_index += 1) {
                     function_domain = if (function_domain) |domain|
                         try self.expr_set_binary(
                             .cartesian_op,

@@ -102,19 +102,11 @@ pub fn build(b: *std.Build) void {
         "benchmark-include-long",
         "Include opt-in long benchmark specs and generated benchmark rows",
     ) orelse false;
-    const benchmark_generated_expressions = b.option(
-        bool,
-        "benchmark-generated-expressions",
-        "Enable generated expression AOT benchmark path",
-    ) orelse true;
     if (benchmark_filter) |filter| {
         run_bench.addArg(filter);
     }
     if (benchmark_include_long) {
         run_bench.addArg("--include-long");
-    }
-    if (benchmark_generated_expressions) {
-        run_bench.addArg("--generated-expressions");
     }
     if (generated_model_path == null) {
         run_bench.addArg("--skip-prefer-generated");
@@ -137,6 +129,135 @@ pub fn build(b: *std.Build) void {
                 .tla = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.tla",
                 .cfg = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.cfg",
                 .filter = "MCBinarySearch",
+            },
+            .{
+                .name = "benchmark_paxos_commit_aot",
+                .model_path = "generated_models/paxos_commit.zig",
+                .tla = "vendor/tlaplus-examples/specifications/transaction_commit/PaxosCommit.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/PaxosCommit.cfg",
+                .filter = "PaxosCommit",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_multi_paxos_small_aot",
+                .model_path = "generated_models/multi_paxos_small.zig",
+                .tla = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC_small.cfg",
+                .filter = "MultiPaxosSmall",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_multi_paxos_aot",
+                .model_path = "generated_models/multi_paxos.zig",
+                .tla = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.cfg",
+                .filter = "MultiPaxos",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_game_of_life_aot",
+                .model_path = "generated_models/game_of_life.zig",
+                .tla = "vendor/tlaplus-examples/specifications/GameOfLife/GameOfLife.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/GameOfLife/GameOfLife.cfg",
+                .filter = "GameOfLife",
+            },
+            .{
+                .name = "benchmark_sailfish1_aot",
+                .model_path = "generated_models/sailfish1.zig",
+                .tla = "vendor/tlaplus-examples/specifications/dag-consensus/TLCSailfish1.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/dag-consensus/TLCSailfish1.cfg",
+                .filter = "Sailfish1",
+            },
+            .{
+                .name = "benchmark_ewd998_small_aot",
+                .model_path = "generated_models/ewd998_small.zig",
+                .tla = "vendor/tlaplus-examples/specifications/ewd998/EWD998.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/ewd998/EWD998Small.cfg",
+                .filter = "EWD998Small",
+            },
+            .{
+                .name = "benchmark_ewd998_chan_small_aot",
+                .model_path = "generated_models/ewd998_chan_small.zig",
+                .tla = "vendor/tlaplus-examples/specifications/ewd998/EWD998Chan.tla",
+                .cfg = "benchmark_configs/EWD998Chan_small.cfg",
+                .filter = "EWD998ChanSmall",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_ewd998_chan_aot",
+                .model_path = "generated_models/ewd998_chan.zig",
+                .tla = "vendor/tlaplus-examples/specifications/ewd998/EWD998Chan.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/ewd998/EWD998Chan.cfg",
+                .filter = "EWD998Chan",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_elevator_liveness_medium_aot",
+                .model_path = "generated_models/elevator_liveness_medium.zig",
+                .tla = "vendor/tlaplus-examples/specifications/MultiCarElevator/Elevator.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/MultiCarElevator/ElevatorLivenessMedium.cfg",
+                .filter = "ElevatorLivenessMedium",
+            },
+            .{
+                .name = "benchmark_spantree_test5_aot",
+                .model_path = "generated_models/spantree_test5.zig",
+                .tla = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTreeTest.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTreeTest5Nodes.cfg",
+                .filter = "SpanTreeTest5Nodes",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_ap_bcast_folklore_aot",
+                .model_path = "generated_models/ap_bcast_folklore.zig",
+                .tla = "vendor/tlaplus-examples/specifications/bcastFolklore/APbcastFolklore.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/bcastFolklore/APbcastFolklore.cfg",
+                .filter = "APbcastFolklore",
+            },
+            .{
+                .name = "benchmark_bosco_aot",
+                .model_path = "generated_models/bosco.zig",
+                .tla = "vendor/tlaplus-examples/specifications/bosco/bosco.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/bosco/bosco.cfg",
+                .filter = "Bosco",
+            },
+            .{
+                .name = "benchmark_btree_aot",
+                .model_path = "generated_models/btree.zig",
+                .tla = "vendor/tlaplus-examples/specifications/btree/btree.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/btree/btree.cfg",
+                .filter = "BTree",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_nano_medium_aot",
+                .model_path = "generated_models/nano_medium.zig",
+                .tla = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNano.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNanoMedium.cfg",
+                .filter = "NanoMedium",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_bcast_folklore_aot",
+                .model_path = "generated_models/bcast_folklore.zig",
+                .tla = "vendor/tlaplus-examples/specifications/bcastFolklore/bcastFolklore.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/bcastFolklore/bcastFolklore.cfg",
+                .filter = "bcastFolklore",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_coffee_can_1000_aot",
+                .model_path = "generated_models/coffee_can_1000.zig",
+                .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan1000Beans.cfg",
+                .filter = "CoffeeCan1000",
+            },
+            .{
+                .name = "benchmark_coffee_can_3000_aot",
+                .model_path = "generated_models/coffee_can_3000.zig",
+                .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan3000Beans.cfg",
+                .filter = "CoffeeCan3000",
+                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mdbtla_client_centric_aot",
@@ -307,7 +428,6 @@ pub fn build(b: *std.Build) void {
                 generated_benchmark.tla,
                 generated_benchmark.cfg,
                 generated_benchmark.filter,
-                benchmark_generated_expressions,
             );
             run_generated_benchmark.step.dependOn(
                 previous_generated_benchmark,
@@ -353,7 +473,6 @@ fn addGeneratedBenchmark(
     generated_benchmark_tla: []const u8,
     generated_benchmark_cfg: []const u8,
     filter: []const u8,
-    generated_expressions: bool,
 ) *std.Build.Step.Run {
     const regenerate = b.addRunArtifact(emitter);
     regenerate.has_side_effects = true;
@@ -391,9 +510,6 @@ fn addGeneratedBenchmark(
         " [AOT]",
         "--auto-only",
     });
-    if (generated_expressions) {
-        run_bench.addArg("--generated-expressions");
-    }
     return run_bench;
 }
 

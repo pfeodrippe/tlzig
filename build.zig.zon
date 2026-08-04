@@ -2,7 +2,7 @@
     .name = .tlzig,
     .fingerprint = 0x850f303a5570eccc,
     .version = "0.0.1",
-    .minimum_zig_version = "0.17.0-dev",
+    .minimum_zig_version = "0.17.0-dev.1543+6db520a4c",
     .dependencies = .{},
     .paths = .{
         "build.zig",

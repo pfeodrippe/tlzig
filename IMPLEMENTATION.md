@@ -14,7 +14,7 @@ Build a TLA+ model checker (a TLC-compatible engine) in Zig that is:
 The project vendors:
 
 - `vendor/tlaplus-examples` — TLA+ example specifications (git submodule).
-- `vendor/zig` — Zig compiler source from Codeberg master (git submodule).
+- `vendor/zig` — source for the pinned Zig master snapshot (git submodule).
 - `vendor/tlaplus` — Reference TLC/SANY implementation (plain clone for study only).
 
 ## 2. What a TLA+ Model Checker Does
@@ -299,10 +299,10 @@ values used during expression evaluation.
 
 ```sh
 # Build the engine.
-./tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build
+./tools/zig-aarch64-macos-0.17.0-dev.1543+6db520a4c/zig build
 
 # Run tests.
-./tools/zig-aarch64-macos-0.17.0-dev.857+2b2b85c5f/zig build test
+./tools/zig-aarch64-macos-0.17.0-dev.1543+6db520a4c/zig build test
 
 # Check a spec.
 ./zig-out/bin/tlzig --spec SPEC.tla --cfg CFG.cfg --max-states N

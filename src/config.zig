@@ -653,6 +653,105 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+pub fn build_codegen_replacements(
+    arena: *Arena,
+    module: ast.Module,
+    cfg: Config,
+) ![]const ast.ConfigReplacement {
+    var replacement_count: usize = 0;
+    for (cfg.constants) |assignment| {
+        const source_module = assignment.module orelse {
+            replacement_count += 1;
+            continue;
+        };
+        for (module.definitions) |definition| {
+            if (definition_from_module(definition, source_module) and
+                eql(unqualified_name(definition.name), assignment.name))
+            {
+                replacement_count += 1;
+            }
+        }
+    }
+    if (replacement_count == 0) return &.{};
+
+    const replacements = try arena.alloc(
+        ast.ConfigReplacement,
+        replacement_count,
+    );
+    var replacement_index: usize = 0;
+    for (cfg.constants) |assignment| {
+        const value = trim(assignment.expr);
+        const kind: ast.ConfigReplacement.Kind = if (assignment.is_substitution and
+            is_operator_alias(value))
+            .alias
+        else
+            .constant;
+        if (assignment.module) |source_module| {
+            for (module.definitions) |definition| {
+                if (!definition_from_module(definition, source_module) or
+                    !eql(unqualified_name(definition.name), assignment.name))
+                {
+                    continue;
+                }
+                replacements[replacement_index] = .{
+                    .name = definition.name,
+                    .value = value,
+                    .is_substitution = assignment.is_substitution,
+                    .kind = kind,
+                };
+                replacement_index += 1;
+            }
+        } else {
+            replacements[replacement_index] = .{
+                .name = assignment.name,
+                .value = value,
+                .is_substitution = assignment.is_substitution,
+                .kind = kind,
+            };
+            replacement_index += 1;
+        }
+    }
+    std.debug.assert(replacement_index == replacements.len);
+    return replacements;
+}
+
+pub fn codegen_replacements_hash(
+    replacements: []const ast.ConfigReplacement,
+) u64 {
+    var hasher = std.hash.Wyhash.init(0x544c_5a49_475f_4347);
+    for (replacements) |replacement| {
+        hash_bytes(&hasher, replacement.name);
+        hash_bytes(&hasher, replacement.value);
+        hasher.update(&.{if (replacement.is_substitution) 1 else 0});
+        hasher.update(&.{switch (replacement.kind) {
+            .alias => 1,
+            .constant => 2,
+        }});
+    }
+    return hasher.final();
+}
+
+fn hash_bytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    const len: u64 = bytes.len;
+    hasher.update(std.mem.asBytes(&len));
+    hasher.update(bytes);
+}
+
+fn unqualified_name(name: []const u8) []const u8 {
+    const bang = std.mem.lastIndexOfScalar(u8, name, '!') orelse return name;
+    return name[bang + 1 ..];
+}
+
+fn definition_from_module(
+    definition: ast.Definition,
+    module_name: []const u8,
+) bool {
+    const basename = std.fs.path.basename(definition.source_path);
+    return basename.len == module_name.len + ".tla".len and
+        eql(basename[0..module_name.len], module_name) and
+        eql(basename[module_name.len..], ".tla");
+}
+
 fn arena_dup(arena: *Arena, s: []const u8) ![]const u8 {
     const copy = try arena.alloc(u8, s.len);
     @memcpy(copy, s);
@@ -725,6 +824,62 @@ test "parse module-scoped model assignment" {
     try std.testing.expectEqualStrings("NoHashVal", cfg.constants[0].expr);
     try std.testing.expectEqualStrings("Nano", cfg.constants[0].module.?);
     try std.testing.expect(cfg.constants[0].is_substitution);
+}
+
+test "codegen replacements preserve module-scoped assignment" {
+    const source =
+        \\CONSTANTS
+        \\  NoHashVal = NoHashVal
+        \\  NoBlock = [Nano]NoBlockVal
+    ;
+    var arena = try Arena.init(16 * 1024);
+    defer arena.deinit();
+
+    var body = ast.Expr{ .bool_literal = true };
+    const definitions = [_]ast.Definition{
+        .{
+            .name = "N!NoBlock",
+            .params = &.{},
+            .body = &body,
+            .source_path = "/spec/Nano.tla",
+        },
+        .{
+            .name = "Other!NoBlock",
+            .params = &.{},
+            .body = &body,
+            .source_path = "/spec/Other.tla",
+        },
+    };
+    const module = ast.Module{
+        .name = "Model",
+        .extends = &.{},
+        .variables = &.{},
+        .constants = &.{},
+        .definitions = &definitions,
+        .assumptions = &.{},
+        .instances = &.{},
+        .namespace_instances = &.{},
+        .init_name = "",
+        .next_name = "",
+        .invariants = &.{},
+    };
+    const cfg = try parse(&arena, source);
+    const replacements = try build_codegen_replacements(
+        &arena,
+        module,
+        cfg,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), replacements.len);
+    try std.testing.expectEqualStrings("NoHashVal", replacements[0].name);
+    try std.testing.expectEqual(.constant, replacements[0].kind);
+    try std.testing.expectEqualStrings("N!NoBlock", replacements[1].name);
+    try std.testing.expectEqualStrings("NoBlockVal", replacements[1].value);
+    try std.testing.expectEqual(.alias, replacements[1].kind);
+    try std.testing.expect(
+        codegen_replacements_hash(replacements) !=
+            codegen_replacements_hash(replacements[0..1]),
+    );
 }
 
 test "state and action constraints remain distinct" {

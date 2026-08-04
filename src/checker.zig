@@ -37,6 +37,7 @@ const WorkerContext = struct {
     compose_states: StateBuffer,
     new_states: StateBuffer,
     prepared_fingerprints: []fingerprint.Fingerprint,
+    prepared_view_ranks: []u64,
     prepared_edge_masks: []u64,
     prepared_generated: u64,
     composition_generated: u64,
@@ -63,6 +64,80 @@ const ParallelState = struct {
     done: bool = false,
     failure: ?Error = null,
 };
+
+const TemporalWorkerContext = struct {
+    arena: Arena,
+    eval_pool: ValuePool,
+    evaluator: Evaluator,
+
+    fn deinit(self: *TemporalWorkerContext) void {
+        self.arena.deinit();
+    }
+};
+
+const TemporalEvaluation = union(enum) {
+    state_expression: struct {
+        expression: *ast.Expr,
+        has_enabled: bool,
+    },
+    enabled_action: *ast.Expr,
+    box_action: struct {
+        action: *ast.Expr,
+        vars: *ast.Expr,
+    },
+};
+
+const ViewProjection = union(enum) {
+    variable: u16,
+    tuple: []const u16,
+};
+
+const ParallelTemporalState = struct {
+    checker: *Checker,
+    evaluation: TemporalEvaluation,
+    results: []bool,
+    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    next_index: u32 = 0,
+    failure: ?Error = null,
+};
+
+fn parallel_temporal_worker(
+    parallel: *ParallelTemporalState,
+    worker: *TemporalWorkerContext,
+) void {
+    const batch_size: u32 = 256;
+    while (true) {
+        assert(std.c.pthread_mutex_lock(&parallel.mutex) == .SUCCESS);
+        if (parallel.failure != null or
+            parallel.next_index >= parallel.results.len)
+        {
+            assert(std.c.pthread_mutex_unlock(&parallel.mutex) == .SUCCESS);
+            return;
+        }
+        const start = parallel.next_index;
+        const end = @min(
+            start +| batch_size,
+            @as(u32, @intCast(parallel.results.len)),
+        );
+        parallel.next_index = end;
+        assert(std.c.pthread_mutex_unlock(&parallel.mutex) == .SUCCESS);
+
+        var index = start;
+        while (index < end) : (index += 1) {
+            parallel.results[index] = parallel.checker.eval_temporal_operation_state(
+                &worker.evaluator,
+                &worker.eval_pool,
+                parallel.evaluation,
+                index,
+            ) catch |err| {
+                assert(std.c.pthread_mutex_lock(&parallel.mutex) == .SUCCESS);
+                if (parallel.failure == null) parallel.failure = err;
+                assert(std.c.pthread_mutex_unlock(&parallel.mutex) == .SUCCESS);
+                return;
+            };
+        }
+    }
+}
 
 const CommitMutex = if (builtin.os.tag == .macos)
     std.c.os_unfair_lock
@@ -109,6 +184,7 @@ fn parallel_worker(
     worker: *WorkerContext,
 ) void {
     const checker = parallel.checker;
+    const deterministic_view = checker.view_name != null;
     const parent_batch_capacity = 16;
     var parent_batch: [parent_batch_capacity]u32 = undefined;
     while (true) {
@@ -118,7 +194,7 @@ fn parallel_worker(
             return;
         }
 
-        const next_idx = checker.queue.peek() orelse {
+        var next_idx = checker.queue.peek() orelse {
             if (parallel.active == 0) {
                 parallel.done = true;
                 parallel_broadcast(parallel);
@@ -130,13 +206,17 @@ fn parallel_worker(
             continue;
         };
         const next_level = checker.state_store.get(next_idx).level;
-        if (checker.graph_enabled and
+        if ((checker.graph_enabled or deterministic_view) and
             next_level > parallel.current_level)
         {
             if (parallel.active != 0) {
                 parallel_wait(parallel);
                 parallel_unlock(parallel);
                 continue;
+            }
+            if (deterministic_view) {
+                checker.sort_view_frontier();
+                next_idx = checker.queue.peek().?;
             }
             parallel.current_level = next_level;
         }
@@ -148,6 +228,14 @@ fn parallel_worker(
             !checker.has_enabled_invariants;
         if (batch_fast_path) {
             while (parent_batch_count < parent_batch.len) {
+                if (deterministic_view) {
+                    const batch_next = checker.queue.peek() orelse break;
+                    if (checker.state_store.get(batch_next).level !=
+                        next_level)
+                    {
+                        break;
+                    }
+                }
                 parent_batch[parent_batch_count] =
                     checker.queue.dequeue() orelse break;
                 parent_batch_count += 1;
@@ -181,8 +269,19 @@ fn parallel_worker(
                     worker.prepared_edge_masks
                 else
                     null,
+                .diagnostics = checker.diagnostics,
             };
             const generation_error: ?Error = blk: {
+                if (deterministic_view and
+                    worker.source_snapshot.get(state_idx).level > 0)
+                {
+                    checker.check_canonical_state_invariants(
+                        &worker.evaluator,
+                        &worker.eval_pool,
+                        state_idx,
+                        &worker.source_snapshot,
+                    ) catch |err| break :blk err;
+                }
                 executor.execute_next(
                     checker.next_spec.?,
                     state_idx,
@@ -197,6 +296,7 @@ fn parallel_worker(
                     &worker.eval_pool,
                     &worker.source_snapshot.values_pool,
                     worker.prepared_fingerprints,
+                    worker.prepared_view_ranks,
                     worker.prepared_edge_masks,
                     &worker.canonical_hash_cache,
                     &worker.candidate_hash_cache,
@@ -232,6 +332,7 @@ fn parallel_worker(
                         &worker.new_states,
                         &worker.candidate_store,
                         worker.prepared_fingerprints,
+                        worker.prepared_view_ranks,
                         &worker.candidate_hash_cache,
                         &worker.source_snapshot,
                     ) catch |err| blk: {
@@ -239,7 +340,7 @@ fn parallel_worker(
                         break :blk 0;
                     };
                 }
-                if (commit_error == null) {
+                if (commit_error == null and !deterministic_view) {
                     checker.check_new_state_invariants(
                         &worker.evaluator,
                         &worker.eval_pool,
@@ -320,6 +421,7 @@ fn parallel_worker(
                         &worker.new_states,
                         &worker.candidate_store,
                         worker.prepared_fingerprints,
+                        worker.prepared_view_ranks,
                         worker.prepared_edge_masks,
                         &worker.candidate_hash_cache,
                     ) catch |err| {
@@ -337,7 +439,7 @@ fn parallel_worker(
             // read-only and may proceed in parallel. New states are not queued
             // until every invariant has passed.
             parallel_commit_unlock(parallel);
-            if (commit_error == null) {
+            if (commit_error == null and !deterministic_view) {
                 checker.check_new_state_invariants(
                     &worker.evaluator,
                     &worker.eval_pool,
@@ -428,10 +530,12 @@ const SymmetryHashCache = struct {
             0;
         const pool_ptr = @intFromPtr(pool);
         const identity = value_identity(value_v);
-        const slot: usize = @intCast(
-            (identity ^ (permutation_ptr *% 0x9e3779b97f4a7c15)) &
-                (self.entries.len - 1),
-        );
+        std.debug.assert(std.math.isPowerOfTwo(self.entries.len));
+        const slot: usize = @intCast(hash_cache_index(
+            identity,
+            pool_ptr,
+            permutation_ptr,
+        ) & (self.entries.len - 1));
         const entry = &self.entries[slot];
         if (entry.occupied and entry.generation == self.generation and
             entry.pool_ptr == pool_ptr and
@@ -457,8 +561,26 @@ const SymmetryHashCache = struct {
     }
 };
 
+fn hash_cache_index(identity: u64, pool_ptr: usize, permutation_ptr: usize) u64 {
+    var mixed = identity ^
+        (@as(u64, pool_ptr) *% 0x9e3779b97f4a7c15) ^
+        (@as(u64, permutation_ptr) *% 0xbf58476d1ce4e5b9);
+    mixed = (mixed ^ (mixed >> 30)) *% 0xbf58476d1ce4e5b9;
+    mixed = (mixed ^ (mixed >> 27)) *% 0x94d049bb133111eb;
+    return mixed ^ (mixed >> 31);
+}
+
+test "hash cache index mixes aggregate offsets from high identity bits" {
+    const first = hash_cache_index(@as(u64, 1) << 32 | 4, 0x1000, 0);
+    const second = hash_cache_index(@as(u64, 2) << 32 | 4, 0x1000, 0);
+    try std.testing.expect(first != second);
+    try std.testing.expect(
+        hash_cache_index(@as(u64, 1) << 32 | 4, 0x2000, 0) != first,
+    );
+}
+
 fn value_identity(value_v: Value) u64 {
-    const tag: u64 = @intFromEnum(value_v);
+    const tag: u64 = @backingInt(value_v);
     return switch (value_v) {
         .bool_v => |value_b| tag ^ @as(u64, @intFromBool(value_b)),
         .int_v => |value_i| tag ^ @as(u64, @bitCast(value_i)),
@@ -608,9 +730,10 @@ fn effective_canonical_hash(hash: fingerprint.Fingerprint) fingerprint.Fingerpri
 }
 
 fn canonical_value_capacity(max_states: u32) u32 {
+    const capacity_limit: u64 = if (builtin.is_test) 1024 else 2_097_152;
     const target = @min(
         @as(u64, max_states) * 2,
-        2_097_152,
+        capacity_limit,
     );
     var capacity: u32 = 1024;
     while (capacity < target) capacity *= 2;
@@ -618,7 +741,144 @@ fn canonical_value_capacity(max_states: u32) u32 {
     return capacity;
 }
 
+const canonical_value_max_probe_count: usize = 64;
+
+fn canonical_value_load_limit(capacity: usize) usize {
+    assert(capacity > 0);
+    assert(std.math.isPowerOfTwo(capacity));
+    return capacity - capacity / 4;
+}
+
+fn candidate_value_capacity(
+    max_states: u32,
+    max_successors: u32,
+    state_value_capacity: u32,
+) u32 {
+    assert(max_states > 0);
+    assert(max_successors > 0);
+    assert(max_successors <= max_states);
+    assert(state_value_capacity > 0);
+    const values_per_state = std.math.divCeil(
+        u64,
+        state_value_capacity,
+        max_states,
+    ) catch unreachable;
+    const requested = std.math.mul(
+        u64,
+        max_successors,
+        values_per_state,
+    ) catch std.math.maxInt(u64);
+    return @intCast(@min(
+        @as(u64, state_value_capacity),
+        @max(@as(u64, 1_048_576), requested),
+    ));
+}
+
+fn direct_view_projection(
+    arena: *Arena,
+    evaluator: *const Evaluator,
+    variable_names: []const []const u8,
+    view_name: []const u8,
+) !?ViewProjection {
+    var name = view_name;
+    var depth: u8 = 0;
+    while (depth < 32) : (depth += 1) {
+        const resolved = evaluator.resolve_alias(name);
+        const definition = evaluator.find_definition(resolved) orelse
+            return null;
+        if (definition.params.len != 0) return null;
+        switch (definition.body.*) {
+            .ident => |identifier| {
+                if (lookup_variable_index(
+                    variable_names,
+                    identifier,
+                )) |index| {
+                    return ViewProjection{ .variable = index };
+                }
+                name = identifier;
+            },
+            .tuple => |items| {
+                const indices = try arena.alloc(u16, items.len);
+                for (items, indices) |item, *index| {
+                    if (item.* != .ident) return null;
+                    index.* = lookup_variable_index(
+                        variable_names,
+                        item.ident,
+                    ) orelse return null;
+                }
+                return ViewProjection{ .tuple = indices };
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn lookup_variable_index(
+    variable_names: []const []const u8,
+    name: []const u8,
+) ?u16 {
+    for (variable_names, 0..) |variable_name, index| {
+        if (std.mem.eql(u8, variable_name, name)) {
+            assert(index <= std.math.maxInt(u16));
+            return @intCast(index);
+        }
+    }
+    return null;
+}
+
+fn view_projection_fingerprint(
+    default_pool: *const ValuePool,
+    state: *const StateStore.State,
+    projection: ViewProjection,
+    permutation: ?[]const u32,
+) fingerprint.Fingerprint {
+    return switch (projection) {
+        .variable => |index| blk: {
+            assert(index < state.values.len);
+            break :blk fingerprint.hash_value_permuted(
+                state.value_pool(index, default_pool),
+                state.values[index],
+                permutation,
+            );
+        },
+        .tuple => |indices| fingerprint.hash_state_tuple_projection(
+            default_pool,
+            state,
+            indices,
+            permutation,
+        ),
+    };
+}
+
 pub const Checker = struct {
+    const InitialCandidateSinkContext = struct {
+        checker: *Checker,
+        candidate_store: *StateStore,
+        candidate_evaluator: *Evaluator,
+        candidate_pool_base: ValuePool.Snapshot,
+        edge_masks: []u64,
+
+        fn consume(raw_context: *anyopaque, out_states: *StateBuffer) Error!void {
+            const context: *InitialCandidateSinkContext = @ptrCast(
+                @alignCast(raw_context),
+            );
+            assert(out_states.items.len > 0);
+            assert(out_states.items.len <= out_states.storage.len);
+            context.checker.successor_attempts += out_states.items.len;
+            try context.checker.process_generated(
+                null,
+                out_states,
+                context.candidate_store,
+                context.candidate_evaluator,
+                context.edge_masks,
+            );
+            out_states.clear();
+            context.candidate_store.reset(context.candidate_pool_base);
+            context.checker.symmetry_hash_cache.advance_generation();
+        }
+    };
+
     arena: *Arena,
     state_store: StateStore,
     candidate_arena: *Arena,
@@ -628,6 +888,9 @@ pub const Checker = struct {
     queue: StateQueue,
     fp_set: FpSet,
     state_fingerprints: []fingerprint.Fingerprint,
+    view_witness_ranks: []u64,
+    view_bfs_orders: []u32,
+    view_queue_scratch: []u32,
     symmetry_hash_cache: SymmetryHashCache,
     canonical_value_entries: []CanonicalValueEntry,
     canonical_value_count: u32,
@@ -678,6 +941,7 @@ pub const Checker = struct {
     fairness_markers: []const action.FairnessMarker,
     symmetry_permutations: []const []const u32,
     view_name: ?[]const u8,
+    view_projection: ?ViewProjection,
     verify_fingerprints: bool,
 
     pub fn init(
@@ -831,6 +1095,15 @@ pub const Checker = struct {
         evaluator.set_treat_unknown_as_model(true);
         const aliases = try evaluate_aliases(arena, module, cfg);
         evaluator.set_aliases(aliases);
+        const view_projection = if (cfg.view_name) |view_name|
+            try direct_view_projection(
+                arena,
+                &evaluator,
+                module.variables,
+                view_name,
+            )
+        else
+            null;
         if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null) {
             for (aliases) |alias| {
                 std.debug.print("CONFIG alias {s} -> {s}\n", .{
@@ -902,6 +1175,15 @@ pub const Checker = struct {
             try arena.alloc(fingerprint.Fingerprint, max_states)
         else
             try arena.alloc(fingerprint.Fingerprint, 0);
+        const view_capacity: u32 = if (cfg.view_name != null)
+            max_states
+        else
+            0;
+        const view_witness_ranks = try arena.alloc(u64, view_capacity);
+        @memset(view_witness_ranks, std.math.maxInt(u64));
+        const view_bfs_orders = try arena.alloc(u32, view_capacity);
+        @memset(view_bfs_orders, std.math.maxInt(u32));
+        const view_queue_scratch = try arena.alloc(u32, view_capacity);
         const eval_pool_base = eval_pool.snapshot();
 
         const candidate_arena = try arena.alloc_object(Arena);
@@ -910,9 +1192,14 @@ pub const Checker = struct {
             candidate_arena,
             module.variables,
             max_successors,
-            @min(state_value_cap, 1_048_576),
+            candidate_value_capacity(
+                max_states,
+                max_successors,
+                state_value_cap,
+            ),
             @min(state_string_cap, 65_536),
         );
+        try candidate_store.values_pool.enable_string_interning(65_536);
         var candidate_evaluator = try evaluator.fork(candidate_arena);
         candidate_evaluator.set_constants(try clone_constants(
             arena,
@@ -1087,7 +1374,9 @@ pub const Checker = struct {
             break :blk result;
         };
 
-        const graph_enabled = properties.len > 0;
+        const graph_enabled = properties.len > 0 or
+            std.c.getenv("TLZIG_DUMP_GRAPH") != null or
+            std.c.getenv("TLZIG_DUMP_INITIAL_STATES") != null;
         const graph_states: u32 = if (graph_enabled) max_states else 0;
         const succ_cap: u32 = if (graph_enabled)
             std.math.mul(u32, max_states, 32) catch
@@ -1129,6 +1418,9 @@ pub const Checker = struct {
             .queue = queue,
             .fp_set = fp_set,
             .state_fingerprints = state_fingerprints,
+            .view_witness_ranks = view_witness_ranks,
+            .view_bfs_orders = view_bfs_orders,
+            .view_queue_scratch = view_queue_scratch,
             .symmetry_hash_cache = symmetry_hash_cache,
             .canonical_value_entries = canonical_value_entries,
             .canonical_value_count = 0,
@@ -1173,6 +1465,7 @@ pub const Checker = struct {
             .fairness_markers = fairness_markers,
             .symmetry_permutations = symmetry_permutations,
             .view_name = cfg.view_name,
+            .view_projection = view_projection,
             .verify_fingerprints = std.c.getenv(
                 "TLZIG_VERIFY_FINGERPRINTS",
             ) != null,
@@ -1233,13 +1526,58 @@ pub const Checker = struct {
             .composition_generated = &composition_generated,
             .fairness_markers = self.fairness_markers,
             .edge_action_masks = if (self.graph_enabled) edge_masks else null,
+            .diagnostics = self.diagnostics,
         };
 
         self.candidate_store.reset(self.candidate_pool_base);
         self.symmetry_hash_cache.advance_generation();
         self.eval_pool.restore(self.eval_pool_base);
-        try executor.execute_init(self.init_spec.?, &out_states);
-        self.successor_attempts += out_states.items.len;
+        var initial_sink_context = InitialCandidateSinkContext{
+            .checker = self,
+            .candidate_store = &self.candidate_store,
+            .candidate_evaluator = &self.candidate_evaluator,
+            .candidate_pool_base = self.candidate_pool_base,
+            .edge_masks = edge_masks,
+        };
+        const stream_initial = !action.steps_contain_composition(
+            self.init_spec.?.steps,
+        );
+        if (stream_initial) {
+            executor.candidate_sink = .{
+                .target = &out_states,
+                .context = &initial_sink_context,
+                .consume = InitialCandidateSinkContext.consume,
+            };
+        }
+        executor.execute_init(self.init_spec.?, &out_states) catch |err| {
+            if (self.diagnostics) {
+                std.debug.print(
+                    "Init failed: {any}; eval={d}/{d} candidate-values={d}/{d} candidate-states={d}/{d} buffered={d}/{d}\n",
+                    .{
+                        err,
+                        self.eval_pool.value_count,
+                        self.eval_pool.value_cap,
+                        self.candidate_store.values_pool.value_count,
+                        self.candidate_store.values_pool.value_cap,
+                        self.candidate_store.count,
+                        self.candidate_store.cap,
+                        out_states.items.len,
+                        out_states.storage.len,
+                    },
+                );
+            }
+            return err;
+        };
+        if (stream_initial and out_states.items.len > 0) {
+            try InitialCandidateSinkContext.consume(
+                &initial_sink_context,
+                &out_states,
+            );
+        } else if (!stream_initial) {
+            self.successor_attempts += out_states.items.len;
+        }
+        executor.candidate_sink = null;
+        if (stream_initial) assert(out_states.items.len == 0);
         if (freeze_generated_cache) {
             self.eval_pool.restore(self.eval_pool_base);
             try self.evaluator.freeze_generated_cache(&self.eval_pool);
@@ -1248,13 +1586,15 @@ pub const Checker = struct {
             );
             self.eval_pool_base = self.eval_pool.snapshot();
         }
-        try self.process_generated(
-            null,
-            &out_states,
-            &self.candidate_store,
-            &self.candidate_evaluator,
-            edge_masks,
-        );
+        if (!stream_initial) {
+            try self.process_generated(
+                null,
+                &out_states,
+                &self.candidate_store,
+                &self.candidate_evaluator,
+                edge_masks,
+            );
+        }
         self.eval_pool.restore(self.eval_pool_base);
 
         if (self.worker_count == 1) {
@@ -1318,6 +1658,9 @@ pub const Checker = struct {
 
     fn check_parallel(self: *Checker) !void {
         assert(self.worker_count > 1);
+        if (self.view_name != null) {
+            self.assign_view_frontier_orders();
+        }
         const workers = try self.arena.alloc(WorkerContext, self.worker_count);
         var initialized: u16 = 0;
         errdefer {
@@ -1366,6 +1709,77 @@ pub const Checker = struct {
         if (parallel.failure) |err| return err;
     }
 
+    fn assign_view_frontier_orders(self: *Checker) void {
+        assert(self.view_name != null);
+        assert(self.queue.count <= self.view_bfs_orders.len);
+        for (0..self.queue.count) |offset| {
+            const queue_index = (self.queue.head + offset) % self.queue.cap;
+            const state_index = self.queue.buffer[queue_index];
+            assert(state_index < self.view_bfs_orders.len);
+            self.view_bfs_orders[state_index] = @intCast(offset);
+        }
+    }
+
+    fn view_rank_less_than(
+        self: *Checker,
+        left: u32,
+        right: u32,
+    ) bool {
+        assert(left < self.view_witness_ranks.len);
+        assert(right < self.view_witness_ranks.len);
+        const left_rank = @atomicLoad(
+            u64,
+            &self.view_witness_ranks[left],
+            .acquire,
+        );
+        const right_rank = @atomicLoad(
+            u64,
+            &self.view_witness_ranks[right],
+            .acquire,
+        );
+        return left_rank < right_rank or
+            (left_rank == right_rank and left < right);
+    }
+
+    fn view_candidate_precedes(
+        self: *Checker,
+        state_index: u32,
+        candidate_level: u32,
+        candidate_rank: u64,
+    ) bool {
+        assert(self.view_name != null);
+        assert(state_index < self.view_witness_ranks.len);
+        const state_v = self.state_store.get(state_index);
+        if (state_v.level != candidate_level) return false;
+        const current_rank = @atomicLoad(
+            u64,
+            &self.view_witness_ranks[state_index],
+            .acquire,
+        );
+        return candidate_rank < current_rank;
+    }
+
+    fn sort_view_frontier(self: *Checker) void {
+        assert(self.view_name != null);
+        const count: usize = self.queue.count;
+        assert(count <= self.view_queue_scratch.len);
+        for (0..count) |offset| {
+            const queue_index = (self.queue.head + offset) % self.queue.cap;
+            self.view_queue_scratch[offset] = self.queue.buffer[queue_index];
+        }
+        const frontier = self.view_queue_scratch[0..count];
+        std.mem.sort(
+            u32,
+            frontier,
+            self,
+            Checker.view_rank_less_than,
+        );
+        @memcpy(self.queue.buffer[0..count], frontier);
+        self.queue.head = 0;
+        self.queue.tail = @intCast(count % self.queue.cap);
+        self.assign_view_frontier_orders();
+    }
+
     fn init_worker(self: *Checker, worker: *WorkerContext) !void {
         worker.eval_arena = try Arena.init(16 * 1024 * 1024);
         errdefer worker.eval_arena.deinit();
@@ -1400,6 +1814,7 @@ pub const Checker = struct {
             1_048_576,
             65_536,
         );
+        try worker.candidate_store.values_pool.enable_string_interning(65_536);
         worker.candidate_store.values_pool.growable = self.scratch_growable;
         worker.candidate_evaluator = try worker.evaluator.fork(
             &worker.candidate_arena,
@@ -1430,6 +1845,13 @@ pub const Checker = struct {
             fingerprint.Fingerprint,
             self.max_successors,
         );
+        worker.prepared_view_ranks = if (self.view_name != null)
+            try worker.candidate_arena.alloc(
+                u64,
+                self.max_successors,
+            )
+        else
+            &.{};
         worker.prepared_edge_masks = if (self.graph_enabled)
             try worker.candidate_arena.alloc(
                 u64,
@@ -1442,6 +1864,26 @@ pub const Checker = struct {
         worker.source_snapshot = self.state_store;
     }
 
+    fn init_temporal_worker(
+        self: *Checker,
+        worker: *TemporalWorkerContext,
+    ) !void {
+        worker.arena = try Arena.init(1024 * 1024);
+        errdefer worker.arena.deinit();
+        worker.evaluator = try self.evaluator.fork(&worker.arena);
+        worker.evaluator.set_constants(self.evaluator.constants);
+        worker.eval_pool = try ValuePool.init(
+            &worker.arena,
+            1_048_576,
+            65_536,
+        );
+        worker.eval_pool.growable = self.scratch_growable;
+        worker.evaluator.localize_generated_cache_from(
+            &self.evaluator,
+            &worker.eval_pool,
+        );
+    }
+
     fn prepare_generated(
         self: *Checker,
         parent_idx: u32,
@@ -1451,6 +1893,7 @@ pub const Checker = struct {
         eval_pool: *ValuePool,
         canonical_pool: *const ValuePool,
         prepared_fingerprints: []fingerprint.Fingerprint,
+        prepared_view_ranks: []u64,
         prepared_edge_masks: []u64,
         canonical_hash_cache: *SymmetryHashCache,
         candidate_hash_cache: *SymmetryHashCache,
@@ -1461,6 +1904,12 @@ pub const Checker = struct {
         if (self.graph_enabled) {
             assert(out_states.items.len <= prepared_edge_masks.len);
         }
+        if (self.view_name != null) {
+            assert(out_states.items.len <= prepared_view_ranks.len);
+            assert(parent_idx < self.view_bfs_orders.len);
+            assert(self.view_bfs_orders[parent_idx] !=
+                std.math.maxInt(u32));
+        }
         var kept_count: u32 = 0;
         var candidate_parent = if (self.action_constraints.len > 0 or
             self.safety_properties.len > 0)
@@ -1470,7 +1919,7 @@ pub const Checker = struct {
             )
         else
             null;
-        for (out_states.items) |candidate_index| {
+        for (out_states.items, 0..) |candidate_index, candidate_ordinal| {
             assert(candidate_index < candidate_store.count);
             const candidate = candidate_store.get(candidate_index);
             candidate.pred = parent_idx;
@@ -1513,8 +1962,17 @@ pub const Checker = struct {
                 canonical_hash_cache,
                 candidate_hash_cache,
             );
+            const candidate_rank = if (self.view_name != null)
+                @as(u64, self.view_bfs_orders[parent_idx]) *
+                    self.max_successors +
+                    candidate_ordinal
+            else
+                std.math.maxInt(u64);
             out_states.items[kept_count] = candidate_index;
             prepared_fingerprints[kept_count] = candidate_fp;
+            if (self.view_name != null) {
+                prepared_view_ranks[kept_count] = candidate_rank;
+            }
             if (self.graph_enabled) {
                 prepared_edge_masks[kept_count] = prepared_edge_masks[
                     @intCast(candidate_index)
@@ -1532,6 +1990,7 @@ pub const Checker = struct {
         new_states: *StateBuffer,
         candidate_store: *StateStore,
         prepared_fingerprints: []const fingerprint.Fingerprint,
+        prepared_view_ranks: []const u64,
         prepared_edge_masks: []u64,
         candidate_hash_cache: *SymmetryHashCache,
     ) !void {
@@ -1539,11 +1998,18 @@ pub const Checker = struct {
         if (self.graph_enabled) {
             assert(out_states.items.len <= prepared_edge_masks.len);
         }
+        if (self.view_name != null) {
+            assert(out_states.items.len <= prepared_view_ranks.len);
+        }
         assert(new_states.items.len == 0);
         var kept_count: u32 = 0;
         for (out_states.items, 0..) |*candidate_index, prepared_index| {
             const candidate = candidate_store.get(candidate_index.*);
             const state_fingerprint = prepared_fingerprints[prepared_index];
+            const candidate_rank = if (self.view_name != null)
+                prepared_view_ranks[prepared_index]
+            else
+                std.math.maxInt(u64);
             const canonical = self.fp_set.find(state_fingerprint);
             const is_new = canonical == null;
             const state_idx = if (canonical) |existing| existing else blk: {
@@ -1556,12 +2022,41 @@ pub const Checker = struct {
                 if (self.state_fingerprints.len > 0) {
                     self.state_fingerprints[permanent_idx] = state_fingerprint;
                 }
+                if (self.view_name != null) {
+                    @atomicStore(
+                        u64,
+                        &self.view_witness_ranks[permanent_idx],
+                        candidate_rank,
+                        .release,
+                    );
+                }
                 assert(self.fp_set.put_with_index(
                     state_fingerprint,
                     permanent_idx,
                 ) == null);
                 break :blk permanent_idx;
             };
+            if (!is_new and self.view_name != null and
+                self.view_candidate_precedes(
+                    state_idx,
+                    candidate.level,
+                    candidate_rank,
+                ))
+            {
+                try self.replace_candidate_state(
+                    state_idx,
+                    candidate,
+                    candidate_store,
+                    parent_idx,
+                    candidate_hash_cache,
+                );
+                @atomicStore(
+                    u64,
+                    &self.view_witness_ranks[state_idx],
+                    candidate_rank,
+                    .release,
+                );
+            }
             if (is_new) {
                 self.distinct += 1;
                 assert(self.distinct <= self.max_states_limit);
@@ -1604,6 +2099,7 @@ pub const Checker = struct {
         new_states: *StateBuffer,
         candidate_store: *StateStore,
         prepared_fingerprints: []const fingerprint.Fingerprint,
+        prepared_view_ranks: []const u64,
         candidate_hash_cache: *SymmetryHashCache,
         canonical_snapshot: *StateStore,
     ) !u64 {
@@ -1611,15 +2107,31 @@ pub const Checker = struct {
         assert(self.safety_properties.len == 0);
         assert(!self.has_enabled_invariants);
         assert(out_states.items.len <= prepared_fingerprints.len);
+        if (self.view_name != null) {
+            assert(out_states.items.len <= prepared_view_ranks.len);
+        }
         assert(new_states.items.len == 0);
 
         var kept_count: u32 = 0;
         for (out_states.items, 0..) |*candidate_index, prepared_index| {
             const candidate = candidate_store.get(candidate_index.*);
             const state_fingerprint = prepared_fingerprints[prepared_index];
+            const candidate_rank = if (self.view_name != null)
+                prepared_view_ranks[prepared_index]
+            else
+                std.math.maxInt(u64);
             var canonical = self.fp_set.find(state_fingerprint);
             var is_new = false;
-            if (canonical == null) {
+            const candidate_may_replace = if (canonical) |existing|
+                self.view_name != null and
+                    self.view_candidate_precedes(
+                        existing,
+                        candidate.level,
+                        candidate_rank,
+                    )
+            else
+                false;
+            if (canonical == null or candidate_may_replace) {
                 assert(candidate.values.len <= 64);
                 var canonical_values: [64]Value = undefined;
                 for (candidate.values, 0..) |source, variable_index| {
@@ -1651,6 +2163,14 @@ pub const Checker = struct {
                         self.state_fingerprints[permanent_idx] =
                             state_fingerprint;
                     }
+                    if (self.view_name != null) {
+                        @atomicStore(
+                            u64,
+                            &self.view_witness_ranks[permanent_idx],
+                            candidate_rank,
+                            .release,
+                        );
+                    }
                     assert(self.fp_set.put_with_index(
                         state_fingerprint,
                         permanent_idx,
@@ -1660,6 +2180,24 @@ pub const Checker = struct {
                     self.maybe_report_progress();
                     canonical = permanent_idx;
                     is_new = true;
+                } else if (self.view_name != null and
+                    self.view_candidate_precedes(
+                        canonical.?,
+                        candidate.level,
+                        candidate_rank,
+                    ))
+                {
+                    self.replace_prepared_candidate_state(
+                        canonical.?,
+                        candidate,
+                        canonical_values[0..candidate.values.len],
+                    );
+                    @atomicStore(
+                        u64,
+                        &self.view_witness_ranks[canonical.?],
+                        candidate_rank,
+                        .release,
+                    );
                 }
                 parallel_commit_unlock(parallel);
             }
@@ -1701,6 +2239,57 @@ pub const Checker = struct {
         return state_idx;
     }
 
+    fn replace_prepared_candidate_state(
+        self: *Checker,
+        state_index: u32,
+        candidate: *const StateStore.State,
+        canonical_values: []const Value,
+    ) void {
+        const state_v = self.state_store.get(state_index);
+        assert(state_v.level == candidate.level);
+        assert(state_v.values.len == canonical_values.len);
+        state_v.pred = candidate.pred;
+        state_v.changed_mask = candidate.changed_mask;
+        state_v.borrowed_mask = 0;
+        state_v.borrowed_pool = null;
+        @memcpy(state_v.values, canonical_values);
+    }
+
+    fn replace_candidate_state(
+        self: *Checker,
+        state_index: u32,
+        candidate: *const StateStore.State,
+        candidate_store: *StateStore,
+        parent_index: u32,
+        candidate_hash_cache: *SymmetryHashCache,
+    ) !void {
+        const state_v = self.state_store.get(state_index);
+        assert(state_v.level == candidate.level);
+        assert(state_v.values.len == candidate.values.len);
+        const parent = self.state_store.get(parent_index);
+        for (
+            candidate.values,
+            state_v.values,
+            0..,
+        ) |source, *target, variable_index| {
+            const changed = candidate.changed_mask &
+                (@as(u64, 1) << @intCast(variable_index)) != 0;
+            target.* = if (changed)
+                try self.intern_canonical_value(
+                    source,
+                    &candidate_store.values_pool,
+                    @intCast(variable_index),
+                    candidate_hash_cache,
+                )
+            else
+                parent.values[variable_index];
+        }
+        state_v.pred = candidate.pred;
+        state_v.changed_mask = candidate.changed_mask;
+        state_v.borrowed_mask = 0;
+        state_v.borrowed_pool = null;
+    }
+
     fn check_new_state_invariants(
         self: *Checker,
         evaluator: *Evaluator,
@@ -1709,26 +2298,41 @@ pub const Checker = struct {
         canonical_store: *StateStore,
     ) !void {
         for (new_states.items) |state_idx| {
-            assert(state_idx < canonical_store.count);
-            const invariant_snapshot = eval_pool.snapshot();
-            const invariants_hold = self.check_invariants_with(
+            try self.check_canonical_state_invariants(
                 evaluator,
                 eval_pool,
-                canonical_store.get(state_idx),
-                &canonical_store.values_pool,
-            ) catch |err| {
-                eval_pool.restore(invariant_snapshot);
-                return err;
-            };
-            eval_pool.restore(invariant_snapshot);
-            if (invariants_hold) continue;
-            std.debug.print(
-                "InvariantViolated generated={d} distinct={d}\n",
-                .{ self.successor_attempts, self.distinct },
+                state_idx,
+                canonical_store,
             );
-            self.print_trace(state_idx);
-            return Error.InvariantViolated;
         }
+    }
+
+    fn check_canonical_state_invariants(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        state_idx: u32,
+        canonical_store: *StateStore,
+    ) !void {
+        assert(state_idx < canonical_store.count);
+        const invariant_snapshot = eval_pool.snapshot();
+        const invariants_hold = self.check_invariants_with(
+            evaluator,
+            eval_pool,
+            canonical_store.get(state_idx),
+            &canonical_store.values_pool,
+        ) catch |err| {
+            eval_pool.restore(invariant_snapshot);
+            return err;
+        };
+        eval_pool.restore(invariant_snapshot);
+        if (invariants_hold) return;
+        std.debug.print(
+            "InvariantViolated generated={d} distinct={d}\n",
+            .{ self.successor_attempts, self.distinct },
+        );
+        self.print_trace(state_idx);
+        return Error.InvariantViolated;
     }
 
     fn process_generated(
@@ -1903,6 +2507,114 @@ pub const Checker = struct {
         candidate_hash_cache: *SymmetryHashCache,
     ) Error!fingerprint.Fingerprint {
         if (self.view_name) |view_name| {
+            if (self.view_projection) |projection| {
+                if (self.symmetry_permutations.len == 0) {
+                    if (parent_idx) |parent_index| {
+                        assert(parent_index < self.state_store.count);
+                        assert(parent_index < self.state_fingerprints.len);
+                        const parent = self.state_store.get(parent_index);
+                        var projected_hash = self.state_fingerprints[
+                            parent_index
+                        ];
+                        switch (projection) {
+                            .variable => |variable_index| {
+                                const changed_bit = @as(u64, 1) <<
+                                    @intCast(variable_index);
+                                if (candidate.changed_mask & changed_bit != 0) {
+                                    projected_hash = candidate_hash_cache.hash_value(
+                                        candidate.value_pool(
+                                            variable_index,
+                                            &candidate_store.values_pool,
+                                        ),
+                                        candidate.values[variable_index],
+                                        null,
+                                    );
+                                }
+                            },
+                            .tuple => |variable_indices| {
+                                for (variable_indices, 0..) |
+                                    variable_index,
+                                    item_index,
+                                | {
+                                    const changed_bit = @as(u64, 1) <<
+                                        @intCast(variable_index);
+                                    if (candidate.changed_mask & changed_bit == 0) {
+                                        continue;
+                                    }
+                                    const parent_pool = parent.value_pool(
+                                        variable_index,
+                                        canonical_pool,
+                                    );
+                                    const candidate_pool = candidate.value_pool(
+                                        variable_index,
+                                        &candidate_store.values_pool,
+                                    );
+                                    projected_hash =
+                                        fingerprint.replace_state_value_hashes(
+                                            projected_hash,
+                                            @intCast(item_index),
+                                            canonical_hash_cache.hash_value(
+                                                parent_pool,
+                                                parent.values[variable_index],
+                                                null,
+                                            ),
+                                            candidate_hash_cache.hash_value(
+                                                candidate_pool,
+                                                candidate.values[variable_index],
+                                                null,
+                                            ),
+                                        );
+                                }
+                            },
+                        }
+                        if (self.verify_fingerprints) {
+                            const full_hash = view_projection_fingerprint(
+                                &candidate_store.values_pool,
+                                candidate,
+                                projection,
+                                null,
+                            );
+                            if (projected_hash != full_hash) {
+                                std.debug.print(
+                                    "incremental VIEW fingerprint mismatch parent={d} changed_mask=0x{x} incremental=0x{x} full=0x{x}\n",
+                                    .{
+                                        parent_index,
+                                        candidate.changed_mask,
+                                        projected_hash,
+                                        full_hash,
+                                    },
+                                );
+                                return Error.AssertionFailed;
+                            }
+                        }
+                        return projected_hash;
+                    }
+                    return view_projection_fingerprint(
+                        &candidate_store.values_pool,
+                        candidate,
+                        projection,
+                        null,
+                    );
+                }
+                var best = view_projection_fingerprint(
+                    &candidate_store.values_pool,
+                    candidate,
+                    projection,
+                    null,
+                );
+                for (self.symmetry_permutations) |permutation| {
+                    best = @min(
+                        best,
+                        view_projection_fingerprint(
+                            &candidate_store.values_pool,
+                            candidate,
+                            projection,
+                            permutation,
+                        ),
+                    );
+                }
+                return best;
+            }
             const snapshot = eval_pool.snapshot();
             defer eval_pool.restore(snapshot);
             const view = try candidate_evaluator.eval_named_zero(
@@ -2101,7 +2813,7 @@ pub const Checker = struct {
                     @intCast(variable_index),
                     candidate_hash_cache,
                 );
-                if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+                if (builtin.mode == .debug or builtin.mode == .safe) {
                     assert(Value.eql_cross_pool(
                         source,
                         &candidate_store.values_pool,
@@ -2142,17 +2854,30 @@ pub const Checker = struct {
         }
         assert(capacity > 0);
         assert(std.math.isPowerOfTwo(capacity));
+        assert(self.canonical_value_count <= canonical_value_load_limit(capacity));
         const hash = source_hash_cache.hash_value(
             source_pool,
             source,
             null,
         );
         const published_hash = effective_canonical_hash(hash);
+        if (self.canonical_value_count >= canonical_value_load_limit(capacity)) {
+            if (self.find_canonical_value(
+                source,
+                source_pool,
+                variable_index,
+                hash,
+            )) |canonical| return canonical;
+            return source.clone(
+                source_pool,
+                &self.state_store.values_pool,
+            );
+        }
         const mixed_hash = fingerprint.hash_combine(published_hash, variable_index);
         const mask = capacity - 1;
         var slot: usize = @intCast(mixed_hash & mask);
         var probes: usize = 0;
-        while (probes < capacity) : (probes += 1) {
+        while (probes < @min(capacity, canonical_value_max_probe_count)) : (probes += 1) {
             const entry = &self.canonical_value_entries[slot];
             const entry_hash = @atomicLoad(
                 fingerprint.Fingerprint,
@@ -2169,7 +2894,7 @@ pub const Checker = struct {
                 entry.value_count = self.state_store.values_pool.value_count;
                 entry.string_count = self.state_store.values_pool.string_count;
                 self.canonical_value_count += 1;
-                assert(self.canonical_value_count <= capacity);
+                assert(self.canonical_value_count <= canonical_value_load_limit(capacity));
                 @atomicStore(
                     fingerprint.Fingerprint,
                     &entry.hash,
@@ -2236,7 +2961,7 @@ pub const Checker = struct {
         const mask = capacity - 1;
         var slot: usize = @intCast(mixed_hash & mask);
         var probes: usize = 0;
-        while (probes < capacity) : (probes += 1) {
+        while (probes < @min(capacity, canonical_value_max_probe_count)) : (probes += 1) {
             const entry = &self.canonical_value_entries[slot];
             const entry_hash = @atomicLoad(
                 fingerprint.Fingerprint,
@@ -2316,33 +3041,6 @@ pub const Checker = struct {
             ) catch |err| {
                 std.debug.print("Error evaluating candidate constraint {s}: {any}\n", .{
                     constraint_name,
-                    err,
-                });
-                return err;
-            };
-            if (!value.is_truthy()) return false;
-        }
-        return true;
-    }
-
-    fn check_candidate_invariants(
-        self: *Checker,
-        candidate: *StateStore.State,
-        candidate_store: *StateStore,
-        candidate_evaluator: *Evaluator,
-        eval_pool: *ValuePool,
-    ) !bool {
-        assert(self.invariant_names.len == self.invariants.len);
-        for (self.invariant_names) |invariant_name| {
-            const value = candidate_evaluator.eval_named_zero(
-                invariant_name,
-                Context.empty(),
-                candidate,
-                eval_pool,
-                &candidate_store.values_pool,
-            ) catch |err| {
-                std.debug.print("Error evaluating candidate invariant {s}: {any}\n", .{
-                    invariant_name,
                     err,
                 });
                 return err;
@@ -2772,6 +3470,7 @@ pub const Checker = struct {
 
     fn build_scc_data(self: *Checker) !SccData {
         const n = self.state_store.count;
+        try self.recompute_fairness_edge_masks();
         const scc_ids = try self.compute_sccs();
         var scc_count: u32 = 0;
         for (scc_ids) |id| {
@@ -3167,48 +3866,347 @@ pub const Checker = struct {
         return false;
     }
 
-    fn eval_action(self: *Checker, action_expr: *ast.Expr, context: Context, parent: *StateStore.State, child: *StateStore.State) Error!bool {
+    fn recompute_fairness_edge_masks(self: *Checker) Error!void {
+        if (self.fairness.len == 0) return;
+        assert(self.fairness.len <= @bitSizeOf(u64));
+        var matched_counts: [@bitSizeOf(u64)]u64 = @splat(0);
+        for (0..self.state_store.count) |parent_index_usize| {
+            const parent_index: u32 = @intCast(parent_index_usize);
+            const parent = self.state_store.get(parent_index);
+            const edge_begin = self.succ_offsets[parent_index];
+            const edge_end = edge_begin + self.succ_counts[parent_index];
+            for (edge_begin..edge_end) |edge_index_usize| {
+                const edge_index: u32 = @intCast(edge_index_usize);
+                assert(edge_index < self.succ_count);
+                const child_index = self.succ_edges[edge_index];
+                assert(child_index < self.state_store.count);
+                const child = self.state_store.get(child_index);
+                var exact_mask: u64 = 0;
+                for (self.fairness, 0..) |condition, fairness_index| {
+                    const action_matches = self.eval_fairness_action(
+                        condition,
+                        parent,
+                        child,
+                    ) catch |err| {
+                        if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                            std.debug.print(
+                                "fairness action evaluation failed: index={d} parent={d} child={d} action={s} bindings={d} error={any}\n",
+                                .{
+                                    fairness_index,
+                                    parent_index,
+                                    child_index,
+                                    @tagName(condition.action.*),
+                                    condition.bindings.len,
+                                    err,
+                                },
+                            );
+                            for (condition.bindings) |binding| {
+                                std.debug.print(
+                                    "  binding {s}={s}\n",
+                                    .{ binding.name, @tagName(binding.value) },
+                                );
+                            }
+                        }
+                        return err;
+                    };
+                    if (!action_matches) continue;
+                    exact_mask |= @as(u64, 1) << @intCast(fairness_index);
+                    matched_counts[fairness_index] += 1;
+                }
+                self.edge_action_masks[edge_index] = exact_mask;
+            }
+        }
+        if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+            for (self.fairness, 0..) |_, fairness_index| {
+                std.debug.print(
+                    "FAIRNESS[{d}] exact matching edges={d}\n",
+                    .{ fairness_index, matched_counts[fairness_index] },
+                );
+            }
+        }
+    }
+
+    fn eval_fairness_action(
+        self: *Checker,
+        condition: FairnessCondition,
+        parent: *StateStore.State,
+        child: *StateStore.State,
+    ) Error!bool {
         const snap = self.eval_pool.snapshot();
         defer self.eval_pool.restore(snap);
         self.evaluator.reset_context_pool();
         const context_snap = self.evaluator.context_snapshot();
         defer self.evaluator.restore_context_pool(context_snap);
+
+        var context = Context.empty();
+        for (condition.bindings) |binding| {
+            const local_value = try binding.value.clone(
+                &self.state_store.values_pool,
+                &self.eval_pool,
+            );
+            context = try self.evaluator.extend_context(
+                context,
+                binding.name,
+                local_value,
+            );
+        }
+
         self.evaluator.set_next_state(child);
         defer self.evaluator.set_next_state(null);
         self.evaluator.begin_state_evaluation(&self.eval_pool);
         defer self.evaluator.end_state_evaluation();
-        const v = try self.evaluator.eval_expr(action_expr, context, parent, &self.eval_pool, &self.state_store.values_pool);
-        return v.is_truthy();
+        const value_v = try self.evaluator.eval_expr(
+            condition.action,
+            context,
+            parent,
+            &self.eval_pool,
+            &self.state_store.values_pool,
+        );
+        return value_v.is_truthy();
     }
 
-    fn eval_vars_equal(self: *Checker, vars_expr: *ast.Expr, context: Context, a: *StateStore.State, b: *StateStore.State) Error!bool {
-        const snap = self.eval_pool.snapshot();
-        defer self.eval_pool.restore(snap);
-        self.evaluator.reset_context_pool();
-        const context_snap = self.evaluator.context_snapshot();
-        defer self.evaluator.restore_context_pool(context_snap);
-        self.evaluator.begin_state_evaluation(&self.eval_pool);
-        const va = self.evaluator.eval_expr(vars_expr, context, a, &self.eval_pool, &self.state_store.values_pool) catch |err| {
-            self.evaluator.end_state_evaluation();
+    fn eval_action(
+        self: *Checker,
+        action_expr: *ast.Expr,
+        context: Context,
+        parent: *StateStore.State,
+        child: *StateStore.State,
+    ) Error!bool {
+        return self.eval_action_with(
+            &self.evaluator,
+            &self.eval_pool,
+            action_expr,
+            context,
+            parent,
+            child,
+        );
+    }
+
+    fn eval_action_with(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        action_expr: *ast.Expr,
+        context: Context,
+        parent: *StateStore.State,
+        child: *StateStore.State,
+    ) Error!bool {
+        const snap = eval_pool.snapshot();
+        defer eval_pool.restore(snap);
+        evaluator.reset_context_pool();
+        const context_snap = evaluator.context_snapshot();
+        defer evaluator.restore_context_pool(context_snap);
+        evaluator.set_next_state(child);
+        defer evaluator.set_next_state(null);
+        evaluator.begin_state_evaluation(eval_pool);
+        defer evaluator.end_state_evaluation();
+        const value_v = try evaluator.eval_expr(
+            action_expr,
+            context,
+            parent,
+            eval_pool,
+            &self.state_store.values_pool,
+        );
+        return value_v.is_truthy();
+    }
+
+    fn eval_vars_equal(
+        self: *Checker,
+        vars_expr: *ast.Expr,
+        context: Context,
+        a: *StateStore.State,
+        b: *StateStore.State,
+    ) Error!bool {
+        return self.eval_vars_equal_with(
+            &self.evaluator,
+            &self.eval_pool,
+            vars_expr,
+            context,
+            a,
+            b,
+        );
+    }
+
+    fn eval_vars_equal_with(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        vars_expr: *ast.Expr,
+        context: Context,
+        a: *StateStore.State,
+        b: *StateStore.State,
+    ) Error!bool {
+        const snap = eval_pool.snapshot();
+        defer eval_pool.restore(snap);
+        evaluator.reset_context_pool();
+        const context_snap = evaluator.context_snapshot();
+        defer evaluator.restore_context_pool(context_snap);
+        evaluator.begin_state_evaluation(eval_pool);
+        const va = evaluator.eval_expr(
+            vars_expr,
+            context,
+            a,
+            eval_pool,
+            &self.state_store.values_pool,
+        ) catch |err| {
+            evaluator.end_state_evaluation();
             return err;
         };
-        self.evaluator.end_state_evaluation();
-        self.evaluator.begin_state_evaluation(&self.eval_pool);
-        defer self.evaluator.end_state_evaluation();
-        const vb = try self.evaluator.eval_expr(vars_expr, context, b, &self.eval_pool, &self.state_store.values_pool);
-        const equal = va.eql(vb, &self.eval_pool);
+        evaluator.end_state_evaluation();
+        evaluator.begin_state_evaluation(eval_pool);
+        defer evaluator.end_state_evaluation();
+        const vb = try evaluator.eval_expr(
+            vars_expr,
+            context,
+            b,
+            eval_pool,
+            &self.state_store.values_pool,
+        );
+        const equal = va.eql(vb, eval_pool);
         if (!equal and std.c.getenv("TLZIG_DUMP_LIVENESS") != null) {
             std.debug.print("stuttering expression differs: before={any} after={any}\n", .{ va, vb });
             if (va == .tuple_v and vb == .tuple_v) {
-                for (va.tuple_v.items(&self.eval_pool), vb.tuple_v.items(&self.eval_pool), 0..) |before, after, index| {
+                for (va.tuple_v.items(eval_pool), vb.tuple_v.items(eval_pool), 0..) |before, after, index| {
                     std.debug.print(
                         "  item[{d}] equal={any} before={any} after={any}\n",
-                        .{ index, before.eql(after, &self.eval_pool), before, after },
+                        .{ index, before.eql(after, eval_pool), before, after },
                     );
                 }
             }
         }
         return equal;
+    }
+
+    fn eval_temporal_operation_state(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        evaluation: TemporalEvaluation,
+        state_index: u32,
+    ) Error!bool {
+        return switch (evaluation) {
+            .state_expression => |state_expression| self.eval_temporal_state_expr_with(
+                evaluator,
+                eval_pool,
+                state_expression.expression,
+                state_expression.has_enabled,
+                state_index,
+            ),
+            .enabled_action => |action_expr| self.eval_enabled_action_with(
+                evaluator,
+                eval_pool,
+                action_expr,
+                state_index,
+            ),
+            .box_action => |box_action| self.eval_box_action_state_with(
+                evaluator,
+                eval_pool,
+                box_action.action,
+                box_action.vars,
+                state_index,
+            ),
+        };
+    }
+
+    fn eval_temporal_all(
+        self: *Checker,
+        evaluation: TemporalEvaluation,
+        results: []bool,
+    ) Error!void {
+        const state_count = self.state_store.count;
+        assert(results.len == state_count);
+        const parallel_min_states = 256;
+        if (self.worker_count == 1 or state_count < parallel_min_states) {
+            for (0..state_count) |state_index| {
+                results[state_index] = try self.eval_temporal_operation_state(
+                    &self.evaluator,
+                    &self.eval_pool,
+                    evaluation,
+                    @intCast(state_index),
+                );
+            }
+            return;
+        }
+
+        const worker_count: u16 = @min(
+            self.worker_count,
+            @as(u16, @intCast(state_count)),
+        );
+        assert(worker_count > 1);
+        const allocator = std.heap.page_allocator;
+        const workers = try allocator.alloc(
+            TemporalWorkerContext,
+            worker_count,
+        );
+        defer allocator.free(workers);
+        var initialized: u16 = 0;
+        errdefer for (workers[0..initialized]) |*worker| worker.deinit();
+        for (workers) |*worker| {
+            try self.init_temporal_worker(worker);
+            initialized += 1;
+        }
+        defer for (workers) |*worker| worker.deinit();
+        initialized = 0;
+
+        var parallel = ParallelTemporalState{
+            .checker = self,
+            .evaluation = evaluation,
+            .results = results,
+        };
+        defer assert(
+            std.c.pthread_mutex_destroy(&parallel.mutex) == .SUCCESS,
+        );
+        const threads = try allocator.alloc(std.Thread, worker_count);
+        defer allocator.free(threads);
+        var spawned: u16 = 0;
+        errdefer for (threads[0..spawned]) |thread| thread.join();
+        for (workers, 0..) |*worker, index| {
+            threads[index] = std.Thread.spawn(
+                .{},
+                parallel_temporal_worker,
+                .{ &parallel, worker },
+            ) catch return Error.OutOfMemory;
+            spawned += 1;
+        }
+        assert(spawned == worker_count);
+        for (threads) |thread| thread.join();
+        spawned = 0;
+        if (parallel.failure) |err| return err;
+        assert(parallel.next_index >= state_count);
+    }
+
+    fn eval_temporal_state_expression_all(
+        self: *Checker,
+        expression: *ast.Expr,
+        results: []bool,
+    ) Error!void {
+        return self.eval_temporal_all(.{ .state_expression = .{
+            .expression = expression,
+            .has_enabled = contains_enabled(expression),
+        } }, results);
+    }
+
+    fn eval_enabled_action_all(
+        self: *Checker,
+        action_expr: *ast.Expr,
+        results: []bool,
+    ) Error!void {
+        return self.eval_temporal_all(
+            .{ .enabled_action = action_expr },
+            results,
+        );
+    }
+
+    fn eval_box_action_all(
+        self: *Checker,
+        action_expr: *ast.Expr,
+        vars_expr: *ast.Expr,
+        results: []bool,
+    ) Error!void {
+        return self.eval_temporal_all(.{ .box_action = .{
+            .action = action_expr,
+            .vars = vars_expr,
+        } }, results);
     }
 
     fn eval_temporal_property_all(
@@ -3227,12 +4225,7 @@ pub const Checker = struct {
         defer self.eval_pool.restore(snap);
 
         if (self.is_pure_state_expression(prop)) {
-            for (0..n) |i| {
-                results[i] = try self.eval_temporal_state_expr(
-                    prop,
-                    @intCast(i),
-                );
-            }
+            try self.eval_temporal_state_expression_all(prop, results);
             try cache.put(std.heap.page_allocator, prop, results);
             return results;
         }
@@ -3243,12 +4236,7 @@ pub const Checker = struct {
                     const resolved = try self.eval_temporal_property_all(def.body, scc_data, cache);
                     @memcpy(results, resolved);
                 } else {
-                    for (0..n) |i| {
-                        results[i] = try self.eval_temporal_state_expr(
-                            prop,
-                            @intCast(i),
-                        );
-                    }
+                    try self.eval_temporal_state_expression_all(prop, results);
                 }
             },
             .apply => |application| {
@@ -3280,12 +4268,7 @@ pub const Checker = struct {
                     }
                 }
                 if (!resolved_temporal) {
-                    for (0..n) |i| {
-                        results[i] = try self.eval_temporal_state_expr(
-                            prop,
-                            @intCast(i),
-                        );
-                    }
+                    try self.eval_temporal_state_expression_all(prop, results);
                 }
             },
             .if_then_else => |ite| {
@@ -3346,12 +4329,10 @@ pub const Checker = struct {
                         @memcpy(results, box_results);
                     },
                     else => {
-                        for (0..n) |i| {
-                            results[i] = try self.eval_temporal_state_expr(
-                                prop,
-                                @intCast(i),
-                            );
-                        }
+                        try self.eval_temporal_state_expression_all(
+                            prop,
+                            results,
+                        );
                     },
                 }
             },
@@ -3368,12 +4349,7 @@ pub const Checker = struct {
                         }
                     },
                     .enabled => {
-                        for (0..n) |i| {
-                            results[i] = try self.eval_enabled_action(
-                                u.operand,
-                                @intCast(i),
-                            );
-                        }
+                        try self.eval_enabled_action_all(u.operand, results);
                     },
                     .temporal_box => {
                         const operand = try self.eval_temporal_property_all(u.operand, scc_data, cache);
@@ -3388,48 +4364,18 @@ pub const Checker = struct {
                         @memcpy(results, diamond_results);
                     },
                     else => {
-                        for (0..n) |i| {
-                            results[i] = try self.eval_temporal_state_expr(
-                                prop,
-                                @intCast(i),
-                            );
-                        }
+                        try self.eval_temporal_state_expression_all(
+                            prop,
+                            results,
+                        );
                     },
                 }
             },
             .box_action => |ba| {
-                for (0..n) |i| {
-                    const state_idx: u32 = @intCast(i);
-                    if (!self.canonical_states[state_idx]) {
-                        results[i] = true;
-                        continue;
-                    }
-                    const parent = self.state_store.get(state_idx);
-                    var holds = true;
-                    for (self.successors(state_idx)) |succ| {
-                        const child = self.state_store.get(succ);
-                        if (try self.eval_action(ba.action, Context.empty(), parent, child)) continue;
-                        if (!try self.eval_vars_equal(ba.vars, Context.empty(), parent, child)) {
-                            if (std.c.getenv("TLZIG_DUMP_LIVENESS") != null) {
-                                std.debug.print(
-                                    "box action rejected edge {d}->{d}\n",
-                                    .{ state_idx, succ },
-                                );
-                            }
-                            holds = false;
-                            break;
-                        }
-                    }
-                    results[i] = holds;
-                }
+                try self.eval_box_action_all(ba.action, ba.vars, results);
             },
             else => {
-                for (0..n) |i| {
-                    results[i] = try self.eval_temporal_state_expr(
-                        prop,
-                        @intCast(i),
-                    );
-                }
+                try self.eval_temporal_state_expression_all(prop, results);
             },
         }
 
@@ -3442,10 +4388,27 @@ pub const Checker = struct {
         action_expr: *ast.Expr,
         state_index: u32,
     ) Error!bool {
+        return self.eval_enabled_action_with(
+            &self.evaluator,
+            &self.eval_pool,
+            action_expr,
+            state_index,
+        );
+    }
+
+    fn eval_enabled_action_with(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        action_expr: *ast.Expr,
+        state_index: u32,
+    ) Error!bool {
         const parent = self.state_store.get(state_index);
         for (self.successors(state_index)) |successor| {
             const child = self.state_store.get(successor);
-            if (try self.eval_action(
+            if (try self.eval_action_with(
+                evaluator,
+                eval_pool,
                 action_expr,
                 Context.empty(),
                 parent,
@@ -3455,27 +4418,83 @@ pub const Checker = struct {
         return false;
     }
 
+    fn eval_box_action_state_with(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        action_expr: *ast.Expr,
+        vars_expr: *ast.Expr,
+        state_index: u32,
+    ) Error!bool {
+        if (!self.canonical_states[state_index]) return true;
+        const parent = self.state_store.get(state_index);
+        for (self.successors(state_index)) |successor| {
+            const child = self.state_store.get(successor);
+            if (try self.eval_action_with(
+                evaluator,
+                eval_pool,
+                action_expr,
+                Context.empty(),
+                parent,
+                child,
+            )) continue;
+            if (try self.eval_vars_equal_with(
+                evaluator,
+                eval_pool,
+                vars_expr,
+                Context.empty(),
+                parent,
+                child,
+            )) continue;
+            if (std.c.getenv("TLZIG_DUMP_LIVENESS") != null) {
+                std.debug.print(
+                    "box action rejected edge {d}->{d}\n",
+                    .{ state_index, successor },
+                );
+            }
+            return false;
+        }
+        return true;
+    }
+
     fn eval_temporal_state_expr(
         self: *Checker,
         prop: *ast.Expr,
         state_index: u32,
     ) Error!bool {
-        const snap = self.eval_pool.snapshot();
-        defer self.eval_pool.restore(snap);
-        if (contains_enabled(prop)) {
-            self.evaluator.set_enabled_result(
+        return self.eval_temporal_state_expr_with(
+            &self.evaluator,
+            &self.eval_pool,
+            prop,
+            contains_enabled(prop),
+            state_index,
+        );
+    }
+
+    fn eval_temporal_state_expr_with(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        prop: *ast.Expr,
+        has_enabled: bool,
+        state_index: u32,
+    ) Error!bool {
+        const snap = eval_pool.snapshot();
+        defer eval_pool.restore(snap);
+        if (has_enabled) {
+            evaluator.set_enabled_result(
                 self.successors(state_index).len > 0,
             );
-            defer self.evaluator.set_enabled_result(null);
+            defer evaluator.set_enabled_result(null);
         }
         const st = self.state_store.get(state_index);
-        self.evaluator.begin_state_evaluation(&self.eval_pool);
-        defer self.evaluator.end_state_evaluation();
-        const value = self.evaluator.eval_expr(
+        evaluator.begin_state_evaluation(eval_pool);
+        defer evaluator.end_state_evaluation();
+        const value = evaluator.eval_expr(
             prop,
             Context.empty(),
             st,
-            &self.eval_pool,
+            eval_pool,
             &self.state_store.values_pool,
         ) catch |err| {
             if (prop.* == .apply and prop.apply.func.* == .ident) {
@@ -4078,6 +5097,71 @@ pub const Checker = struct {
         }
     }
 
+    pub fn dump_fingerprints(self: *Checker, path: [:0]const u8) !void {
+        if (self.state_fingerprints.len < self.state_store.count) {
+            return Error.NotImplemented;
+        }
+
+        const file = std.c.fopen(path.ptr, "wb") orelse return Error.IoError;
+        defer assert(std.c.fclose(file) == 0);
+        const writer = DumpWriter{ .file = file };
+        for (
+            self.state_store.states[0..self.state_store.count],
+            self.state_fingerprints[0..self.state_store.count],
+            0..,
+        ) |state_v, state_fingerprint, state_index| {
+            try writer.print("{d} {x} {d} {d}\n", .{
+                state_index,
+                state_fingerprint,
+                state_v.pred,
+                state_v.level,
+            });
+        }
+    }
+
+    pub fn dump_graph(self: *Checker, path: [:0]const u8) !void {
+        if (!self.graph_enabled) return Error.NotImplemented;
+
+        const file = std.c.fopen(path.ptr, "wb") orelse return Error.IoError;
+        defer assert(std.c.fclose(file) == 0);
+        const writer = DumpWriter{ .file = file };
+
+        for (0..self.state_store.count) |source_usize| {
+            const source: u32 = @intCast(source_usize);
+            if (!self.canonical_states[source]) continue;
+
+            const begin = self.succ_offsets[source];
+            const end = begin + self.succ_counts[source];
+            assert(begin <= end);
+            assert(end <= self.succ_count);
+            for (begin..end) |edge_usize| {
+                const edge: u32 = @intCast(edge_usize);
+                const target = self.succ_edges[edge];
+                assert(target < self.state_store.count);
+                assert(self.canonical_states[target]);
+                try writer.print("{d} {d} {d}\n", .{
+                    source + 1,
+                    target + 1,
+                    self.edge_action_masks[edge],
+                });
+            }
+        }
+    }
+
+    pub fn dump_initial_states(self: *Checker, path: [:0]const u8) !void {
+        if (!self.graph_enabled) return Error.NotImplemented;
+
+        const file = std.c.fopen(path.ptr, "wb") orelse return Error.IoError;
+        defer assert(std.c.fclose(file) == 0);
+        const writer = DumpWriter{ .file = file };
+
+        for (self.initial_states[0..self.state_store.count], 0..) |initial, state_index| {
+            if (!initial) continue;
+            assert(self.canonical_states[state_index]);
+            try writer.print("{d}\n", .{state_index + 1});
+        }
+    }
+
     fn dump_value(
         self: *Checker,
         writer: DumpWriter,
@@ -4244,9 +5328,9 @@ fn contains_enabled(expr: *ast.Expr) bool {
 }
 
 pub const Result = struct {
-    // TLC-compatible non-distinct generated-state count:
-    // initial states plus raw next-state candidates before constraints,
-    // fingerprinting, and successor-edge deduplication.
+    // Initial states plus compiled next-state candidates before constraints,
+    // fingerprinting, and successor-edge deduplication. TLC may report a
+    // larger count when multiple action witnesses produce the same candidate.
     generated: u64,
     // Internal committed graph edges after constraints and per-parent
     // successor deduplication. This is useful for tlzig profiling, not TLC
@@ -4547,7 +5631,23 @@ fn finite_fairness_domain(
                 );
             }
         },
-        else => {},
+        else => {
+            if (!domain_value.is_set_like()) return Error.TypeError;
+            const materialized = try evaluator.materialize_set(
+                domain_value,
+                context,
+                null,
+                eval_pool,
+                state_pool,
+            );
+            if (materialized != .set_v) return Error.TypeError;
+            for (materialized.set_v.items(eval_pool)) |item| {
+                try values.append(
+                    std.heap.page_allocator,
+                    try item.clone(eval_pool, state_pool),
+                );
+            }
+        },
     }
     return try values.toOwnedSlice(std.heap.page_allocator);
 }

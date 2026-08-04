@@ -1,8 +1,10 @@
 const std = @import("std");
 const ast = @import("ast.zig");
+const config = @import("config.zig");
 const overrides = @import("overrides.zig");
 const generated_runtime = @import("generated_runtime.zig");
 const sequence_patterns = @import("sequence_patterns.zig");
+const set_patterns = @import("set_patterns.zig");
 
 pub const Result = struct {
     source: []const u8,
@@ -104,7 +106,7 @@ pub fn emit_module_with_options(
         .{
             generated_runtime.generated_model_abi_version,
             std.zig.fmtString(module.name),
-            config_replacements_hash(module.config_replacements),
+            config.codegen_replacements_hash(module.config_replacements),
         },
     );
     defer allocator.free(module_metadata);
@@ -195,7 +197,8 @@ pub fn emit_module_with_options(
             definition.body,
             body_params,
             body_params.len,
-            reachable[definition_index],
+            reachable[definition_index] and
+                recursive_function_set_sum_pattern(definition) == null,
             &expression_index,
             &generated_expressions,
         );
@@ -227,14 +230,16 @@ pub fn emit_module_with_options(
             operator_supported(module, definition, 0))
         {
             const body_params = definition_body_params(definition);
-            try emit_helpers(
-                &output,
-                allocator,
-                module,
-                definition.body,
-                body_params,
-                &emitted_helpers,
-            );
+            if (recursive_function_set_sum_pattern(definition) == null) {
+                try emit_helpers(
+                    &output,
+                    allocator,
+                    module,
+                    definition.body,
+                    body_params,
+                    &emitted_helpers,
+                );
+            }
             if (definition.function_domain) |domain| {
                 try emit_helpers(
                     &output,
@@ -350,7 +355,10 @@ pub fn emit_module_with_options(
                 if (expression_calls_identifier(
                     definition.body,
                     definition.name,
-                )) "true" else "false",
+                ) and recursive_function_set_sum_pattern(definition) == null)
+                    "true"
+                else
+                    "false",
             },
         );
         defer allocator.free(line);
@@ -507,28 +515,6 @@ fn definition_kind(
         .unsupported;
 }
 
-fn config_replacements_hash(
-    replacements: []const ast.ConfigReplacement,
-) u64 {
-    var hasher = std.hash.Wyhash.init(0x544c_5a49_475f_4347);
-    for (replacements) |replacement| {
-        hash_bytes(&hasher, replacement.name);
-        hash_bytes(&hasher, replacement.value);
-        hasher.update(&.{if (replacement.is_substitution) 1 else 0});
-        hasher.update(&.{switch (replacement.kind) {
-            .alias => 1,
-            .constant => 2,
-        }});
-    }
-    return hasher.final();
-}
-
-fn hash_bytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
-    const len: u64 = bytes.len;
-    hasher.update(std.mem.asBytes(&len));
-    hasher.update(bytes);
-}
-
 fn definition_is_boolean(
     module: ast.Module,
     definition: ast.Definition,
@@ -542,6 +528,239 @@ fn definition_context_free(
 ) bool {
     if (definition.params.len != 0) return false;
     return expr_context_free(module, definition.body, 0);
+}
+
+/// Whether calls to `definition` may be memoized across explored states.
+/// This is deliberately more conservative than ordinary context-freedom:
+/// TLC extension operators with observable or nondeterministic behavior make
+/// an otherwise state-independent expression unsuitable for persistent reuse.
+pub fn definition_persistent_call_cache_safe(
+    module: ast.Module,
+    definition: ast.Definition,
+) bool {
+    var state_active: [64][]const u8 = undefined;
+    if (definition_references_state_operator(
+        module,
+        definition,
+        &state_active,
+        0,
+    )) return false;
+
+    var active: [64][]const u8 = undefined;
+    active[0] = definition.name;
+    return !expr_references_volatile_operator(
+        module,
+        definition.body,
+        &active,
+        1,
+    );
+}
+
+pub fn expression_reordering_safe(
+    module: ast.Module,
+    expression: *const ast.Expr,
+) bool {
+    var active: [64][]const u8 = undefined;
+    return !expr_references_volatile_operator(
+        module,
+        expression,
+        &active,
+        0,
+    );
+}
+
+fn definition_references_state_operator(
+    module: ast.Module,
+    definition: ast.Definition,
+    active: *[64][]const u8,
+    active_len: usize,
+) bool {
+    if (active_len >= active.len) return true;
+    if (active_definition_contains(active, active_len, definition.name)) {
+        return false;
+    }
+    active[active_len] = definition.name;
+    return expr_references_state_operator(
+        module,
+        definition.body,
+        definition.name,
+        definition_body_params(definition),
+        active,
+        active_len + 1,
+    );
+}
+
+fn expr_references_state_operator(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    owner: []const u8,
+    shadowed: []const []const u8,
+    active: *[64][]const u8,
+    active_len: usize,
+) bool {
+    if (active_len >= active.len) return true;
+    for (module.variables) |variable| {
+        for (shadowed) |name| {
+            if (std.mem.eql(u8, variable, name)) break;
+        } else {
+            if (expression_references_identifier(expr, variable)) {
+                if (std.c.getenv("TLZIG_CODEGEN_CACHE_DIAGNOSTICS") != null) {
+                    std.debug.print(
+                        "persistent call cache rejects {s}: state variable {s}\n",
+                        .{ owner, variable },
+                    );
+                }
+                return true;
+            }
+        }
+    }
+
+    for (module.config_replacements) |replacement| {
+        if (name_in_slice(shadowed, replacement.name)) continue;
+        if (!expression_references_identifier(expr, replacement.name)) continue;
+        const symbol = resolved_config_symbol(module, replacement.name) orelse
+            continue;
+        const resolved_name = switch (symbol) {
+            .constant => continue,
+            .name => |name| name,
+        };
+        const dependency = find_definition(module, resolved_name) orelse
+            continue;
+        if (definition_references_state_operator(
+            module,
+            dependency,
+            active,
+            active_len,
+        )) return true;
+    }
+
+    for (module.definitions) |dependency| {
+        if (name_in_slice(shadowed, dependency.name)) continue;
+        if (active_definition_contains(active, active_len, dependency.name)) {
+            continue;
+        }
+        if (!expression_references_identifier(expr, dependency.name)) continue;
+        if (definition_references_state_operator(
+            module,
+            dependency,
+            active,
+            active_len,
+        )) return true;
+    }
+    return false;
+}
+
+fn name_in_slice(names: []const []const u8, target: []const u8) bool {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, target)) return true;
+    }
+    return false;
+}
+
+const volatile_operator_names = [_][]const u8{
+    "Any",
+    "Assert",
+    "CSVWrite",
+    "IOEnvExec",
+    "JavaTime",
+    "Print",
+    "PrintT",
+    "RandomElement",
+    "RandomSubset",
+    "TLCDefer",
+    "TLCEval",
+    "TLCEvalDefinition",
+    "TLCGet",
+    "TLCSet",
+    "ToFile",
+};
+
+fn operator_name_is_volatile(name: []const u8) bool {
+    const unqualified = if (std.mem.lastIndexOfScalar(u8, name, '!')) |bang|
+        name[bang + 1 ..]
+    else
+        name;
+    for (volatile_operator_names) |volatile_name| {
+        if (std.mem.eql(u8, unqualified, volatile_name)) return true;
+    }
+    return false;
+}
+
+fn active_definition_contains(
+    active: *const [64][]const u8,
+    active_len: usize,
+    name: []const u8,
+) bool {
+    for (active[0..active_len]) |active_name| {
+        if (std.mem.eql(u8, active_name, name)) return true;
+    }
+    return false;
+}
+
+fn definition_references_volatile_operator(
+    module: ast.Module,
+    definition: ast.Definition,
+    active: *[64][]const u8,
+    active_len: usize,
+) bool {
+    if (active_len >= active.len) return true;
+    if (active_definition_contains(active, active_len, definition.name)) {
+        return false;
+    }
+    active[active_len] = definition.name;
+    return expr_references_volatile_operator(
+        module,
+        definition.body,
+        active,
+        active_len + 1,
+    );
+}
+
+fn expr_references_volatile_operator(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    active: *[64][]const u8,
+    active_len: usize,
+) bool {
+    if (active_len >= active.len) return true;
+
+    for (volatile_operator_names) |volatile_name| {
+        if (expression_references_identifier(expr, volatile_name)) return true;
+    }
+
+    for (module.config_replacements) |replacement| {
+        if (!expression_references_identifier(expr, replacement.name)) continue;
+        const symbol = resolved_config_symbol(module, replacement.name) orelse
+            continue;
+        switch (symbol) {
+            .constant => {},
+            .name => |resolved_name| {
+                if (operator_name_is_volatile(resolved_name)) return true;
+                const dependency = find_definition(module, resolved_name) orelse
+                    continue;
+                if (definition_references_volatile_operator(
+                    module,
+                    dependency,
+                    active,
+                    active_len,
+                )) return true;
+            },
+        }
+    }
+
+    for (module.definitions) |dependency| {
+        if (active_definition_contains(active, active_len, dependency.name)) {
+            continue;
+        }
+        if (!expression_references_identifier(expr, dependency.name)) continue;
+        if (definition_references_volatile_operator(
+            module,
+            dependency,
+            active,
+            active_len,
+        )) return true;
+    }
+    return false;
 }
 
 fn definition_references_definition(
@@ -743,13 +962,56 @@ fn expr_eager_cache_safe(
             }
             break :blk true;
         },
+        .apply => |application| blk: {
+            if (variable_application_index(module, application) != null or
+                !expression_reordering_safe(module, expr))
+            {
+                break :blk false;
+            }
+            for (application.args) |argument| {
+                if (!expr_eager_cache_safe(
+                    module,
+                    argument,
+                    active,
+                    active_len,
+                )) break :blk false;
+            }
+            const function_name = switch (application.func.*) {
+                .ident => |name| name,
+                else => break :blk false,
+            };
+            if (operator_name_is_volatile(function_name)) break :blk false;
+            if (direct_native_name(module, function_name) != null) {
+                break :blk true;
+            }
+            const resolved = resolved_definition_name(
+                module,
+                function_name,
+            ) orelse break :blk true;
+            for (active[0..active_len]) |active_name| {
+                if (std.mem.eql(u8, active_name, resolved)) break :blk false;
+            }
+            const dependency = find_definition(module, resolved) orelse
+                break :blk true;
+            if (dependency.function_domain != null or
+                dependency.params.len != application.args.len)
+            {
+                break :blk false;
+            }
+            active[active_len] = resolved;
+            break :blk expr_eager_cache_safe(
+                module,
+                dependency.body,
+                active,
+                active_len + 1,
+            );
+        },
         .primed,
         .primed_expr,
         .unchanged,
         .unchanged_expr,
         .quantifier,
         .choose,
-        .apply,
         .set_filter,
         .set_map,
         .function_literal,
@@ -976,7 +1238,7 @@ fn expr_is_boolean(
             => true,
             else => false,
         },
-        .unary => |unary| unary.op == .not,
+        .unary => |unary| unary.op == .not or unary.op == .enabled,
         .if_then_else => |conditional| expr_is_boolean(
             module,
             conditional.then_branch,
@@ -1020,6 +1282,14 @@ fn expr_is_boolean(
         },
         .apply => |application| blk: {
             if (application.func.* != .ident) break :blk false;
+            if (direct_native_name(
+                module,
+                application.func.ident,
+            )) |native_name| {
+                if (std.mem.eql(u8, native_name, "is_finite_set")) {
+                    break :blk application.args.len == 1;
+                }
+            }
             const definition = find_definition(
                 module,
                 application.func.ident,
@@ -1212,8 +1482,206 @@ fn expr_is_temporal(
                 depth + 1,
             );
         },
+        .apply => |application| blk: {
+            if (application.func.* == .ident and
+                (std.mem.startsWith(u8, application.func.ident, "WF_") or
+                    std.mem.startsWith(u8, application.func.ident, "SF_")))
+            {
+                break :blk true;
+            }
+            if (expr_is_temporal(module, application.func, depth + 1)) {
+                break :blk true;
+            }
+            for (application.args) |argument| {
+                if (expr_is_temporal(module, argument, depth + 1)) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        },
         else => false,
     };
+}
+
+const RelationDescendantsPattern = struct {
+    vertices: *const ast.Expr,
+    edges: *const ast.Expr,
+    frontier_param_index: usize,
+};
+
+/// Recognizes the semantics of a breadth-first relation closure expressed as:
+///
+/// IF frontier = {} THEN {} ELSE
+///     LET next == {to \in vertices : \E from \in frontier :
+///         <<from, to>> \in edges}
+///     IN next \cup Self(..., next, ...)
+///
+/// The match is deliberately structural and operator-name agnostic. Expressions
+/// that differ from this shape continue through the general generated runtime.
+fn relation_descendants_pattern(
+    module: ast.Module,
+    definition: ast.Definition,
+) ?RelationDescendantsPattern {
+    if (definition.params.len == 0 or definition.body.* != .if_then_else) {
+        return null;
+    }
+    const conditional = definition.body.if_then_else;
+    if (!expr_is_empty_set(conditional.then_branch) or
+        conditional.cond.* != .binary or
+        conditional.cond.binary.op != .eq)
+    {
+        return null;
+    }
+
+    const condition = conditional.cond.binary;
+    const frontier_expr = if (expr_is_empty_set(condition.left))
+        condition.right
+    else if (expr_is_empty_set(condition.right))
+        condition.left
+    else
+        return null;
+    if (frontier_expr.* != .ident) return null;
+    const frontier_param_index = name_index(
+        definition.params,
+        frontier_expr.ident,
+    ) orelse return null;
+
+    if (conditional.else_branch.* != .let_in) return null;
+    const let_value = conditional.else_branch.let_in;
+    if (let_value.defs.len != 1) return null;
+    const next_definition = let_value.defs[0];
+    if (next_definition.is_function or
+        next_definition.params.len != 0 or
+        next_definition.body.* != .set_filter)
+    {
+        return null;
+    }
+
+    const union_value = set_union_operands(let_value.body) orelse return null;
+    if (!expr_is_identifier(union_value.left, next_definition.name) or
+        union_value.right.* != .apply)
+    {
+        return null;
+    }
+    const recursive_call = union_value.right.apply;
+    if (recursive_call.func.* != .ident or
+        recursive_call.args.len != definition.params.len)
+    {
+        return null;
+    }
+    const resolved_recursive = resolved_definition_name(
+        module,
+        recursive_call.func.ident,
+    ) orelse recursive_call.func.ident;
+    if (!std.mem.eql(u8, resolved_recursive, definition.name)) return null;
+    for (recursive_call.args, definition.params, 0..) |argument, parameter, index| {
+        if (index == frontier_param_index) {
+            if (!expr_is_identifier(argument, next_definition.name)) {
+                return null;
+            }
+        } else if (!expr_is_identifier(argument, parameter)) {
+            return null;
+        }
+    }
+
+    const filter_value = next_definition.body.set_filter;
+    if (filter_value.vars.len != 1 or filter_value.pred.* != .quantifier) {
+        return null;
+    }
+    const destination = filter_value.vars[0];
+    const quantifier = filter_value.pred.quantifier;
+    if (quantifier.kind != .exists or quantifier.vars.len != 1) return null;
+    const source = quantifier.vars[0];
+    if (!expr_is_identifier(source.domain, definition.params[frontier_param_index]) or
+        quantifier.body.* != .binary or
+        quantifier.body.binary.op != .in)
+    {
+        return null;
+    }
+    const membership = quantifier.body.binary;
+    if (membership.left.* != .tuple or membership.left.tuple.len != 2 or
+        !expr_is_identifier(membership.left.tuple[0], source.name) or
+        !expr_is_identifier(membership.left.tuple[1], destination.name))
+    {
+        return null;
+    }
+
+    const vertices = destination.domain;
+    const edges = membership.right;
+    if (expr_references_identifier(vertices, destination.name) or
+        expr_references_identifier(vertices, source.name) or
+        expr_references_identifier(edges, destination.name) or
+        expr_references_identifier(edges, source.name))
+    {
+        return null;
+    }
+    return .{
+        .vertices = vertices,
+        .edges = edges,
+        .frontier_param_index = frontier_param_index,
+    };
+}
+
+fn expr_is_empty_set(expr: *const ast.Expr) bool {
+    return expr.* == .set_enum and expr.set_enum.len == 0;
+}
+
+const SetUnionOperands = struct {
+    left: *const ast.Expr,
+    right: *const ast.Expr,
+};
+
+fn set_union_operands(expr: *const ast.Expr) ?SetUnionOperands {
+    return switch (expr.*) {
+        .binary => |binary| if (binary.op == .set_union)
+            .{ .left = binary.left, .right = binary.right }
+        else
+            null,
+        .set_binary => |binary| if (binary.op == .union_op)
+            .{ .left = binary.left, .right = binary.right }
+        else
+            null,
+        else => null,
+    };
+}
+
+fn name_index(names: []const []const u8, target: []const u8) ?usize {
+    for (names, 0..) |name, index| {
+        if (std.mem.eql(u8, name, target)) return index;
+    }
+    return null;
+}
+
+fn emit_relation_descendants(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    definition: ast.Definition,
+    pattern: RelationDescendantsPattern,
+) !void {
+    try append(output, allocator, "    return try runtime.relation_descendants(context, ");
+    try emit_expr(
+        output,
+        allocator,
+        module,
+        pattern.vertices,
+        definition.params,
+    );
+    try append(output, allocator, ", ");
+    try emit_expr(
+        output,
+        allocator,
+        module,
+        pattern.edges,
+        definition.params,
+    );
+    const suffix = try std.fmt.allocPrint(
+        allocator,
+        ", try runtime.force(context, args[{d}]));\n}}\n\n",
+        .{pattern.frontier_param_index},
+    );
+    defer allocator.free(suffix);
+    try append(output, allocator, suffix);
 }
 
 fn emit_operator(
@@ -1230,6 +1698,10 @@ fn emit_operator(
         definition.body,
         definition.name,
     );
+    const relation_descendants = if (recursive)
+        relation_descendants_pattern(module, definition)
+    else
+        null;
     const source_path = if (definition.source_path.len > 0)
         definition.source_path
     else
@@ -1280,19 +1752,49 @@ fn emit_operator(
     );
     defer allocator.free(header);
     try append(output, allocator, header);
+    if (recursive_function_set_sum_pattern(definition)) |pattern| {
+        const direct_sum = try std.fmt.allocPrint(
+            allocator,
+            "    return try runtime.sum_function_on_set(\n" ++
+                "        context,\n" ++
+                "        try runtime.force(context, args[{d}]),\n" ++
+                "        try runtime.force(context, args[{d}]),\n" ++
+                "    );\n" ++
+                "}}\n\n",
+            .{
+                pattern.function_param_index,
+                pattern.set_param_index,
+            },
+        );
+        defer allocator.free(direct_sum);
+        try append(output, allocator, direct_sum);
+        return;
+    }
     if (recursive) {
+        const stable_call = definition_persistent_call_cache_safe(
+            module,
+            definition,
+        );
         const recursive_wrapper = try std.fmt.allocPrint(
             allocator,
-            "    if (try runtime.cached_recursive_call(context, \"{f}\", args)) |cached| return cached;\n" ++
+            "    if (try runtime.{s}(context, \"{f}\", args)) |cached| return cached;\n" ++
                 "    const result = try {s}_uncached(context, args);\n" ++
-                "    return try runtime.put_cached_recursive_call(context, \"{f}\", args, result);\n" ++
+                "    return try runtime.{s}(context, \"{f}\", args, result);\n" ++
                 "}}\n\n" ++
                 "fn {s}_uncached(context: *runtime.CallContext, args: []const Value) Error!Value {{\n" ++
                 "    std.debug.assert(args.len == {d});\n" ++
                 "    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);\n",
             .{
+                if (stable_call)
+                    "cached_stable_call"
+                else
+                    "cached_recursive_call",
                 std.zig.fmtString(definition.name),
                 function_name,
+                if (stable_call)
+                    "put_cached_stable_call"
+                else
+                    "put_cached_recursive_call",
                 std.zig.fmtString(definition.name),
                 function_name,
                 definition.params.len,
@@ -1300,6 +1802,16 @@ fn emit_operator(
         );
         defer allocator.free(recursive_wrapper);
         try append(output, allocator, recursive_wrapper);
+    }
+    if (relation_descendants) |pattern| {
+        try emit_relation_descendants(
+            output,
+            allocator,
+            module,
+            definition,
+            pattern,
+        );
+        return;
     }
     if (definition_is_boolean(module, definition)) {
         const boolean_name = try zig_boolean_operator_name(
@@ -1548,14 +2060,88 @@ fn emit_boolean_function_body(
             &operands,
             &operand_count,
         );
-        for (operands[0..operand_count], 0..) |operand, index| {
+        var resolved_paths: [256]ResolvedPathAlias = undefined;
+        var resolved_path_count: usize = 0;
+        var index: usize = 0;
+        while (index < operand_count) {
+            const operand = operands[index];
+            if (body.binary.op == .and_op and index + 1 < operand_count) {
+                if (domain_literal_member_field_argument_equal(
+                    module,
+                    operand,
+                    operands[index + 1],
+                    params,
+                )) |pattern| {
+                    const reuse_path = path_used_by_later_operand(
+                        module,
+                        operands[index + 2 .. operand_count],
+                        pattern.variable,
+                        pattern.application,
+                        params,
+                    );
+                    const alias: ?ResolvedPathAlias = if (reuse_path) blk: {
+                        std.debug.assert(resolved_path_count < resolved_paths.len);
+                        const path_alias = ResolvedPathAlias{
+                            .variable = pattern.variable,
+                            .application = pattern.application,
+                            .local_index = index,
+                        };
+                        try emit_resolved_path_declaration(
+                            output,
+                            allocator,
+                            module,
+                            path_alias,
+                            params,
+                        );
+                        resolved_paths[resolved_path_count] = path_alias;
+                        resolved_path_count += 1;
+                        break :blk path_alias;
+                    } else null;
+                    const prefix = try std.fmt.allocPrint(
+                        allocator,
+                        "    const condition_{d} = ",
+                        .{index},
+                    );
+                    defer allocator.free(prefix);
+                    try append(output, allocator, prefix);
+                    if (alias) |path_alias| {
+                        try emit_resolved_domain_literal_member_field_argument_equal(
+                            output,
+                            allocator,
+                            pattern,
+                            path_alias,
+                        );
+                    } else {
+                        try emit_domain_literal_member_field_argument_equal(
+                            output,
+                            allocator,
+                            module,
+                            pattern,
+                            params,
+                        );
+                    }
+                    try append(output, allocator, ";\n");
+                    const branch = try std.fmt.allocPrint(
+                        allocator,
+                        "    if (!condition_{d}) return false;\n",
+                        .{index},
+                    );
+                    defer allocator.free(branch);
+                    try append(output, allocator, branch);
+                    index += 2;
+                    continue;
+                }
+            }
             if (try emit_boolean_unchanged_guards(
                 output,
                 allocator,
                 module,
                 operand,
                 body.binary.op,
-            )) continue;
+            )) {
+                index += 1;
+                continue;
+            }
             const prefix = try std.fmt.allocPrint(
                 allocator,
                 "    const condition_{d} = ",
@@ -1563,13 +2149,22 @@ fn emit_boolean_function_body(
             );
             defer allocator.free(prefix);
             try append(output, allocator, prefix);
-            try emit_boolean_expr(
+            if (!try emit_boolean_expr_with_resolved_paths(
                 output,
                 allocator,
                 module,
                 operand,
                 params,
-            );
+                resolved_paths[0..resolved_path_count],
+            )) {
+                try emit_boolean_expr(
+                    output,
+                    allocator,
+                    module,
+                    operand,
+                    params,
+                );
+            }
             try append(output, allocator, ";\n");
             const branch = if (body.binary.op == .and_op)
                 try std.fmt.allocPrint(
@@ -1585,6 +2180,7 @@ fn emit_boolean_function_body(
                 );
             defer allocator.free(branch);
             try append(output, allocator, branch);
+            index += 1;
         }
         try append(
             output,
@@ -1643,6 +2239,46 @@ fn emit_boolean_expr(
         },
         .apply => |application| {
             if (application.func.* == .ident) {
+                if (application.args.len == 1) {
+                    if (direct_native_name(
+                        module,
+                        application.func.ident,
+                    )) |native_name| {
+                        if (std.mem.eql(
+                            u8,
+                            native_name,
+                            "is_finite_set",
+                        )) {
+                            if (expr_constant_index(
+                                module,
+                                application.args[0],
+                            )) |index| {
+                                const call = try std.fmt.allocPrint(
+                                    allocator,
+                                    "try runtime.constant_is_finite_set_at(context, {d})",
+                                    .{index},
+                                );
+                                defer allocator.free(call);
+                                try append(output, allocator, call);
+                            } else {
+                                try append(
+                                    output,
+                                    allocator,
+                                    "runtime.is_finite_set_bool(",
+                                );
+                                try emit_expr(
+                                    output,
+                                    allocator,
+                                    module,
+                                    application.args[0],
+                                    params,
+                                );
+                                try append(output, allocator, ")");
+                            }
+                            return;
+                        }
+                    }
+                }
                 if (find_definition_index(
                     module,
                     application.func.ident,
@@ -1694,6 +2330,14 @@ fn emit_boolean_expr(
                     }
                 }
             }
+            if (try emit_variable_path_literal_string_call(
+                output,
+                allocator,
+                module,
+                "variable_path_literal_string_boolean",
+                application,
+                params,
+            )) return;
             if (variable_application_index_scoped(module, application, params)) |variable| {
                 try emit_variable_path_call(
                     output,
@@ -1756,6 +2400,13 @@ fn emit_boolean_expr(
                 .subseteq,
                 => {
                     if (binary.op == .in or binary.op == .notin) {
+                        if (try emit_variable_path_domain_membership(
+                            output,
+                            allocator,
+                            module,
+                            binary,
+                            params,
+                        )) return;
                         if (try emit_string_literal_set_membership(
                             output,
                             allocator,
@@ -1763,6 +2414,13 @@ fn emit_boolean_expr(
                             binary,
                             params,
                             .boolean,
+                        )) return;
+                        if (try emit_union_membership(
+                            output,
+                            allocator,
+                            module,
+                            binary,
+                            params,
                         )) return;
                         if (try emit_field_path_membership(
                             output,
@@ -1889,6 +2547,10 @@ fn emit_boolean_expr(
                     params,
                 );
                 try append(output, allocator, ")");
+                return;
+            }
+            if (unary.op == .enabled) {
+                try append(output, allocator, "runtime.enabled_bool(context)");
                 return;
             }
             unreachable;
@@ -2060,13 +2722,15 @@ fn emit_boolean_expr(
             }
             try emit_unchanged_terms(output, allocator, module, names);
         },
-        .unchanged_expr => |tuple_expr| {
-            var names = try allocator.alloc([]const u8, tuple_expr.tuple.len);
-            defer allocator.free(names);
-            for (tuple_expr.tuple, 0..) |item, index| {
-                names[index] = item.ident;
-            }
-            try emit_unchanged_terms(output, allocator, module, names);
+        .unchanged_expr => |unchanged_expr| {
+            try emit_unchanged_expression(
+                output,
+                allocator,
+                module,
+                expr,
+                unchanged_expr,
+                false,
+            );
         },
         .field => {
             if (try emit_field_path_boolean(
@@ -2262,11 +2926,13 @@ fn emit_expr(
             names,
         ),
         .unchanged_expr => |unchanged_expr| {
-            try emit_unchanged_tuple(
+            try emit_unchanged_expression(
                 output,
                 allocator,
                 module,
+                expr,
                 unchanged_expr,
+                true,
             );
         },
         .field => |field| {
@@ -2298,6 +2964,13 @@ fn emit_expr(
                 );
                 return;
             }
+            if (try emit_applied_parameter_field_path(
+                output,
+                allocator,
+                module,
+                expr,
+                params,
+            )) return;
             try append(output, allocator, "try runtime.field(context, ");
             try emit_expr(
                 output,
@@ -2586,6 +3259,37 @@ fn emit_expr(
             try append(output, allocator, suffix);
         },
         .set_filter => |filter_value| {
+            if (set_patterns.hereditary_power_set_filter(
+                filter_value,
+            )) |pattern| {
+                try append(
+                    output,
+                    allocator,
+                    "try runtime.power_set(context, try runtime.filter_at(context, args, ",
+                );
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    pattern.base,
+                    params,
+                );
+                const helper = try hereditary_filter_helper_name(
+                    allocator,
+                    expression_identity(module, expr),
+                );
+                defer allocator.free(helper);
+                try append(output, allocator, ", ");
+                try append(output, allocator, helper);
+                const suffix = try std.fmt.allocPrint(
+                    allocator,
+                    ", {d}))",
+                    .{expression_identity(module, expr)},
+                );
+                defer allocator.free(suffix);
+                try append(output, allocator, suffix);
+                return;
+            }
             if (sorted_bounded_sequence_filter(
                 module,
                 filter_value,
@@ -2613,6 +3317,13 @@ fn emit_expr(
                 try append(output, allocator, ")");
                 return;
             }
+            if (try emit_filter_variable_path_boolean(
+                output,
+                allocator,
+                module,
+                filter_value,
+                params,
+            )) return;
             try append(output, allocator, "try runtime.filter_at(context, args, ");
             try emit_expr(
                 output,
@@ -2637,20 +3348,34 @@ fn emit_expr(
             try append(output, allocator, suffix);
         },
         .set_map => |map_value| {
-            try append(output, allocator, "try runtime.map_set(context, args, ");
-            try emit_expr(
+            try append(
                 output,
                 allocator,
-                module,
-                map_value.vars[0].domain,
-                params,
+                if (map_value.vars.len == 1)
+                    "try runtime.map_set(context, args, "
+                else
+                    "try runtime.map_set_multi(context, args, &[_]Value{",
             );
+            for (map_value.vars, 0..) |bound, index| {
+                if (index > 0) try append(output, allocator, ", ");
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    bound.domain,
+                    params,
+                );
+            }
             const helper = try helper_name(
                 allocator,
                 expression_identity(module, expr),
             );
             defer allocator.free(helper);
-            try append(output, allocator, ", ");
+            try append(
+                output,
+                allocator,
+                if (map_value.vars.len == 1) ", " else "}, ",
+            );
             try append(output, allocator, helper);
             try append(output, allocator, ")");
         },
@@ -2707,11 +3432,18 @@ fn emit_expr(
                     index,
                 );
                 defer allocator.free(helper);
-                const entry = try std.fmt.allocPrint(
-                    allocator,
-                    ".{{ .function = {s}, .arity = {d} }}",
-                    .{ helper, definition.params.len },
-                );
+                const entry = if (definition.is_function)
+                    try std.fmt.allocPrint(
+                        allocator,
+                        ".{{ .function = {s}, .arity = {d}, .recursive = true }}",
+                        .{ helper, definition.function_vars.len },
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        allocator,
+                        ".{{ .function = {s}, .arity = {d} }}",
+                        .{ helper, definition.params.len },
+                    );
                 defer allocator.free(entry);
                 try append(output, allocator, entry);
             }
@@ -2844,6 +3576,10 @@ fn emit_expr(
             try append(output, allocator, "})");
         },
         .unary => |unary| {
+            if (unary.op == .enabled) {
+                try append(output, allocator, "runtime.enabled(context)");
+                return;
+            }
             if (unary.op == .union_all) {
                 if (sequence_patterns.bounded_sequence_union(expr)) |shape| {
                     try append(
@@ -3251,6 +3987,53 @@ fn emit_expr(
                 try append(output, allocator, ")");
                 return;
             }
+            if (is_fold_function_on_set_call(module, application)) {
+                try append(
+                    output,
+                    allocator,
+                    "try runtime.fold_function_on_set(context, args, ",
+                );
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    application.args[1],
+                    params,
+                );
+                try append(output, allocator, ", ");
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    application.args[2],
+                    params,
+                );
+                try append(output, allocator, ", ");
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    application.args[3],
+                    params,
+                );
+                const helper = try helper_name(
+                    allocator,
+                    expression_identity(module, application.args[0]),
+                );
+                defer allocator.free(helper);
+                try append(output, allocator, ", ");
+                try append(output, allocator, helper);
+                try append(output, allocator, ")");
+                return;
+            }
+            if (try emit_variable_path_literal_string_call(
+                output,
+                allocator,
+                module,
+                "variable_path_literal_string",
+                application,
+                params,
+            )) return;
             if (variable_application_index_scoped(
                 module,
                 application,
@@ -3694,7 +4477,14 @@ fn expr_supported_active(
             active_len,
         ),
         .unchanged => |names| variable_names_supported(module, names),
-        .unchanged_expr => |unchanged_expr| unchanged_tuple_supported(module, unchanged_expr),
+        .unchanged_expr => |unchanged_expr| expr_supported_active(
+            module,
+            unchanged_expr,
+            params,
+            depth,
+            active,
+            active_len,
+        ),
         .tuple, .set_enum => |items| expressions_supported_active(
             module,
             items,
@@ -3760,16 +4550,15 @@ fn expr_supported_active(
                 active,
                 active_len,
             ),
-        .set_map => |map_value| map_value.vars.len == 1 and
-            bound_expression_supported_active(
-                module,
-                map_value.vars,
-                map_value.value,
-                params,
-                depth,
-                active,
-                active_len,
-            ),
+        .set_map => |map_value| bound_expression_supported_active(
+            module,
+            map_value.vars,
+            map_value.value,
+            params,
+            depth,
+            active,
+            active_len,
+        ),
         .choose => |choose_value| choose_value.domain != null and
             bound_expression_supported_active(
                 module,
@@ -3862,6 +4651,7 @@ fn expr_supported_active(
             active_len,
         ),
         .unary => |unary| switch (unary.op) {
+            .enabled => true,
             .not, .neg, .subset, .union_all, .domain => expr_supported_active(
                 module,
                 unary.operand,
@@ -3963,6 +4753,38 @@ fn expr_supported_active(
                     ))
                 {
                     break :blk false;
+                }
+                var extended: [64][]const u8 = undefined;
+                @memcpy(extended[0..params.len], params);
+                @memcpy(
+                    extended[params.len..][0..lambda.params.len],
+                    lambda.params,
+                );
+                break :blk expr_supported_active(
+                    module,
+                    lambda.body,
+                    extended[0 .. params.len + lambda.params.len],
+                    depth,
+                    active,
+                    active_len,
+                );
+            }
+            if (is_fold_function_on_set_call(module, application)) {
+                const lambda = application.args[0].*.lambda;
+                if (lambda.params.len != 2 or
+                    params.len + lambda.params.len > 64)
+                {
+                    break :blk false;
+                }
+                for (application.args[1..]) |argument| {
+                    if (!expr_supported_active(
+                        module,
+                        argument,
+                        params,
+                        depth,
+                        active,
+                        active_len,
+                    )) break :blk false;
                 }
                 var extended: [64][]const u8 = undefined;
                 @memcpy(extended[0..params.len], params);
@@ -4082,6 +4904,19 @@ fn expr_supported_active(
             "codegen unsupported expression: kind={s} depth={d} params={d}\n",
             .{ @tagName(expr.*), depth, params.len },
         );
+        switch (expr.*) {
+            .ident => |name| std.debug.print(
+                "codegen unsupported identifier: {s}\n",
+                .{name},
+            ),
+            .apply => |application| if (application.func.* == .ident) {
+                std.debug.print(
+                    "codegen unsupported call: {s}/{d}\n",
+                    .{ application.func.ident, application.args.len },
+                );
+            },
+            else => {},
+        }
     }
     return supported;
 }
@@ -4226,6 +5061,32 @@ fn emit_helpers(
                 emitted_helpers,
             );
         },
+        .unchanged_expr => |operand| {
+            if (!unchanged_tuple_supported(module, operand)) {
+                const helper = try helper_name(
+                    allocator,
+                    expression_identity(module, expr),
+                );
+                defer allocator.free(helper);
+                try emit_named_helper(
+                    output,
+                    allocator,
+                    module,
+                    helper,
+                    operand,
+                    params,
+                    emitted_helpers,
+                );
+            }
+            try emit_helpers(
+                output,
+                allocator,
+                module,
+                operand,
+                params,
+                emitted_helpers,
+            );
+        },
         .quantifier => |quantifier| {
             try emit_bound_helper(
                 output,
@@ -4262,16 +5123,44 @@ fn emit_helpers(
             );
         },
         .set_filter => |filter_value| {
-            try emit_bound_helper(
-                output,
-                allocator,
+            if (set_patterns.hereditary_power_set_filter(
+                filter_value,
+            )) |pattern| {
+                var extended: [64][]const u8 = undefined;
+                std.debug.assert(params.len < extended.len);
+                @memcpy(extended[0..params.len], params);
+                extended[params.len] = pattern.element_name;
+                const helper = try hereditary_filter_helper_name(
+                    allocator,
+                    expression_identity(module, expr),
+                );
+                defer allocator.free(helper);
+                try emit_named_helper(
+                    output,
+                    allocator,
+                    module,
+                    helper,
+                    pattern.predicate,
+                    extended[0 .. params.len + 1],
+                    emitted_helpers,
+                );
+            }
+            if (filter_variable_path_boolean(
                 module,
-                expr,
-                filter_value.vars,
-                filter_value.pred,
+                filter_value,
                 params,
-                emitted_helpers,
-            );
+            ) == null) {
+                try emit_bound_helper(
+                    output,
+                    allocator,
+                    module,
+                    expr,
+                    filter_value.vars,
+                    filter_value.pred,
+                    params,
+                    emitted_helpers,
+                );
+            }
             try emit_bound_children(
                 output,
                 allocator,
@@ -4435,14 +5324,18 @@ fn emit_helpers(
                 emitted_helpers,
             );
         },
-        .unary => |unary| try emit_helpers(
-            output,
-            allocator,
-            module,
-            unary.operand,
-            params,
-            emitted_helpers,
-        ),
+        .unary => |unary| {
+            if (unary.op != .enabled) {
+                try emit_helpers(
+                    output,
+                    allocator,
+                    module,
+                    unary.operand,
+                    params,
+                    emitted_helpers,
+                );
+            }
+        },
         .if_then_else => |conditional| {
             try emit_helpers(
                 output,
@@ -4555,6 +5448,49 @@ fn emit_helpers(
                     params,
                     emitted_helpers,
                 );
+                return;
+            }
+            if (is_fold_function_on_set_call(module, application)) {
+                const lambda_expr = application.args[0];
+                const lambda = lambda_expr.*.lambda;
+                var extended: [64][]const u8 = undefined;
+                @memcpy(extended[0..params.len], params);
+                @memcpy(
+                    extended[params.len..][0..lambda.params.len],
+                    lambda.params,
+                );
+                const helper = try helper_name(
+                    allocator,
+                    expression_identity(module, lambda_expr),
+                );
+                defer allocator.free(helper);
+                try emit_named_helper(
+                    output,
+                    allocator,
+                    module,
+                    helper,
+                    lambda.body,
+                    extended[0 .. params.len + lambda.params.len],
+                    emitted_helpers,
+                );
+                try emit_helpers(
+                    output,
+                    allocator,
+                    module,
+                    lambda.body,
+                    extended[0 .. params.len + lambda.params.len],
+                    emitted_helpers,
+                );
+                for (application.args[1..]) |argument| {
+                    try emit_helpers(
+                        output,
+                        allocator,
+                        module,
+                        argument,
+                        params,
+                        emitted_helpers,
+                    );
+                }
                 return;
             }
             try emit_helpers(
@@ -4723,24 +5659,43 @@ fn let_supported_active(
     var extended: [64][]const u8 = undefined;
     @memcpy(extended[0..params.len], params);
     for (let_value.defs, 0..) |definition, index| {
-        if (definition.is_function or
-            params.len + index + definition.params.len > 64)
-        {
-            return false;
-        }
+        const prefix_len = params.len + index;
         var definition_params: [64][]const u8 = undefined;
-        @memcpy(
-            definition_params[0 .. params.len + index],
-            extended[0 .. params.len + index],
-        );
-        @memcpy(
-            definition_params[params.len + index ..][0..definition.params.len],
-            definition.params,
-        );
+        @memcpy(definition_params[0..prefix_len], extended[0..prefix_len]);
+        const definition_param_count = if (definition.is_function) blk: {
+            if (definition.params.len != 0 or
+                definition.function_vars.len == 0 or
+                definition.function_domain == null or
+                prefix_len + 1 + definition.function_vars.len > 64 or
+                !expr_supported_active(
+                    module,
+                    definition.function_domain.?,
+                    extended[0..prefix_len],
+                    depth,
+                    active,
+                    active_len,
+                ))
+            {
+                return false;
+            }
+            definition_params[prefix_len] = definition.name;
+            @memcpy(
+                definition_params[prefix_len + 1 ..][0..definition.function_vars.len],
+                definition.function_vars,
+            );
+            break :blk prefix_len + 1 + definition.function_vars.len;
+        } else blk: {
+            if (prefix_len + definition.params.len > 64) return false;
+            @memcpy(
+                definition_params[prefix_len..][0..definition.params.len],
+                definition.params,
+            );
+            break :blk prefix_len + definition.params.len;
+        };
         if (!expr_supported_active(
             module,
             definition.body,
-            definition_params[0 .. params.len + index + definition.params.len],
+            definition_params[0..definition_param_count],
             depth,
             active,
             active_len,
@@ -4786,6 +5741,302 @@ fn is_reduce_sequence_call(
     ) orelse application.func.ident;
     const definition = find_definition(module, resolved) orelse return false;
     return reduce_sequence_helper_definition(definition);
+}
+
+fn is_fold_function_on_set_call(
+    module: ast.Module,
+    application: *const ast.Apply,
+) bool {
+    if (application.func.* != .ident or
+        application.args.len != 4 or
+        application.args[0].* != .lambda or
+        application.args[0].lambda.params.len != 2)
+    {
+        return false;
+    }
+    const resolved = resolved_definition_name(
+        module,
+        application.func.ident,
+    ) orelse return false;
+    const definition = find_definition(module, resolved) orelse return false;
+    return fold_function_on_set_helper_definition(module, definition);
+}
+
+const RecursiveFunctionSetSumPattern = struct {
+    function_param_index: usize,
+    set_param_index: usize,
+};
+
+fn recursive_function_set_sum_pattern(
+    definition: ast.Definition,
+) ?RecursiveFunctionSetSumPattern {
+    if (definition.is_function or
+        definition.params.len < 2 or
+        definition.body.* != .if_then_else)
+    {
+        return null;
+    }
+    const conditional = definition.body.if_then_else;
+    if (conditional.then_branch.* != .int_literal or
+        conditional.then_branch.int_literal != 0 or
+        conditional.else_branch.* != .let_in)
+    {
+        return null;
+    }
+    const selection = conditional.else_branch.let_in;
+    if (selection.defs.len != 1 or
+        selection.defs[0].params.len != 0 or
+        selection.body.* != .binary or
+        selection.body.binary.op != .plus)
+    {
+        return null;
+    }
+    const selected = selection.defs[0];
+    if (param_index(definition.params, selected.name) != null or
+        selected.body.* != .choose or
+        selected.body.choose.domain == null or
+        selected.body.choose.domain.?.* != .ident)
+    {
+        return null;
+    }
+    const set_name = selected.body.choose.domain.?.ident;
+    const set_param_index = param_index(
+        definition.params,
+        set_name,
+    ) orelse return null;
+    if (!expr_is_equal_to_empty_set(conditional.cond, set_name) or
+        !choose_any_from_identifier(selected.body, set_name))
+    {
+        return null;
+    }
+
+    const sum = selection.body.binary;
+    const function_param_index =
+        recursive_function_set_sum_mapper(
+            definition,
+            sum.left,
+            sum.right,
+            set_param_index,
+            selected.name,
+        ) orelse recursive_function_set_sum_mapper(
+            definition,
+            sum.right,
+            sum.left,
+            set_param_index,
+            selected.name,
+        ) orelse return null;
+    if (function_param_index == set_param_index) return null;
+    return .{
+        .function_param_index = function_param_index,
+        .set_param_index = set_param_index,
+    };
+}
+
+fn recursive_function_set_sum_mapper(
+    definition: ast.Definition,
+    mapped: *const ast.Expr,
+    recursive: *const ast.Expr,
+    set_param_index: usize,
+    selected_name: []const u8,
+) ?usize {
+    if (mapped.* != .apply or
+        mapped.apply.func.* != .ident or
+        mapped.apply.args.len != 1 or
+        !expr_is_identifier(mapped.apply.args[0], selected_name))
+    {
+        return null;
+    }
+    const function_param_index = param_index(
+        definition.params,
+        mapped.apply.func.ident,
+    ) orelse return null;
+    if (recursive.* != .apply or
+        recursive.apply.func.* != .ident or
+        !std.mem.eql(u8, recursive.apply.func.ident, definition.name) or
+        recursive.apply.args.len != definition.params.len)
+    {
+        return null;
+    }
+    for (
+        recursive.apply.args,
+        definition.params,
+        0..,
+    ) |argument, parameter, index| {
+        if (index == set_param_index) {
+            if (!expr_is_set_without_singleton(
+                argument,
+                parameter,
+                selected_name,
+            )) return null;
+        } else if (!expr_is_identifier(argument, parameter)) {
+            return null;
+        }
+    }
+    return function_param_index;
+}
+
+fn fold_function_on_set_helper_definition(
+    module: ast.Module,
+    definition: ast.Definition,
+) bool {
+    if (definition.params.len != 4 or definition.body.* != .apply) return false;
+    const application = definition.body.apply;
+    if (application.func.* != .ident or application.args.len != 5) return false;
+
+    const resolved = resolved_definition_name(
+        module,
+        application.func.ident,
+    ) orelse return false;
+    const map_then_fold = find_definition(module, resolved) orelse return false;
+    if (!map_then_fold_set_helper_definition(map_then_fold)) return false;
+
+    const op = definition.params[0];
+    const base = definition.params[1];
+    const function = definition.params[2];
+    const indices = definition.params[3];
+    if (!expr_is_identifier(application.args[0], op) or
+        !expr_is_identifier(application.args[1], base) or
+        !expr_is_identifier(application.args[4], indices))
+    {
+        return false;
+    }
+
+    if (application.args[2].* != .lambda or
+        application.args[2].lambda.params.len != 1)
+    {
+        return false;
+    }
+    const map_lambda = application.args[2].lambda;
+    if (!expr_is_application_of_identifier(
+        map_lambda.body,
+        function,
+        map_lambda.params[0],
+    )) return false;
+
+    if (application.args[3].* != .lambda or
+        application.args[3].lambda.params.len != 1)
+    {
+        return false;
+    }
+    const choose_lambda = application.args[3].lambda;
+    return choose_any_from_identifier(
+        choose_lambda.body,
+        choose_lambda.params[0],
+    );
+}
+
+fn map_then_fold_set_helper_definition(definition: ast.Definition) bool {
+    if (definition.params.len != 5 or definition.body.* != .let_in) return false;
+    const op = definition.params[0];
+    const base = definition.params[1];
+    const mapper = definition.params[2];
+    const chooser = definition.params[3];
+    const source_set = definition.params[4];
+    const outer = definition.body.let_in;
+    if (outer.defs.len != 1) return false;
+    const iterator = outer.defs[0];
+    if (!iterator.is_function or
+        iterator.function_vars.len != 1 or
+        iterator.function_domain == null)
+    {
+        return false;
+    }
+    const subset = iterator.function_domain.?.*;
+    if (subset != .unary or
+        subset.unary.op != .subset or
+        !expr_is_identifier(subset.unary.operand, source_set))
+    {
+        return false;
+    }
+    const remainder = iterator.function_vars[0];
+    if (!expr_is_application_of_identifier(
+        outer.body,
+        iterator.name,
+        source_set,
+    )) return false;
+
+    if (iterator.body.* != .if_then_else) return false;
+    const conditional = iterator.body.if_then_else;
+    if (!expr_is_equal_to_empty_set(conditional.cond, remainder) or
+        !expr_is_identifier(conditional.then_branch, base) or
+        conditional.else_branch.* != .let_in)
+    {
+        return false;
+    }
+    const choose = conditional.else_branch.let_in;
+    if (choose.defs.len != 1 or choose.defs[0].params.len != 0) return false;
+    const selected = choose.defs[0];
+    if (!expr_is_application_of_identifier(
+        selected.body,
+        chooser,
+        remainder,
+    )) return false;
+
+    if (choose.body.* != .apply or
+        choose.body.apply.func.* != .ident or
+        !std.mem.eql(u8, choose.body.apply.func.ident, op) or
+        choose.body.apply.args.len != 2)
+    {
+        return false;
+    }
+    const fold = choose.body.apply;
+    if (!expr_is_application_of_identifier(
+        fold.args[0],
+        mapper,
+        selected.name,
+    )) return false;
+    if (fold.args[1].* != .apply or
+        fold.args[1].apply.func.* != .ident or
+        !std.mem.eql(u8, fold.args[1].apply.func.ident, iterator.name) or
+        fold.args[1].apply.args.len != 1)
+    {
+        return false;
+    }
+    return expr_is_set_without_singleton(
+        fold.args[1].apply.args[0],
+        remainder,
+        selected.name,
+    );
+}
+
+fn choose_any_from_identifier(expr: *const ast.Expr, set_name: []const u8) bool {
+    if (expr.* != .choose or expr.choose.domain == null) return false;
+    return expr_is_identifier(expr.choose.domain.?, set_name) and
+        expr.choose.body.* == .bool_literal and
+        expr.choose.body.bool_literal;
+}
+
+fn expr_is_equal_to_empty_set(
+    expr: *const ast.Expr,
+    identifier: []const u8,
+) bool {
+    if (expr.* != .binary or expr.binary.op != .eq) return false;
+    return (expr_is_identifier(expr.binary.left, identifier) and
+        expr_is_empty_set(expr.binary.right)) or
+        (expr_is_empty_set(expr.binary.left) and
+            expr_is_identifier(expr.binary.right, identifier));
+}
+
+fn expr_is_set_without_singleton(
+    expr: *const ast.Expr,
+    set_name: []const u8,
+    element_name: []const u8,
+) bool {
+    const operands = switch (expr.*) {
+        .set_binary => |binary| if (binary.op == .difference_op)
+            SetUnionOperands{ .left = binary.left, .right = binary.right }
+        else
+            return false,
+        .binary => |binary| if (binary.op == .set_difference)
+            SetUnionOperands{ .left = binary.left, .right = binary.right }
+        else
+            return false,
+        else => return false,
+    };
+    return expr_is_identifier(operands.left, set_name) and
+        operands.right.* == .set_enum and
+        operands.right.set_enum.len == 1 and
+        expr_is_identifier(operands.right.set_enum[0], element_name);
 }
 
 fn reduce_sequence_helper_definition(definition: ast.Definition) bool {
@@ -4847,6 +6098,7 @@ fn direct_native_name(module: ast.Module, name: []const u8) ?[]const u8 {
         zig: []const u8,
     }{
         .{ .tla = "Cardinality", .zig = "cardinality" },
+        .{ .tla = "IsFiniteSet", .zig = "is_finite_set" },
         .{ .tla = "Len", .zig = "sequence_len" },
         .{ .tla = "Head", .zig = "sequence_head" },
         .{ .tla = "Tail", .zig = "sequence_tail" },
@@ -4876,6 +6128,163 @@ fn direct_native_name(module: ast.Module, name: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+const FilterVariablePathBoolean = struct {
+    variable: u32,
+    application: *const ast.Apply,
+};
+
+fn filter_variable_path_boolean(
+    module: ast.Module,
+    filter_value: *const ast.SetFilter,
+    params: []const []const u8,
+) ?FilterVariablePathBoolean {
+    if (filter_value.vars.len != 1 or filter_value.pred.* != .apply) {
+        return null;
+    }
+    if (params.len + 1 > 64) return null;
+    var scoped_params: [64][]const u8 = undefined;
+    @memcpy(scoped_params[0..params.len], params);
+    scoped_params[params.len] = filter_value.vars[0].name;
+    const application = filter_value.pred.apply;
+    const variable = variable_application_index_scoped(
+        module,
+        application,
+        scoped_params[0 .. params.len + 1],
+    ) orelse return null;
+    var seen_bound = false;
+    if (!filter_path_keys_supported(
+        application,
+        params,
+        filter_value.vars[0].name,
+        &seen_bound,
+    ) or !seen_bound) return null;
+    return .{
+        .variable = variable,
+        .application = application,
+    };
+}
+
+fn filter_path_keys_supported(
+    application: *const ast.Apply,
+    params: []const []const u8,
+    bound_name: []const u8,
+    seen_bound: *bool,
+) bool {
+    if (application.func.* == .apply and !filter_path_keys_supported(
+        application.func.apply,
+        params,
+        bound_name,
+        seen_bound,
+    )) return false;
+    if (application.args.len != 1) return false;
+    const key = application.args[0];
+    return switch (key.*) {
+        .ident => |name| blk: {
+            if (std.mem.eql(u8, name, bound_name)) {
+                if (seen_bound.*) break :blk false;
+                seen_bound.* = true;
+                break :blk true;
+            }
+            break :blk !seen_bound.* and param_index(params, name) != null;
+        },
+        .string_literal => true,
+        else => false,
+    };
+}
+
+fn emit_filter_variable_path_boolean(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    filter_value: *const ast.SetFilter,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    const pattern = filter_variable_path_boolean(
+        module,
+        filter_value,
+        params,
+    ) orelse return false;
+    try append(
+        output,
+        allocator,
+        "try runtime.filter_variable_path_boolean(context, args, ",
+    );
+    try emit_expr(
+        output,
+        allocator,
+        module,
+        filter_value.vars[0].domain,
+        params,
+    );
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        ", {d}, &[_]runtime.FilterPathKey{{",
+        .{pattern.variable},
+    );
+    defer allocator.free(prefix);
+    try append(output, allocator, prefix);
+    var emitted_count: usize = 0;
+    try emit_filter_path_keys(
+        output,
+        allocator,
+        pattern.application,
+        params,
+        filter_value.vars[0].name,
+        &emitted_count,
+    );
+    try append(output, allocator, "})");
+    return true;
+}
+
+fn emit_filter_path_keys(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    application: *const ast.Apply,
+    params: []const []const u8,
+    bound_name: []const u8,
+    emitted_count: *usize,
+) error{OutOfMemory}!void {
+    if (application.func.* == .apply) try emit_filter_path_keys(
+        output,
+        allocator,
+        application.func.apply,
+        params,
+        bound_name,
+        emitted_count,
+    );
+    std.debug.assert(application.args.len == 1);
+    if (emitted_count.* > 0) try append(output, allocator, ", ");
+    const key = application.args[0];
+    switch (key.*) {
+        .ident => |name| {
+            if (std.mem.eql(u8, name, bound_name)) {
+                try append(output, allocator, ".bound");
+            } else {
+                const index = param_index(params, name) orelse unreachable;
+                std.debug.assert(index <= std.math.maxInt(u8));
+                const descriptor = try std.fmt.allocPrint(
+                    allocator,
+                    ".{{ .argument = {d} }}",
+                    .{index},
+                );
+                defer allocator.free(descriptor);
+                try append(output, allocator, descriptor);
+            }
+        },
+        .string_literal => |literal| {
+            const descriptor = try std.fmt.allocPrint(
+                allocator,
+                ".{{ .field = \"{f}\" }}",
+                .{std.zig.fmtString(literal)},
+            );
+            defer allocator.free(descriptor);
+            try append(output, allocator, descriptor);
+        },
+        else => unreachable,
+    }
+    emitted_count.* += 1;
 }
 
 fn direct_helper_requires_shape(name: []const u8) bool {
@@ -5140,17 +6549,27 @@ fn emit_let_helpers(
             index,
         );
         defer allocator.free(helper);
+        const prefix_len = params.len + index;
         var definition_params: [64][]const u8 = undefined;
-        @memcpy(
-            definition_params[0 .. params.len + index],
-            extended[0 .. params.len + index],
-        );
-        @memcpy(
-            definition_params[params.len + index ..][0..definition.params.len],
-            definition.params,
-        );
-        const helper_params =
-            definition_params[0 .. params.len + index + definition.params.len];
+        @memcpy(definition_params[0..prefix_len], extended[0..prefix_len]);
+        const helper_param_count = if (definition.is_function) blk: {
+            std.debug.assert(definition.function_vars.len > 0);
+            std.debug.assert(prefix_len + 1 + definition.function_vars.len <= 64);
+            definition_params[prefix_len] = definition.name;
+            @memcpy(
+                definition_params[prefix_len + 1 ..][0..definition.function_vars.len],
+                definition.function_vars,
+            );
+            break :blk prefix_len + 1 + definition.function_vars.len;
+        } else blk: {
+            std.debug.assert(prefix_len + definition.params.len <= 64);
+            @memcpy(
+                definition_params[prefix_len..][0..definition.params.len],
+                definition.params,
+            );
+            break :blk prefix_len + definition.params.len;
+        };
+        const helper_params = definition_params[0..helper_param_count];
         try emit_named_helper(
             output,
             allocator,
@@ -5281,28 +6700,20 @@ fn emit_lazy_boolean_let(
                 );
             }
         }
-        for (let_value.defs, 0..) |definition, definition_index| {
+        for (let_value.defs, 0..) |_, definition_index| {
             if (!required[definition_index] or emitted[definition_index]) {
                 continue;
             }
-            const helper = try let_helper_name(
+            try emit_lazy_let_assignment(
+                output,
                 allocator,
+                module,
                 identity,
+                let_value,
+                outer_params,
                 definition_index,
+                "    ",
             );
-            defer allocator.free(helper);
-            const assignment = try std.fmt.allocPrint(
-                allocator,
-                "    values[{d}] = try runtime.operator(context, {s}, {d}, values[0..{d}]);\n",
-                .{
-                    outer_params.len + definition_index,
-                    helper,
-                    definition.params.len,
-                    outer_params.len + definition_index,
-                },
-            );
-            defer allocator.free(assignment);
-            try append(output, allocator, assignment);
             emitted[definition_index] = true;
         }
         const args_line = try std.fmt.allocPrint(
@@ -5393,9 +6804,10 @@ fn emit_lazy_if_let(
     try emit_required_let_assignments(
         output,
         allocator,
+        module,
         identity,
         let_value,
-        outer_params.len,
+        outer_params,
         &condition_required,
         &condition_emitted,
         "    ",
@@ -5426,9 +6838,10 @@ fn emit_lazy_if_let(
     try emit_required_let_assignments(
         output,
         allocator,
+        module,
         identity,
         let_value,
-        outer_params.len,
+        outer_params,
         &then_required,
         &then_emitted,
         "        ",
@@ -5459,9 +6872,10 @@ fn emit_lazy_if_let(
     try emit_required_let_assignments(
         output,
         allocator,
+        module,
         identity,
         let_value,
-        outer_params.len,
+        outer_params,
         &else_required,
         &else_emitted,
         "        ",
@@ -5502,36 +6916,129 @@ fn mark_expression_let_dependencies(
 fn emit_required_let_assignments(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
+    module: ast.Module,
     identity: usize,
     let_value: *const ast.LetIn,
-    outer_param_count: usize,
+    outer_params: []const []const u8,
     required: *const [64]bool,
     emitted: *[64]bool,
     indent: []const u8,
 ) error{OutOfMemory}!void {
-    for (let_value.defs, 0..) |definition, definition_index| {
+    for (let_value.defs, 0..) |_, definition_index| {
         if (!required[definition_index] or emitted[definition_index]) continue;
-        const helper = try let_helper_name(
+        try emit_lazy_let_assignment(
+            output,
             allocator,
+            module,
             identity,
+            let_value,
+            outer_params,
             definition_index,
+            indent,
         );
-        defer allocator.free(helper);
-        const assignment = try std.fmt.allocPrint(
+        emitted[definition_index] = true;
+    }
+}
+
+fn emit_lazy_let_assignment(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    identity: usize,
+    let_value: *const ast.LetIn,
+    outer_params: []const []const u8,
+    definition_index: usize,
+    indent: []const u8,
+) error{OutOfMemory}!void {
+    std.debug.assert(definition_index < let_value.defs.len);
+    std.debug.assert(
+        outer_params.len + definition_index <= 64,
+    );
+    const definition = let_value.defs[definition_index];
+    if (lazy_state_path(
+        module,
+        let_value,
+        outer_params,
+        definition_index,
+    )) |path| {
+        var available_params: [64][]const u8 = undefined;
+        @memcpy(
+            available_params[0..outer_params.len],
+            outer_params,
+        );
+        for (
+            let_value.defs[0..definition_index],
+            outer_params.len..,
+        ) |prior, param_index_v| {
+            available_params[param_index_v] = prior.name;
+        }
+        const prefix = try std.fmt.allocPrint(
             allocator,
-            "{s}values[{d}] = try runtime.operator(context, {s}, {d}, values[0..{d}]);\n",
+            "{s}values[{d}] = blk: {{ const args = values[0..{d}]; break :blk try runtime.state_path_operator(context, {d}, &[_]Value{{",
             .{
                 indent,
-                outer_param_count + definition_index,
+                outer_params.len + definition_index,
+                outer_params.len + definition_index,
+                path.variable_index,
+            },
+        );
+        defer allocator.free(prefix);
+        try append(output, allocator, prefix);
+        try emit_variable_application_keys(
+            output,
+            allocator,
+            module,
+            path.application,
+            available_params[0 .. outer_params.len + definition_index],
+        );
+        const suffix = try std.fmt.allocPrint(
+            allocator,
+            "}}, {d}); }};\n",
+            .{path.arity},
+        );
+        defer allocator.free(suffix);
+        try append(output, allocator, suffix);
+        return;
+    }
+
+    const helper = try let_helper_name(
+        allocator,
+        identity,
+        definition_index,
+    );
+    defer allocator.free(helper);
+    if (!definition.is_function and
+        definition.params.len == 0 and
+        expression_reordering_safe(module, definition.body))
+    {
+        const assignment = try std.fmt.allocPrint(
+            allocator,
+            "{s}values[{d}] = try {s}(context, values[0..{d}]);\n",
+            .{
+                indent,
+                outer_params.len + definition_index,
                 helper,
-                definition.params.len,
-                outer_param_count + definition_index,
+                outer_params.len + definition_index,
             },
         );
         defer allocator.free(assignment);
         try append(output, allocator, assignment);
-        emitted[definition_index] = true;
+        return;
     }
+
+    const assignment = try std.fmt.allocPrint(
+        allocator,
+        "{s}values[{d}] = try runtime.operator(context, {s}, {d}, values[0..{d}]);\n",
+        .{
+            indent,
+            outer_params.len + definition_index,
+            helper,
+            definition.params.len,
+            outer_params.len + definition_index,
+        },
+    );
+    defer allocator.free(assignment);
+    try append(output, allocator, assignment);
 }
 
 fn mark_required_let_definitions(
@@ -5686,23 +7193,108 @@ fn emit_function_body(
             &operand_count,
         );
         std.debug.assert(operand_count > 1);
-        for (operands[0..operand_count], 0..) |operand, index| {
+        var resolved_paths: [256]ResolvedPathAlias = undefined;
+        var resolved_path_count: usize = 0;
+        var index: usize = 0;
+        while (index < operand_count) {
+            const operand = operands[index];
+            if (body.binary.op == .and_op and index + 1 < operand_count) {
+                if (domain_literal_member_field_argument_equal(
+                    module,
+                    operand,
+                    operands[index + 1],
+                    params,
+                )) |pattern| {
+                    const reuse_path = path_used_by_later_operand(
+                        module,
+                        operands[index + 2 .. operand_count],
+                        pattern.variable,
+                        pattern.application,
+                        params,
+                    );
+                    const alias: ?ResolvedPathAlias = if (reuse_path) blk: {
+                        std.debug.assert(resolved_path_count < resolved_paths.len);
+                        const path_alias = ResolvedPathAlias{
+                            .variable = pattern.variable,
+                            .application = pattern.application,
+                            .local_index = index,
+                        };
+                        try emit_resolved_path_declaration(
+                            output,
+                            allocator,
+                            module,
+                            path_alias,
+                            params,
+                        );
+                        resolved_paths[resolved_path_count] = path_alias;
+                        resolved_path_count += 1;
+                        break :blk path_alias;
+                    } else null;
+                    const prefix = try std.fmt.allocPrint(
+                        allocator,
+                        "    const condition_{d} = ",
+                        .{index},
+                    );
+                    defer allocator.free(prefix);
+                    try append(output, allocator, prefix);
+                    if (alias) |path_alias| {
+                        try emit_resolved_domain_literal_member_field_argument_equal(
+                            output,
+                            allocator,
+                            pattern,
+                            path_alias,
+                        );
+                    } else {
+                        try emit_domain_literal_member_field_argument_equal(
+                            output,
+                            allocator,
+                            module,
+                            pattern,
+                            params,
+                        );
+                    }
+                    try append(output, allocator, ";\n");
+                    const branch = try std.fmt.allocPrint(
+                        allocator,
+                        "    if (!condition_{d}) return Value{{ .bool_v = false }};\n",
+                        .{index},
+                    );
+                    defer allocator.free(branch);
+                    try append(output, allocator, branch);
+                    index += 2;
+                    continue;
+                }
+            }
             if (try emit_unchanged_guards(
                 output,
                 allocator,
                 module,
                 operand,
                 body.binary.op,
-            )) continue;
+            )) {
+                index += 1;
+                continue;
+            }
             const prefix = try std.fmt.allocPrint(
                 allocator,
-                "    const condition_{d} = try runtime.boolean(",
+                "    const condition_{d} = ",
                 .{index},
             );
             defer allocator.free(prefix);
             try append(output, allocator, prefix);
-            try emit_expr(output, allocator, module, operand, params);
-            try append(output, allocator, ");\n");
+            if (!try emit_boolean_expr_with_resolved_paths(
+                output,
+                allocator,
+                module,
+                operand,
+                params,
+                resolved_paths[0..resolved_path_count],
+            )) {
+                try append(output, allocator, "try runtime.boolean(");
+                try emit_expr(output, allocator, module, operand, params);
+                try append(output, allocator, ")");
+            }
+            try append(output, allocator, ";\n");
             const branch = if (body.binary.op == .and_op)
                 try std.fmt.allocPrint(
                     allocator,
@@ -5717,6 +7309,7 @@ fn emit_function_body(
                 );
             defer allocator.free(branch);
             try append(output, allocator, branch);
+            index += 1;
         }
         try append(
             output,
@@ -5881,6 +7474,385 @@ fn flatten_boolean_operands(
     count.* += 1;
 }
 
+const DomainLiteralMemberFieldArgumentEqual = struct {
+    variable: u32,
+    application: *const ast.Apply,
+    domain_literal: []const u8,
+    field_name: []const u8,
+    rhs_argument: u8,
+};
+
+const ResolvedPathAlias = struct {
+    variable: u32,
+    application: *const ast.Apply,
+    local_index: usize,
+};
+
+fn applications_equal(
+    left: *const ast.Apply,
+    right: *const ast.Apply,
+) bool {
+    if (left == right) return true;
+    if (left.args.len != right.args.len or
+        !expressions_equal(left.func, right.func))
+    {
+        return false;
+    }
+    for (left.args, right.args) |left_arg, right_arg| {
+        if (!expressions_equal(left_arg, right_arg)) return false;
+    }
+    return true;
+}
+
+fn resolved_path_alias(
+    aliases: []const ResolvedPathAlias,
+    variable: u32,
+    application: *const ast.Apply,
+) ?ResolvedPathAlias {
+    for (aliases) |alias| {
+        if (alias.variable == variable and
+            applications_equal(alias.application, application))
+        {
+            return alias;
+        }
+    }
+    return null;
+}
+
+fn operand_uses_field_from_path(
+    module: ast.Module,
+    operand: *const ast.Expr,
+    variable: u32,
+    application: *const ast.Apply,
+    params: []const []const u8,
+) bool {
+    if (operand.* != .binary) return false;
+    const binary = operand.binary;
+    if (direct_field_path_scoped(module, binary.left, params)) |field_path| {
+        if (field_path.variable == variable and
+            applications_equal(field_path.application, application))
+        {
+            return true;
+        }
+    }
+    if (direct_field_path_scoped(module, binary.right, params)) |field_path| {
+        if (field_path.variable == variable and
+            applications_equal(field_path.application, application))
+        {
+            return true;
+        }
+    }
+    if ((binary.op == .in or binary.op == .notin) and
+        binary.right.* == .unary and
+        binary.right.unary.op == .domain)
+    {
+        if (direct_field_path_scoped(
+            module,
+            binary.right.unary.operand,
+            params,
+        )) |field_path| {
+            return field_path.variable == variable and
+                applications_equal(field_path.application, application);
+        }
+    }
+    return false;
+}
+
+fn path_used_by_later_operand(
+    module: ast.Module,
+    operands: []const *const ast.Expr,
+    variable: u32,
+    application: *const ast.Apply,
+    params: []const []const u8,
+) bool {
+    for (operands) |operand| {
+        if (operand_uses_field_from_path(
+            module,
+            operand,
+            variable,
+            application,
+            params,
+        )) return true;
+    }
+    return false;
+}
+
+fn domain_literal_member_field_argument_equal(
+    module: ast.Module,
+    domain_member_expr: *const ast.Expr,
+    field_equal_expr: *const ast.Expr,
+    params: []const []const u8,
+) ?DomainLiteralMemberFieldArgumentEqual {
+    if (domain_member_expr.* != .binary or
+        domain_member_expr.binary.op != .in or
+        domain_member_expr.binary.left.* != .string_literal or
+        domain_member_expr.binary.right.* != .unary or
+        domain_member_expr.binary.right.unary.op != .domain or
+        domain_member_expr.binary.right.unary.operand.* != .apply)
+    {
+        return null;
+    }
+
+    const domain_path_expr = domain_member_expr.binary.right.unary.operand;
+    const domain_application = domain_path_expr.apply;
+    const variable = variable_application_index_scoped(
+        module,
+        domain_application,
+        params,
+    ) orelse return null;
+
+    if (field_equal_expr.* != .binary or
+        field_equal_expr.binary.op != .eq)
+    {
+        return null;
+    }
+    const field_expr = if (field_equal_expr.binary.left.* == .field and
+        field_equal_expr.binary.right.* != .field)
+        field_equal_expr.binary.left
+    else if (field_equal_expr.binary.right.* == .field and
+        field_equal_expr.binary.left.* != .field)
+        field_equal_expr.binary.right
+    else
+        return null;
+    const rhs_expr = if (field_expr == field_equal_expr.binary.left)
+        field_equal_expr.binary.right
+    else
+        field_equal_expr.binary.left;
+    const field_path = direct_field_path_scoped(
+        module,
+        field_expr,
+        params,
+    ) orelse return null;
+    if (field_path.variable != variable or
+        !expressions_equal(
+            domain_path_expr,
+            field_expr.field.expr,
+        ) or
+        rhs_expr.* != .ident)
+    {
+        return null;
+    }
+    const rhs_argument = param_index(
+        params,
+        rhs_expr.ident,
+    ) orelse return null;
+    if (rhs_argument > std.math.maxInt(u8)) return null;
+
+    return .{
+        .variable = variable,
+        .application = domain_application,
+        .domain_literal = domain_member_expr.binary.left.string_literal,
+        .field_name = field_path.field_name,
+        .rhs_argument = @intCast(rhs_argument),
+    };
+}
+
+fn emit_domain_literal_member_field_argument_equal(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    pattern: DomainLiteralMemberFieldArgumentEqual,
+    params: []const []const u8,
+) error{OutOfMemory}!void {
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "try runtime.variable_path_domain_literal_member_field_argument_equal_bool(context, args, {d}, &[_]Value{{",
+        .{pattern.variable},
+    );
+    defer allocator.free(prefix);
+    try append(output, allocator, prefix);
+    try emit_variable_application_keys(
+        output,
+        allocator,
+        module,
+        pattern.application,
+        params,
+    );
+    const suffix = try std.fmt.allocPrint(
+        allocator,
+        "}}, \"{f}\", \"{f}\", {d})",
+        .{
+            std.zig.fmtString(pattern.domain_literal),
+            std.zig.fmtString(pattern.field_name),
+            pattern.rhs_argument,
+        },
+    );
+    defer allocator.free(suffix);
+    try append(output, allocator, suffix);
+}
+
+fn emit_resolved_path_declaration(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    alias: ResolvedPathAlias,
+    params: []const []const u8,
+) error{OutOfMemory}!void {
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "    const resolved_path_{d} = try runtime.resolve_variable_path(context, {d}, &[_]Value{{",
+        .{ alias.local_index, alias.variable },
+    );
+    defer allocator.free(prefix);
+    try append(output, allocator, prefix);
+    try emit_variable_application_keys(
+        output,
+        allocator,
+        module,
+        alias.application,
+        params,
+    );
+    try append(output, allocator, "});\n");
+}
+
+fn emit_resolved_domain_literal_member_field_argument_equal(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    pattern: DomainLiteralMemberFieldArgumentEqual,
+    alias: ResolvedPathAlias,
+) error{OutOfMemory}!void {
+    const call = try std.fmt.allocPrint(
+        allocator,
+        "try runtime.resolved_path_domain_literal_member_field_argument_equal_bool(context, args, resolved_path_{d}, \"{f}\", \"{f}\", {d})",
+        .{
+            alias.local_index,
+            std.zig.fmtString(pattern.domain_literal),
+            std.zig.fmtString(pattern.field_name),
+            pattern.rhs_argument,
+        },
+    );
+    defer allocator.free(call);
+    try append(output, allocator, call);
+}
+
+fn emit_resolved_path_field(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    field_path: SequenceHeadFieldPath,
+    alias: ResolvedPathAlias,
+) error{OutOfMemory}!void {
+    const call = try std.fmt.allocPrint(
+        allocator,
+        "try runtime.resolved_path_field(context, resolved_path_{d}, \"{f}\")",
+        .{ alias.local_index, std.zig.fmtString(field_path.field_name) },
+    );
+    defer allocator.free(call);
+    try append(output, allocator, call);
+}
+
+fn emit_boolean_expr_with_resolved_paths(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    expr: *const ast.Expr,
+    params: []const []const u8,
+    aliases: []const ResolvedPathAlias,
+) error{OutOfMemory}!bool {
+    if (expr.* != .binary) return false;
+    const binary = expr.binary;
+    if ((binary.op == .in or binary.op == .notin) and
+        binary.right.* == .unary and
+        binary.right.unary.op == .domain)
+    {
+        if (direct_field_path_scoped(
+            module,
+            binary.right.unary.operand,
+            params,
+        )) |field_path| {
+            if (resolved_path_alias(
+                aliases,
+                field_path.variable,
+                field_path.application,
+            )) |alias| {
+                const function_name = if (binary.op == .in)
+                    "resolved_path_field_domain_member_bool"
+                else
+                    "resolved_path_field_domain_not_member_bool";
+                const prefix = try std.fmt.allocPrint(
+                    allocator,
+                    "try runtime.{s}(context, resolved_path_{d}, \"{f}\", ",
+                    .{
+                        function_name,
+                        alias.local_index,
+                        std.zig.fmtString(field_path.field_name),
+                    },
+                );
+                defer allocator.free(prefix);
+                try append(output, allocator, prefix);
+                try emit_expr(
+                    output,
+                    allocator,
+                    module,
+                    binary.left,
+                    params,
+                );
+                try append(output, allocator, ")");
+                return true;
+            }
+        }
+    }
+
+    const function_name = switch (binary.op) {
+        .eq => "equal_bool",
+        .ne => "not_equal_bool",
+        .lt => "less_than_bool",
+        .le => "less_equal_bool",
+        .gt => "greater_than_bool",
+        .ge => "greater_equal_bool",
+        else => return false,
+    };
+    const left_path = direct_field_path_scoped(module, binary.left, params);
+    const right_path = direct_field_path_scoped(module, binary.right, params);
+    const left_alias = if (left_path) |field_path|
+        resolved_path_alias(
+            aliases,
+            field_path.variable,
+            field_path.application,
+        )
+    else
+        null;
+    const right_alias = if (right_path) |field_path|
+        resolved_path_alias(
+            aliases,
+            field_path.variable,
+            field_path.application,
+        )
+    else
+        null;
+    if (left_alias == null and right_alias == null) return false;
+
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "try runtime.{s}(context.eval_pool, ",
+        .{function_name},
+    );
+    defer allocator.free(prefix);
+    try append(output, allocator, prefix);
+    if (left_alias) |alias| {
+        try emit_resolved_path_field(
+            output,
+            allocator,
+            left_path.?,
+            alias,
+        );
+    } else {
+        try emit_expr(output, allocator, module, binary.left, params);
+    }
+    try append(output, allocator, ", ");
+    if (right_alias) |alias| {
+        try emit_resolved_path_field(
+            output,
+            allocator,
+            right_path.?,
+            alias,
+        );
+    } else {
+        try emit_expr(output, allocator, module, binary.right, params);
+    }
+    try append(output, allocator, ")");
+    return true;
+}
+
 fn let_helper_name(
     allocator: std.mem.Allocator,
     identity: usize,
@@ -5933,6 +7905,17 @@ fn helper_name(
     return std.fmt.allocPrint(
         allocator,
         "bound_{x}",
+        .{identity},
+    );
+}
+
+fn hereditary_filter_helper_name(
+    allocator: std.mem.Allocator,
+    identity: usize,
+) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "hereditary_filter_{x}",
         .{identity},
     );
 }
@@ -6007,6 +7990,80 @@ fn binary_value_is_boolean(op: ast.BinaryOp) bool {
         => true,
         else => false,
     };
+}
+
+fn emit_applied_parameter_field_path(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    expression: *const ast.Expr,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    var fields: [64][]const u8 = undefined;
+    var field_count: usize = 0;
+    var base = expression;
+    while (base.* == .field) {
+        if (field_count == fields.len) return false;
+        fields[field_count] = base.field.name;
+        field_count += 1;
+        base = base.field.expr;
+    }
+    std.debug.assert(field_count > 0);
+    if (base.* != .apply or base.apply.func.* != .ident or
+        param_index(params, base.apply.func.ident) == null)
+    {
+        return false;
+    }
+
+    const application = base.apply;
+    try append(
+        output,
+        allocator,
+        if (field_count == 1)
+            "try runtime.call_field(context, "
+        else
+            "try runtime.call_field_path(context, ",
+    );
+    try emit_expr(
+        output,
+        allocator,
+        module,
+        application.func,
+        params,
+    );
+    try append(output, allocator, ", &[_]Value{");
+    for (application.args, 0..) |argument, index| {
+        if (index > 0) try append(output, allocator, ", ");
+        try emit_expr(output, allocator, module, argument, params);
+    }
+    try append(output, allocator, "}, ");
+
+    if (field_count == 1) {
+        const suffix = try std.fmt.allocPrint(
+            allocator,
+            "\"{f}\")",
+            .{std.zig.fmtString(fields[0])},
+        );
+        defer allocator.free(suffix);
+        try append(output, allocator, suffix);
+        return true;
+    }
+
+    try append(output, allocator, "&[_][]const u8{");
+    var index = field_count;
+    while (index > 0) {
+        index -= 1;
+        if (index + 1 < field_count) try append(output, allocator, ", ");
+        const field_name = try std.fmt.allocPrint(
+            allocator,
+            "\"{f}\"",
+            .{std.zig.fmtString(fields[index])},
+        );
+        defer allocator.free(field_name);
+        try append(output, allocator, field_name);
+    }
+    try append(output, allocator, "})");
+    return true;
 }
 
 fn binary_runtime(op: ast.BinaryOp) []const u8 {
@@ -6151,25 +8208,42 @@ fn unchanged_tuple_supported(
     return true;
 }
 
-fn emit_unchanged_tuple(
+fn emit_unchanged_expression(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     module: ast.Module,
-    expr: *const ast.Expr,
+    owner: *const ast.Expr,
+    operand: *const ast.Expr,
+    value_result: bool,
 ) error{OutOfMemory}!void {
-    const items = expr.*.tuple;
-    try append(output, allocator, "Value{ .bool_v = ");
-    if (items.len == 0) {
-        try append(output, allocator, "true");
-    } else {
-        var names = try allocator.alloc([]const u8, items.len);
-        defer allocator.free(names);
-        for (items, 0..) |item, index| {
-            names[index] = item.*.ident;
+    if (value_result) try append(output, allocator, "Value{ .bool_v = ");
+    if (unchanged_tuple_supported(module, operand)) {
+        const items = operand.tuple;
+        if (items.len == 0) {
+            try append(output, allocator, "true");
+        } else {
+            var names = try allocator.alloc([]const u8, items.len);
+            defer allocator.free(names);
+            for (items, 0..) |item, index| {
+                names[index] = item.ident;
+            }
+            try emit_unchanged_terms(output, allocator, module, names);
         }
-        try emit_unchanged_terms(output, allocator, module, names);
+    } else {
+        const helper = try helper_name(
+            allocator,
+            expression_identity(module, owner),
+        );
+        defer allocator.free(helper);
+        try append(
+            output,
+            allocator,
+            "try runtime.unchanged_expression(context, args, ",
+        );
+        try append(output, allocator, helper);
+        try append(output, allocator, ")");
     }
-    try append(output, allocator, " }");
+    if (value_result) try append(output, allocator, " }");
 }
 
 fn emit_unchanged_terms(
@@ -6280,7 +8354,8 @@ fn expression_uses_shared_helper(
         ),
         .apply => |application| blk: {
             if (is_select_sequence_call(application) or
-                is_reduce_sequence_call(module, application))
+                is_reduce_sequence_call(module, application) or
+                is_fold_function_on_set_call(module, application))
             {
                 break :blk true;
             }
@@ -6551,6 +8626,597 @@ fn expr_references_identifier(
         .unchanged_expr => |operand| expr_references_identifier(operand, name),
         .at => std.mem.eql(u8, name, "$at"),
         .bool_literal, .int_literal, .string_literal => false,
+    };
+}
+
+const CallableUse = struct {
+    valid: bool = true,
+    seen: bool = false,
+    arity: u16 = 0,
+};
+
+const LazyStatePath = struct {
+    variable_index: u32,
+    application: *const ast.Apply,
+    arity: u16,
+};
+
+fn invalid_callable_use() CallableUse {
+    return .{ .valid = false };
+}
+
+fn direct_callable_use(arity: usize) CallableUse {
+    if (arity == 0 or arity > std.math.maxInt(u16)) {
+        return invalid_callable_use();
+    }
+    return .{
+        .seen = true,
+        .arity = @intCast(arity),
+    };
+}
+
+fn merge_callable_use(
+    result: *CallableUse,
+    next: CallableUse,
+) void {
+    if (!result.valid or !next.valid) {
+        result.* = invalid_callable_use();
+        return;
+    }
+    if (!next.seen) return;
+    if (!result.seen) {
+        result.* = next;
+        return;
+    }
+    if (result.arity != next.arity) {
+        result.* = invalid_callable_use();
+    }
+}
+
+fn callable_definition_parameter_use(
+    module: ast.Module,
+    definition: ast.Definition,
+    parameter_index: usize,
+    depth: u8,
+) CallableUse {
+    if (depth >= 16) return .{};
+    const parameters = definition_body_params(definition);
+    if (parameter_index >= parameters.len) {
+        return invalid_callable_use();
+    }
+    return callable_identifier_use(
+        module,
+        definition.body,
+        parameters[parameter_index],
+        depth + 1,
+    );
+}
+
+fn callable_application_use(
+    module: ast.Module,
+    application: *const ast.Apply,
+    name: []const u8,
+    depth: u8,
+) CallableUse {
+    if (application.func.* == .ident and
+        std.mem.eql(u8, application.func.ident, name))
+    {
+        var result = direct_callable_use(application.args.len);
+        for (application.args) |argument| {
+            merge_callable_use(
+                &result,
+                callable_identifier_use(
+                    module,
+                    argument,
+                    name,
+                    depth,
+                ),
+            );
+        }
+        return result;
+    }
+
+    var result = callable_identifier_use(
+        module,
+        application.func,
+        name,
+        depth,
+    );
+    const target = if (application.func.* == .ident)
+        if (resolved_definition_name(
+            module,
+            application.func.ident,
+        )) |resolved|
+            find_definition(module, resolved)
+        else
+            null
+    else
+        null;
+    for (application.args, 0..) |argument, argument_index| {
+        if (argument.* == .ident and
+            std.mem.eql(u8, argument.ident, name))
+        {
+            const definition = target orelse {
+                merge_callable_use(
+                    &result,
+                    invalid_callable_use(),
+                );
+                continue;
+            };
+            merge_callable_use(
+                &result,
+                callable_definition_parameter_use(
+                    module,
+                    definition,
+                    argument_index,
+                    depth,
+                ),
+            );
+            continue;
+        }
+        merge_callable_use(
+            &result,
+            callable_identifier_use(
+                module,
+                argument,
+                name,
+                depth,
+            ),
+        );
+    }
+    return result;
+}
+
+fn callable_bound_use(
+    module: ast.Module,
+    vars: []const ast.BoundVar,
+    body: *const ast.Expr,
+    name: []const u8,
+    depth: u8,
+) CallableUse {
+    var result = CallableUse{};
+    for (vars) |bound| {
+        merge_callable_use(
+            &result,
+            callable_identifier_use(
+                module,
+                bound.domain,
+                name,
+                depth,
+            ),
+        );
+        if (std.mem.eql(u8, bound.name, name)) return result;
+    }
+    merge_callable_use(
+        &result,
+        callable_identifier_use(module, body, name, depth),
+    );
+    return result;
+}
+
+fn callable_identifier_use(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    name: []const u8,
+    depth: u8,
+) CallableUse {
+    return switch (expr.*) {
+        .ident => |identifier| if (std.mem.eql(
+            u8,
+            identifier,
+            name,
+        ))
+            invalid_callable_use()
+        else
+            .{},
+        .primed => |identifier| if (std.mem.eql(
+            u8,
+            identifier,
+            name,
+        ))
+            invalid_callable_use()
+        else
+            .{},
+        .primed_expr => |operand| callable_identifier_use(
+            module,
+            operand,
+            name,
+            depth,
+        ),
+        .binary => |binary| blk: {
+            var result = callable_identifier_use(
+                module,
+                binary.left,
+                name,
+                depth,
+            );
+            merge_callable_use(
+                &result,
+                callable_identifier_use(
+                    module,
+                    binary.right,
+                    name,
+                    depth,
+                ),
+            );
+            break :blk result;
+        },
+        .unary => |unary| callable_identifier_use(
+            module,
+            unary.operand,
+            name,
+            depth,
+        ),
+        .if_then_else => |conditional| blk: {
+            var result = callable_identifier_use(
+                module,
+                conditional.cond,
+                name,
+                depth,
+            );
+            merge_callable_use(
+                &result,
+                callable_identifier_use(
+                    module,
+                    conditional.then_branch,
+                    name,
+                    depth,
+                ),
+            );
+            merge_callable_use(
+                &result,
+                callable_identifier_use(
+                    module,
+                    conditional.else_branch,
+                    name,
+                    depth,
+                ),
+            );
+            break :blk result;
+        },
+        .apply => |application| callable_application_use(
+            module,
+            application,
+            name,
+            depth,
+        ),
+        .field => |field_value| callable_identifier_use(
+            module,
+            field_value.expr,
+            name,
+            depth,
+        ),
+        .tuple, .set_enum => |items| blk: {
+            var result = CallableUse{};
+            for (items) |item| {
+                merge_callable_use(
+                    &result,
+                    callable_identifier_use(
+                        module,
+                        item,
+                        name,
+                        depth,
+                    ),
+                );
+            }
+            break :blk result;
+        },
+        .record => |fields| blk: {
+            var result = CallableUse{};
+            for (fields) |field_value| {
+                merge_callable_use(
+                    &result,
+                    callable_identifier_use(
+                        module,
+                        field_value.value,
+                        name,
+                        depth,
+                    ),
+                );
+            }
+            break :blk result;
+        },
+        .set_binary => |set_binary| blk: {
+            var result = callable_identifier_use(
+                module,
+                set_binary.left,
+                name,
+                depth,
+            );
+            merge_callable_use(
+                &result,
+                callable_identifier_use(
+                    module,
+                    set_binary.right,
+                    name,
+                    depth,
+                ),
+            );
+            break :blk result;
+        },
+        .set_of_functions => |function_set| blk: {
+            var result = callable_identifier_use(
+                module,
+                function_set.domain,
+                name,
+                depth,
+            );
+            merge_callable_use(
+                &result,
+                callable_identifier_use(
+                    module,
+                    function_set.codomain,
+                    name,
+                    depth,
+                ),
+            );
+            break :blk result;
+        },
+        .record_set => |record_set_value| blk: {
+            var result = CallableUse{};
+            for (record_set_value.fields) |field_value| {
+                merge_callable_use(
+                    &result,
+                    callable_identifier_use(
+                        module,
+                        field_value.domain,
+                        name,
+                        depth,
+                    ),
+                );
+            }
+            break :blk result;
+        },
+        .function_literal => |function_literal| callable_bound_use(
+            module,
+            function_literal.vars,
+            function_literal.body,
+            name,
+            depth,
+        ),
+        .set_filter => |filter_value| callable_bound_use(
+            module,
+            filter_value.vars,
+            filter_value.pred,
+            name,
+            depth,
+        ),
+        .set_map => |map_value| callable_bound_use(
+            module,
+            map_value.vars,
+            map_value.value,
+            name,
+            depth,
+        ),
+        .quantifier => |quantifier| callable_bound_use(
+            module,
+            quantifier.vars,
+            quantifier.body,
+            name,
+            depth,
+        ),
+        .choose => |choose_value| blk: {
+            var result = if (choose_value.domain) |domain|
+                callable_identifier_use(
+                    module,
+                    domain,
+                    name,
+                    depth,
+                )
+            else
+                CallableUse{};
+            if (!std.mem.eql(u8, choose_value.var_name, name)) {
+                merge_callable_use(
+                    &result,
+                    callable_identifier_use(
+                        module,
+                        choose_value.body,
+                        name,
+                        depth,
+                    ),
+                );
+            }
+            break :blk result;
+        },
+        .except => |except_value| blk: {
+            var result = callable_identifier_use(
+                module,
+                except_value.func,
+                name,
+                depth,
+            );
+            for (except_value.steps) |step| {
+                if (step != .index) continue;
+                merge_callable_use(
+                    &result,
+                    callable_identifier_use(
+                        module,
+                        step.index,
+                        name,
+                        depth,
+                    ),
+                );
+            }
+            merge_callable_use(
+                &result,
+                callable_identifier_use(
+                    module,
+                    except_value.value,
+                    name,
+                    depth,
+                ),
+            );
+            break :blk result;
+        },
+        .let_in => |let_value| blk: {
+            var result = CallableUse{};
+            var shadowed = false;
+            for (let_value.defs) |definition| {
+                if (shadowed) continue;
+                if (std.mem.eql(u8, definition.name, name)) {
+                    shadowed = true;
+                    continue;
+                }
+                if (definition.function_domain) |domain| {
+                    merge_callable_use(
+                        &result,
+                        callable_identifier_use(
+                            module,
+                            domain,
+                            name,
+                            depth,
+                        ),
+                    );
+                }
+                var parameter_shadows = false;
+                for (definition_body_params(definition)) |parameter| {
+                    if (std.mem.eql(u8, parameter, name)) {
+                        parameter_shadows = true;
+                        break;
+                    }
+                }
+                if (!parameter_shadows) {
+                    merge_callable_use(
+                        &result,
+                        callable_identifier_use(
+                            module,
+                            definition.body,
+                            name,
+                            depth,
+                        ),
+                    );
+                }
+            }
+            if (!shadowed) {
+                merge_callable_use(
+                    &result,
+                    callable_identifier_use(
+                        module,
+                        let_value.body,
+                        name,
+                        depth,
+                    ),
+                );
+            }
+            break :blk result;
+        },
+        .case_expr => |case_value| blk: {
+            var result = CallableUse{};
+            for (case_value.arms) |arm| {
+                merge_callable_use(
+                    &result,
+                    callable_identifier_use(
+                        module,
+                        arm.cond,
+                        name,
+                        depth,
+                    ),
+                );
+                merge_callable_use(
+                    &result,
+                    callable_identifier_use(
+                        module,
+                        arm.value,
+                        name,
+                        depth,
+                    ),
+                );
+            }
+            if (case_value.otherwise) |otherwise| {
+                merge_callable_use(
+                    &result,
+                    callable_identifier_use(
+                        module,
+                        otherwise,
+                        name,
+                        depth,
+                    ),
+                );
+            }
+            break :blk result;
+        },
+        .box_action => |box_action| blk: {
+            var result = callable_identifier_use(
+                module,
+                box_action.action,
+                name,
+                depth,
+            );
+            merge_callable_use(
+                &result,
+                callable_identifier_use(
+                    module,
+                    box_action.vars,
+                    name,
+                    depth,
+                ),
+            );
+            break :blk result;
+        },
+        .lambda => |lambda_value| blk: {
+            for (lambda_value.params) |parameter| {
+                if (std.mem.eql(u8, parameter, name)) {
+                    break :blk CallableUse{};
+                }
+            }
+            break :blk callable_identifier_use(
+                module,
+                lambda_value.body,
+                name,
+                depth,
+            );
+        },
+        .unchanged => |identifiers| blk: {
+            for (identifiers) |identifier| {
+                if (std.mem.eql(u8, identifier, name)) {
+                    break :blk invalid_callable_use();
+                }
+            }
+            break :blk CallableUse{};
+        },
+        .unchanged_expr => |operand| callable_identifier_use(
+            module,
+            operand,
+            name,
+            depth,
+        ),
+        .bool_literal,
+        .int_literal,
+        .string_literal,
+        .at,
+        => .{},
+    };
+}
+
+fn lazy_state_path(
+    module: ast.Module,
+    let_value: *const ast.LetIn,
+    outer_params: []const []const u8,
+    definition_index: usize,
+) ?LazyStatePath {
+    if (let_value.defs.len != 1 or definition_index != 0) return null;
+    const definition = let_value.defs[0];
+    if (definition.is_function or definition.params.len != 0 or
+        definition.body.* != .apply)
+    {
+        return null;
+    }
+    const variable = variable_application_index_scoped(
+        module,
+        definition.body.apply,
+        outer_params,
+    ) orelse return null;
+    const use = callable_identifier_use(
+        module,
+        let_value.body,
+        definition.name,
+        0,
+    );
+    if (!use.valid or !use.seen or use.arity == 0) return null;
+    return .{
+        .variable_index = variable,
+        .application = definition.body.apply,
+        .arity = use.arity,
     };
 }
 
@@ -7197,6 +9863,7 @@ fn mark_reachable_expr(
                     }
                 } else if (is_select_sequence_call(application) or
                     is_reduce_sequence_call(module, application) or
+                    is_fold_function_on_set_call(module, application) or
                     direct_native_name(module, name) != null or
                     is_native_override(name))
                 {
@@ -7213,7 +9880,8 @@ fn mark_reachable_expr(
                     );
                 }
             } else if (!is_select_sequence_call(application) and
-                !is_reduce_sequence_call(module, application))
+                !is_reduce_sequence_call(module, application) and
+                !is_fold_function_on_set_call(module, application))
             {
                 mark_reachable_expr(
                     module,
@@ -8478,6 +11146,130 @@ fn string_literal_set_items(expr: *const ast.Expr) ?[]const *ast.Expr {
     return expr.set_enum;
 }
 
+fn collect_union_membership_leaves(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    leaves: *[32]*const ast.Expr,
+    count: *usize,
+    depth: u8,
+) bool {
+    if (depth >= 32) return false;
+    const union_expr = if (set_union_operands(expr) != null)
+        expr
+    else blk: {
+        const name = switch (expr.*) {
+            .ident => |name| name,
+            .apply => |application| if (application.args.len == 0 and
+                application.func.* == .ident)
+                application.func.ident
+            else
+                break :blk expr,
+            else => break :blk expr,
+        };
+        if (constant_substitution_name(module, name) != null or
+            is_native_override(name))
+        {
+            break :blk expr;
+        }
+        const resolved = resolved_definition_name(module, name) orelse
+            break :blk expr;
+        const definition = find_definition(module, resolved) orelse
+            break :blk expr;
+        if (definition.params.len != 0 or definition.is_function or
+            set_union_operands(definition.body) == null)
+        {
+            break :blk expr;
+        }
+        break :blk definition.body;
+    };
+    const operands = set_union_operands(union_expr) orelse {
+        if (count.* == leaves.len) return false;
+        leaves[count.*] = expr;
+        count.* += 1;
+        return true;
+    };
+    const snapshot = count.*;
+    if (!collect_union_membership_leaves(
+        module,
+        operands.left,
+        leaves,
+        count,
+        depth + 1,
+    ) or !collect_union_membership_leaves(
+        module,
+        operands.right,
+        leaves,
+        count,
+        depth + 1,
+    )) {
+        count.* = snapshot;
+        return false;
+    }
+    return true;
+}
+
+fn emit_union_membership(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    binary: *const ast.Binary,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    if ((binary.op != .in and binary.op != .notin) or
+        !expression_reordering_safe(module, binary.right))
+    {
+        return false;
+    }
+    var leaves: [32]*const ast.Expr = undefined;
+    var leaf_count: usize = 0;
+    if (!collect_union_membership_leaves(
+        module,
+        binary.right,
+        &leaves,
+        &leaf_count,
+        0,
+    ) or leaf_count < 2) {
+        return false;
+    }
+
+    const identity = expression_identity(module, binary.left);
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "member_{x}: {{ const member_value_{x} = ",
+        .{ identity, identity },
+    );
+    defer allocator.free(prefix);
+    try append(output, allocator, prefix);
+    try emit_expr(
+        output,
+        allocator,
+        module,
+        binary.left,
+        params,
+    );
+    const middle = try std.fmt.allocPrint(
+        allocator,
+        "; break :member_{x} {s}(",
+        .{ identity, if (binary.op == .notin) "!" else "" },
+    );
+    defer allocator.free(middle);
+    try append(output, allocator, middle);
+    for (leaves[0..leaf_count], 0..) |leaf, index| {
+        if (index > 0) try append(output, allocator, " or ");
+        const call = try std.fmt.allocPrint(
+            allocator,
+            "try runtime.member_bool(context, member_value_{x}, ",
+            .{identity},
+        );
+        defer allocator.free(call);
+        try append(output, allocator, call);
+        try emit_expr(output, allocator, module, leaf, params);
+        try append(output, allocator, ")");
+    }
+    try append(output, allocator, "); }");
+    return true;
+}
+
 fn emit_sequence_head_field_path_comparison(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -8533,6 +11325,52 @@ fn emit_variable_path_call(
         params,
     );
     try append(output, allocator, "})");
+}
+
+fn emit_variable_path_literal_string_call(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    function_name: []const u8,
+    application: *const ast.Apply,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    if (application.args.len != 1 or
+        application.args[0].* != .string_literal)
+    {
+        return false;
+    }
+    const variable = variable_application_index_scoped(
+        module,
+        application,
+        params,
+    ) orelse return false;
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "try runtime.{s}(context, {d}, &[_]Value{{",
+        .{ function_name, variable },
+    );
+    defer allocator.free(prefix);
+    try append(output, allocator, prefix);
+    switch (application.func.*) {
+        .apply => |parent| try emit_variable_application_keys(
+            output,
+            allocator,
+            module,
+            parent,
+            params,
+        ),
+        .ident => {},
+        else => unreachable,
+    }
+    const suffix = try std.fmt.allocPrint(
+        allocator,
+        "}}, \"{f}\")",
+        .{std.zig.fmtString(application.args[0].string_literal)},
+    );
+    defer allocator.free(suffix);
+    try append(output, allocator, suffix);
+    return true;
 }
 
 fn emit_field_path_call(
@@ -8747,6 +11585,72 @@ fn emit_variable_path_membership(
         allocator,
         module,
         binary.right.apply,
+        params,
+    );
+    try append(output, allocator, "}, ");
+    try emit_expr(output, allocator, module, binary.left, params);
+    try append(output, allocator, ")");
+    return true;
+}
+
+fn emit_variable_path_domain_membership(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    binary: *const ast.Binary,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    if ((binary.op != .in and binary.op != .notin) or
+        binary.right.* != .unary or
+        binary.right.unary.op != .domain)
+    {
+        return false;
+    }
+    const domain_operand = binary.right.unary.operand;
+    if (direct_field_path_scoped(
+        module,
+        domain_operand,
+        params,
+    )) |field_path| {
+        const function_name = if (binary.op == .in)
+            "variable_path_field_domain_member_bool"
+        else
+            "variable_path_field_domain_not_member_bool";
+        try emit_field_path_call(
+            output,
+            allocator,
+            module,
+            function_name,
+            field_path.variable,
+            field_path.application,
+            field_path.field_name,
+            params,
+            binary.left,
+        );
+        return true;
+    }
+    if (domain_operand.* != .apply) return false;
+    const variable = variable_application_index_scoped(
+        module,
+        domain_operand.apply,
+        params,
+    ) orelse return false;
+    const function_name = if (binary.op == .in)
+        "variable_path_domain_member_bool"
+    else
+        "variable_path_domain_not_member_bool";
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "try runtime.{s}(context, {d}, &[_]Value{{",
+        .{ function_name, variable },
+    );
+    defer allocator.free(prefix);
+    try append(output, allocator, prefix);
+    try emit_variable_application_keys(
+        output,
+        allocator,
+        module,
+        domain_operand.apply,
         params,
     );
     try append(output, allocator, "}, ");
@@ -9567,6 +12471,163 @@ test "generated expressions capture only referenced lexical parameters" {
     ) != null);
 }
 
+test "persistent call cache admits only state-independent deterministic definitions" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------- MODULE PersistentCallSafety ----------------
+        \\VARIABLE x
+        \\Pure(S) == {<<v, v>> : v \in S}
+        \\Shadowed(x) == {x}
+        \\Stateful(S) == S \cup {x}
+        \\Noisy(S) == IF PrintT(TRUE) THEN S ELSE {}
+        \\WrappedNoisy(S) == Noisy(S)
+        \\===================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+
+    try std.testing.expect(definition_persistent_call_cache_safe(
+        module,
+        find_definition(module, "Pure").?,
+    ));
+    try std.testing.expect(definition_persistent_call_cache_safe(
+        module,
+        find_definition(module, "Shadowed").?,
+    ));
+    try std.testing.expect(!definition_persistent_call_cache_safe(
+        module,
+        find_definition(module, "Stateful").?,
+    ));
+    try std.testing.expect(!definition_persistent_call_cache_safe(
+        module,
+        find_definition(module, "Noisy").?,
+    ));
+    try std.testing.expect(!definition_persistent_call_cache_safe(
+        module,
+        find_definition(module, "WrappedNoisy").?,
+    ));
+}
+
+test "eager cache admits deterministic finite domains built through operators" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------- MODULE EagerFiniteDomain ----------------
+        \\EXTENDS FiniteSets
+        \\CONSTANT Replicas
+        \\Commands == {"write", "read"}
+        \\NumCommands == Cardinality(Commands)
+        \\Slots == 1..NumCommands
+        \\AMessages == [type: {"A"}, src: Replicas, slot: Slots]
+        \\BMessages == [type: {"B"}, src: Replicas, slot: Slots]
+        \\Messages == AMessages \cup BMessages
+        \\==========================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Messages"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        ".name = \"NumCommands\", .arity = 0, .function = op_1, " ++
+            ".cacheable = true, .eager_cache = true",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        ".name = \"Messages\", .arity = 0, .function = op_5, " ++
+            ".cacheable = true, .eager_cache = true",
+    ) != null);
+}
+
+test "membership in a pure named union lowers to symbolic leaf tests" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------- MODULE UnionMembership ----------------
+        \\CONSTANT Replicas
+        \\AMessages == [type: {"A"}, src: Replicas]
+        \\BMessages == [type: {"B"}, src: Replicas]
+        \\Messages == AMessages \cup BMessages
+        \\Contains(message) == message \in Messages
+        \\========================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Contains"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "break :member_",
+    ) != null);
+    try std.testing.expect(std.mem.count(
+        u8,
+        result.source,
+        "runtime.member_bool(context, member_value_",
+    ) >= 2);
+    const source_z = try std.testing.allocator.allocSentinel(
+        u8,
+        result.source.len,
+        0,
+    );
+    defer std.testing.allocator.free(source_z);
+    @memcpy(source_z, result.source);
+    var tree = try std.zig.Ast.parse(std.testing.allocator, source_z, .{});
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+}
+
+test "volatile union membership retains ordinary eager evaluation" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------- MODULE VolatileUnionMembership ----------------
+        \\EXTENDS TLC
+        \\Messages == {1} \cup {TLCGet("level")}
+        \\Contains(message) == message \in Messages
+        \\================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Contains"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "break :member_",
+    ) == null);
+}
+
 test "emit scalar and direct native operators without fallbacks" {
     const Arena = @import("arena.zig").Arena;
     const parser = @import("parser.zig");
@@ -9575,6 +12636,10 @@ test "emit scalar and direct native operators without fallbacks" {
         \\Inc(x) == x + 1
         \\Positive(x) == Inc(x) > 0
         \\Unsupported(S) == Cardinality(S)
+        \\Finite(S) == IsFiniteSet(S)
+        \\CONSTANT C
+        \\FiniteConstant == IsFiniteSet(C)
+        \\WrappedFinite(S) == <<IsFiniteSet(S)>>
         \\Sub == SubSeq(<<1, 2>>, 1, 1)
         \\==============================================================
         \\
@@ -9589,7 +12654,7 @@ test "emit scalar and direct native operators without fallbacks" {
     );
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u32, 4), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 7), result.generated_count);
     try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
     try std.testing.expectEqual(@as(usize, 0), result.unsupported.len);
     try std.testing.expect(
@@ -9606,7 +12671,318 @@ test "emit scalar and direct native operators without fallbacks" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         result.source,
+        "runtime.is_finite_set(context",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.is_finite_set_bool(try runtime.force(context",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.constant_is_finite_set_at(context",
+    ) != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "runtime.native(") == null,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
         "runtime.sequence_subseq(context",
+    ) != null);
+}
+
+test "emit enabled actions and quantified fairness without fallbacks" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedFairness ----------------------
+        \\VARIABLE x
+        \\Calls == [floor : {1, 2}, direction : {"Up", "Down"}]
+        \\Init == x = 0
+        \\Advance(call) == x' = x
+        \\Step(call) ==
+        \\    /\ ENABLED Advance(call)
+        \\    /\ x' = x
+        \\Next == \E call \in Calls : Step(call)
+        \\TemporalAssumptions == \A call \in Calls : WF_x(Step(call))
+        \\Spec ==
+        \\    /\ Init
+        \\    /\ [][Next]_x
+        \\    /\ TemporalAssumptions
+        \\======================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const step_definition = find_definition(module, "Step") orelse {
+        for (module.definitions) |definition| {
+            std.debug.print("parsed definition: {s}\n", .{definition.name});
+        }
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(operator_supported(
+        module,
+        step_definition,
+        0,
+    ));
+    const temporal_body = find_definition(
+        module,
+        "TemporalAssumptions",
+    ).?.body;
+    try std.testing.expect(expr_is_temporal(
+        module,
+        temporal_body,
+        0,
+    ));
+    const spec_body = find_definition(module, "Spec").?.body;
+    try std.testing.expect(expr_is_temporal(
+        module,
+        spec_body,
+        0,
+    ));
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Spec", "TemporalAssumptions" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    if (result.fallback_count != 0) {
+        for (result.unsupported) |name| {
+            std.debug.print("unexpected codegen fallback: {s}\n", .{name});
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expectEqual(@as(usize, 0), result.unsupported.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.enabled_bool(context)",
+    ) != null);
+}
+
+test "emit hereditary power-set filters symbolically without fallbacks" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedPowerSetFilter ----------------------
+        \\EXTENDS Naturals, FiniteSets
+        \\Pairs == {E \in SUBSET (SUBSET (1..5)) :
+        \\             \A e \in E : Cardinality(e) = 2}
+        \\===========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Pairs"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    if (result.fallback_count != 0) {
+        for (result.unsupported) |name| {
+            std.debug.print("unexpected codegen fallback: {s}\n", .{name});
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expectEqual(@as(usize, 0), result.unsupported.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.power_set(context, try runtime.filter_at(context, args,",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "hereditary_filter_",
+    ) != null);
+}
+
+test "direct Boolean state-path filters stream the bound value" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------- MODULE GeneratedPathFilter ----------------
+        \\CONSTANT Ids
+        \\VARIABLE snapshots
+        \\Active(node) == {tx \in Ids : snapshots[node][tx]["active"]}
+        \\=============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Active"},
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.filter_variable_path_boolean(context, args,",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        ".{ .argument = 0 }, .bound, .{ .field = \"active\" }",
+    ) != null);
+}
+
+test "literal string state paths avoid temporary string values" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------- MODULE GeneratedLiteralStringPath ----------------
+        \\VARIABLE snapshots
+        \\Read(node, tx) == snapshots[node][tx]["active"]
+        \\===============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Read"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_path_literal_string(context, 0,",
+    ) != null);
+}
+
+test "adjacent domain and field predicates share a state path" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------- MODULE GeneratedSharedPath ----------------
+        \\VARIABLE mlog
+        \\Check(node, expected) == "tid" \in DOMAIN mlog[node] /\ mlog[node].tid = expected
+        \\=============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Check"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    if (result.fallback_count != 0) {
+        for (result.unsupported) |name| {
+            std.debug.print("unexpected codegen fallback: {s}\n", .{name});
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_path_domain_literal_member_field_argument_equal_bool(context, args, 0,",
+    ) != null);
+}
+
+test "later conjunction predicates reuse a resolved state path" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------- MODULE GeneratedResolvedPath ----------------
+        \\VARIABLE mlog
+        \\Check(node, expected, key, limit) ==
+        \\    /\ "tid" \in DOMAIN mlog[node]
+        \\    /\ mlog[node].tid = expected
+        \\    /\ mlog[node].ts <= limit
+        \\    /\ key \in DOMAIN mlog[node].data
+        \\===============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Check"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "const resolved_path_0 = try runtime.resolve_variable_path(context, 0,",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.resolved_path_domain_literal_member_field_argument_equal_bool",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.resolved_path_field(context, resolved_path_0, \"ts\")",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.resolved_path_field_domain_member_bool(context, resolved_path_0, \"data\"",
+    ) != null);
+}
+
+test "state-path domain membership avoids materializing domains" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------- MODULE GeneratedDomainMembership ----------------
+        \\VARIABLE values
+        \\Direct(node, key) == key \in DOMAIN values[node]
+        \\Field(node, key) == key \notin DOMAIN values[node].data
+        \\===================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Direct", "Field" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_path_domain_member_bool(context, 0,",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_path_field_domain_not_member_bool(context, 0,",
     ) != null);
 }
 
@@ -9887,6 +13263,54 @@ test "state set relations avoid cloning generated variables" {
     ) != null);
 }
 
+test "UNCHANGED computed expressions use generated primed evaluation" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedUnchangedExpression ----------------------
+        \\VARIABLE x
+        \\Domain == {1, 2}
+        \\Image == [i \in Domain |-> x]
+        \\Computed == UNCHANGED Image
+        \\=========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    try std.testing.expectEqual(@as(usize, 3), module.definitions.len);
+    const unchanged = try arena.alloc_object(ast.Expr);
+    unchanged.* = .{
+        .unchanged_expr = module.definitions[1].body,
+    };
+    @constCast(module.definitions)[2].body = unchanged;
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Computed"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.unchanged_expression(context, args, bound_",
+    ) != null);
+    const source_z = try std.testing.allocator.allocSentinel(
+        u8,
+        result.source.len,
+        0,
+    );
+    defer std.testing.allocator.free(source_z);
+    @memcpy(source_z, result.source);
+    var tree = try std.zig.Ast.parse(std.testing.allocator, source_z, .{});
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+}
+
 test "state variable EXCEPT lowers to a cross-pool update" {
     const Arena = @import("arena.zig").Arena;
     const parser = @import("parser.zig");
@@ -9922,7 +13346,7 @@ test "state variable EXCEPT lowers to a cross-pool update" {
     );
     defer std.testing.allocator.free(source_z);
     @memcpy(source_z, result.source);
-    var tree = try std.zig.Ast.parse(std.testing.allocator, source_z, .zig);
+    var tree = try std.zig.Ast.parse(std.testing.allocator, source_z, .{});
     defer tree.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
 }
@@ -9959,13 +13383,103 @@ test "self-recursive operators are generated without fallbacks" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         result.source,
-        "runtime.cached_recursive_call(context, \"Recur\", args)",
+        "runtime.cached_stable_call(context, \"Recur\", args)",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         result.source,
-        "runtime.put_cached_recursive_call(context, \"Recur\", args, result)",
+        "runtime.put_cached_stable_call(context, \"Recur\", args, result)",
     ) != null);
+}
+
+test "recursive LET functions are generated without fallbacks" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedLetRecursion ----------------------
+        \\Maximum(S) ==
+        \\    LET Max[T \in SUBSET S] ==
+        \\        IF T = {} THEN -1
+        \\        ELSE LET n == CHOOSE n \in T : TRUE
+        \\                 rmax == Max[T \ {n}]
+        \\             IN IF n >= rmax THEN n ELSE rmax
+        \\    IN Max[S]
+        \\Use == Maximum({1, 2, 3})
+        \\=========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Maximum", "Use" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expectEqual(@as(usize, 0), result.unsupported.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        ".recursive = true",
+    ) != null);
+    const source_z = try std.testing.allocator.allocSentinel(
+        u8,
+        result.source.len,
+        0,
+    );
+    defer std.testing.allocator.free(source_z);
+    @memcpy(source_z, result.source);
+    var tree = try std.zig.Ast.parse(std.testing.allocator, source_z, .{});
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+}
+
+test "recursive relation closure uses structural native lowering" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedRelationClosure ----------------------
+        \\Reach(graph, frontier) == IF frontier = {} THEN {} ELSE
+        \\    LET next == {to \in graph[1] : \E from \in frontier :
+        \\        <<from, to>> \in graph[2]}
+        \\    IN next \cup Reach(graph, next)
+        \\Use == Reach(<<{1, 2}, {<<1, 2>>}>>, {1})
+        \\=========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Reach", "Use" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.relation_descendants(context",
+    ) != null);
+    const source_z = try std.testing.allocator.allocSentinel(
+        u8,
+        result.source.len,
+        0,
+    );
+    defer std.testing.allocator.free(source_z);
+    @memcpy(source_z, result.source);
+    var tree = try std.zig.Ast.parse(std.testing.allocator, source_z, .{});
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
 }
 
 test "nonrecursive CHOOSE operators do not emit recursive memo wrappers" {
@@ -10031,6 +13545,100 @@ test "generated LET evaluates only the selected IF branch" {
         result.source,
         "runtime.let_expression",
     ) == null);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, result.source, "] = try let_"),
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "] = try runtime.operator(context, let_",
+    ) == null);
+}
+
+test "volatile LET expressions are not memoized" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedVolatileLet ----------------------
+        \\Probe == RandomElement({1})
+        \\=========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    try std.testing.expectEqual(@as(usize, 1), module.definitions.len);
+    try std.testing.expect(!expression_reordering_safe(
+        module,
+        module.definitions[0].body,
+    ));
+}
+
+test "generated callable LET paths avoid intermediate state clones" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedCallableLet ----------------------
+        \\VARIABLE ledgers
+        \\RECURSIVE ReadThrough(_,_)
+        \\ReadThrough(f, key) ==
+        \\    IF key = 0 THEN f[key] ELSE ReadThrough(f, 0)
+        \\Safe(node, key) ==
+        \\    LET ledger == ledgers[node]
+        \\    IN /\ ledger[key] = 7
+        \\       /\ ReadThrough(ledger, key) = 7
+        \\FieldRead(node, key) ==
+        \\    LET ledger == ledgers[node]
+        \\        signed == ledger[key]
+        \\    IN signed.block.type = "open"
+        \\DirectField(f, key) == f[key].block.type
+        \\Materialize(node) ==
+        \\    LET ledger == ledgers[node]
+        \\    IN ledger = ledger
+        \\============================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Safe", "FieldRead", "DirectField", "Materialize" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(
+            u8,
+            result.source,
+            "runtime.state_path_operator",
+        ),
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.call_field_path",
+    ) != null);
+    const source_z = try std.testing.allocator.allocSentinel(
+        u8,
+        result.source.len,
+        0,
+    );
+    defer std.testing.allocator.free(source_z);
+    @memcpy(source_z, result.source);
+    var tree = try std.zig.Ast.parse(
+        std.testing.allocator,
+        source_z,
+        .{},
+    );
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
 }
 
 test "configured operator replacement wins over direct native lowering" {
@@ -10144,6 +13752,59 @@ test "generated Cartesian products use the direct runtime path" {
     ) != null);
 }
 
+test "generated multi-bound set maps use the direct runtime path" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE MultiBoundSetMap ----------------------
+        \\Pairs == {<<x, y>> : x, y \in 1..2}
+        \\========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module(std.testing.allocator, module);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.map_set_multi(context",
+    ) != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.source, "runtime.cartesian_product(context") == null,
+    );
+}
+
+test "generated tuple-bound functions keep the declared domain" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE TupleBoundFunction ----------------------
+        \\EXTENDS Naturals
+        \\PairSum[<<x, y>> \in {1, 2} \X {3, 4}] == x + y
+        \\========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module(std.testing.allocator, module);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, result.source, "runtime.cartesian_product(context"),
+    );
+}
+
 test "generated binary operators do not use named native dispatch" {
     const Arena = @import("arena.zig").Arena;
     const parser = @import("parser.zig");
@@ -10238,6 +13899,131 @@ test "direct helper lowering requires recognized helper body" {
     try std.testing.expect(
         std.mem.indexOf(u8, result.source, "runtime.function_range(") != null,
     );
+}
+
+test "recursive function set sum lowers without recursive call machinery" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE RecursiveFunctionSetSum ----------------------
+        \\EXTENDS Integers
+        \\RECURSIVE Sum(_, _), Difference(_, _)
+        \\Sum(f, S) == IF S = {} THEN 0
+        \\             ELSE LET x == CHOOSE x \in S : TRUE
+        \\                  IN f[x] + Sum(f, S \ {x})
+        \\Difference(f, S) == IF S = {} THEN 0
+        \\                    ELSE LET x == CHOOSE x \in S : TRUE
+        \\                         IN f[x] - Difference(f, S \ {x})
+        \\F == [i \in 1..3 |-> i]
+        \\Good == Sum(F, {1, 2, 3})
+        \\NearMiss == Difference(F, {1, 2, 3})
+        \\============================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Good", "NearMiss" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, result.source, "runtime.sum_function_on_set("),
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.cached_stable_call",
+    ) != null);
+    const source_z = try std.testing.allocator.allocSentinel(
+        u8,
+        result.source.len,
+        0,
+    );
+    defer std.testing.allocator.free(source_z);
+    @memcpy(source_z, result.source);
+    var tree = try std.zig.Ast.parse(std.testing.allocator, source_z, .{});
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+}
+
+test "structural function set fold lowers an operator reference to a callback" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE FunctionSetFold ----------------------
+        \\MapThenFoldSet(op(_, _), base, f(_), choose(_), S) ==
+        \\  LET iter[s \in SUBSET S] ==
+        \\        IF s = {} THEN base
+        \\        ELSE LET x == choose(s)
+        \\             IN op(f(x), iter[s \ {x}])
+        \\  IN iter[S]
+        \\FoldFunctionOnSet(op(_, _), base, fun, indices) ==
+        \\  MapThenFoldSet(op, base, LAMBDA i : fun[i],
+        \\      LAMBDA s : CHOOSE x \in s : TRUE, indices)
+        \\F == [i \in 0..2 |-> i + 2]
+        \\Sum == FoldFunctionOnSet(+, 0, F, 0..2)
+        \\===================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Sum"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expectEqual(@as(usize, 0), result.unsupported.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.fold_function_on_set(context",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "TLA+ operator: MapThenFoldSet",
+    ) == null);
+}
+
+test "function set fold lowering rejects a same-named user definition" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE FunctionSetFoldShadow ----------------------
+        \\FoldFunctionOnSet(op(_, _), base, fun, indices) == 42
+        \\F == [i \in 0..2 |-> i + 2]
+        \\Result == FoldFunctionOnSet(+, 0, F, 0..2)
+        \\=========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Result"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.fold_function_on_set(context",
+    ) == null);
 }
 
 test "shadowed direct helper name stays generated when body differs" {

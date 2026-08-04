@@ -17,6 +17,7 @@ const overrides = @import("overrides.zig");
 const generated_runtime = @import("generated_runtime.zig");
 const codegen = @import("codegen.zig");
 const sequence_patterns = @import("sequence_patterns.zig");
+const set_patterns = @import("set_patterns.zig");
 
 pub const Constant = generated_runtime.NamedValue;
 
@@ -483,7 +484,7 @@ const ContextPool = struct {
             const bit = @as(u64, 1) << variable_index;
             assert(self.state.mask & bit != 0);
             self.state.mask &= ~bit;
-            if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+            if (builtin.mode == .debug or builtin.mode == .safe) {
                 self.state.names[variable_index] = &.{};
                 self.state.values[variable_index] = .{ .bool_v = false };
                 self.state.value_pools[variable_index] = null;
@@ -689,11 +690,14 @@ const CallMemoEntry = struct {
 };
 
 const StateCallMemo = struct {
-    const slot_count = 2048;
+    const entry_count = 1024;
+    const slot_count = entry_count * 2;
 
     pool: ?*ValuePool = null,
+    hash_node_budget: u32 = 16,
+    fingerprint_only: bool = false,
     count: u16 = 0,
-    entries: [1024]CallMemoEntry = undefined,
+    entries: [entry_count]CallMemoEntry = undefined,
     slots: [slot_count]u16 = undefined,
     slot_generations: [slot_count]u64 = @splat(0),
     generation: u64 = 0,
@@ -709,19 +713,26 @@ const StateCallMemo = struct {
     }
 
     fn hash_call(
+        self: *const StateCallMemo,
         name: []const u8,
         args: []const Value,
         args_pool: *const ValuePool,
         state_address: usize,
         next_state_address: usize,
-    ) fingerprint.Fingerprint {
+    ) ?fingerprint.Fingerprint {
         var hash = fingerprint.hash_bytes(fingerprint.hash_init(), name);
         hash = fingerprint.hash_combine(hash, state_address);
         hash = fingerprint.hash_combine(hash, next_state_address);
+        var remaining_nodes = self.hash_node_budget;
         for (args) |argument| {
+            const argument_hash = fingerprint.hash_value_unseeded_bounded(
+                args_pool,
+                argument,
+                &remaining_nodes,
+            ) orelse return null;
             hash = fingerprint.hash_combine(
                 hash,
-                fingerprint.hash_value_unseeded(args_pool, argument),
+                argument_hash,
             );
         }
         return hash;
@@ -736,13 +747,15 @@ const StateCallMemo = struct {
         next_state_address: usize,
     ) ?Value {
         const memo_pool = self.pool orelse return null;
-        const hash = hash_call(
+        assert(self.count <= entry_count);
+        if (self.count == 0) return null;
+        const hash = self.hash_call(
             name,
             args,
             args_pool,
             state_address,
             next_state_address,
-        );
+        ) orelse return null;
         var slot: usize = @intCast(hash & (slot_count - 1));
         var probes: usize = 0;
         while (probes < slot_count) : (probes += 1) {
@@ -760,6 +773,7 @@ const StateCallMemo = struct {
                 slot = (slot + 1) & (slot_count - 1);
                 continue;
             }
+            if (self.fingerprint_only) return entry.value;
             for (args, 0..) |argument, index| {
                 if (!Value.eql_cross_pool(
                     argument,
@@ -788,13 +802,13 @@ const StateCallMemo = struct {
         {
             return error.OutOfMemory;
         }
-        const hash = hash_call(
+        const hash = self.hash_call(
             name,
             args,
             args_pool,
             state_address,
             next_state_address,
-        );
+        ) orelse return error.NotImplemented;
         var slot: usize = @intCast(hash & (slot_count - 1));
         var probes: usize = 0;
         while (probes < slot_count and
@@ -805,13 +819,15 @@ const StateCallMemo = struct {
         if (probes == slot_count) return error.OutOfMemory;
         const snapshot = memo_pool.snapshot();
         errdefer memo_pool.restore(snapshot);
-        const args_offset = memo_pool.value_count;
-        _ = try memo_pool.alloc_values(@intCast(args.len));
-        for (args, 0..) |argument, index| {
-            memo_pool.values[args_offset + index] = try argument.clone(
-                args_pool,
-                memo_pool,
-            );
+        const args_offset = if (self.fingerprint_only) 0 else memo_pool.value_count;
+        if (!self.fingerprint_only) {
+            _ = try memo_pool.alloc_values(@intCast(args.len));
+            for (args, 0..) |argument, index| {
+                memo_pool.values[args_offset + index] = try argument.clone(
+                    args_pool,
+                    memo_pool,
+                );
+            }
         }
         const memo_value = try value_v.clone(args_pool, memo_pool);
         self.entries[self.count] = .{
@@ -829,6 +845,11 @@ const StateCallMemo = struct {
     }
 };
 
+const generated_cache_entry_value_budget: u32 = 16 * 1024;
+const generated_cache_entry_string_budget: u32 = 64 * 1024;
+const generated_cache_total_value_budget: u32 = 64 * 1024;
+const generated_cache_total_string_budget: u32 = 1024 * 1024;
+
 pub const Evaluator = struct {
     module: ast.Module,
     constants: []const Constant,
@@ -843,6 +864,11 @@ pub const Evaluator = struct {
     state_definition_memo: *DefinitionMemo,
     state_call_memo: *StateCallMemo,
     state_definition_pool: *ValuePool,
+    persistent_call_memo: *StateCallMemo,
+    persistent_call_pool: *ValuePool,
+    persistent_call_safe: []const bool,
+    action_call_memo: *StateCallMemo,
+    action_call_pool: *ValuePool,
     recursive_definitions: []?bool,
     generated_cache_pool: *ValuePool,
     generated_cache: []?Value,
@@ -876,10 +902,36 @@ pub const Evaluator = struct {
         state_call_memo.* = .{};
         const state_definition_pool = try arena.alloc_object(ValuePool);
         state_definition_pool.* = try ValuePool.init(arena, 4096, 4096);
+        const persistent_call_memo = try arena.alloc_object(StateCallMemo);
+        persistent_call_memo.* = .{
+            .hash_node_budget = 4096,
+            .fingerprint_only = builtin.mode == .fast or
+                builtin.mode == .small,
+        };
+        const persistent_call_pool = try arena.alloc_object(ValuePool);
+        persistent_call_pool.* = try ValuePool.init(arena, 32 * 1024, 64 * 1024);
+        persistent_call_pool.growable = false;
+        persistent_call_memo.reset(persistent_call_pool);
+        const action_call_memo = try arena.alloc_object(StateCallMemo);
+        action_call_memo.* = .{};
+        const action_call_pool = try arena.alloc_object(ValuePool);
+        action_call_pool.* = try ValuePool.init(arena, 64 * 1024, 64 * 1024);
+        action_call_pool.growable = false;
+        const persistent_call_safe = try arena.alloc(bool, module.definitions.len);
+        for (module.definitions, persistent_call_safe) |definition, *safe| {
+            safe.* = codegen.definition_persistent_call_cache_safe(
+                module,
+                definition,
+            );
+        }
         const recursive_definitions = try arena.alloc(?bool, module.definitions.len);
         @memset(recursive_definitions, null);
         const generated_cache_pool = try arena.alloc_object(ValuePool);
-        generated_cache_pool.* = try ValuePool.init(arena, 4096, 4096);
+        generated_cache_pool.* = try ValuePool.init(
+            arena,
+            generated_cache_total_value_budget,
+            generated_cache_total_string_budget,
+        );
         const generated_cache = try arena.alloc(?Value, module.definitions.len);
         @memset(generated_cache, null);
         const generated_cache_rollback = try arena.alloc(
@@ -915,6 +967,11 @@ pub const Evaluator = struct {
             .state_definition_memo = state_definition_memo,
             .state_call_memo = state_call_memo,
             .state_definition_pool = state_definition_pool,
+            .persistent_call_memo = persistent_call_memo,
+            .persistent_call_pool = persistent_call_pool,
+            .persistent_call_safe = persistent_call_safe,
+            .action_call_memo = action_call_memo,
+            .action_call_pool = action_call_pool,
             .recursive_definitions = recursive_definitions,
             .generated_cache_pool = generated_cache_pool,
             .generated_cache = generated_cache,
@@ -941,6 +998,21 @@ pub const Evaluator = struct {
         state_call_memo.* = .{};
         const state_definition_pool = try arena.alloc_object(ValuePool);
         state_definition_pool.* = try ValuePool.init(arena, 4096, 4096);
+        const persistent_call_memo = try arena.alloc_object(StateCallMemo);
+        persistent_call_memo.* = .{
+            .hash_node_budget = 4096,
+            .fingerprint_only = builtin.mode == .fast or
+                builtin.mode == .small,
+        };
+        const persistent_call_pool = try arena.alloc_object(ValuePool);
+        persistent_call_pool.* = try ValuePool.init(arena, 32 * 1024, 64 * 1024);
+        persistent_call_pool.growable = false;
+        persistent_call_memo.reset(persistent_call_pool);
+        const action_call_memo = try arena.alloc_object(StateCallMemo);
+        action_call_memo.* = .{};
+        const action_call_pool = try arena.alloc_object(ValuePool);
+        action_call_pool.* = try ValuePool.init(arena, 64 * 1024, 64 * 1024);
+        action_call_pool.growable = false;
         const recursive_definitions = try arena.alloc(
             ?bool,
             self.module.definitions.len,
@@ -969,6 +1041,10 @@ pub const Evaluator = struct {
         copy.state_definition_memo = state_definition_memo;
         copy.state_call_memo = state_call_memo;
         copy.state_definition_pool = state_definition_pool;
+        copy.persistent_call_memo = persistent_call_memo;
+        copy.persistent_call_pool = persistent_call_pool;
+        copy.action_call_memo = action_call_memo;
+        copy.action_call_pool = action_call_pool;
         copy.recursive_definitions = recursive_definitions;
         copy.generated_cache_pool = generated_cache_pool;
         copy.generated_cache = generated_cache;
@@ -1001,8 +1077,6 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) void {
-        const cache_value_budget: u32 = 4096;
-        const cache_string_budget: u32 = 64 * 1024;
         assert(!self.generated_cache_frozen);
         assert(self.generated_cache_pool != eval_pool);
         assert(self.generated_cache_rollback.len == self.generated_cache.len);
@@ -1043,8 +1117,8 @@ pub const Evaluator = struct {
             const cache_strings = self.generated_cache_pool.string_count -
                 cache_snapshot.string_count;
             const admitted = warmed and
-                cache_values <= cache_value_budget and
-                cache_strings <= cache_string_budget;
+                cache_values <= generated_cache_entry_value_budget and
+                cache_strings <= generated_cache_entry_string_budget;
             if (!admitted) {
                 @memcpy(self.generated_cache, self.generated_cache_rollback);
                 self.generated_cache_pool.restore(cache_snapshot);
@@ -1079,10 +1153,10 @@ pub const Evaluator = struct {
         source: *const Evaluator,
         local_pool: *ValuePool,
     ) void {
-        const entry_value_budget: u32 = 8192;
+        const entry_value_budget = generated_cache_entry_value_budget;
         const entry_string_budget: u32 = 256 * 1024;
-        const total_value_budget: u32 = 64 * 1024;
-        const total_string_budget: u32 = 1024 * 1024;
+        const total_value_budget = generated_cache_total_value_budget;
+        const total_string_budget = generated_cache_total_string_budget;
         assert(source.generated_cache_frozen);
         assert(!self.generated_cache_frozen);
         assert(self.generated_cache.len == source.generated_cache.len);
@@ -1323,6 +1397,89 @@ pub const Evaluator = struct {
         ) catch |err| switch (err) {
             error.OutOfMemory, error.NotImplemented => {},
         };
+    }
+
+    fn reset_persistent_call_cache(self: *const Evaluator) void {
+        self.persistent_call_pool.restore(.{
+            .value_count = 0,
+            .string_count = 0,
+            .string_intern_count = 0,
+        });
+        self.persistent_call_memo.reset(self.persistent_call_pool);
+        assert(self.persistent_call_memo.count == 0);
+    }
+
+    fn cached_persistent_call(
+        self: *const Evaluator,
+        name: []const u8,
+        args: []const Value,
+        eval_pool: *ValuePool,
+    ) Error!?Value {
+        assert(eval_pool != self.persistent_call_pool);
+        const cached = self.persistent_call_memo.get(
+            name,
+            args,
+            eval_pool,
+            0,
+            0,
+        ) orelse return null;
+        return try cached.clone(self.persistent_call_pool, eval_pool);
+    }
+
+    fn memoize_persistent_call(
+        self: *const Evaluator,
+        name: []const u8,
+        args: []const Value,
+        result: Value,
+        eval_pool: *ValuePool,
+    ) void {
+        assert(eval_pool != self.persistent_call_pool);
+        self.persistent_call_memo.put(
+            name,
+            args,
+            eval_pool,
+            0,
+            0,
+            result,
+        ) catch |err| switch (err) {
+            error.NotImplemented => return,
+            error.OutOfMemory => {
+                self.reset_persistent_call_cache();
+                self.persistent_call_memo.put(
+                    name,
+                    args,
+                    eval_pool,
+                    0,
+                    0,
+                    result,
+                ) catch return;
+            },
+        };
+    }
+
+    fn persistent_call_result_worth_caching(result: Value) bool {
+        if (result.is_set_like()) return true;
+        return switch (result) {
+            .function_v, .record_v, .tuple_v => true,
+            else => false,
+        };
+    }
+
+    pub fn begin_action_evaluation(self: *const Evaluator) void {
+        assert(self.action_call_memo.pool == null);
+        self.action_call_pool.restore(.{
+            .value_count = 0,
+            .string_count = 0,
+            .string_intern_count = 0,
+        });
+        self.action_call_memo.reset(self.action_call_pool);
+        assert(self.action_call_memo.pool == self.action_call_pool);
+    }
+
+    pub fn end_action_evaluation(self: *const Evaluator) void {
+        assert(self.action_call_memo.pool == self.action_call_pool);
+        self.action_call_memo.reset(null);
+        assert(self.action_call_memo.pool == null);
     }
 
     fn definition_is_recursive(
@@ -1667,19 +1824,23 @@ pub const Evaluator = struct {
     ) Error!Value {
         _ = self;
         if (arity > expression.arg_names.len) return Error.TypeError;
+        if (expression.arg_required.len != 0 and
+            expression.arg_required.len != expression.arg_names.len)
+        {
+            return Error.TypeError;
+        }
         const capture_count = expression.arg_names.len - arity;
         const captures = try eval_pool.alloc_values(@intCast(capture_count));
-        for (expression.arg_names[0..capture_count], 0..) |name, index| {
-            captures[index] = (try context.lookup_value(name, eval_pool)) orelse {
-                if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
-                    std.debug.print(
-                        "generated operator expression {d} missing capture {s}; args={any} arity={d}\n",
-                        .{ expression.identity, name, expression.arg_names, arity },
-                    );
-                }
-                return Error.UndefinedSymbol;
-            };
-        }
+        const required = if (expression.arg_required.len == 0)
+            &.{}
+        else
+            expression.arg_required[0..capture_count];
+        try context.lookup_values(
+            expression.arg_names[0..capture_count],
+            required,
+            captures,
+            eval_pool,
+        );
         const offset: u32 = if (captures.len == 0)
             0
         else
@@ -1716,6 +1877,7 @@ pub const Evaluator = struct {
     }
 
     pub fn set_constants(self: *Evaluator, constants: []const Constant) void {
+        self.reset_persistent_call_cache();
         self.constants = constants;
         @memset(self.constant_slots, null);
         for (self.module.constants, 0..) |name, index| {
@@ -1729,6 +1891,7 @@ pub const Evaluator = struct {
     }
 
     pub fn set_aliases(self: *Evaluator, aliases: []const Alias) void {
+        self.reset_persistent_call_cache();
         self.aliases = aliases;
     }
 
@@ -2116,7 +2279,23 @@ pub const Evaluator = struct {
                 if (try eval_symbolic_set(self, expr, ctx, s0, eval_pool, state_pool)) |sv| return sv;
                 return try self.eval_set_binary(sb, ctx, s0, eval_pool, state_pool);
             },
-            .set_of_functions => |sf| return try self.eval_set_of_functions(sf, ctx, s0, eval_pool, state_pool),
+            .set_of_functions => |sf| {
+                if (try eval_symbolic_set(
+                    self,
+                    expr,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                )) |symbolic| return symbolic;
+                return try self.eval_set_of_functions(
+                    sf,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                );
+            },
             .record_set => |rs| {
                 if (try eval_symbolic_set(self, expr, ctx, s0, eval_pool, state_pool)) |sv| return sv;
                 return try self.eval_record_set(rs, ctx, s0, eval_pool, state_pool);
@@ -2668,28 +2847,11 @@ pub const Evaluator = struct {
         eval_pool: *ValuePool,
         state_pool: *ValuePool,
     ) Error!?Value {
-        if (filter.vars.len != 1 or
-            filter.vars[0].domain.* != .unary or
-            filter.vars[0].domain.unary.op != .subset or
-            filter.pred.* != .quantifier)
-        {
+        const pattern = set_patterns.hereditary_power_set_filter(filter) orelse
             return null;
-        }
-        const outer_name = filter.vars[0].name;
-        const predicate = filter.pred.quantifier;
-        if (predicate.kind != .forall or predicate.vars.len != 1 or
-            predicate.vars[0].domain.* != .ident or
-            !std.mem.eql(
-                u8,
-                predicate.vars[0].domain.ident,
-                outer_name,
-            ))
-        {
-            return null;
-        }
 
         const inner_domain = try self.eval_set_materialized(
-            filter.vars[0].domain.unary.operand,
+            pattern.base,
             ctx,
             s0,
             eval_pool,
@@ -2706,11 +2868,11 @@ pub const Evaluator = struct {
             const candidate = eval_pool.values[source.offset + i];
             const predicate_ctx = try self.extend_context(
                 ctx,
-                predicate.vars[0].name,
+                pattern.element_name,
                 candidate,
             );
             const accepted = try self.eval_expr(
-                predicate.body,
+                pattern.predicate,
                 predicate_ctx,
                 s0,
                 eval_pool,
@@ -4414,7 +4576,8 @@ pub const Evaluator = struct {
                     },
                 }
             }
-            if (self.find_definition(name)) |def| {
+            if (self.find_definition_index(name)) |definition_index| {
+                const def = self.module.definitions[definition_index];
                 var argument_storage: [64]Value = undefined;
                 const values = try self.eval_application_arguments(
                     ap.args,
@@ -4425,6 +4588,17 @@ pub const Evaluator = struct {
                     &argument_storage,
                 );
                 const memoize_recursive = self.definition_is_recursive(def);
+                const persistent_cache = def.params.len > 0 and
+                    !def.is_function and
+                    !memoize_recursive and
+                    self.persistent_call_safe[definition_index];
+                if (persistent_cache) {
+                    if (try self.cached_persistent_call(
+                        name,
+                        values,
+                        eval_pool,
+                    )) |cached| return cached;
+                }
                 if (def.is_function) {
                     const params = if (def.function_vars.len > 0)
                         def.function_vars
@@ -4528,6 +4702,16 @@ pub const Evaluator = struct {
                         name,
                         values,
                         s0,
+                        result,
+                        eval_pool,
+                    );
+                }
+                if (persistent_cache and
+                    persistent_call_result_worth_caching(result))
+                {
+                    self.memoize_persistent_call(
+                        name,
+                        values,
                         result,
                         eval_pool,
                     );
@@ -4693,6 +4877,7 @@ pub const Evaluator = struct {
             .partial_values = partial_value_slice,
             .partial_value_pools = partial_pool_slice,
             .read_primed = false,
+            .enabled_result = self.enabled_result,
             .constants = self.constants,
             .constant_slots = self.constant_slots,
             .generated_cache = self.generated_cache,
@@ -4702,6 +4887,8 @@ pub const Evaluator = struct {
             .memo_context = self,
             .cached_call = generated_cached_call,
             .put_cached_call = generated_put_cached_call,
+            .cached_stable_call = generated_cached_stable_call,
+            .put_cached_stable_call = generated_put_cached_stable_call,
             .native_context = &self.override_registry,
             .native_call = generated_native_call,
             .max_seq_len = self.override_registry.ctx.max_seq_len,
@@ -4746,6 +4933,7 @@ pub const Evaluator = struct {
             .partial_values = partial_value_slice,
             .partial_value_pools = partial_pool_slice,
             .read_primed = false,
+            .enabled_result = self.enabled_result,
             .constants = self.constants,
             .constant_slots = self.constant_slots,
             .generated_cache = self.generated_cache,
@@ -4755,6 +4943,8 @@ pub const Evaluator = struct {
             .memo_context = self,
             .cached_call = generated_cached_call,
             .put_cached_call = generated_put_cached_call,
+            .cached_stable_call = generated_cached_stable_call,
+            .put_cached_stable_call = generated_put_cached_stable_call,
             .native_context = &self.override_registry,
             .native_call = generated_native_call,
             .max_seq_len = self.override_registry.ctx.max_seq_len,
@@ -6178,11 +6368,16 @@ pub const Evaluator = struct {
         return null;
     }
 
-    pub fn find_definition(self: *const Evaluator, name: []const u8) ?ast.Definition {
-        for (self.module.definitions) |definition| {
-            if (name_eql(definition.name, name)) return definition;
+    fn find_definition_index(self: *const Evaluator, name: []const u8) ?usize {
+        for (self.module.definitions, 0..) |definition, index| {
+            if (name_eql(definition.name, name)) return index;
         }
         return null;
+    }
+
+    pub fn find_definition(self: *const Evaluator, name: []const u8) ?ast.Definition {
+        const index = self.find_definition_index(name) orelse return null;
+        return self.module.definitions[index];
     }
 
     pub fn find_subexpression(self: *const Evaluator, name: []const u8) ?*ast.Expr {
@@ -6285,6 +6480,96 @@ fn generated_put_cached_call(
     ) catch |err| switch (err) {
         error.OutOfMemory, error.NotImplemented => {},
     };
+}
+
+fn generated_cached_stable_call(
+    context: *const anyopaque,
+    name: []const u8,
+    args: []const Value,
+    eval_pool: *ValuePool,
+    current_state: ?*StateStore.State,
+    next_state: ?*StateStore.State,
+) Error!?Value {
+    const evaluator: *const Evaluator = @ptrCast(@alignCast(context));
+    const contains_state_path =
+        generated_runtime.arguments_contain_state_path_operator(args);
+    if (!contains_state_path) {
+        if (try evaluator.cached_persistent_call(
+            name,
+            args,
+            eval_pool,
+        )) |cached| return cached;
+    }
+    if (!contains_state_path and
+        evaluator.action_call_memo.pool != null)
+    {
+        assert(evaluator.action_call_memo.pool == evaluator.action_call_pool);
+        const cached = evaluator.action_call_memo.get(
+            name,
+            args,
+            eval_pool,
+            0,
+            0,
+        ) orelse return null;
+        return try cached.clone(evaluator.action_call_pool, eval_pool);
+    }
+    return generated_cached_call(
+        context,
+        name,
+        args,
+        eval_pool,
+        current_state,
+        next_state,
+    );
+}
+
+fn generated_put_cached_stable_call(
+    context: *const anyopaque,
+    name: []const u8,
+    args: []const Value,
+    result: Value,
+    eval_pool: *ValuePool,
+    current_state: ?*StateStore.State,
+    next_state: ?*StateStore.State,
+) Error!void {
+    const evaluator: *const Evaluator = @ptrCast(@alignCast(context));
+    const contains_state_path =
+        generated_runtime.arguments_contain_state_path_operator(args);
+    if (!contains_state_path and
+        Evaluator.persistent_call_result_worth_caching(result))
+    {
+        evaluator.memoize_persistent_call(
+            name,
+            args,
+            result,
+            eval_pool,
+        );
+    }
+    if (!contains_state_path and
+        evaluator.action_call_memo.pool != null)
+    {
+        assert(evaluator.action_call_memo.pool == evaluator.action_call_pool);
+        evaluator.action_call_memo.put(
+            name,
+            args,
+            eval_pool,
+            0,
+            0,
+            result,
+        ) catch |err| switch (err) {
+            error.OutOfMemory, error.NotImplemented => {},
+        };
+        return;
+    }
+    return generated_put_cached_call(
+        context,
+        name,
+        args,
+        result,
+        eval_pool,
+        current_state,
+        next_state,
+    );
 }
 
 fn expr_mentions_bound_names(
@@ -6705,7 +6990,7 @@ fn make_set(eval_pool: *ValuePool, values: []Value) Error!value.Set {
             while (dynamic_table[slot] != 0) {
                 const existing_index = dynamic_table[slot] - 1;
                 if (dynamic_hashes[existing_index] == candidate_hash and
-                    (builtin.mode == .ReleaseFast or
+                    (builtin.mode == .fast or
                         values[existing_index].eql(candidate, eval_pool)))
                 {
                     duplicate = true;
@@ -6749,7 +7034,7 @@ fn make_set(eval_pool: *ValuePool, values: []Value) Error!value.Set {
             while (table[insert_slot] != 0) {
                 const existing_index = table[insert_slot] - 1;
                 if (hashes[existing_index] == candidate_hash) {
-                    if (builtin.mode == .ReleaseFast or
+                    if (builtin.mode == .fast or
                         values[existing_index].eql(candidate, eval_pool))
                     {
                         duplicate = true;
@@ -6761,7 +7046,7 @@ fn make_set(eval_pool: *ValuePool, values: []Value) Error!value.Set {
         } else {
             for (values[0..unique_len], 0..) |existing, i| {
                 if (use_hashes and hashes[i] != candidate_hash) continue;
-                if (use_hashes and builtin.mode == .ReleaseFast) {
+                if (use_hashes and builtin.mode == .fast) {
                     // TLC also uses 64-bit fingerprints as its identity boundary.
                     // Debug and safe builds retain structural verification so a
                     // collision is observable during development.
@@ -7433,7 +7718,9 @@ fn test_eager_cache_root(
         return cached;
     }
     _ = try test_eager_cache_dependency(context, &.{});
-    const items = try context.eval_pool.alloc_values(4096);
+    const items = try context.eval_pool.alloc_values(
+        generated_cache_entry_value_budget,
+    );
     @memset(items, Value{ .int_v = 1 });
     const result = Value{ .tuple_v = .{
         .offset = @intCast((@intFromPtr(items.ptr) -
@@ -7441,6 +7728,62 @@ fn test_eager_cache_root(
         .len = @intCast(items.len),
     } };
     return generated_runtime.put_cached_definition(context, 1, result);
+}
+
+fn test_eager_cache_large_string(
+    context: *generated_runtime.CallContext,
+    args: []const Value,
+) Error!Value {
+    assert(args.len == 0);
+    if (try generated_runtime.cached_definition(context, 0)) |cached| {
+        return cached;
+    }
+    var bytes: [5000]u8 = undefined;
+    @memset(&bytes, 'x');
+    const result = Value{
+        .string_v = try context.eval_pool.push_string(&bytes),
+    };
+    return generated_runtime.put_cached_definition(context, 0, result);
+}
+
+test "eager cache admits entries larger than four kibibytes" {
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE CacheCapacity ----------------------
+        \\Root == "placeholder"
+        \\==================================================================
+        \\
+    ;
+    var arena = try Arena.init(8 * 1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const generated = [_]generated_runtime.Operator{.{
+        .name = "Root",
+        .arity = 0,
+        .function = test_eager_cache_large_string,
+        .cacheable = true,
+        .eager_cache = true,
+        .cache_index = 0,
+    }};
+    var evaluator = try Evaluator.init_generated(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+        &generated,
+        &.{},
+    );
+    var eval_pool = try ValuePool.init(&arena, 64, 8192);
+    var state_pool = try ValuePool.init(&arena, 64, 64);
+
+    evaluator.warm_eager_generated_cache(&eval_pool, &state_pool);
+
+    const cached = evaluator.generated_cache[0].?;
+    try std.testing.expectEqual(@as(u32, 5000), cached.string_v.len);
+    try std.testing.expectEqual(
+        @as(u32, 5000),
+        evaluator.generated_cache_pool.string_count,
+    );
 }
 
 test "rejected eager cache admission rolls back dependency slots" {
@@ -7480,7 +7823,11 @@ test "rejected eager cache admission rolls back dependency slots" {
         &generated,
         &.{},
     );
-    var eval_pool = try ValuePool.init(&arena, 8192, 64);
+    var eval_pool = try ValuePool.init(
+        &arena,
+        generated_cache_entry_value_budget + 2,
+        64,
+    );
     var state_pool = try ValuePool.init(&arena, 64, 64);
     const cache_snapshot = evaluator.generated_cache_pool.snapshot();
 
@@ -7526,6 +7873,89 @@ test "state call memo resets with generations" {
         @as(?Value, null),
         memo.get("F", &arguments, &argument_pool, 1, 2),
     );
+}
+
+test "state call memo bypasses nested operator arguments" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var argument_pool = try ValuePool.init(&arena, 64, 64);
+    var memo_pool = try ValuePool.init(&arena, 64, 64);
+    var body: u8 = 0;
+    var context: u8 = 0;
+    var lambda = value.Lambda{
+        .params = &.{},
+        .body = &body,
+        .ctx = &context,
+    };
+    const tuple_offset = try argument_pool.push_values(&.{
+        Value{ .int_v = 7 },
+        Value{ .lambda_v = &lambda },
+    });
+    const arguments = [_]Value{.{ .tuple_v = .{
+        .offset = tuple_offset,
+        .len = 2,
+    } }};
+    var memo = StateCallMemo{};
+
+    memo.reset(&memo_pool);
+    try std.testing.expectEqual(
+        @as(?Value, null),
+        memo.get("F", &arguments, &argument_pool, 1, 2),
+    );
+    try std.testing.expectError(
+        error.NotImplemented,
+        memo.put(
+            "F",
+            &arguments,
+            &argument_pool,
+            1,
+            2,
+            Value{ .int_v = 11 },
+        ),
+    );
+    try std.testing.expectEqual(@as(u16, 0), memo.count);
+    try std.testing.expectEqual(@as(u32, 0), memo_pool.value_count);
+}
+
+test "state call memo bypasses expensive aggregate arguments" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var argument_pool = try ValuePool.init(&arena, 128, 64);
+    var memo_pool = try ValuePool.init(&arena, 64, 64);
+    const domain_items = try argument_pool.alloc_values(16);
+    const entries = try argument_pool.alloc_values(16);
+    for (domain_items, entries, 0..) |*domain_item, *entry, index| {
+        domain_item.* = .{ .int_v = @intCast(index + 1) };
+        entry.* = .{ .bool_v = index % 2 == 0 };
+    }
+    const arguments = [_]Value{.{ .function_v = .{
+        .domain = .{
+            .offset = value_offset(&argument_pool, domain_items.ptr),
+            .len = @intCast(domain_items.len),
+        },
+        .offset = value_offset(&argument_pool, entries.ptr),
+        .len = @intCast(entries.len),
+    } }};
+    var memo = StateCallMemo{};
+
+    memo.reset(&memo_pool);
+    try std.testing.expectEqual(
+        @as(?Value, null),
+        memo.get("F", &arguments, &argument_pool, 1, 2),
+    );
+    try std.testing.expectError(
+        error.NotImplemented,
+        memo.put(
+            "F",
+            &arguments,
+            &argument_pool,
+            1,
+            2,
+            Value{ .int_v = 11 },
+        ),
+    );
+    try std.testing.expectEqual(@as(u16, 0), memo.count);
+    try std.testing.expectEqual(@as(u32, 0), memo_pool.value_count);
 }
 
 test "pointwise function predicate requires access by bound key" {
@@ -7592,6 +8022,15 @@ test "generated expression availability ignores unused captures" {
         &values,
         &pool,
     ));
+
+    try context.lookup_values(
+        &.{ "unused", "used" },
+        &.{ false, true },
+        &values,
+        &pool,
+    );
+    try std.testing.expectEqual(Value{ .bool_v = false }, values[0]);
+    try std.testing.expectEqual(Value{ .int_v = 7 }, values[1]);
 }
 
 test "state bindings preserve local stack lookup and lexical shadowing" {

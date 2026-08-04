@@ -10,11 +10,146 @@ TLAPS proof-only modules are intentionally outside the product scope.
 - [~] In progress
 - [x] Done
 
+## Validation snapshot (2026-08-03)
+- [x] Pin the official macOS AArch64 Zig master snapshot
+  `0.17.0-dev.1543+6db520a4c`; verify the published archive SHA-256
+  `226a8168e7823eb402120c327787a75f9dd84b166dc2870c963dfb2cbe735f59`;
+  align `vendor/zig` to the same `6db520a4c` source commit. The compiler is
+  repository-local under `tools/`; no global installation or `PATH` change.
+- [x] Port to the snapshot's AST parse-options API and lowercase optimization
+  modes. All `220` tests, ReleaseFast compilation, and the complete default
+  benchmark pass.
+- [x] Memoize safe zero-arity generated `LET` definitions at first use and
+  incrementally update direct tuple `VIEW` fingerprints from changed state
+  variables. NanoMedium dropped from `184.475B` to `148.963B` instructions
+  (`19.3%`) while retaining the exact `530,587` projected states. Independent
+  single-worker projected-state dumps are byte-identical after sorting, MD5
+  `9a149d04f6b1d63850f263c057135ba1`.
+- [x] Revalidate NanoMedium on the new snapshot: TLC-auto `2.584s`, tlzig AOT
+  auto `1.118s` (`2.31x`), exact `530,587` distinct states, generated ABI 2,
+  `fallback_count = 0`.
+- [x] Mix all bits of aggregate identity and pool identity when indexing the
+  fixed root hash cache. Aggregate offsets occupy the high 32 bits, so the old
+  low-bit mask collided for equal-length values. Alternating exact Storage
+  runs improved from a `14.215s` control mean to `14.041s` with no allocation
+  or capacity increase; NanoMedium retained exactly `530,587` states.
+- [x] Lower structurally recognized Boolean state-path set filters to one
+  allocation-free generated-runtime loop. The compiler emits numeric variable
+  and argument slots plus literal field keys; the runtime contains no model,
+  operator, or field-name dispatch. Exhaustive MDBTLA Storage retained exactly
+  `8,723,634/1,078,623` generated/distinct states and improved from the prior
+  `14.606s` tlzig run to `11.965s` (`18.1%`), versus paired TLC-auto `36.979s`
+  (`3.09x`). An independent exact repeat completed in `12.095s`.
+- [x] Audit generated/runtime boundaries: no generated `runtime.native` calls,
+  no nonzero fallback counts, no user-spec names in runtime/checker/evaluator
+  or overrides, and only TLA+/TLC built-ins in the override registry. MDBTLA
+  coverage remains complete: `11` TLC-valid configurations benchmark-covered
+  and `2` upstream configurations rejected by TLC.
+- [x] Reject and remove generation-scoped recursive value-hash memoization.
+  Exact ReleaseFast runs regressed NanoMedium from `1.118s` to `1.186s` and
+  Storage exhaustive from `14.606s` to `16.314s`; per-node cache probes cost
+  more than shared-subtree reuse saved.
+- [x] Reject and remove native-Boolean set-filter callbacks. Storage exhaustive
+  retained exact `1,078,623` distinct states but regressed from `14.606s` to
+  `16.221s`; Boolean result boxing is not a decisive Storage cost.
+- [x] Reject and remove a validated per-filter record-slot cache. Exact Storage
+  runs were `12.103s`, `12.093s`, and `12.358s`, versus the retained direct
+  filter's `11.965-12.095s` range; cache validation and state cost more than
+  the avoided field scans. A narrower interned-token cache also regressed to
+  `12.994s` and `13.439s`; revisit only when typed lowering proves a fixed
+  record slot and can omit validation.
+- [x] Re-run the complete default ReleaseFast benchmark after the retained
+  changes. Every row passed its configured outcome/count contract, all strict
+  AOT models reported zero fallbacks, and the final SingleLog row retained the
+  exact TLC count `21,748/2,247`.
+- [x] Reject and remove standalone disjoint-`EXCEPT` reconstruction fusion.
+  Storage already uses the retained fused primed-variable comparison path;
+  adding a second constructor increased code without helping exploration.
+  Exact isolated runs regressed to `10.513s/10.920s/10.881s`, versus reverted
+  `10.396s/10.436s/10.886s` under the same load.
+- [x] Reuse a resolved state path across later predicates in a flattened
+  short-circuit conjunction. Resolution remains at the first fused
+  domain/field guard, preserving evaluation order, and the view carries only
+  `(Value, source_pool)` with no allocation. Five alternating exact Storage
+  runs improved median all-core time from `10.761s` to `10.413s` (`3.2%`) and
+  mean from `10.606s` to `10.449s`; the new binary won four of five paired
+  positions. All `223` tests and the complete default ReleaseFast benchmark
+  pass with zero generated fallback.
+- [x] Reject and remove capture of a second repeated path during an ordered
+  field comparison. It preserved exact counts and evaluation order but added
+  enough code to regress five-run Storage median from `10.831s` to `11.066s`
+  and mean from `10.805s` to `10.940s`; it won only one paired position.
+- [x] Reject and remove generic candidate clone-and-fingerprint fusion. It
+  cloned and hashed every concrete and symbolic `Value` variant in one walk
+  and seeded the existing candidate cache, but five alternating exact Storage
+  runs regressed median from `11.668s` to `11.823s` and mean from `11.455s` to
+  `11.568s`; it won only two paired positions. The cache relocation, sidecar
+  design, tests, and fused implementation were all removed.
+- [x] Bypass generic cross-pool equality after dense integer/model function
+  lookup has derived a candidate slot. Direct tag/value validation preserves
+  sparse-domain rejection without allocation or spec-specific semantics. Five
+  alternating exact Storage runs improved median from `11.711s` to `11.386s`
+  (`2.8%`) and mean from `11.527s` to `11.369s` (`1.4%`), winning four of five
+  pairs. All ten runs retained `8,723,634/1,078,623` counts.
+- [x] Pass all `224` tests, formatting, ReleaseFast build, complete MDBTLA
+  coverage audit, and the complete default ReleaseFast benchmark after the
+  dense lookup change. Every strict artifact reported `fallbacks=0`, every
+  AOT row was faster than TLC-auto, and exhaustive rows retained exact counts.
+- [x] Force-inline generic cross-pool function/tuple/record application into
+  path resolution. Eight alternating/reverse-order exact Storage runs improved
+  aggregate median from `12.385s` to `11.543s` (`6.8%`) and mean from
+  `12.264s` to `11.757s` (`4.1%`), with 4/8 pairwise wins under substantial
+  thermal variance. The generated executable also shrank by `17,152` bytes.
+  A fresh sample removes `apply_cross_pool` as an out-of-line hotspot and
+  attributes the inlined work to `resolve_path`. All `224` tests and a second
+  complete default ReleaseFast benchmark pass with zero fallback and every
+  AOT row faster than TLC-auto.
+- [x] Force-inline generated path resolution into its AOT callers. Eight exact
+  alternating/reverse-order Storage runs improved median from `10.387s` to
+  `10.118s` (`2.6%`) and mean from `10.439s` to `10.305s` (`1.3%`), winning
+  seven of eight pairs. The executable grew by `17,536` bytes; the measured
+  speedup justifies that bounded increase.
+- [x] Force-inline literal-string cross-pool application into generated path
+  resolution. Six fully recorded exact Storage pairs improved median from
+  `10.354s` to `10.012s` (`3.3%`) and mean from `10.537s` to `9.965s`
+  (`5.4%`), winning all six pairs. The executable shrank by `128` bytes versus
+  the path-inline control. Formatting, all `224` tests, ReleaseFast build,
+  complete MDBTLA coverage audit, and the default ReleaseFast benchmark pass;
+  every strict generated artifact reports `fallbacks=0` and every AOT row is
+  faster than TLC-auto.
+- [x] Reject and remove whole-filter force-inlining. Five exact Storage pairs
+  left median effectively flat (`10.859s` to `10.849s`) but regressed mean
+  from `10.694s` to `10.887s`, winning only two pairs. Specialization must
+  target the post-bound field access directly instead of duplicating the full
+  validation and iteration loop at generated call sites.
+- [x] Lower state paths whose final key is a literal string without creating a
+  temporary `Value.string`. The generic helper preserves both record and
+  string-keyed function semantics. Ten exact all-core Storage pairs won 7/10;
+  aggregate median improved from `10.768s` to `10.729s` and mean from
+  `10.972s` to `10.848s`. Hardware counters across three exact pairs reduced
+  retired instructions by `0.450%`, `0.440%`, and `0.528%` (`0.473%` mean),
+  from `1.962156T` to `1.952880T`. The executable grew by only `144` bytes.
+- [x] Validate literal-string path lowering with all `225` tests, formatting,
+  ReleaseFast compilation, complete MDBTLA coverage, and the full default
+  ReleaseFast benchmark. Every generated artifact reports `fallbacks=0`, all
+  AOT rows remain faster than TLC-auto, and exhaustive Storage A/B runs retain
+  exactly `8,723,634/1,078,623` generated/distinct states.
+- [x] Specify the safety contract for a typed lazy patch before revisiting
+  candidate materialization: its base must outlive evaluator rollback; path
+  and replacement data must be candidate-owned or copied scalars; rejected
+  branches must consume no persistent candidate capacity; primed reads must
+  observe the overlay; repeated/nested EXCEPT paths must retain TLA+ update
+  order; and equality, fingerprinting, canonicalization, and final
+  materialization must agree without pointer-identity shortcuts.
+- [ ] Implement typed lazy patches only when the representation can satisfy
+  that contract and remove reconstruction work. Merely merging the existing
+  clone and hash loops has already measured slower and must not be revived.
+
 ## Phase 0 — Foundation
 - [x] Add `vendor/tlaplus-examples` submodule
 - [x] Add `vendor/zig` (Codeberg master) submodule
 - [x] Add `vendor/tlaplus` clone for study
-- [x] Download latest Zig master binary for macOS aarch64
+- [x] Pin official Zig master snapshot `0.17.0-dev.1543+6db520a4c` for macOS aarch64
 - [x] Create `build.zig` / `build.zig.zon`
 - [x] Create `IMPLEMENTATION.md`
 - [x] Get `zig build test` green
@@ -2511,12 +2646,13 @@ allocation-free Zig operator overrides, and
   recursive clone identity (`10.94-11.08s` despite fewer instructions), and a
   structure-of-arrays canonical table (`11.36-12.31s`). None remain in the hot
   path.
-- [x] Stop duplicate Java execution for generated benchmark rows. The baseline
-  benchmark owns TLC/interpreted comparison; generated AOT rows now run with
-  `--tlzig-only --auto-only` and compare against the stored tlzig baseline.
-  Completed rows retain exact configured generated/distinct checks; configured
-  first-error rows compare the violation/deadlock outcome because all-core
-  traversal can reach the same error at a different nondeterministic frontier.
+- [x] Stop duplicate Java execution for generated benchmark rows. The current
+  mechanism supersedes the temporary stored-baseline design: the base runner
+  skips generated-preferred models and each generated AOT row runs exactly one
+  TLC-auto process and one tlzig-AOT-auto process. Completed rows retain exact
+  configured generated/distinct checks; configured first-error rows compare
+  the violation/deadlock outcome because all-core traversal can reach the same
+  error at a different nondeterministic frontier.
 
 - [x] Replace the permissive tlzig-only corpus probe with a paired TLC/tlzig
   auditor. `scripts/audit_spec_coverage.py` resolves configured roots, runs TLC
@@ -2545,7 +2681,7 @@ allocation-free Zig operator overrides, and
 - [ ] Exhaustively validate the `115` rows that exceed the short 15-second or
   200,000-state corpus gate. Bounded acceptance is not a 100% compatibility
   claim.
-- [ ] Re-run and accept the default `ReleaseFast` benchmark after the latest
+- [x] Re-run and accept the default `ReleaseFast` benchmark after the latest
   liveness/action fixes. Any correctness or performance regression takes
   priority over additional optimization work.
 
@@ -2661,11 +2797,12 @@ allocation-free Zig operator overrides, and
   independently compile in ReleaseFast with ABI `2` and `fallback_count = 0`;
   the MDBTLA audit classifies all `13` cfgs (`11` covered TLC-valid, `2`
   TLC-invalid); and production source contains no audited model identifiers.
-- [ ] Refresh the full bounded primary-corpus manifest after these runtime
-  changes. The retained `primary_final_clean.jsonl` remains `158` exact, `24`
-  outcome-exact, `1` stochastic, `35` bounded, `60` TLC-invalid, and `2`
-  non-model rows with zero hard gaps; do not present the 35 bounded rows as
-  exhaustive evidence.
+- [x] Refresh the full bounded primary-corpus manifest after these runtime
+  changes. `coverage_results/primary_2026-07-16_post_streaming.jsonl` records
+  `136` exact, `23` outcome-exact, `1` stochastic, `58` bounded, `60`
+  TLC-invalid, and `2` non-model rows with zero hard gaps and zero completed
+  distinct-count mismatches. Do not present the 58 bounded rows as exhaustive
+  evidence.
 - [x] Remove the default generated benchmark's dependency on untracked local
   tlzig baseline files. The base runner skips generated-preferred models and
   every generated row now compares one TLC-auto run directly with one strict
@@ -2683,8 +2820,397 @@ allocation-free Zig operator overrides, and
   generated capture-depth metadata. Preserve lazy LET/operator scope and reject
   the change unless differential tests and ReleaseFast counters improve.
 - [ ] Lower the highest-volume generic generated patterns without model-name
-  dispatch: `25,472` nested helper chains, `5,068` variable paths, `1,231`
-  whole-root primed comparisons, `555` mapped sets, `435` unchanged
+  dispatch: `25,548` nested helper chains, `5,073` variable paths, `1,233`
+  whole-root primed comparisons, `557` mapped sets, `435` unchanged
   expressions, `234` EXCEPT reconstructions, and `176` function ranges. Start
   with borrowed path reads and patch-based EXCEPT because clone/fingerprint/
   action work dominates the final profile; measure before adding SIMD.
+
+## 2026-07-16 Corpus, Lazy Function-Set, And Performance Gate
+
+- [x] Make recursive state-call memoization safe for nested executable values.
+  Lambda and generated-operator arguments now bypass the optional cache instead
+  of reaching fingerprint panics. Add regressions for nested operators and
+  fixed-generation cache reset.
+- [x] Bound memo-key admission to 16 aggregate nodes. Large functions and sets
+  are rejected before recursive hashing/cloning, while compact integer and
+  tuple recursion remains memoized. ReleaseFast Time Profiler data on
+  GameOfLife identified `15.3` aggregate CPU-seconds in the old memo path;
+  strict AOT wall time improved from `2.575s` to `0.794s` with exact
+  `131072/65536` counts, versus fresh TLC-auto `1.624s`.
+- [x] Preserve tuple-bound function domains. `F[<<x,y>> \in D]` now keeps `D`
+  once and destructures each key; it is no longer lowered as `D \X D`.
+  Ordinary comma-separated binders retain Cartesian-product semantics.
+- [x] Generate multi-bound set maps through a direct recursive domain iterator
+  rather than materializing an intermediate Cartesian product. Strict
+  GameOfLife generation now reports `9` operators and `fallback_count = 0`.
+- [x] Keep `[S -> T]` symbolic in both interpreted and generated expression
+  paths. Membership assignments stream one candidate function at a time, and
+  the initial candidate pool is pre-sized from the checker's configured state
+  budget. A regression proves 256 functions can be explored with a 1,024-value
+  fixed scratch pool that cannot hold an eager materialization.
+- [x] Complete a fresh paired 280-configuration audit after the generic
+  changes: `136` exact, `23` outcome-exact, `1` stochastic-outcome, `58`
+  bounded, `60` TLC-invalid, and `2` non-model harnesses. There are zero hard
+  gaps, outcome mismatches, or exhaustive distinct-state mismatches.
+- [x] Complete a fresh paired all-core ReleaseFast RC/snapshot exhaustive run.
+  TLC and strict zero-fallback tlzig both reached exact
+  `405005930/67629092`; TLC took `697.495s` and tlzig `314.422s` (`2.218x`).
+  The current run is `1.013x` faster than the prior exact `318.628s` tlzig run
+  and `2.162x` faster than the original `679.912s` tlzig baseline.
+- [x] Compile all 26 stored generated models independently in ReleaseFast.
+  Every model declares ABI `2` and `fallback_count = 0`; production runtime
+  source contains no MDBTLA, GameOfLife, or Chameneos identifiers.
+- [x] Pass the complete default ReleaseFast benchmark with heavy one-worker
+  rows still disabled. Fresh exact comparisons include Slush Medium
+  `21.109s/16.541s`, MCBinarySearch `2.001s/0.714s`, GameOfLife
+  `1.498s/0.778s`, ClientCentric `2.334s/1.052s`, SingleShardTxn safety
+  `1.833s/0.054s`, and SingleLog MDBLinearizability `2.013s/0.746s`
+  (TLC/tlzig).
+- [ ] Continue generic lowering of the 28-artifact generated-pattern backlog.
+  Prioritize borrowed indexed state paths, patch-based EXCEPT updates, and
+  typed fixed-domain layouts before SIMD. Do not add model-name dispatch or
+  user-operator runtime overrides.
+
+## 2026-07-16 Large Initial-State And Saturation Gate
+
+- [x] Stream initial candidates through the fixed successor buffer instead of
+  requiring every initial state to fit simultaneously. Candidate batches are
+  canonicalized immediately, the resettable pool is restored between batches,
+  and action compositions retain the non-streaming path until their
+  intermediate-state lifetime can be partitioned safely.
+- [x] Lower direct filtered-set assignments to nested domain choices and stream
+  symbolic record-set products one record at a time. Candidate and canonical
+  pools intern repeated strings, so record field names and values do not
+  exhaust fixed string storage. The fixed-scratch regressions cover function
+  sets, filtered record sets, and candidate buffers smaller than the initial
+  state count.
+- [x] Bound canonical aggregate-cache insertion at 75% occupancy and every
+  lookup/insertion to 64 probes. Before this fix, a 2,097,152-entry table was
+  scanned in full for each later unique aggregate. A test-only 1,024-entry cap
+  exercises saturation with 1,024 distinct record-valued initial states;
+  assertion-enabled tests pass `186/186`.
+- [x] Add representative CoffeeCan1000 to the default benchmark and keep
+  CoffeeCan3000 opt-in. Fresh strict AOT all-core paired results are exact:
+  CoffeeCan1000 `2,000,002/501,500`, TLC `13.082s`, tlzig `2.081s` (`6.29x`);
+  CoffeeCan3000 `18,000,002/4,504,500`, TLC `131.203s`, tlzig `18.600s`
+  (`7.05x`). CoffeeCan3000 is `5.25x` faster than the prior accepted tlzig
+  `97.649s` run. Both generated models report `fallback_count = 0`.
+- [x] Complete the longer paired corpus retry. The authoritative 280-row
+  manifest `coverage_results/primary_2026-07-16_retry60_1m.jsonl` contains
+  `151` exact, `24` outcome-exact, `1` stochastic-outcome, `42` bounded, `60`
+  TLC-invalid, and `2` non-model rows, with zero hard gaps, outcome
+  mismatches, or completed distinct-count mismatches.
+- [x] Re-run the complete default ReleaseFast benchmark after the initial-state
+  changes. Heavy one-worker rows remain disabled; all exact and configured
+  first-witness contracts pass, and every default strict row is faster than
+  its paired TLC-auto run.
+- [x] Compile all `28` stored generated models independently for both CLI and
+  benchmark entry points in ReleaseFast. Every artifact declares ABI `2` and
+  `fallback_count = 0`; the production `src` tree contains no CoffeeCan,
+  MDBTLA, MultiShardTxn, GameOfLife, Slush, or MCBinarySearch identifiers.
+- [x] Prevent benchmark metadata accumulation. TLC now receives a unique
+  per-run metadir that is recursively removed on every normal/error return.
+  The focused ReleaseFast HourClock gate left no metadata directory. Removed
+  `45 GB` of stale TLC metadata, increasing free disk from `15 GB` to `61 GB`;
+  Zig caches remain reproducible and are removed after the final build gates.
+
+## 2026-07-16 EWD998 Strict AOT And Semantic Graph Gate
+
+- [x] Lower the standard `Functions!FoldFunctionOnSet` definition only after a
+  structural match of its recursive map/fold semantics. The generated reducer
+  is a direct callback, range/function inputs are iterated without materialized
+  sets, and a shadow definition with the same name is deliberately rejected.
+  EWD998Small now generates `24` operators with `fallback_count = 0`.
+- [x] Add assertion-enabled runtime and codegen regressions for allocation-free
+  range folding, reducer callback capture, strict zero-fallback generation,
+  helper reachability, and same-name shadowing. `zig build test` passes.
+- [x] Prove semantic parity on the complete N=2 EWD998 graph with the reusable
+  `scripts/compare_state_graphs.py` audit: exact `6,876` states, `32` initial
+  states, `26,182` unique edges, and `6,158` weak-fair `System` edges. TLC's
+  DOT contains `31,392` raw edges because it preserves `5,210` duplicate action
+  witnesses; this is not a transition-relation difference.
+- [x] Add EWD998Small to the default strict AOT benchmark. The exhaustive N=3
+  row has exact `1,520,618` distinct states; fresh all-core ReleaseFast timing
+  is TLC-auto `3.274s` versus tlzig-AOT-auto `1.865s`, a `1.76x` speedup.
+  TLC/tlzig raw witness counters are `11,238,019/10,507,635` and are explicitly
+  excluded from this row after the complete graph audit above.
+- [ ] Continue the bounded primary-corpus queue now that Misra, Sailfish, and
+  EWD998Small are exhaustive. Require strict zero-fallback generation and
+  paired TLC semantic evidence before reclassifying each remaining row.
+
+## 2026-07-18 Elevator Liveness And Symbolic Fairness Gate
+
+- [x] Propagate compiled `ENABLED` feasibility into generated operators. The
+  strict generator now classifies `ENABLED` as Boolean and treats quantified
+  `WF_`/`SF_` applications as temporal definitions without interpreter
+  fallback.
+- [x] Expand finite fairness domains represented by symbolic set-like values.
+  Record sets are materialized once during checker initialization, cloned into
+  stable storage, and non-set domains return `TypeError` instead of silently
+  dropping fairness conditions. Assertion-enabled regressions cover strict
+  generation and four record-valued fairness bindings; all `196` tests pass.
+- [x] Complete an exact large MultiCarElevator semantic audit. TLC and tlzig
+  match all `50,653` states, `729` initial states, and `218,899` unique edges.
+  The upgraded generic graph verifier also matches all `20` parameterized
+  fairness relations exactly; TLC's `11,271` additional raw edges are duplicate
+  action witnesses.
+- [x] Add `ElevatorLivenessMedium` as a default all-core strict AOT benchmark
+  with heavy one-core measurement disabled. Both engines complete the temporal
+  property at exact `14,296/4,122` counts. After exact fairness replay, the
+  focused ReleaseFast benchmark is TLC-auto `4.260s` versus tlzig-AOT-auto
+  `0.162s`, a `26.3x` speedup, and the generated artifact reports `22`
+  operators with `fallback_count = 0`.
+- [ ] Continue the remaining bounded primary-corpus rows. Full completion and
+  exact distinct-state parity are required for successful models; first-error
+  rows require the same semantic outcome. Keep all performance measurements
+  in ReleaseFast and all runtime semantics specification-independent.
+
+## 2026-07-18 Hereditary Power-Set And SpanTree Gate
+
+- [x] Share a structural hereditary-filter matcher across evaluator, action
+  compiler, and generator. Lower
+  `{E \in SUBSET A : \A e \in E : P(e)}` to the symbolic
+  `SUBSET {e \in A : P(e)}` without model-name dispatch or a runtime override.
+- [x] Add fixed-capacity end-to-end coverage that produces exactly `1,024`
+  initial states from five nodes, plus strict codegen assertions for the direct
+  inner predicate helper and `fallback_count = 0`. The full test suite passes.
+- [x] Complete `SpanTreeTest5Nodes` in both engines with exact
+  `3,150,464/410,112` generated/distinct counts and both temporal properties
+  satisfied. ReleaseFast all-core timing is TLC `423.53s` versus strict AOT
+  tlzig `2.83s`, a `149.7x` speedup.
+- [x] Add SpanTree as an opt-in strict AOT benchmark. Its seven-minute TLC run
+  is excluded from the default duration budget and heavy one-core runs remain
+  disabled.
+
+## 2026-07-18 Exact Fairness And bcastFolklore Gate
+
+- [x] Fix strict membership for a symbolic state set in `SUBSET A`. The shared
+  generated runtime performs direct cross-pool inclusion for concrete sets and
+  ranges and retains an exact materializing path for other symbolic set forms.
+- [x] Replace inferred named-call fairness masks at the temporal correctness
+  boundary. Every configured fairness action is evaluated once per concrete
+  graph edge, including stable quantified bindings, and the exact masks are
+  reused for SCC and induced-cycle checks.
+- [x] Add assertion-enabled regressions for cross-pool symbolic range
+  membership and a conjunctive weak-fairness action whose idle cycle must be
+  rejected. The focused interpreted and strict zero-fallback AOT checks pass.
+- [x] Complete full `bcastFolklore` parity. TLC and strict AOT tlzig both finish
+  without error at exact `9,718,336/501,552` generated/distinct counts. Fresh
+  ReleaseFast all-core time is TLC `1,148.63s` versus tlzig `65.42s`, a
+  `17.56x` speedup; the corrected tlzig path is also `1.6%` faster than its
+  prior semantically wrong `66.48s` run.
+- [x] Add `bcastFolklore` as an opt-in all-core AOT benchmark with one-core
+  disabled. The generated artifact reports `12` generated operators, `5`
+  native temporal definitions, and `fallback_count = 0`.
+- [ ] Continue the remaining TLC-valid bounded primary corpus with the same
+  exact outcome/count requirement before performance work.
+
+## 2026-07-21 APbcastFolklore INSTANCE Gate
+
+- [x] Generate strict AOT for the annotated `APbcastFolklore` wrapper through
+  generic INSTANCE translation: `12` generated operators, `1` native temporal
+  definition, and `fallback_count = 0`.
+- [x] Complete paired all-core runs with no errors and exact
+  `9,718,336/501,552` generated/distinct counts. The public ReleaseFast
+  benchmark is TLC `3.950s` versus tlzig `1.713s`, a `2.31x` speedup;
+  separately measured peak RSS is about `1.67 GB` versus `423 MB`.
+- [x] Add APbcastFolklore as a default representative all-core benchmark and
+  keep one-core disabled. The related nineteen-minute temporal model remains
+  opt-in.
+
+## 2026-07-21 Cross-Pool Nested EXCEPT Gate
+
+- [x] Fix every fused single- and double-EXCEPT equality leaf to localize a
+  canonical-state operand before invoking a generated updater. Generated
+  updater arguments now always belong to the evaluation pool they are decoded
+  against; primitive values retain the allocation-free path.
+- [x] Add an assertion-enabled regression with a function-valued state whose
+  outer EXCEPT updates a nested record field across distinct state/evaluation
+  pools. The focused test passes and the prior Debug assertion identifies the
+  exact invalid-pool boundary.
+- [x] Revalidate strict `ElevatorLivenessMedium` in ReleaseFast at exact
+  `14,296/4,122` counts: TLC-auto `4.260s`, tlzig-AOT-auto `0.162s` (`26.3x`).
+
+## 2026-07-21 Bounded Power-Set Action Gate
+
+- [x] Lower the generic action pattern
+  `x \in SUBSET Base /\ x \subseteq Upper /\ Lower \subseteq x` to direct
+  enumeration of `Lower \cup SUBSET((Base \cap Upper) \ Lower)`. The action
+  compiler accepts only leading, bound-independent, unprimed, nonvolatile
+  constraints; no model name or user-operator override is involved.
+- [x] Add assertion-enabled compiler coverage and pass all `202` tests. A
+  diagnostic ReleaseFast smoke run confirms bosco's `Receive` action contains
+  one bounded power-set choice followed directly by the primed assignment.
+- [x] Complete exact all-core ReleaseFast bosco parity at
+  `29,223,200/1,072,452` generated/distinct states. The public benchmark moved
+  tlzig from the recorded `43.04s` baseline to `6.938s` (`6.20x` faster), while
+  TLC-auto took `59.855s`; strict tlzig is `8.63x` faster than TLC.
+- [x] Revalidate the `APbosco` wrapper at the same exact counts. Strict tlzig
+  takes `6.64s` versus the recorded TLC-auto `67.83s` (`10.22x`). Both generated
+  translations report `27` operators, `1` temporal-native definition, and
+  `fallback_count = 0`.
+- [x] Add bosco as a generated-preferred default benchmark with one-core runs
+  disabled. The base benchmark runs TLC once and compares it directly with the
+  strict AOT all-core path.
+- [ ] Continue reconciling the remaining bounded primary-corpus rows, starting
+  with the FiniteMonotonic annotation wrappers. Exact successful rows require
+  equal generated/distinct counts; first-error rows require matching outcomes.
+
+## 2026-07-21 Recursive LET And PaxosCommit Gate
+
+- [x] Generate local recursive functions of the form
+  `LET F[x \in S] == ... F[...] ... IN ...` as self-capturing generated
+  operators. Support analysis, helper emission, and runtime capture layout use
+  the same bounded lexical frame; no model-specific name or override is used.
+- [x] Add assertion-enabled recursive-LET coverage and pass the full test suite.
+  PaxosCommit now emits `16` generated operators, `1` native definition, and
+  `fallback_count = 0` instead of rejecting `Maximum`, `Phase2a`, and `PCNext`.
+- [x] Complete full ReleaseFast all-core PaxosCommit parity at exact
+  `1,321,761` distinct states. TLC reports `16,959,159` raw generated witnesses
+  in `13.202s`; strict AOT tlzig reports `15,242,979` in `11.914s`.
+- [x] Prove the raw-count difference is duplicate-witness accounting on the
+  reduced complete graph: exact `1,461` states, `1` initial state, and `5,136`
+  semantic edges; TLC retains `9,935` raw edges, including `4,799` duplicates.
+- [ ] Profile and optimize the full strict PaxosCommit row from the recorded
+  `11.914s` baseline. The current `1.11x` speedup is correct but below the
+  project target of at least `2x` versus TLC-auto.
+
+## 2026-07-21 EWD998Chan Symbolic Set And Parallel Temporal Gate
+
+- [x] Preserve set operations symbolically when a record, tuple, function, or
+  nested set domain contains an unmaterializable range. `Message == TokenMsg
+  \cup BasicMsg` therefore remains a lazy union instead of trying to enumerate
+  a record field over all `Int`; structural sequence membership stays exact.
+- [x] Generate imported actions containing `UNCHANGED` computed INSTANCE
+  substitutions. EWD998Chan now emits `35` operators, uses `3` native built-in
+  definitions, and has `fallback_count = 0` without model-specific runtime
+  behavior.
+- [x] Prove complete N=2 graph parity: exact `7,150` states, `32` initial
+  states, `27,550` semantic edges, and `6,410` weak-fair `System` edges. TLC's
+  DOT has `37,084` raw edges, including `9,534` duplicate witnesses.
+- [x] Parallelize read-only temporal state, `ENABLED`, and boxed-action
+  evaluation across isolated evaluator/value-pool workers. Assertion-enabled
+  coverage exercises a 256-state four-worker boxed refinement; all `206`
+  tests pass.
+- [x] Complete the original N=3 configuration at exact `1,524,022` distinct
+  states with both temporal checks satisfied. ReleaseFast all-core tlzig
+  improved from `124.150s` to `21.868s` (`5.68x`) and is `3.12x` faster than
+  TLC-auto at `68.32s`.
+- [x] Generate MultiPaxosSmall strictly with `60` generated operators, `1`
+  native temporal definition, and `fallback_count = 0`.
+- [x] Prove complete MultiPaxosSmall quotient-graph parity under
+  `SymmetricPerms`: exact `343,796` states, `1` initial state, and `735,847`
+  unique semantic edges. TLC's DOT retains `736,011` raw edges, including
+  `164` duplicate action witnesses; tlzig stores each semantic edge once.
+- [x] Make deterministic zero-argument finite domains eligible for the
+  generated eager cache and raise the bounded cache admission/storage limits
+  consistently. `Messages` now warms once at `10,630` values and `20,920`
+  string bytes instead of being rebuilt in every `TypeOK` evaluation.
+- [x] Profile and optimize the clean all-core ReleaseFast MultiPaxosSmall row.
+  Generic codegen now fuses membership in a pure named set union into
+  short-circuit membership against the original symbolic leaves, evaluating
+  the element once. `TypeOK` checks five record-set domains instead of scanning
+  a materialized `2,214`-record union. Repeated exact paired runs measured TLC
+  `2.719s/2.753s` and tlzig `1.338s/1.311s`; the latter is `2.10x` faster than
+  paired TLC and `2.12x` faster than the pre-fusion tlzig `2.773s`. The matcher
+  is structural, rejects volatile TLC expressions, and has no model-name
+  dispatch or user-operator override.
+- [ ] Continue strict primary-corpus generation with NanoLarge; require zero
+  fallback and paired semantic evidence before performance work.
+
+## 2026-07-28 Generic Closure, Recursive Fold, And Full Gate
+
+- [x] Bound generated action-call memo admission structurally. Empty memo
+  lookups return before hashing, and action-local calls use the same 16-node
+  aggregate budget as the evaluator instead of hashing large recursive
+  arguments. No model flag or operator name selects this path.
+- [x] Lower the structural recursive finite-set sum
+  `IF S = {} THEN 0 ELSE f[x] + Sum(f, S \ {x})`, including swapped addition
+  operands, to one allocation-free iterable fold. The matcher verifies the
+  recursive call, CHOOSE binding, parameter identity, and set subtraction;
+  near matches retain ordinary generated code.
+- [x] Restore exact GameOfLife parity at `131,072/65,536` and improve strict
+  all-core ReleaseFast from the recorded tlzig `2.581s` baseline to `0.788s`.
+  The paired TLC run took `2.573s`, so current tlzig is `3.27x` faster than TLC
+  and `3.28x` faster than its pre-fix baseline.
+- [x] Fix optional lexical captures in generated lazy operators. Closure
+  construction now honors each expression's required-argument mask and fills
+  unused slots without requiring a binding. The new opt-in BTree benchmark
+  completes exact `2,820,091/374,727`; TLC-auto took `4.066s` and strict tlzig
+  took `0.954s` (`4.26x`).
+- [x] Directly lower standard `IsFiniteSet` calls, including a constant-slot
+  Boolean path that does not clone aggregate constants during TypeOK checks.
+  Generated artifacts now contain zero `runtime.native` or
+  `runtime.native_binary` string-dispatch calls.
+- [x] Remove the benchmark-only generated-expression feature switch. A linked
+  strict model now always uses its complete generated operator and expression
+  tables, matching the production CLI; benchmark compilation rejects any
+  artifact with `fallback_count != 0`. A no-switch GameOfLife gate remains
+  exact at `131,072/65,536`, TLC `1.673s`, tlzig `0.682s`.
+- [x] Pass all `211` assertion-enabled tests, compile all `40` stored generated
+  artifacts through the ReleaseFast CLI and benchmark entry points, and verify
+  ABI `2` plus `fallback_count = 0` for every artifact. Production runtime
+  source contains no audited user-spec dispatch names.
+- [x] Pass the complete default ReleaseFast benchmark. Every strict AOT row
+  reports zero fallback and is faster than its paired TLC-auto run. Exact
+  examples include Slush Medium `24.807s/18.591s`, GameOfLife
+  `2.573s/0.788s`, Elevator liveness `4.637s/0.181s`, Bosco
+  `55.167s/6.778s`, ClientCentric `2.328s/0.429s`, and SingleLog
+  MDBLinearizability `2.040s/0.156s` (TLC/tlzig).
+- [x] Complete a fresh eight-worker paired 280-configuration audit:
+  `142` exact, `22` outcome-exact, `53` bounded, `61` TLC-invalid, and `2`
+  non-model harnesses, with zero hard gaps, outcome mismatches, or exhaustive
+  distinct-state mismatches. The two initially unresolved trace-tool configs
+  were rerun for 60 seconds and are rejected by current Java TLC before model
+  checking because of its Java trace-serializer signature.
+- [ ] Continue converting the `53` short-gate bounded rows to independent
+  exhaustive evidence. Existing exact long-run evidence remains valid, but a
+  bounded row is never itself described as exhaustive.
+
+## 2026-08-03 Shared State-Path Predicate Gate
+
+- [x] Fuse the generic adjacent predicate shape
+  `"field" \in DOMAIN state_path /\ state_path.record_field = argument` in
+  generated Boolean functions. The matcher requires the same structural path,
+  a string-literal domain member, and a delayed operator argument on the
+  equality side. It preserves left-to-right short-circuit/error order and has
+  no model-name or user-operator dispatch.
+- [x] Check string membership in record/function domains without materializing
+  a `DOMAIN` set. Successful predicates resolve the shared state path once,
+  then perform the field equality directly across pools; failed domain checks
+  do not force the delayed equality argument. The hot path performs no heap
+  allocation.
+- [x] Retain exact Storage exhaustive parity at
+  `8,723,634/1,078,623` tlzig generated/distinct states. Fresh paired
+  ReleaseFast all-core timing is TLC `32.385s` versus tlzig `10.529s`
+  (`3.08x`); a direct tlzig repeat is `10.579s`. This is `12-13%` faster than
+  the immediately preceding accepted tlzig range (`11.965-12.095s`) and
+  `27.9%` faster than the pre-path-lowering `14.606s` baseline.
+- [x] Pass all `221` assertion-enabled tests, the full default ReleaseFast
+  benchmark, the ReleaseFast build, formatting/diff checks, and strict audits.
+  Every regenerated default artifact reports `fallbacks=0`; MDBTLA coverage
+  remains all `11` TLC-valid upstream configurations covered, with the other
+  two rejected by TLC for missing `Timestamps` assignments.
+- [x] Reject and remove primitive-leaf fingerprint replacement. Strong scalar
+  mixing plus Wyhash preserved exact counts but regressed Storage exhaustive to
+  `10.766s`, `10.796s`, and `11.123s`; the accepted FNV leaf code remains.
+- [x] Lower membership in `DOMAIN state_path` and
+  `DOMAIN state_path.record_field` directly for functions, tuples, and records.
+  The generic runtime resolves the path once and tests the domain in place,
+  avoiding construction of an intermediate set. All `222` assertion-enabled
+  tests and the complete default ReleaseFast benchmark pass with exact counts
+  and zero generated fallback.
+- [x] Improve exact Storage exhaustive further to a paired `10.162s`, with
+  isolated repeats of `10.016s` and `10.496s`. This is approximately `3%`
+  faster than the preceding shared-path lowering and `30%` faster than the
+  pre-path `14.606s` baseline. TLC and tlzig retain exact `1,078,623` distinct
+  states.
+- [x] Reject and remove string-literal-only domain-membership helpers. A paired
+  run reached `9.654s`, but isolated A/B runs were slower at
+  `10.365s/10.836s` versus `9.971s/10.003s` for the generic direct-domain
+  binary. The redundant specialization and API were removed.
+- [ ] Continue with patch-aware candidate construction/fingerprinting. Direct
+  writes into append-only candidate pools remain unsafe across failed action
+  branches; any accepted design must provide bounded rollback or a typed patch
+  lifetime before removing the current reconstruct/clone/hash traversals.

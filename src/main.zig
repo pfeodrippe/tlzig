@@ -193,8 +193,9 @@ pub fn main(init: std.process.Init.Minimal) void {
         defer roots.deinit(std.heap.page_allocator);
         if (default_cfg) {
             const cfg = config.Config.from_module(&arena, module);
-            module.config_replacements = build_codegen_replacements(
+            module.config_replacements = config.build_codegen_replacements(
                 &arena,
+                module,
                 cfg,
             ) catch {
                 std.debug.print("failed to allocate config replacements\n", .{});
@@ -213,8 +214,9 @@ pub fn main(init: std.process.Init.Minimal) void {
                 std.debug.print("failed to parse config\n", .{});
                 std.process.exit(1);
             };
-            module.config_replacements = build_codegen_replacements(
+            module.config_replacements = config.build_codegen_replacements(
                 &arena,
+                module,
                 cfg,
             ) catch {
                 std.debug.print("failed to allocate config replacements\n", .{});
@@ -292,12 +294,16 @@ pub fn main(init: std.process.Init.Minimal) void {
             std.process.exit(1);
         };
     };
-    module.config_replacements = build_codegen_replacements(&arena, cfg) catch {
+    module.config_replacements = config.build_codegen_replacements(
+        &arena,
+        module,
+        cfg,
+    ) catch {
         std.debug.print("failed to allocate config replacements\n", .{});
         std.process.exit(1);
     };
     if (generated_model.generated_count > 0 and
-        !generated_config_covers(cfg))
+        !generated_config_covers(module, cfg))
     {
         std.debug.print(
             "generated model does not cover every configured root\n",
@@ -343,6 +349,8 @@ pub fn main(init: std.process.Init.Minimal) void {
     };
     defer ch.deinit();
     ch.set_scratch_growable(unlimited_memory);
+    const diagnostics = std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null;
+    ch.set_diagnostics(diagnostics);
     ch.set_progress_interval(progress_interval_states);
 
     const result = ch.check() catch |err| {
@@ -371,6 +379,11 @@ pub fn main(init: std.process.Init.Minimal) void {
             ch.successor_attempts,
             ch.distinct,
         });
+        if (diagnostics) {
+            if (@errorReturnTrace()) |trace| {
+                std.debug.dumpErrorReturnTrace(trace);
+            }
+        }
         std.process.exit(1);
     };
 
@@ -380,33 +393,26 @@ pub fn main(init: std.process.Init.Minimal) void {
             std.process.exit(1);
         };
     }
-
-    _ = std.c.printf("generated=%llu distinct=%llu\n", result.generated, result.distinct);
-}
-
-fn build_codegen_replacements(
-    arena: *Arena,
-    cfg: config.Config,
-) ![]const ast.ConfigReplacement {
-    if (cfg.constants.len == 0) return &.{};
-    const replacements = try arena.alloc(
-        ast.ConfigReplacement,
-        cfg.constants.len,
-    );
-    for (cfg.constants, replacements) |assignment, *replacement| {
-        const value = std.mem.trim(u8, assignment.expr, " \t");
-        replacement.* = .{
-            .name = assignment.name,
-            .value = value,
-            .is_substitution = assignment.is_substitution,
-            .kind = if (assignment.is_substitution and
-                config.is_operator_alias(value))
-                .alias
-            else
-                .constant,
+    if (std.process.Environ.getPosix(init.environ, "TLZIG_DUMP_FINGERPRINTS")) |dump_path| {
+        ch.dump_fingerprints(dump_path) catch |err| {
+            std.debug.print("failed to dump fingerprints: {any}\n", .{err});
+            std.process.exit(1);
         };
     }
-    return replacements;
+    if (std.process.Environ.getPosix(init.environ, "TLZIG_DUMP_GRAPH")) |dump_path| {
+        ch.dump_graph(dump_path) catch |err| {
+            std.debug.print("failed to dump graph: {any}\n", .{err});
+            std.process.exit(1);
+        };
+    }
+    if (std.process.Environ.getPosix(init.environ, "TLZIG_DUMP_INITIAL_STATES")) |dump_path| {
+        ch.dump_initial_states(dump_path) catch |err| {
+            std.debug.print("failed to dump initial states: {any}\n", .{err});
+            std.process.exit(1);
+        };
+    }
+
+    _ = std.c.printf("generated=%llu distinct=%llu\n", result.generated, result.distinct);
 }
 
 fn format_zig(
@@ -416,7 +422,7 @@ fn format_zig(
     const source_z = try allocator.allocSentinel(u8, source.len, 0);
     defer allocator.free(source_z);
     @memcpy(source_z, source);
-    var tree = try std.zig.Ast.parse(allocator, source_z, .zig);
+    var tree = try std.zig.Ast.parse(allocator, source_z, .{});
     defer tree.deinit(allocator);
     if (tree.errors.len != 0) return error.InvalidGeneratedZig;
     return tree.renderAlloc(allocator);
@@ -441,6 +447,9 @@ fn append_config_roots(
         try roots.append(std.heap.page_allocator, name);
     }
     if (cfg.symmetry_name) |name| {
+        try roots.append(std.heap.page_allocator, name);
+    }
+    if (cfg.view_name) |name| {
         try roots.append(std.heap.page_allocator, name);
     }
     try roots.appendSlice(std.heap.page_allocator, cfg.invariants);
@@ -478,9 +487,12 @@ fn find_definition(module: ast.Module, name: []const u8) ?ast.Definition {
     return null;
 }
 
-fn generated_config_covers(cfg: config.Config) bool {
+fn generated_config_covers(
+    module: ast.Module,
+    cfg: config.Config,
+) bool {
     if (generated_model.config_replacements_hash !=
-        config_replacements_hash(cfg))
+        config.codegen_replacements_hash(module.config_replacements))
     {
         return false;
     }
@@ -488,6 +500,7 @@ fn generated_config_covers(cfg: config.Config) bool {
     if (!generated_root_covered(cfg.init_name)) return false;
     if (!generated_root_covered(cfg.next_name)) return false;
     if (!generated_root_covered(cfg.symmetry_name)) return false;
+    if (!generated_root_covered(cfg.view_name)) return false;
     for (cfg.invariants) |name| {
         if (!generated_root_covered(name)) return false;
     }
@@ -501,28 +514,6 @@ fn generated_config_covers(cfg: config.Config) bool {
         if (!generated_root_covered(name)) return false;
     }
     return true;
-}
-
-fn config_replacements_hash(cfg: config.Config) u64 {
-    var hasher = std.hash.Wyhash.init(0x544c_5a49_475f_4347);
-    for (cfg.constants) |assignment| {
-        const value = std.mem.trim(u8, assignment.expr, " \t");
-        hash_bytes(&hasher, assignment.name);
-        hash_bytes(&hasher, value);
-        hasher.update(&.{if (assignment.is_substitution) 1 else 0});
-        hasher.update(&.{if (assignment.is_substitution and
-            config.is_operator_alias(value))
-            1
-        else
-            2});
-    }
-    return hasher.final();
-}
-
-fn hash_bytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
-    const len: u64 = bytes.len;
-    hasher.update(std.mem.asBytes(&len));
-    hasher.update(bytes);
 }
 
 fn generated_root_covered(optional_name: ?[]const u8) bool {

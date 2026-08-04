@@ -13,6 +13,7 @@ const Arena = @import("arena.zig").Arena;
 const Error = @import("err.zig").Error;
 const generated_runtime = @import("generated_runtime.zig");
 const codegen = @import("codegen.zig");
+const set_patterns = @import("set_patterns.zig");
 
 const InlinedBoundExpression = struct {
     vars: []const ast.BoundVar,
@@ -65,6 +66,17 @@ fn arguments_reference_identifier(
         }
     }
     return false;
+}
+
+fn value_offset(pool: *const ValuePool, pointer: [*]Value) u32 {
+    const base = @intFromPtr(pool.values.ptr);
+    const address = @intFromPtr(pointer);
+    assert(address >= base);
+    const bytes = address - base;
+    assert(bytes % @sizeOf(Value) == 0);
+    const offset: u32 = @intCast(bytes / @sizeOf(Value));
+    assert(offset <= pool.value_count);
+    return offset;
 }
 
 fn inline_bound_expression(
@@ -727,6 +739,7 @@ pub const ActionStep = union(enum(u8)) {
     enabled_check: EnabledCheck,
     mark_action: MarkAction,
     choose: Choose,
+    bounded_power_set_choose: BoundedPowerSetChoose,
     branch: Branch,
     if_branch: IfBranch,
     case_branch: CaseBranch,
@@ -736,6 +749,75 @@ pub const ActionStep = union(enum(u8)) {
     unchanged: Unchanged,
 };
 
+pub fn steps_contain_composition(steps: []const ActionStep) bool {
+    return steps_contain_composition_depth(steps, 0);
+}
+
+fn steps_contain_composition_depth(
+    steps: []const ActionStep,
+    depth: u32,
+) bool {
+    if (depth >= 64) return true;
+    for (steps) |step| {
+        const nested = switch (step) {
+            .compose => return true,
+            .enabled_check => |enabled| steps_contain_composition_depth(
+                enabled.steps,
+                depth + 1,
+            ),
+            .choose => |choose| steps_contain_composition_depth(
+                choose.body_steps,
+                depth + 1,
+            ),
+            .bounded_power_set_choose => |choose| steps_contain_composition_depth(
+                choose.body_steps,
+                depth + 1,
+            ),
+            .branch => |branch| blk: {
+                for (branch.options) |option| {
+                    if (steps_contain_composition_depth(option, depth + 1)) {
+                        break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .if_branch => |conditional| steps_contain_composition_depth(
+                conditional.then_steps,
+                depth + 1,
+            ) or steps_contain_composition_depth(
+                conditional.else_steps,
+                depth + 1,
+            ),
+            .case_branch => |case_branch| blk: {
+                for (case_branch.arms) |arm| {
+                    if (steps_contain_composition_depth(arm.steps, depth + 1)) {
+                        break :blk true;
+                    }
+                }
+                if (case_branch.otherwise_steps) |otherwise| {
+                    if (steps_contain_composition_depth(otherwise, depth + 1)) {
+                        break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .call => |call| steps_contain_composition_depth(
+                call.body_steps,
+                depth + 1,
+            ),
+            .assign_var,
+            .assign_prime,
+            .condition,
+            .mark_action,
+            .let_bind,
+            .unchanged,
+            => false,
+        };
+        if (nested) return true;
+    }
+    return false;
+}
+
 pub const AssignVar = struct {
     var_name: []const u8,
     var_index: u32,
@@ -743,12 +825,7 @@ pub const AssignVar = struct {
     is_membership: bool,
 };
 
-pub const AssignPrime = struct {
-    var_name: []const u8,
-    var_index: u32,
-    expr: CompiledExpr,
-    is_membership: bool,
-};
+pub const AssignPrime = AssignVar;
 
 pub const Unchanged = struct {
     var_name: []const u8,
@@ -787,10 +864,30 @@ pub const Choose = struct {
     body_steps: []const ActionStep,
 };
 
+pub const BoundedPowerSetChoose = struct {
+    var_name: []const u8,
+    base: CompiledExpr,
+    upper: CompiledExpr,
+    lower: ?CompiledExpr,
+    body_steps: []const ActionStep,
+};
+
+pub const ActionStateArgument = struct {
+    variable_name: []const u8,
+    variable_index: u32,
+    primed: bool,
+};
+
+const ActionParameterBinding = struct {
+    name: []const u8,
+    state_argument: ?ActionStateArgument,
+};
+
 pub const Call = struct {
     name: []const u8,
     params: []const []const u8,
     args: []const CompiledExpr,
+    state_args: []const ?ActionStateArgument,
     body_steps: []const ActionStep,
 };
 
@@ -833,6 +930,12 @@ pub const CompiledNext = struct {
     steps: []const ActionStep,
 };
 
+pub const CandidateSink = struct {
+    target: *StateBuffer,
+    context: *anyopaque,
+    consume: *const fn (*anyopaque, *StateBuffer) Error!void,
+};
+
 pub const StateBuffer = struct {
     storage: []u32,
     items: []u32,
@@ -863,6 +966,7 @@ pub const ActionCompiler = struct {
     arena: *Arena,
     evaluator: Evaluator,
     canonical_names: *CanonicalNames,
+    action_parameters: []const ActionParameterBinding = &.{},
 
     const CanonicalNames = struct {
         arena: *Arena,
@@ -896,6 +1000,7 @@ pub const ActionCompiler = struct {
             .arena = arena,
             .evaluator = evaluator,
             .canonical_names = canonical_names,
+            .action_parameters = &.{},
         };
     }
 
@@ -903,7 +1008,13 @@ pub const ActionCompiler = struct {
         var steps = std.ArrayList(ActionStep).empty;
         defer steps.deinit(std.heap.page_allocator);
         try self.collect_steps(expr, &steps, true);
-        return CompiledInit{ .steps = try self.dup_slice(ActionStep, steps.items) };
+        const compiled = CompiledInit{
+            .steps = try self.dup_slice(ActionStep, steps.items),
+        };
+        if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null) {
+            dump_action_steps("INIT", compiled.steps, 0);
+        }
+        return compiled;
     }
 
     pub fn compile_next(self: ActionCompiler, expr: *ast.Expr) !CompiledNext {
@@ -926,6 +1037,61 @@ pub const ActionCompiler = struct {
             }
         }
         return false;
+    }
+
+    fn action_parameter(
+        self: ActionCompiler,
+        name: []const u8,
+    ) ?ActionParameterBinding {
+        for (self.action_parameters) |binding| {
+            if (std.mem.eql(u8, binding.name, name)) return binding;
+        }
+        return null;
+    }
+
+    fn module_state_argument(
+        self: ActionCompiler,
+        name: []const u8,
+        primed: bool,
+    ) ?ActionStateArgument {
+        const resolved = self.evaluator.resolve_alias(name);
+        const index = self.evaluator.find_variable(resolved) orelse
+            return null;
+        assert(index < self.evaluator.module.variables.len);
+        return .{
+            .variable_name = self.evaluator.module.variables[index],
+            .variable_index = index,
+            .primed = primed,
+        };
+    }
+
+    fn resolve_state_argument(
+        self: ActionCompiler,
+        expr: *const ast.Expr,
+    ) ?ActionStateArgument {
+        return switch (expr.*) {
+            .ident => |name| if (self.action_parameter(name)) |binding|
+                binding.state_argument
+            else
+                self.module_state_argument(name, false),
+            .primed => |name| if (self.action_parameter(name)) |binding| blk: {
+                var target = binding.state_argument orelse break :blk null;
+                if (target.primed) break :blk null;
+                target.primed = true;
+                break :blk target;
+            } else self.module_state_argument(name, true),
+            else => null,
+        };
+    }
+
+    fn assignment_target(
+        self: ActionCompiler,
+        expr: *const ast.Expr,
+        is_init: bool,
+    ) ?ActionStateArgument {
+        const target = self.resolve_state_argument(expr) orelse return null;
+        if (is_init == target.primed) return null;
+        return target;
     }
 
     fn compile_expr(self: ActionCompiler, expr: *ast.Expr) !CompiledExpr {
@@ -1039,6 +1205,10 @@ pub const ActionCompiler = struct {
         switch (expr.*) {
             .primed, .primed_expr, .unchanged, .unchanged_expr => return true,
             .ident => |name| {
+                if (self.action_parameter(name)) |binding| {
+                    const target = binding.state_argument orelse return false;
+                    return is_init != target.primed;
+                }
                 const resolved = self.evaluator.resolve_alias(name);
                 if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null and
                     !std.mem.eql(u8, name, resolved))
@@ -1235,42 +1405,58 @@ pub const ActionCompiler = struct {
                     }
                 }
                 if (b.op == .eq) {
-                    if (!is_init and b.left.* == .primed) {
-                        const name = self.evaluator.resolve_alias(b.left.*.primed);
-                        const index = self.evaluator.find_variable(name) orelse {
-                            std.debug.print("unknown primed action variable: {s}\n", .{name});
-                            return Error.UndefinedSymbol;
+                    if (self.assignment_target(b.left, is_init)) |target| {
+                        const assignment = AssignVar{
+                            .var_name = try self.canonical_name(
+                                target.variable_name,
+                            ),
+                            .var_index = target.variable_index,
+                            .expr = try self.compile_expr(b.right),
+                            .is_membership = false,
                         };
-                        try steps.append(std.heap.page_allocator, ActionStep{ .assign_prime = .{ .var_name = try self.canonical_name(name), .var_index = index, .expr = try self.compile_expr(b.right), .is_membership = false } });
-                        return;
-                    }
-                    if (is_init and b.left.* == .ident) {
-                        const name = self.evaluator.resolve_alias(b.left.*.ident);
-                        const index = self.evaluator.find_variable(name) orelse {
-                            std.debug.print("unknown init variable: {s}\n", .{name});
-                            return Error.UndefinedSymbol;
-                        };
-                        try steps.append(std.heap.page_allocator, ActionStep{ .assign_var = .{ .var_name = try self.canonical_name(name), .var_index = index, .expr = try self.compile_expr(b.right), .is_membership = false } });
+                        try steps.append(
+                            std.heap.page_allocator,
+                            if (is_init)
+                                ActionStep{ .assign_var = assignment }
+                            else
+                                ActionStep{ .assign_prime = assignment },
+                        );
                         return;
                     }
                 }
                 if (b.op == .in) {
-                    if (is_init and b.left.* == .ident) {
-                        const name = self.evaluator.resolve_alias(b.left.*.ident);
-                        const index = self.evaluator.find_variable(name) orelse {
-                            std.debug.print("unknown init membership variable: {s}\n", .{name});
-                            return Error.UndefinedSymbol;
+                    if (self.assignment_target(b.left, is_init)) |target| {
+                        if (b.right.* == .set_filter and
+                            set_patterns.hereditary_power_set_filter(
+                                b.right.set_filter,
+                            ) == null)
+                        {
+                            try self.append_filtered_membership(
+                                steps,
+                                try self.canonical_name(
+                                    target.variable_name,
+                                ),
+                                target.variable_index,
+                                b.right.set_filter,
+                                !is_init,
+                            );
+                            return;
+                        }
+                        const assignment = AssignVar{
+                            .var_name = try self.canonical_name(
+                                target.variable_name,
+                            ),
+                            .var_index = target.variable_index,
+                            .expr = try self.compile_expr(b.right),
+                            .is_membership = true,
                         };
-                        try steps.append(std.heap.page_allocator, ActionStep{ .assign_var = .{ .var_name = try self.canonical_name(name), .var_index = index, .expr = try self.compile_expr(b.right), .is_membership = true } });
-                        return;
-                    }
-                    if (!is_init and b.left.* == .primed) {
-                        const name = self.evaluator.resolve_alias(b.left.*.primed);
-                        const index = self.evaluator.find_variable(name) orelse {
-                            std.debug.print("unknown primed membership variable: {s}\n", .{name});
-                            return Error.UndefinedSymbol;
-                        };
-                        try steps.append(std.heap.page_allocator, ActionStep{ .assign_prime = .{ .var_name = try self.canonical_name(name), .var_index = index, .expr = try self.compile_expr(b.right), .is_membership = true } });
+                        try steps.append(
+                            std.heap.page_allocator,
+                            if (is_init)
+                                ActionStep{ .assign_var = assignment }
+                            else
+                                ActionStep{ .assign_prime = assignment },
+                        );
                         return;
                     }
                 }
@@ -1306,6 +1492,51 @@ pub const ActionCompiler = struct {
                     q.vars.len > 0 and
                     self.is_action_expr(q.body, is_init))
                 {
+                    if (bounded_power_set_pattern(
+                        self,
+                        q,
+                        is_init,
+                    )) |bounded| {
+                        var body_steps = std.ArrayList(ActionStep).empty;
+                        defer body_steps.deinit(std.heap.page_allocator);
+                        var operands: [256]*ast.Expr = undefined;
+                        var operand_count: usize = 0;
+                        flatten_conjunction(
+                            q.body,
+                            &operands,
+                            &operand_count,
+                        );
+                        for (operands[0..operand_count]) |operand| {
+                            if (operand == bounded.upper_constraint) continue;
+                            if (bounded.lower_constraint) |constraint| {
+                                if (operand == constraint) continue;
+                            }
+                            try self.collect_steps(
+                                operand,
+                                &body_steps,
+                                is_init,
+                            );
+                        }
+                        try steps.append(
+                            std.heap.page_allocator,
+                            .{ .bounded_power_set_choose = .{
+                                .var_name = try self.canonical_name(
+                                    q.vars[0].name,
+                                ),
+                                .base = try self.compile_expr(bounded.base),
+                                .upper = try self.compile_expr(bounded.upper),
+                                .lower = if (bounded.lower) |lower|
+                                    try self.compile_expr(lower)
+                                else
+                                    null,
+                                .body_steps = try self.dup_slice(
+                                    ActionStep,
+                                    body_steps.items,
+                                ),
+                            } },
+                        );
+                        return;
+                    }
                     var body_steps = std.ArrayList(ActionStep).empty;
                     defer body_steps.deinit(std.heap.page_allocator);
                     try self.collect_steps(q.body, &body_steps, is_init);
@@ -1552,7 +1783,30 @@ pub const ActionCompiler = struct {
                             }
                             var body_steps = std.ArrayList(ActionStep).empty;
                             defer body_steps.deinit(std.heap.page_allocator);
-                            try self.collect_steps(
+                            const state_args = try self.arena.alloc(
+                                ?ActionStateArgument,
+                                ap.args.len,
+                            );
+                            const parameter_bindings = try self.arena.alloc(
+                                ActionParameterBinding,
+                                def.params.len,
+                            );
+                            for (
+                                def.params,
+                                ap.args,
+                                state_args,
+                                parameter_bindings,
+                            ) |param, arg, *state_arg, *binding| {
+                                state_arg.* = self.resolve_state_argument(arg);
+                                binding.* = .{
+                                    .name = param,
+                                    .state_argument = state_arg.*,
+                                };
+                            }
+                            var call_compiler = self;
+                            call_compiler.action_parameters =
+                                parameter_bindings;
+                            try call_compiler.collect_steps(
                                 def.body,
                                 &body_steps,
                                 is_init,
@@ -1565,6 +1819,7 @@ pub const ActionCompiler = struct {
                                         def.params,
                                     ),
                                     .args = try self.compile_exprs(ap.args),
+                                    .state_args = state_args,
                                     .body_steps = try self.dup_slice(
                                         ActionStep,
                                         body_steps.items,
@@ -1679,6 +1934,59 @@ pub const ActionCompiler = struct {
         } };
     }
 
+    fn append_filtered_membership(
+        self: ActionCompiler,
+        steps: *std.ArrayList(ActionStep),
+        variable_name: []const u8,
+        variable_index: u32,
+        filter: *ast.SetFilter,
+        primed: bool,
+    ) !void {
+        assert(filter.vars.len > 0);
+        const element = try self.filtered_element_expr(filter.vars);
+        const compiled_element = try self.compile_expr(element);
+        const body = try self.arena.alloc(ActionStep, 2);
+        body[0] = .{ .condition = try self.compile_expr(filter.pred) };
+        body[1] = if (primed)
+            .{ .assign_prime = .{
+                .var_name = variable_name,
+                .var_index = variable_index,
+                .expr = compiled_element,
+                .is_membership = false,
+            } }
+        else
+            .{ .assign_var = .{
+                .var_name = variable_name,
+                .var_index = variable_index,
+                .expr = compiled_element,
+                .is_membership = false,
+            } };
+        try steps.append(
+            std.heap.page_allocator,
+            try self.compile_existential(filter.vars, body),
+        );
+    }
+
+    fn filtered_element_expr(
+        self: ActionCompiler,
+        vars: []const ast.BoundVar,
+    ) !*ast.Expr {
+        assert(vars.len > 0);
+        if (vars.len == 1) {
+            const element = try self.arena.alloc_object(ast.Expr);
+            element.* = .{ .ident = try self.canonical_name(vars[0].name) };
+            return element;
+        }
+        const items = try self.arena.alloc(*ast.Expr, vars.len);
+        for (vars, items) |bound, *item| {
+            item.* = try self.arena.alloc_object(ast.Expr);
+            item.*.* = .{ .ident = try self.canonical_name(bound.name) };
+        }
+        const element = try self.arena.alloc_object(ast.Expr);
+        element.* = .{ .tuple = items };
+        return element;
+    }
+
     fn dup_slice(self: ActionCompiler, comptime T: type, items: []const T) ![]const T {
         const copy = try self.arena.alloc(T, items.len);
         @memcpy(copy, items);
@@ -1715,6 +2023,13 @@ fn dump_action_steps(label: []const u8, steps: []const ActionStep, depth: u32) v
             ),
             .choose => |choose| {
                 std.debug.print("{s}: choose {s}\n", .{ label, choose.var_name });
+                dump_action_steps(label, choose.body_steps, depth + 1);
+            },
+            .bounded_power_set_choose => |choose| {
+                std.debug.print(
+                    "{s}: bounded power-set choose {s}\n",
+                    .{ label, choose.var_name },
+                );
                 dump_action_steps(label, choose.body_steps, depth + 1);
             },
             .branch => |branch| {
@@ -1778,6 +2093,86 @@ fn flatten_conjunction(
     assert(count.* < operands.len);
     operands[count.*] = expr;
     count.* += 1;
+}
+
+const BoundedPowerSetPattern = struct {
+    base: *ast.Expr,
+    upper: *ast.Expr,
+    lower: ?*ast.Expr,
+    upper_constraint: *ast.Expr,
+    lower_constraint: ?*ast.Expr,
+};
+
+/// Recognizes an existential power-set choice constrained by an upper set and,
+/// optionally, a required lower set. The executor can enumerate only values
+/// between those bounds instead of materializing and filtering the full power
+/// set.
+fn bounded_power_set_pattern(
+    compiler: ActionCompiler,
+    quantifier: *const ast.Quantifier,
+    is_init: bool,
+) ?BoundedPowerSetPattern {
+    if (quantifier.kind != .exists or quantifier.vars.len != 1) return null;
+    const bound = quantifier.vars[0];
+    if (bound.domain.* != .unary or
+        bound.domain.unary.op != .subset)
+    {
+        return null;
+    }
+
+    var operands: [256]*ast.Expr = undefined;
+    var operand_count: usize = 0;
+    flatten_conjunction(
+        quantifier.body,
+        &operands,
+        &operand_count,
+    );
+    if (operand_count == 0 or operands[0].* != .binary) return null;
+    const upper_binary = operands[0].binary;
+    if (upper_binary.op != .subseteq or
+        upper_binary.left.* != .ident or
+        !std.mem.eql(u8, upper_binary.left.ident, bound.name) or
+        codegen.expression_references_identifier(
+            upper_binary.right,
+            bound.name,
+        ) or
+        compiler.is_action_expr(upper_binary.right, is_init) or
+        !codegen.expression_reordering_safe(
+            compiler.evaluator.module,
+            upper_binary.right,
+        ))
+    {
+        return null;
+    }
+
+    var lower: ?*ast.Expr = null;
+    var lower_constraint: ?*ast.Expr = null;
+    if (operand_count > 1 and operands[1].* == .binary) {
+        const lower_binary = operands[1].binary;
+        if (lower_binary.op == .subseteq and
+            lower_binary.right.* == .ident and
+            std.mem.eql(u8, lower_binary.right.ident, bound.name) and
+            !codegen.expression_references_identifier(
+                lower_binary.left,
+                bound.name,
+            ) and
+            !compiler.is_action_expr(lower_binary.left, is_init) and
+            codegen.expression_reordering_safe(
+                compiler.evaluator.module,
+                lower_binary.left,
+            ))
+        {
+            lower = lower_binary.left;
+            lower_constraint = operands[1];
+        }
+    }
+    return .{
+        .base = bound.domain.unary.operand,
+        .upper = upper_binary.right,
+        .lower = lower,
+        .upper_constraint = operands[0],
+        .lower_constraint = lower_constraint,
+    };
 }
 
 fn flatten_action_disjunction(
@@ -1848,6 +2243,8 @@ pub const ActionExecutor = struct {
     fairness_markers: []const FairnessMarker = &.{},
     edge_action_masks: ?[]u64 = null,
     enabled_probe: ?*bool = null,
+    candidate_sink: ?CandidateSink = null,
+    diagnostics: bool = false,
 
     const Continuation = struct {
         steps: []const ActionStep,
@@ -1863,6 +2260,8 @@ pub const ActionExecutor = struct {
         assert(compiled.steps.len >= 0);
         assert(out_states.items.len == 0);
         self.evaluator.reset_context_pool();
+        self.evaluator.begin_action_evaluation();
+        defer self.evaluator.end_action_evaluation();
         try self.execute_steps(compiled.steps, null, Context.empty(), null, out_states, true, 0);
     }
 
@@ -1874,6 +2273,8 @@ pub const ActionExecutor = struct {
     ) !void {
         const s0 = self.source_state_store.get(s0_idx);
         self.evaluator.reset_context_pool();
+        self.evaluator.begin_action_evaluation();
+        defer self.evaluator.end_action_evaluation();
         try self.execute_steps(compiled.steps, null, Context.empty(), s0, out_states, false, 0);
     }
 
@@ -2050,6 +2451,418 @@ pub const ActionExecutor = struct {
         return value_v.member(self.eval_pool, member);
     }
 
+    fn execute_function_set_membership(
+        self: *const ActionExecutor,
+        function_set: value.FunctionSet,
+        rest: []const ActionStep,
+        continuation: ?*const Continuation,
+        context: Context,
+        state: ?*StateStore.State,
+        out_states: *StateBuffer,
+        is_init: bool,
+        action_mask: u64,
+        variable_name: []const u8,
+        variable_index: u32,
+    ) Error!void {
+        const domain = try self.evaluator.materialize_set(
+            function_set.domain(self.eval_pool),
+            context,
+            state,
+            self.eval_pool,
+            &self.source_state_store.values_pool,
+        );
+        const codomain = try self.evaluator.materialize_set(
+            function_set.codomain(self.eval_pool),
+            context,
+            state,
+            self.eval_pool,
+            &self.source_state_store.values_pool,
+        );
+        if (domain != .set_v or codomain != .set_v) {
+            return Error.TypeError;
+        }
+
+        const domain_count = domain.set_v.len;
+        const codomain_count = codomain.set_v.len;
+        var candidate_count: u64 = 1;
+        var domain_index: u32 = 0;
+        while (domain_index < domain_count) : (domain_index += 1) {
+            candidate_count = std.math.mul(
+                u64,
+                candidate_count,
+                codomain_count,
+            ) catch return Error.OutOfMemory;
+            if (candidate_count > std.math.maxInt(u32)) {
+                return Error.OutOfMemory;
+            }
+        }
+
+        const snapshot = self.eval_pool.snapshot();
+        const context_snapshot = self.evaluator.context_snapshot();
+        const codomain_values = codomain.set_v.items(self.eval_pool);
+        var combination: u64 = 0;
+        while (combination < candidate_count) : (combination += 1) {
+            const entries = try self.eval_pool.alloc_values(domain_count);
+            var cursor = combination;
+            domain_index = 0;
+            while (domain_index < domain_count) : (domain_index += 1) {
+                assert(codomain_count > 0);
+                const selected: usize = @intCast(cursor % codomain_count);
+                cursor /= codomain_count;
+                entries[domain_index] = codomain_values[selected];
+            }
+            assert(cursor == 0);
+            const function = Value{ .function_v = .{
+                .domain = domain.set_v,
+                .offset = value_offset(self.eval_pool, entries.ptr),
+                .len = domain_count,
+            } };
+            const next_context = try self.evaluator.extend_state_context(
+                context,
+                variable_name,
+                variable_index,
+                function,
+                .changed,
+            );
+            try self.execute_steps(
+                rest,
+                continuation,
+                next_context,
+                state,
+                out_states,
+                is_init,
+                action_mask,
+            );
+            self.eval_pool.restore(snapshot);
+            self.evaluator.restore_context_pool(context_snapshot);
+            if (self.enabled_probe) |probe| {
+                if (probe.*) return;
+            }
+        }
+    }
+
+    const RecordSetIteration = struct {
+        record_set: value.RecordSet,
+        domains_offset: u32,
+        candidate_count: u32,
+    };
+
+    fn prepare_record_set_iteration(
+        self: *const ActionExecutor,
+        record_set: value.RecordSet,
+        context: Context,
+        state: ?*StateStore.State,
+    ) Error!RecordSetIteration {
+        const domains = try self.eval_pool.alloc_values(record_set.len);
+        const domains_offset = value_offset(self.eval_pool, domains.ptr);
+        var candidate_count: u64 = if (record_set.len == 0) 0 else 1;
+        var field_index: u32 = 0;
+        while (field_index < record_set.len) : (field_index += 1) {
+            const domain = try self.evaluator.materialize_set(
+                record_set.field_domain(self.eval_pool, field_index),
+                context,
+                state,
+                self.eval_pool,
+                &self.source_state_store.values_pool,
+            );
+            if (domain != .set_v) return Error.TypeError;
+            self.eval_pool.values[domains_offset + field_index] = domain;
+            candidate_count = std.math.mul(
+                u64,
+                candidate_count,
+                domain.set_v.len,
+            ) catch return Error.OutOfMemory;
+            if (candidate_count > std.math.maxInt(u32)) {
+                return Error.OutOfMemory;
+            }
+        }
+        return .{
+            .record_set = record_set,
+            .domains_offset = domains_offset,
+            .candidate_count = @intCast(candidate_count),
+        };
+    }
+
+    fn record_set_candidate(
+        self: *const ActionExecutor,
+        iteration: RecordSetIteration,
+        combination: u32,
+    ) Error!Value {
+        assert(combination < iteration.candidate_count);
+        const field_value_count = std.math.mul(
+            u32,
+            iteration.record_set.len,
+            2,
+        ) catch return Error.OutOfMemory;
+        const fields = try self.eval_pool.alloc_values(
+            field_value_count,
+        );
+        const fields_offset = value_offset(self.eval_pool, fields.ptr);
+        var cursor = combination;
+        var field_index: u32 = 0;
+        while (field_index < iteration.record_set.len) : (field_index += 1) {
+            const domain = self.eval_pool.values[
+                iteration.domains_offset + field_index
+            ];
+            assert(domain == .set_v);
+            assert(domain.set_v.len > 0);
+            const selected = cursor % domain.set_v.len;
+            cursor /= domain.set_v.len;
+            self.eval_pool.values[fields_offset + field_index * 2] = .{
+                .string_v = iteration.record_set.field_name(
+                    self.eval_pool,
+                    field_index,
+                ),
+            };
+            self.eval_pool.values[fields_offset + field_index * 2 + 1] =
+                self.eval_pool.values[domain.set_v.offset + selected];
+        }
+        assert(cursor == 0);
+        return .{ .record_v = .{
+            .offset = fields_offset,
+            .len = iteration.record_set.len,
+        } };
+    }
+
+    fn execute_record_set_membership(
+        self: *const ActionExecutor,
+        record_set: value.RecordSet,
+        rest: []const ActionStep,
+        continuation: ?*const Continuation,
+        context: Context,
+        state: ?*StateStore.State,
+        out_states: *StateBuffer,
+        is_init: bool,
+        action_mask: u64,
+        variable_name: []const u8,
+        variable_index: u32,
+    ) Error!void {
+        const iteration = try self.prepare_record_set_iteration(
+            record_set,
+            context,
+            state,
+        );
+        const snapshot = self.eval_pool.snapshot();
+        const context_snapshot = self.evaluator.context_snapshot();
+        var combination: u32 = 0;
+        while (combination < iteration.candidate_count) : (combination += 1) {
+            const candidate = try self.record_set_candidate(
+                iteration,
+                combination,
+            );
+            const next_context = try self.evaluator.extend_state_context(
+                context,
+                variable_name,
+                variable_index,
+                candidate,
+                .changed,
+            );
+            try self.execute_steps(
+                rest,
+                continuation,
+                next_context,
+                state,
+                out_states,
+                is_init,
+                action_mask,
+            );
+            self.eval_pool.restore(snapshot);
+            self.evaluator.restore_context_pool(context_snapshot);
+            if (self.enabled_probe) |probe| {
+                if (probe.*) return;
+            }
+        }
+    }
+
+    fn execute_record_set_choice(
+        self: *const ActionExecutor,
+        record_set: value.RecordSet,
+        choice: Choose,
+        rest: []const ActionStep,
+        continuation: ?*const Continuation,
+        context: Context,
+        state: ?*StateStore.State,
+        out_states: *StateBuffer,
+        is_init: bool,
+        action_mask: u64,
+    ) Error!void {
+        const iteration = try self.prepare_record_set_iteration(
+            record_set,
+            context,
+            state,
+        );
+        const snapshot = self.eval_pool.snapshot();
+        const context_snapshot = self.evaluator.context_snapshot();
+        const next = Continuation{
+            .steps = rest,
+            .next = continuation,
+            .return_context = context,
+        };
+        var combination: u32 = 0;
+        while (combination < iteration.candidate_count) : (combination += 1) {
+            const candidate = try self.record_set_candidate(
+                iteration,
+                combination,
+            );
+            const next_context = try self.evaluator.extend_context(
+                context,
+                choice.var_name,
+                candidate,
+            );
+            try self.execute_steps(
+                choice.body_steps,
+                if (rest.len == 0 and continuation == null) null else &next,
+                next_context,
+                state,
+                out_states,
+                is_init,
+                action_mask,
+            );
+            self.eval_pool.restore(snapshot);
+            self.evaluator.restore_context_pool(context_snapshot);
+            if (self.enabled_probe) |probe| {
+                if (probe.*) return;
+            }
+        }
+    }
+
+    fn execute_bounded_power_set_choice(
+        self: *const ActionExecutor,
+        choice: BoundedPowerSetChoose,
+        rest: []const ActionStep,
+        continuation: ?*const Continuation,
+        context: Context,
+        state: ?*StateStore.State,
+        out_states: *StateBuffer,
+        is_init: bool,
+        action_mask: u64,
+    ) Error!void {
+        const base_value = try self.eval_compiled_expr(
+            choice.base,
+            context,
+            state,
+        );
+        const upper_value = try self.eval_compiled_expr(
+            choice.upper,
+            context,
+            state,
+        );
+        if (!base_value.is_set_like() or !upper_value.is_set_like()) {
+            return Error.TypeError;
+        }
+        const base = try self.evaluator.materialize_set(
+            base_value,
+            context,
+            state,
+            self.eval_pool,
+            &self.source_state_store.values_pool,
+        );
+        const upper = try self.evaluator.materialize_set(
+            upper_value,
+            context,
+            state,
+            self.eval_pool,
+            &self.source_state_store.values_pool,
+        );
+        if (base != .set_v or upper != .set_v) return Error.TypeError;
+        if (base.set_v.len > 30) return Error.OutOfMemory;
+
+        const lower = if (choice.lower) |compiled| lower: {
+            const lower_value = try self.eval_compiled_expr(
+                compiled,
+                context,
+                state,
+            );
+            if (!lower_value.is_set_like()) return Error.TypeError;
+            const materialized = try self.evaluator.materialize_set(
+                lower_value,
+                context,
+                state,
+                self.eval_pool,
+                &self.source_state_store.values_pool,
+            );
+            if (materialized != .set_v) return Error.TypeError;
+            break :lower materialized;
+        } else Value{ .set_v = .{
+            .offset = base.set_v.offset,
+            .len = 0,
+        } };
+
+        const base_items = base.set_v.items(self.eval_pool);
+        const upper_set = upper.set_v;
+        const lower_set = lower.set_v;
+        const lower_items = lower_set.items(self.eval_pool);
+        for (lower_items) |item| {
+            if (!base.set_v.contains(self.eval_pool, item) or
+                !upper_set.contains(self.eval_pool, item))
+            {
+                return;
+            }
+        }
+
+        const optional = try self.eval_pool.alloc_values(base.set_v.len);
+        var optional_count: u32 = 0;
+        for (base_items) |item| {
+            if (!upper_set.contains(self.eval_pool, item) or
+                lower_set.contains(self.eval_pool, item))
+            {
+                continue;
+            }
+            optional[optional_count] = item;
+            optional_count += 1;
+        }
+        assert(lower_set.len + optional_count <= base.set_v.len);
+        const candidate_storage = try self.eval_pool.alloc_values(
+            lower_set.len + optional_count,
+        );
+        @memcpy(candidate_storage[0..lower_set.len], lower_items);
+        const candidate_offset = value_offset(
+            self.eval_pool,
+            candidate_storage.ptr,
+        );
+        const snapshot = self.eval_pool.snapshot();
+        const context_snapshot = self.evaluator.context_snapshot();
+        const next = Continuation{
+            .steps = rest,
+            .next = continuation,
+            .return_context = context,
+        };
+        const candidate_count = @as(u64, 1) << @intCast(optional_count);
+        var mask: u64 = 0;
+        while (mask < candidate_count) : (mask += 1) {
+            var candidate_len = lower_set.len;
+            for (optional[0..optional_count], 0..) |item, bit| {
+                if (mask & (@as(u64, 1) << @intCast(bit)) == 0) continue;
+                candidate_storage[candidate_len] = item;
+                candidate_len += 1;
+            }
+            assert(candidate_len <= lower_set.len + optional_count);
+            const candidate = Value{ .set_v = .{
+                .offset = candidate_offset,
+                .len = candidate_len,
+            } };
+            const next_context = try self.evaluator.extend_context(
+                context,
+                choice.var_name,
+                candidate,
+            );
+            try self.execute_steps(
+                choice.body_steps,
+                if (rest.len == 0 and continuation == null) null else &next,
+                next_context,
+                state,
+                out_states,
+                is_init,
+                action_mask,
+            );
+            self.eval_pool.restore(snapshot);
+            self.evaluator.restore_context_pool(context_snapshot);
+            if (self.enabled_probe) |probe| {
+                if (probe.*) return;
+            }
+        }
+    }
+
     fn execute_steps(
         self: *const ActionExecutor,
         steps: []const ActionStep,
@@ -2059,7 +2872,7 @@ pub const ActionExecutor = struct {
         out_states: *StateBuffer,
         is_init: bool,
         action_mask: u64,
-    ) !void {
+    ) Error!void {
         const previous_context_floor = self.evaluator.pin_context_pool();
         defer self.evaluator.unpin_context_pool(previous_context_floor);
         assert(self.eval_pool.value_count <= self.eval_pool.value_cap);
@@ -2112,6 +2925,36 @@ pub const ActionExecutor = struct {
                     }
                     if (a.is_membership) {
                         if (!val.is_set_like()) return Error.TypeError;
+                        if (val == .function_set_v) {
+                            try self.execute_function_set_membership(
+                                val.function_set_v,
+                                rest,
+                                current_cont,
+                                current_ctx,
+                                s0,
+                                out_states,
+                                is_init,
+                                action_mask,
+                                a.var_name,
+                                a.var_index,
+                            );
+                            return;
+                        }
+                        if (val == .record_set_v) {
+                            try self.execute_record_set_membership(
+                                val.record_set_v,
+                                rest,
+                                current_cont,
+                                current_ctx,
+                                s0,
+                                out_states,
+                                is_init,
+                                action_mask,
+                                a.var_name,
+                                a.var_index,
+                            );
+                            return;
+                        }
                         const mat = try self.evaluator.materialize_set(val, current_ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                         if (mat != .set_v) return Error.TypeError;
                         const items = mat.set_v.items(self.eval_pool);
@@ -2156,6 +2999,36 @@ pub const ActionExecutor = struct {
                     }
                     if (a.is_membership) {
                         if (!val.is_set_like()) return Error.TypeError;
+                        if (val == .function_set_v) {
+                            try self.execute_function_set_membership(
+                                val.function_set_v,
+                                rest,
+                                current_cont,
+                                current_ctx,
+                                s0,
+                                out_states,
+                                is_init,
+                                action_mask,
+                                a.var_name,
+                                a.var_index,
+                            );
+                            return;
+                        }
+                        if (val == .record_set_v) {
+                            try self.execute_record_set_membership(
+                                val.record_set_v,
+                                rest,
+                                current_cont,
+                                current_ctx,
+                                s0,
+                                out_states,
+                                is_init,
+                                action_mask,
+                                a.var_name,
+                                a.var_index,
+                            );
+                            return;
+                        }
                         const mat = try self.evaluator.materialize_set(val, current_ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                         if (mat != .set_v) return Error.TypeError;
                         const items = mat.set_v.items(self.eval_pool);
@@ -2187,7 +3060,26 @@ pub const ActionExecutor = struct {
                     }
                 },
                 .condition => |e| {
-                    if (!try self.eval_compiled_bool(e, current_ctx, s0)) return;
+                    if (!try self.eval_compiled_bool(e, current_ctx, s0)) {
+                        if (self.diagnostics and
+                            std.c.getenv(
+                                "TLZIG_ACTION_DIAGNOSTICS",
+                            ) != null)
+                        {
+                            if (e.generated) |generated| {
+                                std.debug.print(
+                                    "action condition rejected: expression={d} kind={s}\n",
+                                    .{ generated.identity, @tagName(e.expr.*) },
+                                );
+                            } else {
+                                std.debug.print(
+                                    "action condition rejected: interpreted kind={s}\n",
+                                    .{@tagName(e.expr.*)},
+                                );
+                            }
+                        }
+                        return;
+                    }
                     current_steps = rest;
                     continue;
                 },
@@ -2243,6 +3135,20 @@ pub const ActionExecutor = struct {
                 .choose => |c| {
                     const set_v = try self.eval_compiled_expr(c.domain, current_ctx, s0);
                     if (!set_v.is_set_like()) return Error.TypeError;
+                    if (set_v == .record_set_v) {
+                        try self.execute_record_set_choice(
+                            set_v.record_set_v,
+                            c,
+                            rest,
+                            current_cont,
+                            current_ctx,
+                            s0,
+                            out_states,
+                            is_init,
+                            action_mask,
+                        );
+                        return;
+                    }
                     const mat = try self.evaluator.materialize_set(set_v, current_ctx, s0, self.eval_pool, &self.source_state_store.values_pool);
                     if (mat != .set_v) return Error.TypeError;
                     const items = mat.set_v.items(self.eval_pool);
@@ -2277,6 +3183,19 @@ pub const ActionExecutor = struct {
                     }
                     return;
                 },
+                .bounded_power_set_choose => |choice| {
+                    try self.execute_bounded_power_set_choice(
+                        choice,
+                        rest,
+                        current_cont,
+                        current_ctx,
+                        s0,
+                        out_states,
+                        is_init,
+                        action_mask,
+                    );
+                    return;
+                },
                 .let_bind => |l| {
                     const v = if (l.operator_arity) |arity|
                         try self.evaluator.make_generated_expression_operator(
@@ -2297,16 +3216,26 @@ pub const ActionExecutor = struct {
                     continue;
                 },
                 .call => |c| {
-                    if (c.params.len != c.args.len) return Error.TypeError;
+                    if (c.params.len != c.args.len or
+                        c.state_args.len != c.args.len)
+                    {
+                        return Error.TypeError;
+                    }
                     if (c.args.len > 32) return Error.NotImplemented;
                     const context_snap = self.evaluator.context_snapshot();
                     var values: [32]Value = undefined;
                     for (c.args, 0..) |arg, i| {
-                        values[i] = try self.eval_compiled_expr(
-                            arg,
-                            current_ctx,
-                            s0,
-                        );
+                        values[i] = if (c.state_args[i]) |state_arg|
+                            try generated_runtime.state_reference(
+                                state_arg.variable_index,
+                                state_arg.primed,
+                            )
+                        else
+                            try self.eval_compiled_expr(
+                                arg,
+                                current_ctx,
+                                s0,
+                            );
                     }
                     var call_ctx = current_ctx.operator_frame();
                     for (c.params, 0..) |p, i| {
@@ -2364,6 +3293,8 @@ pub const ActionExecutor = struct {
                             .composition_generated = self.composition_generated,
                             .fairness_markers = self.fairness_markers,
                             .edge_action_masks = self.edge_action_masks,
+                            .candidate_sink = self.candidate_sink,
+                            .diagnostics = self.diagnostics,
                         };
                         try second.execute_steps(
                             composition.right_steps,
@@ -2767,7 +3698,7 @@ pub const ActionExecutor = struct {
                 source_pool,
                 &self.candidate_store.values_pool,
             );
-            if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+            if (builtin.mode == .debug or builtin.mode == .safe) {
                 assert(Value.eql_cross_pool(
                     assigned.value,
                     source_pool,
@@ -2781,6 +3712,13 @@ pub const ActionExecutor = struct {
             masks[out_states.items.len] = action_mask;
         }
         try out_states.append(new_idx);
+        if (self.candidate_sink) |sink| {
+            if (out_states == sink.target and
+                out_states.items.len == out_states.storage.len)
+            {
+                try sink.consume(sink.context, out_states);
+            }
+        }
     }
 };
 
@@ -2862,4 +3800,40 @@ test "action compiler branches only existential assignments" {
     const compiled_next = try compiler.compile_next(next_action.body);
     try std.testing.expectEqual(@as(usize, 1), compiled_next.steps.len);
     try std.testing.expect(compiled_next.steps[0] == .choose);
+}
+
+test "action compiler enumerates bounded power-set choices directly" {
+    const parser = @import("parser.zig");
+    const overrides = @import("overrides.zig");
+    const source =
+        \\---------------- MODULE BoundedPowerSetAction ----------------
+        \\VARIABLE x
+        \\D == {1, 2, 3}
+        \\Init == x = {}
+        \\Next == \E r \in SUBSET D:
+        \\          /\ r \subseteq {1, 2}
+        \\          /\ {1} \subseteq r
+        \\          /\ x' = r
+        \\===============================================================
+        \\
+    ;
+    var arena = try Arena.init(4 * 1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const evaluator = try Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    const compiler = try ActionCompiler.init(&arena, evaluator);
+
+    const next = evaluator.find_definition("Next").?;
+    const compiled = try compiler.compile_next(next.body);
+    try std.testing.expectEqual(@as(usize, 1), compiled.steps.len);
+    try std.testing.expect(compiled.steps[0] == .bounded_power_set_choose);
+    const choice = compiled.steps[0].bounded_power_set_choose;
+    try std.testing.expect(choice.lower != null);
+    try std.testing.expectEqual(@as(usize, 1), choice.body_steps.len);
+    try std.testing.expect(choice.body_steps[0] == .assign_prime);
 }

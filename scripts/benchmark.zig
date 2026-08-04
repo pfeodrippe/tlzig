@@ -18,6 +18,11 @@ comptime {
     {
         @compileError("generated model ABI mismatch; regenerate it with tlzig --emit-zig");
     }
+    if (generated_model.fallback_count != 0) {
+        @compileError(
+            "benchmark requires a strict generated model with fallback_count == 0",
+        );
+    }
 }
 
 const Spec = struct {
@@ -48,7 +53,6 @@ const Options = struct {
     tlzig_only: bool = false,
     skip_prefer_generated: bool = false,
     write_tlzig_baseline: bool = false,
-    generated_expressions: bool = false,
 };
 
 const specs = [_]Spec{
@@ -60,6 +64,7 @@ const specs = [_]Spec{
     .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.cfg", .max_states = 5000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.cfg", .max_states = 5000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan100Beans.cfg", .default_enabled = false, .one_core_default = false, .max_states = 100_000, .max_nat = 1000, .min_int = -1000, .max_int = 1000 },
+    .{ .label = "CoffeeCan1000", .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan1000Beans.cfg", .one_core_default = false, .max_states = 600_000, .state_values_per_state = 16, .prefer_generated = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/TeachingConcurrency/Simple.tla", .cfg = "vendor/tlaplus-examples/specifications/TeachingConcurrency/Simple.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/barriers/Barrier.tla", .cfg = "vendor/tlaplus-examples/specifications/barriers/Barrier.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/locks_auxiliary_vars/Lock.tla", .cfg = "vendor/tlaplus-examples/specifications/locks_auxiliary_vars/Lock.cfg" },
@@ -68,13 +73,25 @@ const specs = [_]Spec{
     .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/TwoPhase.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/TwoPhase.cfg", .max_states = 100_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/LiveHourClock.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/Liveness/LiveHourClock.cfg" },
     // Higher state count specs:
-    // .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan3000Beans.cfg", .max_states = 50_000_000, .max_nat = 10000, .min_int = -10000, .max_int = 10000 },
+    .{ .label = "CoffeeCan3000", .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan3000Beans.cfg", .default_enabled = false, .one_core_default = false, .max_states = 5_000_000, .max_nat = 10_000, .min_int = -10_000, .max_int = 10_000, .state_values_per_state = 16, .prefer_generated = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/TCommit.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/TCommit.cfg", .max_states = 500_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/transaction_commit/APTCommit.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/APTCommit.cfg", .max_states = 500_000 },
+    // The reduced complete graph audit proves exact states and semantic edges;
+    // TLC additionally counts duplicate existential/action witnesses.
+    .{ .label = "PaxosCommit", .tla = "vendor/tlaplus-examples/specifications/transaction_commit/PaxosCommit.tla", .cfg = "vendor/tlaplus-examples/specifications/transaction_commit/PaxosCommit.cfg", .default_enabled = false, .one_core_default = false, .max_states = 5_000_000, .state_values_per_state = 192, .compare_generated = false, .prefer_generated = true },
+    // Complete quotient-graph audit: exact states, initial state, and semantic
+    // edges under the configured replica symmetry. TLC retains duplicate
+    // action witnesses, so its raw generated-state counter is non-semantic.
+    .{ .label = "MultiPaxosSmall", .tla = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.tla", .cfg = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC_small.cfg", .default_enabled = false, .one_core_default = false, .max_states = 2_000_000, .state_values_per_state = 320, .compare_generated = false, .prefer_generated = true },
+    .{ .label = "MultiPaxos", .tla = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.tla", .cfg = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.cfg", .default_enabled = false, .one_core_default = false, .max_states = 5_000_000, .state_values_per_state = 320, .prefer_generated = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.tla", .cfg = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.cfg", .max_states = 500_000, .expected_violation = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.tla", .cfg = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.cfg", .default_enabled = false, .one_core_default = false, .max_states = 500_000, .expected_violation = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.cfg", .max_states = 500_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.cfg", .max_states = 200_000, .compare_generated = false },
+    // Complete N=2 graph audit: exact states, initial states, semantic edges,
+    // and weak-fair System edges. TLC retains duplicate action witnesses.
+    .{ .label = "EWD998ChanSmall", .tla = "vendor/tlaplus-examples/specifications/ewd998/EWD998Chan.tla", .cfg = "benchmark_configs/EWD998Chan_small.cfg", .default_enabled = false, .one_core_default = false, .max_states = 500_000, .state_values_per_state = 96, .compare_generated = false, .prefer_generated = true },
+    .{ .label = "EWD998Chan", .tla = "vendor/tlaplus-examples/specifications/ewd998/EWD998Chan.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd998/EWD998Chan.cfg", .default_enabled = false, .one_core_default = false, .max_states = 20_000_000, .state_values_per_state = 96, .compare_generated = false, .prefer_generated = true },
     // Representative larger state spaces and advanced semantics:
     .{
         .label = "Slush Medium",
@@ -87,6 +104,36 @@ const specs = [_]Spec{
     .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.cfg", .max_states = 200_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.cfg", .max_states = 200_000, .compare_generated = false },
     .{ .label = "MCBinarySearch", .tla = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.tla", .cfg = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.cfg", .one_core_default = false, .max_states = 200_000, .prefer_generated = true },
+    .{ .label = "GameOfLife", .tla = "vendor/tlaplus-examples/specifications/GameOfLife/GameOfLife.tla", .cfg = "vendor/tlaplus-examples/specifications/GameOfLife/GameOfLife.cfg", .one_core_default = false, .max_states = 200_000, .state_values_per_state = 80, .prefer_generated = true },
+    // TLC counts duplicate existential witnesses as generated states here.
+    // Strict graph audits establish exact state and transition-relation parity.
+    .{ .label = "Sailfish1", .tla = "vendor/tlaplus-examples/specifications/dag-consensus/TLCSailfish1.tla", .cfg = "vendor/tlaplus-examples/specifications/dag-consensus/TLCSailfish1.cfg", .one_core_default = false, .max_states = 120_000, .state_values_per_state = 256, .compare_generated = false, .prefer_generated = true },
+    // TLC retains duplicate action witnesses in its generated-state counter.
+    // The N=2 strict audit matches all states, initial states, unique edges,
+    // and the weak-fair System edge subset; compare exact distinct states here.
+    .{ .label = "EWD998Small", .tla = "vendor/tlaplus-examples/specifications/ewd998/EWD998.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd998/EWD998Small.cfg", .one_core_default = false, .max_states = 1_600_000, .state_values_per_state = 60, .compare_generated = false, .prefer_generated = true },
+    // Completing liveness check with 18 quantified WF/SF obligations.
+    .{ .label = "ElevatorLivenessMedium", .tla = "vendor/tlaplus-examples/specifications/MultiCarElevator/Elevator.tla", .cfg = "vendor/tlaplus-examples/specifications/MultiCarElevator/ElevatorLivenessMedium.cfg", .one_core_default = false, .max_states = 100_000, .state_values_per_state = 256, .prefer_generated = true },
+    // TLC spends about seven minutes eagerly enumerating the outer power set;
+    // keep the exact paired row available without extending the default gate.
+    .{ .label = "SpanTreeTest5Nodes", .tla = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTreeTest.tla", .cfg = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTreeTest5Nodes.cfg", .default_enabled = false, .one_core_default = false, .max_states = 500_000, .state_values_per_state = 60, .prefer_generated = true },
+    // INSTANCE translation over a 501,552-state, 9.7-million-transition graph.
+    .{ .label = "APbcastFolklore", .tla = "vendor/tlaplus-examples/specifications/bcastFolklore/APbcastFolklore.tla", .cfg = "vendor/tlaplus-examples/specifications/bcastFolklore/APbcastFolklore.cfg", .one_core_default = false, .max_states = 1_000_000, .state_values_per_state = 160, .prefer_generated = true },
+    // Direct bounded power-set enumeration over a 1,072,452-state,
+    // 29,223,200-generated-transition graph.
+    .{ .label = "Bosco", .tla = "vendor/tlaplus-examples/specifications/bosco/bosco.tla", .cfg = "vendor/tlaplus-examples/specifications/bosco/bosco.cfg", .one_core_default = false, .max_states = 1_200_000, .state_values_per_state = 16, .prefer_generated = true },
+    // Exhaustive recursive operators, nested functions, and multi-bound
+    // function literals. Keep it opt-in because the paired run takes tens of
+    // seconds even with all cores.
+    .{ .label = "BTree", .tla = "vendor/tlaplus-examples/specifications/btree/btree.tla", .cfg = "vendor/tlaplus-examples/specifications/btree/btree.cfg", .default_enabled = false, .one_core_default = false, .max_states = 500_000, .state_values_per_state = 60, .prefer_generated = true },
+    // VIEW hides hash-allocation order. Parallel publication must preserve
+    // TLC's deterministic BFS representative while generated actions run
+    // concurrently. TLC counts duplicate action witnesses, so compare the
+    // complete canonical state set here.
+    .{ .label = "NanoMedium", .tla = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNano.tla", .cfg = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNanoMedium.cfg", .default_enabled = false, .one_core_default = false, .max_states = 700_000, .state_values_per_state = 160, .compare_generated = false, .prefer_generated = true },
+    // TLC's four temporal branches take about nineteen minutes on the full
+    // graph. Keep this exact liveness comparison opt-in.
+    .{ .label = "bcastFolklore", .tla = "vendor/tlaplus-examples/specifications/bcastFolklore/bcastFolklore.tla", .cfg = "vendor/tlaplus-examples/specifications/bcastFolklore/bcastFolklore.cfg", .default_enabled = false, .one_core_default = false, .max_states = 1_000_000, .state_values_per_state = 160, .prefer_generated = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd687a/MCEWD687a.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AdvancedExamples/MCInnerSerial.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.tla", .cfg = "vendor/tlaplus-examples/specifications/YoYo/MCYoYoNoPruning.cfg", .default_enabled = false, .one_core_default = false, .max_states = 200_000 },
@@ -349,7 +396,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     const allocator = std.heap.page_allocator;
     const options = parse_options(init) catch {
         std.debug.print(
-            "usage: benchmark [--include-long] [--include-one-core] [--auto-only] [--tlzig-only] [--skip-prefer-generated] [--write-tlzig-baseline] [--generated-expressions] [--filter TEXT|TEXT]\n",
+            "usage: benchmark [--include-long] [--include-one-core] [--auto-only] [--tlzig-only] [--skip-prefer-generated] [--write-tlzig-baseline] [--filter TEXT|TEXT]\n",
             .{},
         );
         std.process.exit(2);
@@ -392,7 +439,6 @@ pub fn main(init: std.process.Init.Minimal) void {
             options.label_suffix,
             options.tlzig_only,
             options.write_tlzig_baseline,
-            options.generated_expressions,
         ) catch |err| {
             failures += 1;
             std.debug.print("{s:40} ERROR {any}\n", .{ spec.tla, err });
@@ -425,8 +471,6 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
             options.skip_prefer_generated = true;
         } else if (std.mem.eql(u8, arg, "--write-tlzig-baseline")) {
             options.write_tlzig_baseline = true;
-        } else if (std.mem.eql(u8, arg, "--generated-expressions")) {
-            options.generated_expressions = true;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.InvalidArgs;
         } else if (options.filter == null) {
@@ -440,9 +484,19 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
 
 fn filter_matches(spec: Spec, optional_filter: ?[]const u8) bool {
     const needle = optional_filter orelse return false;
-    return filter_label_matches(spec, optional_filter) or
-        std.mem.indexOf(u8, spec.tla, needle) != null or
+    if (filter_is_known_label(needle)) {
+        return filter_label_matches(spec, optional_filter);
+    }
+    return std.mem.indexOf(u8, spec.tla, needle) != null or
         std.mem.indexOf(u8, spec.cfg, needle) != null;
+}
+
+fn filter_is_known_label(needle: []const u8) bool {
+    for (specs) |spec| {
+        const label = spec.label orelse continue;
+        if (std.mem.eql(u8, label, needle)) return true;
+    }
+    return false;
 }
 
 fn filter_label_matches(spec: Spec, optional_filter: ?[]const u8) bool {
@@ -460,7 +514,6 @@ fn run_comparison(
     label_suffix: []const u8,
     tlzig_only: bool,
     write_baseline: bool,
-    use_generated_expressions: bool,
 ) !void {
     const cpu_count = tlzig.platform.auto_worker_count();
     const tlzig_one: ?RunResult = if (run_one_core)
@@ -470,7 +523,6 @@ fn run_comparison(
             spec,
             1,
             true,
-            use_generated_expressions,
         )
     else
         null;
@@ -481,7 +533,6 @@ fn run_comparison(
         spec,
         cpu_count,
         true,
-        use_generated_expressions,
     );
     defer tlzig_auto.deinit(allocator);
     const spec_java_cp = spec.java_classpath orelse java_cp;
@@ -760,14 +811,23 @@ fn tlzig_baseline_path(
     spec: Spec,
 ) ![]const u8 {
     var hasher = std.hash.Wyhash.init(0x4245_4e43_484d_4152);
-    hash_bytes(&hasher, spec.tla);
-    hash_bytes(&hasher, spec.cfg);
-    if (spec.label) |label| hash_bytes(&hasher, label);
+    benchmark_hash_bytes(&hasher, spec.tla);
+    benchmark_hash_bytes(&hasher, spec.cfg);
+    if (spec.label) |label| benchmark_hash_bytes(&hasher, label);
     return try std.fmt.allocPrint(
         allocator,
         "benchmark_results/tlzig_auto_{x}.txt",
         .{hasher.final()},
     );
+}
+
+fn benchmark_hash_bytes(
+    hasher: *std.hash.Wyhash,
+    bytes: []const u8,
+) void {
+    const len: u64 = bytes.len;
+    hasher.update(std.mem.asBytes(&len));
+    hasher.update(bytes);
 }
 
 fn elapsed_ms(io: std.Io, start: std.Io.Clock.Timestamp) u64 {
@@ -785,7 +845,6 @@ fn run_tlzig_internal(
     spec: Spec,
     worker_count: u16,
     use_generated: bool,
-    use_generated_expressions: bool,
 ) !RunResult {
     const start = std.Io.Clock.Timestamp.now(io, .real);
 
@@ -816,7 +875,11 @@ fn run_tlzig_internal(
         std.debug.print("failed to parse cfg {s}: {any}\n", .{ spec.cfg, err });
         return error.LoadFailed;
     };
-    module.config_replacements = try build_codegen_replacements(&arena, cfg);
+    module.config_replacements = try config.build_codegen_replacements(
+        &arena,
+        module,
+        cfg,
+    );
 
     const override_ctx = overrides.OverrideContext{
         .max_seq_len = 5,
@@ -840,14 +903,14 @@ fn run_tlzig_internal(
     ));
 
     const generated_model_matches =
-        use_generated and generated_matches(module.name, cfg);
+        use_generated and generated_matches(module, cfg);
     const generated: []const generated_runtime.Operator =
         if (generated_model_matches)
             &generated_model.operators
         else
             &.{};
     const generated_expressions: []const generated_runtime.Expression =
-        if (generated_model_matches and use_generated_expressions)
+        if (generated_model_matches)
             &generated_model.expressions
         else
             &.{};
@@ -925,14 +988,14 @@ fn run_tlzig_internal(
     };
 }
 
-fn generated_matches(module_name: []const u8, cfg: config.Config) bool {
+fn generated_matches(module: ast.Module, cfg: config.Config) bool {
     if (generated_model.generated_count == 0 or
-        !std.mem.eql(u8, generated_model.module_name, module_name))
+        !std.mem.eql(u8, generated_model.module_name, module.name))
     {
         return false;
     }
     if (generated_model.config_replacements_hash !=
-        config_replacements_hash(cfg))
+        config.codegen_replacements_hash(module.config_replacements))
     {
         return false;
     }
@@ -940,6 +1003,7 @@ fn generated_matches(module_name: []const u8, cfg: config.Config) bool {
     if (!generated_root_covered(cfg.init_name)) return false;
     if (!generated_root_covered(cfg.next_name)) return false;
     if (!generated_root_covered(cfg.symmetry_name)) return false;
+    if (!generated_root_covered(cfg.view_name)) return false;
     for (cfg.invariants) |name| {
         if (!generated_root_covered(name)) return false;
     }
@@ -953,53 +1017,6 @@ fn generated_matches(module_name: []const u8, cfg: config.Config) bool {
         if (!generated_root_covered(name)) return false;
     }
     return true;
-}
-
-fn config_replacements_hash(cfg: config.Config) u64 {
-    var hasher = std.hash.Wyhash.init(0x544c_5a49_475f_4347);
-    for (cfg.constants) |assignment| {
-        const value = std.mem.trim(u8, assignment.expr, " \t");
-        hash_bytes(&hasher, assignment.name);
-        hash_bytes(&hasher, value);
-        hasher.update(&.{if (assignment.is_substitution) 1 else 0});
-        hasher.update(&.{if (assignment.is_substitution and
-            config.is_operator_alias(value))
-            1
-        else
-            2});
-    }
-    return hasher.final();
-}
-
-fn hash_bytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
-    const len: u64 = bytes.len;
-    hasher.update(std.mem.asBytes(&len));
-    hasher.update(bytes);
-}
-
-fn build_codegen_replacements(
-    arena: *Arena,
-    cfg: config.Config,
-) ![]const ast.ConfigReplacement {
-    if (cfg.constants.len == 0) return &.{};
-    const replacements = try arena.alloc(
-        ast.ConfigReplacement,
-        cfg.constants.len,
-    );
-    for (cfg.constants, replacements) |assignment, *replacement| {
-        const value = std.mem.trim(u8, assignment.expr, " \t");
-        replacement.* = .{
-            .name = assignment.name,
-            .value = value,
-            .is_substitution = assignment.is_substitution,
-            .kind = if (assignment.is_substitution and
-                config.is_operator_alias(value))
-                .alias
-            else
-                .constant,
-        };
-    }
-    return replacements;
 }
 
 fn generated_root_covered(optional_name: ?[]const u8) bool {
@@ -1019,6 +1036,22 @@ fn run_tlc(
 ) !RunResult {
     const classpath = try std.mem.concat(allocator, u8, &.{ java_cp, ":specs/modules" });
     defer allocator.free(classpath);
+    const metadir_nonce: u64 = @bitCast(
+        std.Io.Clock.Timestamp.now(io, .real).raw.toMicroseconds(),
+    );
+    const metadir_hash = std.hash.Wyhash.hash(metadir_nonce, spec.cfg);
+    const metadir = try std.fmt.allocPrint(
+        allocator,
+        "benchmark_results/tlc_meta-{x}-{s}",
+        .{ metadir_hash, workers },
+    );
+    defer allocator.free(metadir);
+    defer std.Io.Dir.cwd().deleteTree(io, metadir) catch |err| {
+        std.debug.print("failed to remove TLC metadata {s}: {any}\n", .{
+            metadir,
+            err,
+        });
+    };
     const argv_auto = [_][]const u8{
         "java",
         "-cp",
@@ -1026,7 +1059,7 @@ fn run_tlc(
         "-Dtlc2.tool.impl.Tool.cdot=true",
         "tlc2.TLC",
         "-metadir",
-        "benchmark_results/tlc_meta",
+        metadir,
         "-workers",
         workers,
         "-cleanup",
@@ -1043,7 +1076,7 @@ fn run_tlc(
         "-Dtlc2.tool.impl.Tool.cdot=true",
         "tlc2.TLC",
         "-metadir",
-        "benchmark_results/tlc_meta",
+        metadir,
         "-workers",
         workers,
         "-cleanup",

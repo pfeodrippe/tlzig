@@ -5,6 +5,7 @@ const ModelTable = @import("value.zig").ModelTable;
 const Set = @import("value.zig").Set;
 const BinarySet = @import("value.zig").BinarySet;
 const Function = @import("value.zig").Function;
+const Record = @import("value.zig").Record;
 const State = @import("state.zig").StateStore.State;
 const Error = @import("err.zig").Error;
 
@@ -3171,6 +3172,105 @@ inline fn apply_literal_string_cross_pool(
     };
 }
 
+inline fn record_lookup_literal_cached(
+    record_value: Record,
+    pool: *const ValuePool,
+    field_name: []const u8,
+    cached_index: *?u32,
+) ?Value {
+    const fields = record_value.fields(pool);
+    if (cached_index.*) |field_index| {
+        if (field_index < record_value.len) {
+            const offset = field_index * 2;
+            const key = fields[offset];
+            if (key == .string_v and std.mem.eql(
+                u8,
+                key.string_v.slice(pool),
+                field_name,
+            )) {
+                var preceding_index: u32 = 0;
+                while (preceding_index < field_index) : (preceding_index += 1) {
+                    const preceding_key = fields[preceding_index * 2];
+                    std.debug.assert(preceding_key != .string_v or
+                        !std.mem.eql(
+                            u8,
+                            preceding_key.string_v.slice(pool),
+                            field_name,
+                        ));
+                }
+                return fields[offset + 1];
+            }
+        }
+    }
+    var field_index: u32 = 0;
+    while (field_index < record_value.len) : (field_index += 1) {
+        const offset = field_index * 2;
+        const key = fields[offset];
+        if (key != .string_v or !std.mem.eql(
+            u8,
+            key.string_v.slice(pool),
+            field_name,
+        )) continue;
+        cached_index.* = field_index;
+        return fields[offset + 1];
+    }
+    return null;
+}
+
+test "record field slot cache validates heterogeneous layouts" {
+    const Arena = @import("arena.zig").Arena;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 32, 64);
+
+    const first_offset = try pool.push_values(&.{
+        .{ .string_v = try pool.push_string("other") },
+        .{ .int_v = 1 },
+        .{ .string_v = try pool.push_string("active") },
+        .{ .bool_v = true },
+    });
+    const second_offset = try pool.push_values(&.{
+        .{ .string_v = try pool.push_string("active") },
+        .{ .bool_v = false },
+        .{ .string_v = try pool.push_string("other") },
+        .{ .int_v = 2 },
+    });
+    const first = Record{ .offset = first_offset, .len = 2 };
+    const second = Record{ .offset = second_offset, .len = 2 };
+    var cached_index: ?u32 = null;
+
+    try std.testing.expectEqual(
+        true,
+        record_lookup_literal_cached(
+            first,
+            &pool,
+            "active",
+            &cached_index,
+        ).?.bool_v,
+    );
+    try std.testing.expectEqual(@as(?u32, 1), cached_index);
+    try std.testing.expectEqual(
+        false,
+        record_lookup_literal_cached(
+            second,
+            &pool,
+            "active",
+            &cached_index,
+        ).?.bool_v,
+    );
+    try std.testing.expectEqual(@as(?u32, 0), cached_index);
+    try std.testing.expectEqual(
+        true,
+        record_lookup_literal_cached(
+            first,
+            &pool,
+            "active",
+            &cached_index,
+        ).?.bool_v,
+    );
+    try std.testing.expectEqual(@as(?u32, 1), cached_index);
+}
+
 fn function_dense_entry_probe(
     keys: []const Value,
     entries: []const Value,
@@ -5478,6 +5578,7 @@ pub fn filter_variable_path_boolean(
     const accepted = try context.eval_pool.alloc_values(count);
     const accepted_offset = value_offset(context.eval_pool, accepted.ptr);
     var accepted_count: u32 = 0;
+    var first_field_index: ?u32 = null;
     var index: u32 = 0;
     while (index < count) : (index += 1) {
         const candidate = try iterable_value(context, iterable, index);
@@ -5487,13 +5588,22 @@ pub fn filter_variable_path_boolean(
             candidate,
             context.eval_pool,
         );
-        for (path[candidate_path_index + 1 ..]) |key| {
+        for (path[candidate_path_index + 1 ..], 0..) |key, path_index| {
             value = switch (key) {
-                .field => |field_name| try apply_literal_string_cross_pool(
-                    value,
-                    source_pool,
-                    field_name,
-                ),
+                .field => |field_name| if (path_index == 0 and
+                    value == .record_v)
+                    record_lookup_literal_cached(
+                        value.record_v,
+                        source_pool,
+                        field_name,
+                        &first_field_index,
+                    ) orelse return Error.UndefinedSymbol
+                else
+                    try apply_literal_string_cross_pool(
+                        value,
+                        source_pool,
+                        field_name,
+                    ),
                 .argument, .bound => return Error.TypeError,
             };
         }

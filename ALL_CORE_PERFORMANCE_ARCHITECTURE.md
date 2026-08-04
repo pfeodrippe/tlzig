@@ -174,6 +174,8 @@ prevents repeating attractive but slower changes.
 | Per-filter validated record-slot caches | Index-cache exact runs were 12.103s, 12.093s, and 12.358s; interned-token-cache repeats were 12.994s and 13.439s, versus the retained 11.965-12.095s direct-filter range | Removed; validation and cache state outweighed shorter field scans; revisit only with a proven typed slot |
 | Candidate clone-and-fingerprint fusion | Exact five-run Storage median regressed from 11.668s to 11.823s and mean from 11.455s to 11.568s; won 2/5 pairs | Removed completely; inline hash work and cache insertion outweighed the later traversal saved |
 | Whole direct-filter force-inlining | Exact five-run Storage median was effectively flat at 10.859s to 10.849s, but mean regressed from 10.694s to 10.887s and it won 2/5 pairs | Removed; specialize the post-bound field access without duplicating the entire loop |
+| Nonrecursive state-filter call memoization | Three exact Storage pairs increased mean retired instructions from 1.950606T to 1.989776T (+2.008%); wall median regressed from 11.450s to 11.580s and mean from 11.553s to 12.117s | Removed completely; cloning results and memo hashing cost more than recomputing small filters |
+| Separate materialized-aggregate fingerprint routines | Three exact Storage pairs increased mean retired instructions by 0.204%, wall mean by 1.030%, wall median by 0.095%, and executable size by 17,392 bytes | Removed completely; lower cycles did not compensate for worse instructions and wall time |
 
 ## Current Hot Path
 
@@ -521,6 +523,53 @@ reduction from `1.962156T` to `1.952880T` (`0.473%`). Code size increased by
 `144` bytes. The post-change gate has `225` passing tests, complete MDBTLA
 coverage, zero generated fallback, and every default AOT row faster than
 TLC-auto.
+
+The same representation-preserving path specialization now covers equality,
+inequality, and set membership. It resolves the prefix once and applies the
+final literal directly; literal string right-hand operands are compared by
+bytes without constructing another `Value.string`. This remains generic over
+records and string-keyed functions and contains no model names or model
+semantics. Exhaustive Storage lowers `28` hot sites (`18` equality, `6`
+inequality, and `4` membership). Six alternating exact ReleaseFast pairs
+reduced retired instructions in every pair, from a `1.953476T` baseline mean
+to `1.950359T`, a `0.160%` reduction. Aggregate wall mean moved from `10.553s`
+to `10.508s` and median from `10.660s` to `10.370s`; pairwise wall order was
+noisy, so the consistent counter result is the acceptance evidence. The
+executable grew by `32` bytes. Formatting, all `225` tests, ReleaseFast
+compilation, coverage audit, full default benchmark, zero-fallback audit, and
+no-spec-semantics audit all pass.
+
+Recursive value fingerprints now inline a generic primitive-child dispatcher.
+The fingerprint format is unchanged: Boolean, integer, model, string, and
+range leaves retain their exact FNV tags and bytes, model permutations remain
+identical, and bounded hashing consumes the same node budget. Only aggregate
+values enter the larger recursive switch, so primitive children avoid a full
+out-of-line redispatch. This is representation-level machinery shared by all
+models; it has no generated operator or model-name knowledge. Three
+alternating exact ReleaseFast Storage pairs retained
+`8,723,634/1,078,623` generated/distinct states while mean retired
+instructions fell from `1.950677T` to `1.748778T` (`10.350%`) and cycles fell
+`4.863%`. Wall mean improved from `11.930s` to `11.293s` (`5.337%`) and
+median from `11.930s` to `11.380s` (`4.610%`), with all three pairs faster.
+The executable grew by `16,544` bytes. Formatting, all `225` tests,
+ReleaseFast compilation, complete MDBTLA coverage, the full default
+benchmark, zero-fallback audit, and no-spec-semantics audit pass.
+
+Generated Boolean set filters now retain a verified slot for their first
+post-bound literal record field. The first candidate scans normally. Later
+candidates reuse the slot only when its field name still matches; a different
+record layout falls back to a scan and updates the slot. Debug builds also
+assert that no earlier field has the same name, matching TLA+ record-field
+uniqueness. The cache lives on the filter stack, performs no allocation, and
+is selected from a general AST shape emitted in eight MDBTLA models. Six
+alternating exact ReleaseFast Storage pairs retained
+`8,723,634/1,078,623` generated/distinct states. Mean retired instructions
+fell from `1.748343T` to `1.715462T` (`1.881%`) and cycles fell `2.187%`, with
+no executable growth. Wall mean improved `0.568%`; median regressed `2.237%`
+under run-order noise, while the candidate won four of six pair positions.
+Formatting, all `226` tests, ReleaseFast compilation, complete MDBTLA
+coverage, the full default benchmark, zero-fallback audit, and
+no-spec-semantics audit pass.
 
 Any future lazy EXCEPT patch must satisfy a stricter ownership contract than
 the current evaluator representation:

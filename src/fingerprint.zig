@@ -83,7 +83,7 @@ fn hash_value_inner(
     return hash_value_inner_impl(false, pool, v, permutation, &unused);
 }
 
-fn hash_value_inner_impl(
+inline fn hash_value_inner_impl(
     comptime bounded: bool,
     pool: *const ValuePool,
     v: Value,
@@ -98,6 +98,63 @@ fn hash_value_inner_impl(
         }
         bounded_state.remaining_nodes -= 1;
     }
+    return switch (v) {
+        .bool_v => |value| blk: {
+            var hash = hash_byte(hash_init(), @backingInt(v));
+            hash = hash_byte(hash, if (value) 1 else 0);
+            break :blk hash;
+        },
+        .int_v => |value| blk: {
+            var hash = hash_byte(hash_init(), @backingInt(v));
+            const bytes: [@sizeOf(i64)]u8 = @bitCast(value);
+            hash = hash_bytes(hash, &bytes);
+            break :blk hash;
+        },
+        .model_v => |value| blk: {
+            var hash = hash_byte(hash_init(), @backingInt(v));
+            const permuted = if (permutation) |mapping|
+                if (value < mapping.len) mapping[value] else value
+            else
+                value;
+            const bytes: [@sizeOf(u32)]u8 = @bitCast(permuted);
+            hash = hash_bytes(hash, &bytes);
+            break :blk hash;
+        },
+        .string_v => |value| blk: {
+            if (bounded and value.len > 128) {
+                bounded_state.valid = false;
+                break :blk 0;
+            }
+            var hash = hash_byte(hash_init(), @backingInt(v));
+            hash = hash_bytes(hash, value.slice(pool));
+            break :blk hash;
+        },
+        .range_v => |value| blk: {
+            var hash = hash_byte(hash_init(), @backingInt(v));
+            hash = hash_byte(hash, 0x17);
+            const lo_bytes: [@sizeOf(i64)]u8 = @bitCast(value.lo);
+            const hi_bytes: [@sizeOf(i64)]u8 = @bitCast(value.hi);
+            hash = hash_bytes(hash, &lo_bytes);
+            hash = hash_bytes(hash, &hi_bytes);
+            break :blk hash;
+        },
+        else => hash_value_inner_aggregate_impl(
+            bounded,
+            pool,
+            v,
+            permutation,
+            bounded_state,
+        ),
+    };
+}
+
+fn hash_value_inner_aggregate_impl(
+    comptime bounded: bool,
+    pool: *const ValuePool,
+    v: Value,
+    permutation: ?[]const u32,
+    bounded_state: *BoundedHashState,
+) Fingerprint {
     var h = hash_init();
     const sequence_layout = if (v == .function_v)
         sequence_function_layout(pool, v.function_v)
@@ -109,28 +166,7 @@ fn hash_value_inner_impl(
         @backingInt(v);
     h = hash_byte(h, tag);
     switch (v) {
-        .bool_v => |b| {
-            h = hash_byte(h, if (b) 1 else 0);
-        },
-        .int_v => |i| {
-            const bytes: [@sizeOf(i64)]u8 = @bitCast(i);
-            h = hash_bytes(h, &bytes);
-        },
-        .model_v => |m| {
-            const permuted = if (permutation) |mapping|
-                if (m < mapping.len) mapping[m] else m
-            else
-                m;
-            const bytes: [@sizeOf(u32)]u8 = @bitCast(permuted);
-            h = hash_bytes(h, &bytes);
-        },
-        .string_v => |s| {
-            if (bounded and s.len > 128) {
-                bounded_state.valid = false;
-                return 0;
-            }
-            h = hash_bytes(h, s.slice(pool));
-        },
+        .bool_v, .int_v, .model_v, .string_v, .range_v => unreachable,
         .set_v => |s| {
             var unordered = unordered_hash_init();
             for (s.items(pool)) |it| {
@@ -398,13 +434,6 @@ fn hash_value_inner_impl(
                 permutation,
                 bounded_state,
             ));
-        },
-        .range_v => |r| {
-            h = hash_byte(h, 0x17);
-            const lo_bytes: [@sizeOf(i64)]u8 = @bitCast(r.lo);
-            const hi_bytes: [@sizeOf(i64)]u8 = @bitCast(r.hi);
-            h = hash_bytes(h, &lo_bytes);
-            h = hash_bytes(h, &hi_bytes);
         },
         .seq_set_v => |ss| {
             h = hash_byte(h, 0x18);

@@ -134,6 +134,54 @@ TLAPS proof-only modules are intentionally outside the product scope.
   ReleaseFast benchmark. Every generated artifact reports `fallbacks=0`, all
   AOT rows remain faster than TLC-auto, and exhaustive Storage A/B runs retain
   exactly `8,723,634/1,078,623` generated/distinct states.
+- [x] Lower equality, inequality, and membership over final literal-string
+  state-path keys through generic record/function-preserving helpers. Exhaustive
+  Storage converts `28` hot sites (`18` equality, `6` inequality, and `4`
+  membership). Across six exact alternating ReleaseFast pairs, retired
+  instructions fell in every pair by `0.092%` to `0.218%`, from a
+  `1.953476T` baseline mean to `1.950359T` (`0.160%`). Aggregate wall mean
+  improved from `10.553s` to `10.508s` and median from `10.660s` to `10.370s`;
+  the executable grew by `32` bytes. All `225` tests, ReleaseFast compilation,
+  complete MDBTLA coverage, the full default benchmark, zero-fallback audit,
+  and no-spec-semantics audit pass.
+- [x] Reject and remove generic state-call memoization for nonrecursive
+  state-dependent set-filter operators. Three alternating exact Storage pairs
+  preserved `8,723,634/1,078,623` states, but mean retired instructions rose
+  from `1.950606T` to `1.989776T` (`2.008%`). Wall median regressed from
+  `11.450s` to `11.580s`, mean regressed from `11.553s` to `12.117s`, and the
+  executable grew by `320` bytes. Cloning/hash-table work costs more than
+  recomputing these small filters; the runtime helpers, codegen policy, and
+  tests were removed completely.
+- [x] Inline the generic primitive-child fingerprint dispatcher while
+  preserving the exact FNV tags, byte order, bounded-hash accounting, and
+  permutation semantics. Aggregate recursion now handles Boolean, integer,
+  model, string, and range children without re-entering the full aggregate
+  switch. Three alternating exact ReleaseFast Storage pairs retained
+  `8,723,634/1,078,623` generated/distinct states and reduced mean retired
+  instructions from `1.950677T` to `1.748778T` (`10.350%`) and cycles by
+  `4.863%`. Wall mean improved from `11.930s` to `11.293s` (`5.337%`) and
+  median from `11.930s` to `11.380s` (`4.610%`), with all three wall pairs
+  faster; the executable grew by `16,544` bytes. All `225` tests, ReleaseFast
+  compilation, the full default benchmark, complete MDBTLA coverage, the
+  zero-fallback audit, and the no-spec-semantics audit pass.
+- [x] Reject and remove splitting materialized set, tuple, function, and record
+  fingerprints into separate out-of-line routines. Three exact alternating
+  Storage pairs preserved state counts but increased mean retired instructions
+  by `0.204%`, regressed wall mean by `1.030%`, left wall median effectively
+  flat (`+0.095%`), and grew the executable by `17,392` bytes. Lower cycles
+  alone did not justify worse instruction and wall results.
+- [x] Cache the first post-bound literal record-field slot within generated
+  Boolean set filters. Every reuse verifies the field name; heterogeneous
+  layouts fall back to a scan and refresh the slot, and debug builds assert
+  the TLA+ unique-field invariant. The helper is allocation-free and shared by
+  the same AST shape in eight MDBTLA models. Six alternating exact ReleaseFast
+  Storage pairs retained `8,723,634/1,078,623` generated/distinct states while
+  reducing mean retired instructions from `1.748343T` to `1.715462T`
+  (`1.881%`) and cycles by `2.187%`, with no executable growth. Wall mean
+  improved `0.568%`, wall median was noisy and regressed `2.237%`, and the
+  candidate won four of six pair positions. All `226` tests, ReleaseFast
+  compilation, the complete default benchmark, full MDBTLA coverage, the
+  zero-fallback audit, and the no-spec-semantics audit pass.
 - [x] Specify the safety contract for a typed lazy patch before revisiting
   candidate materialization: its base must outlive evaluator rollback; path
   and replacement data must be candidate-owned or copied scalars; rejected

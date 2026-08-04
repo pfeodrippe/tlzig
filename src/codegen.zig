@@ -11335,6 +11335,26 @@ fn emit_variable_path_literal_string_call(
     application: *const ast.Apply,
     params: []const []const u8,
 ) error{OutOfMemory}!bool {
+    if (!try emit_variable_path_literal_string_prefix(
+        output,
+        allocator,
+        module,
+        function_name,
+        application,
+        params,
+    )) return false;
+    try append(output, allocator, ")");
+    return true;
+}
+
+fn emit_variable_path_literal_string_prefix(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    function_name: []const u8,
+    application: *const ast.Apply,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
     if (application.args.len != 1 or
         application.args[0].* != .string_literal)
     {
@@ -11365,7 +11385,7 @@ fn emit_variable_path_literal_string_call(
     }
     const suffix = try std.fmt.allocPrint(
         allocator,
-        "}}, \"{f}\")",
+        "}}, \"{f}\"",
         .{std.zig.fmtString(application.args[0].string_literal)},
     );
     defer allocator.free(suffix);
@@ -11573,6 +11593,23 @@ fn emit_variable_path_membership(
         "variable_path_member_bool"
     else
         "variable_path_not_member_bool";
+    const literal_function_name = if (binary.op == .in)
+        "variable_path_literal_string_member_bool"
+    else
+        "variable_path_literal_string_not_member_bool";
+    if (try emit_variable_path_literal_string_prefix(
+        output,
+        allocator,
+        module,
+        literal_function_name,
+        binary.right.apply,
+        params,
+    )) {
+        try append(output, allocator, ", ");
+        try emit_expr(output, allocator, module, binary.left, params);
+        try append(output, allocator, ")");
+        return true;
+    }
     const prefix = try std.fmt.allocPrint(
         allocator,
         "try runtime.{s}(context, {d}, &[_]Value{{",
@@ -12306,6 +12343,39 @@ fn emit_one_sided_path_comparison(
     other: *ast.Expr,
     params: []const []const u8,
 ) error{OutOfMemory}!bool {
+    const other_is_string = other.* == .string_literal;
+    const literal_function_name = if (other_is_string)
+        if (binary.op == .eq)
+            "variable_path_literal_string_equal_string_bool"
+        else
+            "variable_path_literal_string_not_equal_string_bool"
+    else if (binary.op == .eq)
+        "variable_path_literal_string_equal_bool"
+    else
+        "variable_path_literal_string_not_equal_bool";
+    if (try emit_variable_path_literal_string_prefix(
+        output,
+        allocator,
+        module,
+        literal_function_name,
+        path_application,
+        params,
+    )) {
+        if (other_is_string) {
+            const suffix = try std.fmt.allocPrint(
+                allocator,
+                ", \"{f}\")",
+                .{std.zig.fmtString(other.string_literal)},
+            );
+            defer allocator.free(suffix);
+            try append(output, allocator, suffix);
+        } else {
+            try append(output, allocator, ", ");
+            try emit_expr(output, allocator, module, other, params);
+            try append(output, allocator, ")");
+        }
+        return true;
+    }
     const function_name = if (binary.op == .eq)
         "variable_path_equal_bool"
     else
@@ -12847,6 +12917,9 @@ test "literal string state paths avoid temporary string values" {
         \\---------------- MODULE GeneratedLiteralStringPath ----------------
         \\VARIABLE snapshots
         \\Read(node, tx) == snapshots[node][tx]["active"]
+        \\Ready(node, tx) == snapshots[node][tx]["mode"] = "ready"
+        \\Matches(node, tx, expected) == snapshots[node][tx]["mode"] = expected
+        \\Contains(node, tx, item) == item \in snapshots[node][tx]["items"]
         \\===============================================================
         \\
     ;
@@ -12857,7 +12930,7 @@ test "literal string state paths avoid temporary string values" {
     const result = try emit_module_with_roots(
         std.testing.allocator,
         module,
-        &.{"Read"},
+        &.{ "Read", "Ready", "Matches", "Contains" },
     );
     defer result.deinit(std.testing.allocator);
 
@@ -12866,6 +12939,21 @@ test "literal string state paths avoid temporary string values" {
         u8,
         result.source,
         "runtime.variable_path_literal_string(context, 0,",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_path_literal_string_equal_string_bool(context, 0,",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_path_literal_string_equal_bool(context, 0,",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_path_literal_string_member_bool(context, 0,",
     ) != null);
 }
 

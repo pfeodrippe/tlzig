@@ -26,6 +26,9 @@ COMMUNITY_JAR = ROOT / "vendor/tlaplus/tlatools/org.lamport.tlatools/lib/Communi
 TLZIG = ROOT / "zig-out/bin/tlzig"
 COUNT_RE = re.compile(r"([\d,]+) states generated, ([\d,]+) distinct states found")
 TLZIG_COUNT_RE = re.compile(r"generated=(\d+) distinct=(\d+)")
+SIMULATION_DEPTH = 100
+SIMULATION_SEED = 0x544C5A49475F5349
+SIMULATION_MAX_STATES = 1_000_000
 
 # Local cfgs exercise upstream modules without copying the TLA+ source.
 LOCAL_CONFIG_MODULES = {
@@ -95,9 +98,10 @@ def discover(corpora: list[str]) -> list[Path]:
     return sorted(set(configs))
 
 
-def manifest_modules() -> dict[str, str]:
+def manifest_models() -> tuple[dict[str, str], dict[str, int]]:
     root = ROOT / "vendor/tlaplus-examples"
     mappings: dict[str, str] = {}
+    simulations: dict[str, int] = {}
     for manifest in root.rglob("manifest.json"):
         try:
             contents = json.loads(manifest.read_text())
@@ -107,11 +111,15 @@ def manifest_modules() -> dict[str, str]:
             tla = root / module["path"]
             for model in module.get("models", []):
                 cfg = root / model["path"]
-                mappings[str(cfg.relative_to(ROOT))] = str(tla.relative_to(ROOT))
-    return mappings
+                relative = str(cfg.relative_to(ROOT))
+                mappings[relative] = str(tla.relative_to(ROOT))
+                mode = model.get("mode")
+                if isinstance(mode, dict) and "simulate" in mode:
+                    simulations[relative] = int(mode["simulate"]["traceCount"])
+    return mappings, simulations
 
 
-MANIFEST_CONFIG_MODULES = manifest_modules()
+MANIFEST_CONFIG_MODULES, MANIFEST_SIMULATION_MODELS = manifest_models()
 
 
 def candidate_modules(cfg: Path) -> list[Path]:
@@ -234,6 +242,7 @@ def run_tlc(
     timeout: int,
     workers: str,
     xmx: str,
+    simulation_trace_count: int | None = None,
 ) -> Run:
     classpath = os.pathsep.join((str(TLC_JAR), str(COMMUNITY_JAR), str(ROOT / "specs/modules")))
     with tempfile.TemporaryDirectory(prefix="tlzig-tlc-audit-") as metadir:
@@ -241,6 +250,18 @@ def run_tlc(
             ["-XX:ActiveProcessorCount=1", "-XX:+UseSerialGC"]
             if workers == "1"
             else ["-XX:+UseParallelGC"]
+        )
+        mode_options = (
+            [
+                "-simulate",
+                f"num={simulation_trace_count}",
+                "-depth",
+                str(SIMULATION_DEPTH),
+                "-seed",
+                str(SIMULATION_SEED),
+            ]
+            if simulation_trace_count is not None
+            else []
         )
         argv = ["java", *java_options,
             f"-Xmx{xmx}",
@@ -253,6 +274,9 @@ def run_tlc(
             "-workers",
             workers,
             "-cleanup",
+            "-lncheck",
+            "final",
+            *mode_options,
             "-config",
             str(cfg),
             str(tla),
@@ -299,7 +323,13 @@ def run_tlzig(
     arena_bytes: int,
     eval_arena_bytes: int,
     workers: str,
+    simulation_trace_count: int | None = None,
 ) -> Run:
+    effective_max_states = (
+        max(max_states, SIMULATION_MAX_STATES)
+        if simulation_trace_count is not None
+        else max_states
+    )
     argv = [
         str(TLZIG),
         "--spec",
@@ -309,7 +339,7 @@ def run_tlzig(
         "--workers",
         workers,
         "--max-states",
-        str(max_states),
+        str(effective_max_states),
         "--max-successors",
         str(max_successors),
         "--state-values-per-state",
@@ -320,6 +350,15 @@ def run_tlzig(
         "--eval-arena-bytes",
         str(eval_arena_bytes),
     ]
+    if simulation_trace_count is not None:
+        argv.extend((
+            "--simulate-traces",
+            str(simulation_trace_count),
+            "--simulate-depth",
+            str(SIMULATION_DEPTH),
+            "--seed",
+            str(SIMULATION_SEED),
+        ))
     returncode, output, seconds = run_process(argv, ROOT, timeout)
     return classify_tlzig(returncode, output, seconds)
 
@@ -376,15 +415,22 @@ def resolve_and_run(
             "parity": "non-model-harness",
         }
     candidates = candidate_modules(cfg)
+    simulation_trace_count = MANIFEST_SIMULATION_MODELS.get(relative)
     rejected: list[str] = []
     last_tlc: Run | None = None
     for candidate in candidates:
+        candidate_timeout = (
+            timeout
+            if len(candidates) == 1 or candidate == cfg.with_suffix(".tla")
+            else resolve_timeout
+        )
         tlc = run_tlc(
             cfg,
             candidate,
-            timeout if candidate == cfg.with_suffix(".tla") else resolve_timeout,
+            candidate_timeout,
             tlc_workers,
             tlc_xmx,
+            simulation_trace_count,
         )
         last_tlc = tlc
         if tlc.status.startswith("invalid"):
@@ -393,6 +439,29 @@ def resolve_and_run(
         if tlc.status == "resolution-timeout":
             rejected.append(f"{candidate.name}: resolution timeout")
             continue
+        if simulation_trace_count is not None:
+            tlzig = run_tlzig(
+                cfg,
+                candidate,
+                timeout,
+                max_states,
+                max_successors,
+                state_values_per_state,
+                arena_bytes,
+                eval_arena_bytes,
+                tlzig_workers,
+                simulation_trace_count,
+            )
+            parity = compare_runs(tlc, tlzig, True)
+            return {
+                "cfg": relative,
+                "tla": str(candidate.relative_to(ROOT)),
+                "tlc": dataclasses.asdict(tlc),
+                "tlzig": dataclasses.asdict(tlzig),
+                "mode": {"simulate": {"traceCount": simulation_trace_count}},
+                "workers": {"tlc": tlc_workers, "tlzig": tlzig_workers},
+                "parity": parity,
+            }
         tlzig = run_tlzig(
             cfg,
             candidate,
@@ -452,6 +521,10 @@ def load_completed(
                 row["tlzig"] = None
                 row["parity"] = "non-model-harness"
                 rows[str(row["cfg"])] = row
+                continue
+            if str(row["cfg"]) in MANIFEST_SIMULATION_MODELS:
+                # Older audits ran these models exhaustively, which is not the
+                # mode declared by the examples corpus. Re-run them correctly.
                 continue
             tlc_data = row.get("tlc")
             tlzig_data = row.get("tlzig")

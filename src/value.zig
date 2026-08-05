@@ -87,8 +87,8 @@ pub const Lambda = struct {
 
 pub const GeneratedOperator = extern struct {
     function_address: usize,
-    arity: u16,
     captured_offset: u32,
+    arity: u16,
     captured_len: u16,
 };
 
@@ -981,6 +981,11 @@ pub const Value = union(ValueTag) {
         };
     }
 };
+
+test "value representation remains compact" {
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(GeneratedOperator));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(Value));
+}
 
 fn ordered_values_eql_cross_pool(
     left: []const Value,

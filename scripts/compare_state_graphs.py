@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import re
 import sys
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 
@@ -350,6 +351,162 @@ def canonical_state(
     return result
 
 
+def project_state(state: str, variable_names: tuple[str, ...]) -> str:
+    assignments = dict(
+        line.split("=", 1)
+        for line in state.splitlines()
+    )
+    missing = set(variable_names) - assignments.keys()
+    if missing:
+        raise ValueError(
+            "state is missing identity variables: " + ", ".join(sorted(missing)),
+        )
+    return "\n".join(
+        f"{name}={assignments[name]}"
+        for name in sorted(variable_names)
+    )
+
+
+def shortest_levels(
+    initial: set[int],
+    edges: list[tuple[int, int, object]],
+) -> dict[int, int]:
+    successors: dict[int, list[int]] = defaultdict(list)
+    for source, target, _ in edges:
+        successors[source].append(target)
+    levels = {state_id: 1 for state_id in initial}
+    queue = deque(initial)
+    while queue:
+        source = queue.popleft()
+        for target in successors[source]:
+            if target in levels:
+                continue
+            levels[target] = levels[source] + 1
+            queue.append(target)
+    return levels
+
+
+def report_representative_differences(
+    tlc_states: dict[int, str],
+    tlc_initial: set[int],
+    tlc_edges: list[tuple[int, int, str]],
+    tlzig_states: dict[int, str],
+    tlzig_initial: set[int],
+    tlzig_edges: list[tuple[int, int, int]],
+    identity_vars: tuple[str, ...],
+) -> None:
+    tlc_by_identity = {
+        project_state(state, identity_vars): (state_id, state)
+        for state_id, state in tlc_states.items()
+    }
+    tlzig_by_identity = {
+        project_state(state, identity_vars): (state_id, state)
+        for state_id, state in tlzig_states.items()
+    }
+    if len(tlc_by_identity) != len(tlc_states):
+        raise ValueError("TLC contains duplicate projected state identities")
+    if len(tlzig_by_identity) != len(tlzig_states):
+        raise ValueError("tlzig contains duplicate projected state identities")
+
+    tlc_levels = shortest_levels(tlc_initial, tlc_edges)
+    tlzig_levels = shortest_levels(tlzig_initial, tlzig_edges)
+    tlc_order: dict[int, list[str]] = defaultdict(list)
+    for state_id, state in tlc_states.items():
+        tlc_order[tlc_levels[state_id]].append(project_state(state, identity_vars))
+    tlzig_order: dict[int, list[str]] = defaultdict(list)
+    for state_id, state in tlzig_states.items():
+        tlzig_order[tlzig_levels[state_id]].append(project_state(state, identity_vars))
+    for level in sorted(tlc_order.keys() | tlzig_order.keys()):
+        expected = tlc_order[level]
+        actual = tlzig_order[level]
+        if expected == actual:
+            continue
+        first_index = next(
+            (
+                index
+                for index, pair in enumerate(zip(expected, actual))
+                if pair[0] != pair[1]
+            ),
+            min(len(expected), len(actual)),
+        )
+        print(
+            f"projected discovery order first differs at level={level} "
+            f"index={first_index} TLC count={len(expected)} "
+            f"tlzig count={len(actual)}",
+        )
+        break
+    differences: list[tuple[int, int, str, int, int, str, str]] = []
+    for identity in tlc_by_identity.keys() & tlzig_by_identity.keys():
+        tlc_id, tlc_state = tlc_by_identity[identity]
+        tlzig_id, tlzig_state = tlzig_by_identity[identity]
+        if tlc_state == tlzig_state:
+            continue
+        differences.append(
+            (
+                tlc_levels.get(tlc_id, sys.maxsize),
+                tlzig_levels.get(tlzig_id, sys.maxsize),
+                identity,
+                tlc_id,
+                tlzig_id,
+                tlc_state,
+                tlzig_state,
+            ),
+        )
+
+    print(f"concrete representative differences: {len(differences)}")
+    if not differences:
+        return
+    level_pairs = Counter(
+        (tlc_level, tlzig_level)
+        for tlc_level, tlzig_level, _, _, _, _, _ in differences
+    )
+    print(f"  level pairs: {sorted(level_pairs.items())}")
+    first = min(differences, key=lambda item: (item[0], item[1], item[2]))
+    tlc_assignments = dict(line.split("=", 1) for line in first[5].splitlines())
+    tlzig_assignments = dict(line.split("=", 1) for line in first[6].splitlines())
+    differing_variables = sorted(
+        name
+        for name in tlc_assignments.keys() | tlzig_assignments.keys()
+        if tlc_assignments.get(name) != tlzig_assignments.get(name)
+    )
+    print(
+        f"  first difference: TLC level={first[0]} "
+        f"tlzig level={first[1]} TLC id={first[3]} tlzig id={first[4]} "
+        f"variables={','.join(differing_variables)}",
+    )
+    tlc_level_counts: dict[int, int] = defaultdict(int)
+    tlc_level_positions: dict[int, int] = {}
+    for state_id in tlc_states:
+        level = tlc_levels[state_id]
+        tlc_level_positions[state_id] = tlc_level_counts[level]
+        tlc_level_counts[level] += 1
+    tlzig_level_counts: dict[int, int] = defaultdict(int)
+    tlzig_level_positions: dict[int, int] = {}
+    for state_id in tlzig_states:
+        level = tlzig_levels[state_id]
+        tlzig_level_positions[state_id] = tlzig_level_counts[level]
+        tlzig_level_counts[level] += 1
+    tlc_parents = [
+        source
+        for source, target, _ in tlc_edges
+        if target == first[3]
+    ]
+    tlzig_parents = [
+        source
+        for source, target, _ in tlzig_edges
+        if target == first[4]
+    ]
+    print(
+        "  incoming parent positions: "
+        f"TLC={[(parent, tlc_levels[parent], tlc_level_positions[parent]) for parent in tlc_parents]} "
+        f"tlzig={[(parent, tlzig_levels[parent], tlzig_level_positions[parent]) for parent in tlzig_parents]}",
+    )
+    for name in differing_variables:
+        tlc_value = tlc_assignments.get(name, "<missing>")
+        tlzig_value = tlzig_assignments.get(name, "<missing>")
+        print(f"    {name}: TLC={tlc_value[:256]} tlzig={tlzig_value[:256]}")
+
+
 def canonicalize_state_item(item: tuple[int, str]) -> tuple[int, str]:
     state_id, state = item
     return state_id, canonical_state(state, WORKER_SYMMETRY_REWRITES)
@@ -548,6 +705,20 @@ def parse_symmetry_atoms(value: str) -> tuple[str, ...]:
     return atoms
 
 
+def parse_identity_vars(value: str) -> tuple[str, ...]:
+    names = tuple(name for name in value.split(",") if name)
+    if not names:
+        raise argparse.ArgumentTypeError("identity variables cannot be empty")
+    if len(set(names)) != len(names):
+        raise argparse.ArgumentTypeError("identity variables contain duplicates")
+    for name in names:
+        if SYMMETRY_ATOM_RE.fullmatch(name) is None:
+            raise argparse.ArgumentTypeError(
+                f"identity variable is not an identifier: {name}",
+            )
+    return names
+
+
 def report_difference(label: str, expected: set[object], actual: set[object]) -> bool:
     missing = expected - actual
     extra = actual - expected
@@ -573,6 +744,15 @@ def main() -> int:
         type=int,
         default=min(16, os.cpu_count() or 1),
         help="parallel state canonicalization workers (default: up to 16)",
+    )
+    parser.add_argument(
+        "--identity-vars",
+        type=parse_identity_vars,
+        metavar="VAR[,VAR]",
+        help=(
+            "compare projected state identities and report differing concrete "
+            "representatives, for example variables used by VIEW"
+        ),
     )
     parser.add_argument(
         "--symmetry-atoms",
@@ -626,6 +806,25 @@ def main() -> int:
     tlzig_initial_ids = parse_id_set(args.tlzig_initial)
     tlzig_raw_edges = parse_tlzig_edges(args.tlzig_graph)
 
+    if args.identity_vars is not None:
+        report_representative_differences(
+            tlc_states,
+            tlc_initial_ids,
+            tlc_raw_edges,
+            tlzig_states,
+            tlzig_initial_ids,
+            tlzig_raw_edges,
+            args.identity_vars,
+        )
+        tlc_states = {
+            state_id: project_state(state, args.identity_vars)
+            for state_id, state in tlc_states.items()
+        }
+        tlzig_states = {
+            state_id: project_state(state, args.identity_vars)
+            for state_id, state in tlzig_states.items()
+        }
+
     tlc_state_set = set(tlc_states.values())
     tlzig_state_set = set(tlzig_states.values())
     state_identities = {
@@ -659,6 +858,14 @@ def main() -> int:
     passed &= report_difference("states", tlc_state_set, tlzig_state_set)
     passed &= report_difference("initial states", tlc_initial, tlzig_initial)
     passed &= report_difference("semantic edges", tlc_edges, tlzig_edges)
+    if args.identity_vars is not None:
+        missing_edges = tlc_edges - tlzig_edges
+        extra_edges = tlzig_edges - tlc_edges
+        print(
+            "edge identity diagnostics: "
+            f"missing self={sum(source == target for source, target in missing_edges)} "
+            f"extra self={sum(source == target for source, target in extra_edges)}",
+        )
     print(
         f"raw edges: TLC={len(tlc_raw_edges)} tlzig={len(tlzig_raw_edges)} "
         f"TLC duplicate witnesses={len(tlc_raw_edges) - len(tlc_edges)}",

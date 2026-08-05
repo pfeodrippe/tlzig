@@ -37,6 +37,9 @@ pub const Config = struct {
     view_name: ?[]const u8 = null,
     check_deadlock: bool,
     strict_constants: bool = false,
+    // Orbit-state quotienting is not sound for general temporal properties.
+    // This opt-in exists for controlled compatibility tests only.
+    allow_unsafe_temporal_symmetry: bool = false,
 
     pub fn empty() Config {
         return Config{
@@ -413,6 +416,7 @@ pub fn parse(arena: *Arena, source: []const u8) !Config {
         .view_name = cfg.view_name,
         .check_deadlock = cfg.check_deadlock,
         .strict_constants = true,
+        .allow_unsafe_temporal_symmetry = cfg.allow_unsafe_temporal_symmetry,
     };
 }
 

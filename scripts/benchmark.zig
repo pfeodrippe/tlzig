@@ -32,16 +32,22 @@ const Spec = struct {
     default_enabled: bool = true,
     one_core_default: bool = true,
     max_states: u32 = 100_000,
+    max_successors: u32 = 65_536,
+    max_graph_edges: ?u32 = null,
     max_nat: i64 = 1000,
     min_int: i64 = -1000,
     max_int: i64 = 1000,
     state_values_per_state: u32 = 60,
+    state_value_cap: ?u32 = null,
+    scratch_growable: bool = false,
     expected_violation: bool = false,
     distinct_tolerance: u64 = 0,
+    expected_distinct_tolerance: ?u64 = null,
     compare_generated: bool = true,
     compare_distinct: bool = true,
     prefer_generated: bool = false,
     java_classpath: ?[]const u8 = null,
+    java_heap: ?[]const u8 = null,
 };
 
 const Options = struct {
@@ -52,6 +58,7 @@ const Options = struct {
     auto_only: bool = false,
     tlzig_only: bool = false,
     skip_prefer_generated: bool = false,
+    tlc_baseline_prefer_generated: bool = false,
     write_tlzig_baseline: bool = false,
 };
 
@@ -83,7 +90,9 @@ const specs = [_]Spec{
     // edges under the configured replica symmetry. TLC retains duplicate
     // action witnesses, so its raw generated-state counter is non-semantic.
     .{ .label = "MultiPaxosSmall", .tla = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.tla", .cfg = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC_small.cfg", .default_enabled = false, .one_core_default = false, .max_states = 2_000_000, .state_values_per_state = 320, .compare_generated = false, .prefer_generated = true },
-    .{ .label = "MultiPaxos", .tla = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.tla", .cfg = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.cfg", .default_enabled = false, .one_core_default = false, .max_states = 5_000_000, .state_values_per_state = 320, .prefer_generated = true },
+    // Full 37-million-state quotient graph. TLC retains 10,668 additional
+    // duplicate action witnesses, so require exact distinct-state parity.
+    .{ .label = "MultiPaxos", .tla = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.tla", .cfg = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.cfg", .default_enabled = false, .one_core_default = false, .max_states = 40_000_000, .max_successors = 4_096, .state_values_per_state = 2, .state_value_cap = 80_000_000, .compare_generated = false, .prefer_generated = true, .java_heap = "-Xmx24g" },
     .{ .tla = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.tla", .cfg = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.cfg", .max_states = 500_000, .expected_violation = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.tla", .cfg = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.cfg", .default_enabled = false, .one_core_default = false, .max_states = 500_000, .expected_violation = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.cfg", .max_states = 500_000, .compare_generated = false },
@@ -101,6 +110,21 @@ const specs = [_]Spec{
         .max_states = 10_000_000,
         .prefer_generated = true,
     },
+    // Exact 244-million-state graph. Keep the all-core pair opt-in because it
+    // takes roughly twenty minutes and approaches the memory limit of a 48 GiB
+    // machine. The upstream configuration has no symmetry reduction.
+    .{
+        .label = "Slush Large",
+        .tla = "vendor/tlaplus-examples/specifications/SlushProtocol/Slush.tla",
+        .cfg = "vendor/tlaplus-examples/specifications/SlushProtocol/SlushLarge.cfg",
+        .default_enabled = false,
+        .one_core_default = false,
+        .max_states = 250_000_000,
+        .state_values_per_state = 2,
+        .state_value_cap = 8_000_000,
+        .prefer_generated = true,
+        .java_heap = "-Xmx32g",
+    },
     .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.cfg", .max_states = 200_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.tla", .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.cfg", .max_states = 200_000, .compare_generated = false },
     .{ .label = "MCBinarySearch", .tla = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.tla", .cfg = "vendor/tlaplus-examples/specifications/LoopInvariance/MCBinarySearch.cfg", .one_core_default = false, .max_states = 200_000, .prefer_generated = true },
@@ -112,8 +136,26 @@ const specs = [_]Spec{
     // The N=2 strict audit matches all states, initial states, unique edges,
     // and the weak-fair System edge subset; compare exact distinct states here.
     .{ .label = "EWD998Small", .tla = "vendor/tlaplus-examples/specifications/ewd998/EWD998.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd998/EWD998Small.cfg", .one_core_default = false, .max_states = 1_600_000, .state_values_per_state = 60, .compare_generated = false, .prefer_generated = true },
+    // Complete constrained N=2 temporal graph. This exercises both temporal
+    // properties and catches generated UNCHANGED calls that inherit enclosing
+    // action parameters. TLC retains duplicate action witnesses, so compare
+    // exact distinct states and outcomes.
+    .{ .label = "EWD998 N2 Temporal", .tla = "vendor/tlaplus-examples/specifications/ewd998/EWD998.tla", .cfg = "benchmark_configs/EWD998N2Temporal.cfg", .one_core_default = false, .max_states = 100_000, .state_values_per_state = 96, .compare_generated = false, .prefer_generated = true },
+    // Original N=4 temporal model. Keep the exhaustive pair opt-in because
+    // its complete graph has 248,006,200 states and 2,083,298,801 edges.
+    .{ .label = "EWD998 Original Large", .tla = "vendor/tlaplus-examples/specifications/ewd998/EWD998.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd998/EWD998.cfg", .default_enabled = false, .one_core_default = false, .max_states = 250_000_000, .max_successors = 4_096, .max_graph_edges = 2_200_000_000, .state_values_per_state = 2, .state_value_cap = 180_000_000, .scratch_growable = true, .compare_generated = false, .prefer_generated = true, .java_heap = "-Xmx24g" },
     // Completing liveness check with 18 quantified WF/SF obligations.
     .{ .label = "ElevatorLivenessMedium", .tla = "vendor/tlaplus-examples/specifications/MultiCarElevator/Elevator.tla", .cfg = "vendor/tlaplus-examples/specifications/MultiCarElevator/ElevatorLivenessMedium.cfg", .one_core_default = false, .max_states = 100_000, .state_values_per_state = 256, .prefer_generated = true },
+    // Two-million-state temporal graph with quantified weak fairness. This
+    // guards exact exploration and the allocation-free edge-marker SCC path.
+    .{ .label = "cf1s folklore", .tla = "vendor/tlaplus-examples/specifications/cf1s-folklore/cf1s_folklore.tla", .cfg = "vendor/tlaplus-examples/specifications/cf1s-folklore/cf1s_folklore.cfg", .one_core_default = false, .max_states = 3_000_000, .state_values_per_state = 160, .prefer_generated = true },
+    // Exhaustive 18-million-state safety model. Keep the all-core pair opt-in
+    // so the default benchmark stays within its interactive time budget.
+    .{ .label = "ElevatorSafetyMedium", .tla = "vendor/tlaplus-examples/specifications/MultiCarElevator/Elevator.tla", .cfg = "vendor/tlaplus-examples/specifications/MultiCarElevator/ElevatorSafetyMedium.cfg", .default_enabled = false, .one_core_default = false, .max_states = 20_000_000, .state_values_per_state = 16, .state_value_cap = 402_653_184, .compare_generated = false, .prefer_generated = true },
+    // Exact 59-million-state safety model. Initial states are streamed in
+    // bounded batches; the lower successor cap avoids reserving scratch for
+    // the complete 390,625-state initial relation at once.
+    .{ .label = "ElevatorSafetyLarge", .tla = "vendor/tlaplus-examples/specifications/MultiCarElevator/Elevator.tla", .cfg = "vendor/tlaplus-examples/specifications/MultiCarElevator/ElevatorSafetyLarge.cfg", .default_enabled = false, .one_core_default = false, .max_states = 65_000_000, .max_successors = 4_096, .state_values_per_state = 2, .state_value_cap = 130_000_000, .compare_generated = false, .prefer_generated = true, .java_heap = "-Xmx24g" },
     // TLC spends about seven minutes eagerly enumerating the outer power set;
     // keep the exact paired row available without extending the default gate.
     .{ .label = "SpanTreeTest5Nodes", .tla = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTreeTest.tla", .cfg = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTreeTest5Nodes.cfg", .default_enabled = false, .one_core_default = false, .max_states = 500_000, .state_values_per_state = 60, .prefer_generated = true },
@@ -122,15 +164,30 @@ const specs = [_]Spec{
     // Direct bounded power-set enumeration over a 1,072,452-state,
     // 29,223,200-generated-transition graph.
     .{ .label = "Bosco", .tla = "vendor/tlaplus-examples/specifications/bosco/bosco.tla", .cfg = "vendor/tlaplus-examples/specifications/bosco/bosco.cfg", .one_core_default = false, .max_states = 1_200_000, .state_values_per_state = 16, .prefer_generated = true },
+    // The upstream N=3 configuration violates TypeOK because messages to a
+    // failed process can age beyond maxAge. This reduced model reaches the
+    // same age-43 counterexample quickly and exercises direct SUBSET actions.
+    .{ .label = "EnvironmentControllerN2Safety", .tla = "vendor/tlaplus-examples/specifications/detector_chan96/EnvironmentController.tla", .cfg = "benchmark_configs/EnvironmentControllerN2Safety.cfg", .one_core_default = false, .max_states = 200_000, .state_values_per_state = 160, .expected_violation = true, .expected_distinct_tolerance = 30_000, .compare_generated = false, .prefer_generated = true },
+    // Exact no-symmetry safety graph with two invariants and more than 56
+    // million generated transitions. It stays in the default performance gate.
+    .{ .label = "MCKVSSafetySmall", .tla = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVS.tla", .cfg = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVSSafetySmall.cfg", .one_core_default = false, .max_states = 4_000_000, .state_values_per_state = 16, .prefer_generated = true, .java_heap = "-Xmx8g" },
+    // Exact 17-million-state symmetry-reduced safety graph. Keep the pair
+    // opt-in so the default gate remains within its interactive time budget.
+    .{ .label = "MCKVSSafetyMedium", .tla = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVS.tla", .cfg = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVSSafetyMedium.cfg", .default_enabled = false, .one_core_default = false, .max_states = 18_000_000, .state_values_per_state = 16, .prefer_generated = true, .java_heap = "-Xmx12g" },
+    // Snapshot-isolation safety and temporal termination over the complete
+    // concrete graph. TLC documents symmetry reduction as unsafe for liveness.
+    .{ .label = "MCKVsnap", .tla = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVsnap.tla", .cfg = "benchmark_configs/MCKVsnap_no_sym.cfg", .one_core_default = false, .max_states = 250_000, .state_values_per_state = 160, .prefer_generated = true },
     // Exhaustive recursive operators, nested functions, and multi-bound
     // function literals. Keep it opt-in because the paired run takes tens of
     // seconds even with all cores.
     .{ .label = "BTree", .tla = "vendor/tlaplus-examples/specifications/btree/btree.tla", .cfg = "vendor/tlaplus-examples/specifications/btree/btree.cfg", .default_enabled = false, .one_core_default = false, .max_states = 500_000, .state_values_per_state = 60, .prefer_generated = true },
-    // VIEW hides hash-allocation order. Parallel publication must preserve
-    // TLC's deterministic BFS representative while generated actions run
-    // concurrently. TLC counts duplicate action witnesses, so compare the
-    // complete canonical state set here.
-    .{ .label = "NanoMedium", .tla = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNano.tla", .cfg = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNanoMedium.cfg", .default_enabled = false, .one_core_default = false, .max_states = 700_000, .state_values_per_state = 160, .compare_generated = false, .prefer_generated = true },
+    // VIEW hides hash-allocation order. Exact generated and distinct counts
+    // guard deferred primed arguments across generated action-call frames.
+    .{ .label = "NanoMedium", .tla = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNano.tla", .cfg = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNanoMedium.cfg", .default_enabled = false, .one_core_default = false, .max_states = 700_000, .state_values_per_state = 160, .prefer_generated = true },
+    .{ .label = "NanoHash5Small", .tla = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNano.tla", .cfg = "benchmark_configs/MCNanoHash5Small.cfg", .one_core_default = false, .max_states = 2_000_000, .state_values_per_state = 32, .prefer_generated = true },
+    // Large safety configuration; opt-in because the reachable graph exceeds
+    // the default benchmark's memory and time budget.
+    .{ .label = "NanoLarge", .tla = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNano.tla", .cfg = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNanoLarge.cfg", .default_enabled = false, .one_core_default = false, .max_states = 130_000_000, .max_successors = 4_096, .state_values_per_state = 2, .state_value_cap = 260_000_000, .prefer_generated = true, .java_heap = "-Xmx24g" },
     // TLC's four temporal branches take about nineteen minutes on the full
     // graph. Keep this exact liveness comparison opt-in.
     .{ .label = "bcastFolklore", .tla = "vendor/tlaplus-examples/specifications/bcastFolklore/bcastFolklore.tla", .cfg = "vendor/tlaplus-examples/specifications/bcastFolklore/bcastFolklore.cfg", .default_enabled = false, .one_core_default = false, .max_states = 1_000_000, .state_values_per_state = 160, .prefer_generated = true },
@@ -326,10 +383,10 @@ const specs = [_]Spec{
     .{
         .label = "SingleShardTxn ShardTxn",
         .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
-        .cfg = "vendor/MDBTLA/SingleShardTxn/ShardTxn.cfg",
+        .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_no_sym.cfg",
         .default_enabled = false,
         .one_core_default = false,
-        .max_states = 6_000_000,
+        .max_states = 12_000_000,
         .state_values_per_state = 220,
         .compare_generated = false,
         .prefer_generated = true,
@@ -339,20 +396,7 @@ const specs = [_]Spec{
     .{
         .label = "SingleShardTxn ShardTxn/small",
         .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
-        .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_small.cfg",
-        .one_core_default = false,
-        .max_states = 500_000,
-        .state_values_per_state = 220,
-        .compare_generated = false,
-        .prefer_generated = true,
-        .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
-            "vendor/MDBTLA/MultiShardTxn/lib/CommunityModules.jar",
-    },
-    .{
-        .label = "SingleShardTxn ShardTxn/small no-sym",
-        .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
         .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_small_no_sym.cfg",
-        .default_enabled = false,
         .one_core_default = false,
         .max_states = 500_000,
         .state_values_per_state = 220,
@@ -396,7 +440,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     const allocator = std.heap.page_allocator;
     const options = parse_options(init) catch {
         std.debug.print(
-            "usage: benchmark [--include-long] [--include-one-core] [--auto-only] [--tlzig-only] [--skip-prefer-generated] [--write-tlzig-baseline] [--filter TEXT|TEXT]\n",
+            "usage: benchmark [--include-long] [--include-one-core] [--auto-only] [--tlzig-only] [--skip-prefer-generated] [--tlc-baseline-prefer-generated] [--write-tlzig-baseline] [--filter TEXT|TEXT]\n",
             .{},
         );
         std.process.exit(2);
@@ -421,12 +465,24 @@ pub fn main(init: std.process.Init.Minimal) void {
         const explicit_match = filter_matches(spec, options.filter);
         const exact_label_match = filter_label_matches(spec, options.filter);
         if (options.filter != null and !explicit_match) continue;
-        if (options.skip_prefer_generated and spec.prefer_generated) {
-            continue;
-        }
         if (!options.include_long and !spec.default_enabled and
             (options.filter == null or !exact_label_match))
         {
+            continue;
+        }
+        if (options.tlc_baseline_prefer_generated and spec.prefer_generated) {
+            run_tlc_baseline(
+                allocator,
+                io,
+                java_classpath,
+                spec,
+            ) catch |err| {
+                failures += 1;
+                std.debug.print("{s:40} ERROR {any}\n", .{ spec.tla, err });
+            };
+            continue;
+        }
+        if (options.skip_prefer_generated and spec.prefer_generated) {
             continue;
         }
         run_comparison(
@@ -469,6 +525,8 @@ fn parse_options(init: std.process.Init.Minimal) !Options {
             options.tlzig_only = true;
         } else if (std.mem.eql(u8, arg, "--skip-prefer-generated")) {
             options.skip_prefer_generated = true;
+        } else if (std.mem.eql(u8, arg, "--tlc-baseline-prefer-generated")) {
+            options.tlc_baseline_prefer_generated = true;
         } else if (std.mem.eql(u8, arg, "--write-tlzig-baseline")) {
             options.write_tlzig_baseline = true;
         } else if (std.mem.startsWith(u8, arg, "--")) {
@@ -613,7 +671,19 @@ fn run_comparison(
             try write_tlzig_baseline(allocator, spec, tlzig_auto);
             return;
         }
-        try compare_tlzig_baseline(allocator, spec, tlzig_auto);
+        compare_tlzig_baseline(
+            allocator,
+            spec,
+            tlzig_auto,
+        ) catch |err| switch (err) {
+            error.MissingBaseline => {
+                std.debug.print(
+                    "  AOT baseline unavailable; tlzig-only result was not cross-checked\n",
+                    .{},
+                );
+            },
+            else => return err,
+        };
         return;
     }
 
@@ -622,13 +692,18 @@ fn run_comparison(
             tlc_one.?.outcome != tlc_auto.?.outcome
     else
         false;
-    const expected_distinct_mismatch = spec.compare_distinct and
-        run_one_core and
+    const expected_distinct_mismatch = if (spec.expected_distinct_tolerance) |tolerance|
         !distinct_within_tolerance(
+            tlc_auto.?.distinct,
+            tlzig_auto.distinct,
+            tolerance,
+        ) or (run_one_core and !distinct_within_tolerance(
             tlc_one.?.distinct,
             tlzig_one.?.distinct,
-            spec.distinct_tolerance,
-        );
+            tolerance,
+        ))
+    else
+        false;
     const mismatch = one_core_mismatch or
         tlc_auto.?.outcome != tlzig_auto.outcome or
         (if (spec.expected_violation)
@@ -685,6 +760,32 @@ fn run_comparison(
     }
 }
 
+fn run_tlc_baseline(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    java_cp: []const u8,
+    spec: Spec,
+) !void {
+    const spec_java_cp = spec.java_classpath orelse java_cp;
+    const result = try run_tlc(allocator, io, spec_java_cp, spec, "auto");
+    defer result.deinit(allocator);
+    const display_name = spec.label orelse std.fs.path.basename(spec.tla);
+    std.debug.print(
+        "{s:32} {s:>10} {d:>10.3} {s:>10} {s:>10} {d:>9}/{d:<8} {s:>18}\n",
+        .{
+            display_name,
+            "-",
+            seconds(result.elapsed_ms),
+            "-",
+            "-",
+            result.generated,
+            result.distinct,
+            "-",
+        },
+    );
+    try write_tlzig_baseline(allocator, spec, result);
+}
+
 fn distinct_within_tolerance(
     expected: u64,
     actual: u64,
@@ -731,13 +832,20 @@ fn compare_tlzig_baseline(
         (!spec.expected_violation and
             spec.compare_generated and
             baseline.generated != actual.generated) or
-        (!spec.expected_violation and
-            spec.compare_distinct and
+        (if (spec.expected_distinct_tolerance) |tolerance|
             !distinct_within_tolerance(
                 baseline.distinct,
                 actual.distinct,
-                spec.distinct_tolerance,
-            ));
+                tolerance,
+            )
+        else
+            !spec.expected_violation and
+                spec.compare_distinct and
+                !distinct_within_tolerance(
+                    baseline.distinct,
+                    actual.distinct,
+                    spec.distinct_tolerance,
+                ));
     if (!mismatch) return;
 
     std.debug.print(
@@ -890,13 +998,14 @@ fn run_tlzig_internal(
 
     const eval_value_cap: u32 = 1_048_576;
     const eval_string_cap: u32 = 65_536;
-    const state_value_cap = cap_u32(@min(
+    const state_value_cap = spec.state_value_cap orelse cap_u32(@min(
         @max(
             @as(u64, spec.max_states) * spec.state_values_per_state,
             1_000_000,
         ),
         192_000_000,
     ));
+    std.debug.assert(state_value_cap >= 1_000_000);
     const state_string_cap = cap_u32(@min(
         @max(@as(u64, spec.max_states) * 4, 500_000),
         8_000_000,
@@ -914,12 +1023,13 @@ fn run_tlzig_internal(
             &generated_model.expressions
         else
             &.{};
-    var ch = checker.Checker.init_generated_with_successor_limit(
+    var ch = checker.Checker.init_generated_with_resource_limits(
         &arena,
         module,
         cfg,
         spec.max_states,
-        @min(spec.max_states, 65_536),
+        @min(spec.max_states, spec.max_successors),
+        spec.max_graph_edges,
         eval_value_cap,
         eval_string_cap,
         state_value_cap,
@@ -934,21 +1044,21 @@ fn run_tlzig_internal(
         return error.CheckFailed;
     };
     defer ch.deinit();
-    ch.set_scratch_growable(false);
+    ch.set_scratch_growable(spec.scratch_growable);
     ch.set_diagnostics(std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null);
 
     const result = ch.check() catch |err| {
         const elapsed = elapsed_ms(io, start);
         const distinct = ch.distinct;
-        const output = try std.fmt.allocPrint(
-            allocator,
-            "generated={d} distinct={d} error={any}",
-            .{ ch.successor_attempts, distinct, err },
-        );
         if (err == error.InvariantViolated or
             err == error.PropertyViolated or
             err == error.Deadlock)
         {
+            const output = try std.fmt.allocPrint(
+                allocator,
+                "generated={d} distinct={d} error={any}",
+                .{ ch.successor_attempts, distinct, err },
+            );
             return RunResult{
                 .elapsed_ms = elapsed,
                 .generated = ch.successor_attempts,
@@ -960,7 +1070,16 @@ fn run_tlzig_internal(
                 .output = output,
             };
         }
-        std.debug.print("checking failed for {s}: {any}", .{ spec.tla, err });
+        std.debug.print(
+            "checking failed for {s}: {any} -- generated={d} distinct={d} queued={d}",
+            .{
+                spec.tla,
+                err,
+                ch.successor_attempts,
+                distinct,
+                ch.queue.len(),
+            },
+        );
         if (ch.evaluator.err_ctx.context) |context| {
             std.debug.print(
                 " -- context: {s} {s}",
@@ -1046,14 +1165,39 @@ fn run_tlc(
         .{ metadir_hash, workers },
     );
     defer allocator.free(metadir);
+    const stdout_path = try std.fmt.allocPrint(
+        allocator,
+        "benchmark_results/tlc_output-{x}-{s}.log",
+        .{ metadir_hash, workers },
+    );
+    defer allocator.free(stdout_path);
+    const stderr_path = try std.fmt.allocPrint(
+        allocator,
+        "benchmark_results/tlc_output-{x}-{s}.err",
+        .{ metadir_hash, workers },
+    );
+    defer allocator.free(stderr_path);
     defer std.Io.Dir.cwd().deleteTree(io, metadir) catch |err| {
         std.debug.print("failed to remove TLC metadata {s}: {any}\n", .{
             metadir,
             err,
         });
     };
-    const argv_auto = [_][]const u8{
-        "java",
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "java");
+    if (std.mem.eql(u8, workers, "1")) {
+        try argv.appendSlice(allocator, &.{
+            "-XX:ActiveProcessorCount=1",
+            "-XX:+UseSerialGC",
+        });
+    } else {
+        try argv.append(allocator, "-XX:+UseParallelGC");
+    }
+    if (spec.java_heap) |java_heap| {
+        try argv.append(allocator, java_heap);
+    }
+    try argv.appendSlice(allocator, &.{
         "-cp",
         classpath,
         "-Dtlc2.tool.impl.Tool.cdot=true",
@@ -1063,52 +1207,68 @@ fn run_tlc(
         "-workers",
         workers,
         "-cleanup",
+        "-lncheck",
+        "final",
         "-config",
         spec.cfg,
         spec.tla,
-    };
-    const argv_single = [_][]const u8{
-        "java",
-        "-XX:ActiveProcessorCount=1",
-        "-XX:+UseSerialGC",
-        "-cp",
-        classpath,
-        "-Dtlc2.tool.impl.Tool.cdot=true",
-        "tlc2.TLC",
-        "-metadir",
-        metadir,
-        "-workers",
-        workers,
-        "-cleanup",
-        "-config",
-        spec.cfg,
-        spec.tla,
-    };
-    const argv: []const []const u8 = if (std.mem.eql(u8, workers, "1"))
-        &argv_single
-    else
-        &argv_auto;
+    });
 
     const start = std.Io.Clock.Timestamp.now(io, .real);
-    const result = try std.process.run(allocator, io, .{ .argv = argv });
-    defer allocator.free(result.stderr);
+    std.debug.print("  TLC output: {s}\n", .{stdout_path});
+    const term = term: {
+        const cwd = std.Io.Dir.cwd();
+        var stdout_file = try cwd.createFile(io, stdout_path, .{});
+        defer stdout_file.close(io);
+        var stderr_file = try cwd.createFile(io, stderr_path, .{});
+        defer stderr_file.close(io);
+        var child = try std.process.spawn(io, .{
+            .argv = argv.items,
+            .stdin = .ignore,
+            .stdout = .{ .file = stdout_file },
+            .stderr = .{ .file = stderr_file },
+        });
+        defer child.kill(io);
+        break :term try child.wait(io);
+    };
     const elapsed = elapsed_ms(io, start);
+    const stdout = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        stdout_path,
+        allocator,
+        .limited(64 * 1024 * 1024),
+    );
+    errdefer allocator.free(stdout);
+    const stderr = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        stderr_path,
+        allocator,
+        .limited(64 * 1024 * 1024),
+    );
+    defer allocator.free(stderr);
+    const result: std.process.RunResult = .{
+        .term = term,
+        .stdout = stdout,
+        .stderr = stderr,
+    };
 
     const generated = parse_before_keyword(result.stdout, " states generated") orelse {
         print_tlc_failure(spec, workers, result);
-        allocator.free(result.stdout);
         return error.TlcFailed;
     };
     const distinct = parse_before_keyword(result.stdout, " distinct states found") orelse {
         print_tlc_failure(spec, workers, result);
-        allocator.free(result.stdout);
+        return error.TlcFailed;
+    };
+    const outcome = parse_tlc_outcome(result.stdout, result.term) orelse {
+        print_tlc_failure(spec, workers, result);
         return error.TlcFailed;
     };
     return RunResult{
         .elapsed_ms = elapsed,
         .generated = generated,
         .distinct = distinct,
-        .outcome = parse_tlc_outcome(result.stdout, result.term),
+        .outcome = outcome,
         .output = result.stdout,
     };
 }
@@ -1127,14 +1287,58 @@ fn print_tlc_failure(
 fn parse_tlc_outcome(
     output: []const u8,
     term: std.process.Child.Term,
-) Outcome {
+) ?Outcome {
     if (std.mem.indexOf(u8, output, "Deadlock reached") != null) {
         return .deadlock;
     }
-    return switch (term) {
-        .exited => |code| if (code == 0) .completed else .violation,
-        else => .violation,
+    if (term.success()) return .completed;
+    const violation_markers = [_][]const u8{
+        " is violated.",
+        " is violated by the initial state",
+        " was violated.",
+        " were violated.",
+        "The first argument of Assert evaluated to FALSE",
     };
+    for (violation_markers) |marker| {
+        if (std.mem.indexOf(u8, output, marker) != null) return .violation;
+    }
+    return null;
+}
+
+test "TLC outcome classification rejects non-semantic process failures" {
+    try std.testing.expectEqual(
+        Outcome.completed,
+        parse_tlc_outcome("Model checking completed.", .{ .exited = 0 }).?,
+    );
+    try std.testing.expectEqual(
+        Outcome.deadlock,
+        parse_tlc_outcome("Error: Deadlock reached.", .{ .exited = 12 }).?,
+    );
+    try std.testing.expectEqual(
+        Outcome.violation,
+        parse_tlc_outcome(
+            "Error: Temporal property Live was violated.",
+            .{ .exited = 13 },
+        ).?,
+    );
+    try std.testing.expectEqual(
+        Outcome.violation,
+        parse_tlc_outcome(
+            "Error: Invariant TypeOK is violated.",
+            .{ .exited = 12 },
+        ).?,
+    );
+    try std.testing.expectEqual(
+        @as(?Outcome, null),
+        parse_tlc_outcome(
+            "TLC threw an unexpected exception. OutOfMemoryError",
+            .{ .exited = 255 },
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(?Outcome, null),
+        parse_tlc_outcome("", .{ .signal = .KILL }),
+    );
 }
 
 fn parse_before_keyword(output: []const u8, keyword: []const u8) ?u64 {

@@ -19,6 +19,14 @@ TLC_INVALID_CFGS = {
     "vendor/MDBTLA/MultiShardTxn/models/MultiShardTxn_RC.cfg",
 }
 
+# TLC warns that symmetry reduction is unsound during liveness checking. These
+# upstream configurations are covered by equivalent symmetry-free benchmark
+# configs so the result is evidence for the actual temporal semantics.
+SOUND_TEMPORAL_BASELINES = {
+    "vendor/MDBTLA/SingleShardTxn/ShardTxn.cfg":
+        "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_no_sym.cfg",
+}
+
 
 def posix(path: Path) -> str:
     return path.relative_to(REPO).as_posix()
@@ -34,7 +42,9 @@ def main() -> int:
 
     missing = [
         cfg for cfg in upstream_cfgs
-        if cfg not in benchmark_cfgs and cfg not in TLC_INVALID_CFGS
+        if cfg not in benchmark_cfgs
+        and SOUND_TEMPORAL_BASELINES.get(cfg) not in benchmark_cfgs
+        and cfg not in TLC_INVALID_CFGS
     ]
     stale_invalid = sorted(TLC_INVALID_CFGS - set(upstream_cfgs))
 
@@ -44,6 +54,10 @@ def main() -> int:
         f"{sum(cfg in benchmark_cfgs for cfg in upstream_cfgs)}"
     )
     print(f"TLC-invalid upstream cfgs: {len(TLC_INVALID_CFGS)}")
+    print(
+        "sound temporal baseline substitutions: "
+        f"{len(SOUND_TEMPORAL_BASELINES)}"
+    )
 
     if missing:
         print("\nmissing benchmark coverage:")

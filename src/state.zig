@@ -37,7 +37,6 @@ pub const StateStore = struct {
         level: u32,
         pred: u32,
         changed_mask: u64,
-        borrowed_mask: u64,
         borrowed_pool: ?*const ValuePool,
         values: []Value,
 
@@ -47,10 +46,11 @@ pub const StateStore = struct {
             default_pool: *const ValuePool,
         ) *const ValuePool {
             assert(variable_index < self.values.len);
-            if (self.borrowed_mask &
-                (@as(u64, 1) << @intCast(variable_index)) != 0)
+            const variable_bit = @as(u64, 1) << @intCast(variable_index);
+            if (self.borrowed_pool != null and
+                self.changed_mask & variable_bit == 0)
             {
-                return self.borrowed_pool orelse unreachable;
+                return self.borrowed_pool.?;
             }
             return default_pool;
         }
@@ -91,7 +91,6 @@ pub const StateStore = struct {
             .level = 0,
             .pred = 0,
             .changed_mask = 0,
-            .borrowed_mask = 0,
             .borrowed_pool = null,
             .values = self.state_values[values_start..][0..variable_count],
         };
@@ -139,18 +138,22 @@ pub const StateStore = struct {
     }
 };
 
+test "state metadata remains cache compact" {
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(StateStore.State));
+}
+
 test "canonical value capacity follows the arena budget" {
     const gib: u64 = 1024 * 1024 * 1024;
     const capacity = canonical_value_capacity(24 * gib, 18_000_000, 160);
 
     try std.testing.expect(capacity > 192_000_000);
-    try std.testing.expectEqual(@as(u32, 402_653_184), capacity);
+    try std.testing.expectEqual(@as(u32, 536_870_912), capacity);
 }
 
 test "canonical value capacity remains bounded for smaller arenas" {
     const gib: u64 = 1024 * 1024 * 1024;
     try std.testing.expectEqual(
-        @as(u32, 16_777_216),
+        @as(u32, 22_369_621),
         canonical_value_capacity(gib, 18_000_000, 160),
     );
 }

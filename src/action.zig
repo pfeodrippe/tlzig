@@ -867,9 +867,15 @@ pub const Choose = struct {
 pub const BoundedPowerSetChoose = struct {
     var_name: []const u8,
     base: CompiledExpr,
-    upper: CompiledExpr,
+    upper: ?CompiledExpr,
     lower: ?CompiledExpr,
+    element_filter: ?ElementFilter,
     body_steps: []const ActionStep,
+};
+
+pub const ElementFilter = struct {
+    var_name: []const u8,
+    predicate: CompiledExpr,
 };
 
 pub const ActionStateArgument = struct {
@@ -1507,8 +1513,13 @@ pub const ActionCompiler = struct {
                             &operand_count,
                         );
                         for (operands[0..operand_count]) |operand| {
-                            if (operand == bounded.upper_constraint) continue;
+                            if (bounded.upper_constraint) |constraint| {
+                                if (operand == constraint) continue;
+                            }
                             if (bounded.lower_constraint) |constraint| {
+                                if (operand == constraint) continue;
+                            }
+                            if (bounded.element_filter_constraint) |constraint| {
                                 if (operand == constraint) continue;
                             }
                             try self.collect_steps(
@@ -1524,9 +1535,23 @@ pub const ActionCompiler = struct {
                                     q.vars[0].name,
                                 ),
                                 .base = try self.compile_expr(bounded.base),
-                                .upper = try self.compile_expr(bounded.upper),
+                                .upper = if (bounded.upper) |upper|
+                                    try self.compile_expr(upper)
+                                else
+                                    null,
                                 .lower = if (bounded.lower) |lower|
                                     try self.compile_expr(lower)
+                                else
+                                    null,
+                                .element_filter = if (bounded.element_filter) |filter|
+                                    .{
+                                        .var_name = try self.canonical_name(
+                                            filter.var_name,
+                                        ),
+                                        .predicate = try self.compile_expr(
+                                            filter.predicate,
+                                        ),
+                                    }
                                 else
                                     null,
                                 .body_steps = try self.dup_slice(
@@ -2097,16 +2122,22 @@ fn flatten_conjunction(
 
 const BoundedPowerSetPattern = struct {
     base: *ast.Expr,
-    upper: *ast.Expr,
+    upper: ?*ast.Expr,
     lower: ?*ast.Expr,
-    upper_constraint: *ast.Expr,
+    upper_constraint: ?*ast.Expr,
     lower_constraint: ?*ast.Expr,
+    element_filter: ?ElementFilterPattern,
+    element_filter_constraint: ?*ast.Expr,
 };
 
-/// Recognizes an existential power-set choice constrained by an upper set and,
-/// optionally, a required lower set. The executor can enumerate only values
-/// between those bounds instead of materializing and filtering the full power
-/// set.
+const ElementFilterPattern = struct {
+    var_name: []const u8,
+    predicate: *ast.Expr,
+};
+
+/// Recognizes an existential power-set choice, including optional upper and
+/// lower bounds. The executor enumerates subsets directly instead of
+/// materializing the complete power set before evaluating the action body.
 fn bounded_power_set_pattern(
     compiler: ActionCompiler,
     quantifier: *const ast.Quantifier,
@@ -2127,27 +2158,33 @@ fn bounded_power_set_pattern(
         &operands,
         &operand_count,
     );
-    if (operand_count == 0 or operands[0].* != .binary) return null;
-    const upper_binary = operands[0].binary;
-    if (upper_binary.op != .subseteq or
-        upper_binary.left.* != .ident or
-        !std.mem.eql(u8, upper_binary.left.ident, bound.name) or
-        codegen.expression_references_identifier(
-            upper_binary.right,
-            bound.name,
-        ) or
-        compiler.is_action_expr(upper_binary.right, is_init) or
-        !codegen.expression_reordering_safe(
-            compiler.evaluator.module,
-            upper_binary.right,
-        ))
-    {
-        return null;
-    }
-
+    var upper: ?*ast.Expr = null;
+    var upper_constraint: ?*ast.Expr = null;
     var lower: ?*ast.Expr = null;
     var lower_constraint: ?*ast.Expr = null;
-    if (operand_count > 1 and operands[1].* == .binary) {
+    if (operand_count > 0 and operands[0].* == .binary) {
+        const upper_binary = operands[0].binary;
+        if (upper_binary.op == .subseteq and
+            upper_binary.left.* == .ident and
+            std.mem.eql(u8, upper_binary.left.ident, bound.name) and
+            !codegen.expression_references_identifier(
+                upper_binary.right,
+                bound.name,
+            ) and
+            !compiler.is_action_expr(upper_binary.right, is_init) and
+            codegen.expression_reordering_safe(
+                compiler.evaluator.module,
+                upper_binary.right,
+            ))
+        {
+            upper = upper_binary.right;
+            upper_constraint = operands[0];
+        }
+    }
+    if (upper_constraint != null and
+        operand_count > 1 and
+        operands[1].* == .binary)
+    {
         const lower_binary = operands[1].binary;
         if (lower_binary.op == .subseteq and
             lower_binary.right.* == .ident and
@@ -2166,12 +2203,65 @@ fn bounded_power_set_pattern(
             lower_constraint = operands[1];
         }
     }
+
+    var element_filter: ?ElementFilterPattern = null;
+    var element_filter_constraint: ?*ast.Expr = null;
+    for (operands[0..operand_count]) |operand| {
+        if (upper_constraint) |constraint| {
+            if (operand == constraint) continue;
+        }
+        if (lower_constraint) |constraint| {
+            if (operand == constraint) continue;
+        }
+        if (power_set_element_filter(
+            compiler,
+            operand,
+            bound.name,
+            is_init,
+        )) |filter| {
+            element_filter = filter;
+            element_filter_constraint = operand;
+            break;
+        }
+    }
     return .{
         .base = bound.domain.unary.operand,
-        .upper = upper_binary.right,
+        .upper = upper,
         .lower = lower,
-        .upper_constraint = operands[0],
+        .upper_constraint = upper_constraint,
         .lower_constraint = lower_constraint,
+        .element_filter = element_filter,
+        .element_filter_constraint = element_filter_constraint,
+    };
+}
+
+fn power_set_element_filter(
+    compiler: ActionCompiler,
+    expression: *ast.Expr,
+    subset_name: []const u8,
+    is_init: bool,
+) ?ElementFilterPattern {
+    if (expression.* != .quantifier) return null;
+    const quantifier = expression.quantifier;
+    if (quantifier.kind != .forall or quantifier.vars.len != 1) return null;
+    const element = quantifier.vars[0];
+    if (element.domain.* != .ident or
+        !std.mem.eql(u8, element.domain.ident, subset_name) or
+        codegen.expression_references_identifier(
+            quantifier.body,
+            subset_name,
+        ) or
+        compiler.is_action_expr(quantifier.body, is_init) or
+        !codegen.expression_reordering_safe(
+            compiler.evaluator.module,
+            quantifier.body,
+        ))
+    {
+        return null;
+    }
+    return .{
+        .var_name = element.name,
+        .predicate = quantifier.body,
     };
 }
 
@@ -2276,6 +2366,768 @@ pub const ActionExecutor = struct {
         self.evaluator.begin_action_evaluation();
         defer self.evaluator.end_action_evaluation();
         try self.execute_steps(compiled.steps, null, Context.empty(), s0, out_states, false, 0);
+    }
+
+    pub fn top_level_action_count(
+        self: *const ActionExecutor,
+        compiled: CompiledNext,
+    ) !u32 {
+        self.evaluator.reset_context_pool();
+        self.evaluator.begin_action_evaluation();
+        defer self.evaluator.end_action_evaluation();
+        const pool_snapshot = self.eval_pool.snapshot();
+        defer self.eval_pool.restore(pool_snapshot);
+        const count = try self.action_prefix_count(
+            compiled.steps,
+            null,
+            Context.empty(),
+        );
+        assert(count > 0);
+        return count;
+    }
+
+    pub fn execute_next_action(
+        self: *const ActionExecutor,
+        compiled: CompiledNext,
+        action_index: u32,
+        s0_idx: u32,
+        out_states: *StateBuffer,
+    ) !void {
+        const s0 = self.source_state_store.get(s0_idx);
+        self.evaluator.reset_context_pool();
+        self.evaluator.begin_action_evaluation();
+        defer self.evaluator.end_action_evaluation();
+        var remaining = action_index;
+        try self.execute_action_prefix(
+            compiled.steps,
+            null,
+            Context.empty(),
+            s0,
+            out_states,
+            &remaining,
+            0,
+        );
+        assert(remaining == 0);
+    }
+
+    fn constant_prefix_domain(
+        self: *const ActionExecutor,
+        compiled: CompiledExpr,
+        context: Context,
+    ) Error!?Value {
+        const value_v = self.eval_compiled_expr(
+            compiled,
+            context,
+            null,
+        ) catch |err| return switch (err) {
+            Error.OutOfMemory, Error.StateSpaceExhausted => err,
+            else => null,
+        };
+        if (!value_v.is_set_like()) return null;
+        const materialized = self.evaluator.materialize_set(
+            value_v,
+            context,
+            null,
+            self.eval_pool,
+            &self.source_state_store.values_pool,
+        ) catch |err| return switch (err) {
+            Error.OutOfMemory, Error.StateSpaceExhausted => err,
+            else => null,
+        };
+        if (materialized != .set_v) return null;
+        return materialized;
+    }
+
+    fn constant_let_context(
+        self: *const ActionExecutor,
+        binding: LetBind,
+        context: Context,
+    ) Error!?Context {
+        const value_v = if (binding.operator_arity) |arity|
+            self.evaluator.make_generated_expression_operator(
+                binding.expr.generated orelse return null,
+                arity,
+                context,
+                self.eval_pool,
+            ) catch |err| return switch (err) {
+                Error.OutOfMemory, Error.StateSpaceExhausted => err,
+                else => null,
+            }
+        else
+            self.eval_compiled_expr(
+                binding.expr,
+                context,
+                null,
+            ) catch |err| return switch (err) {
+                Error.OutOfMemory, Error.StateSpaceExhausted => err,
+                else => null,
+            };
+        return try self.evaluator.extend_context(
+            context,
+            binding.name,
+            value_v,
+        );
+    }
+
+    fn constant_call_context(
+        self: *const ActionExecutor,
+        call: Call,
+        context: Context,
+    ) Error!?Context {
+        if (call.params.len != call.args.len or
+            call.state_args.len != call.args.len or
+            call.args.len > 32)
+        {
+            return null;
+        }
+        for (call.state_args) |state_argument| {
+            if (state_argument != null) return null;
+        }
+
+        var values: [32]Value = undefined;
+        for (call.args, 0..) |argument, index| {
+            values[index] = self.eval_compiled_expr(
+                argument,
+                context,
+                null,
+            ) catch |err| return switch (err) {
+                Error.OutOfMemory, Error.StateSpaceExhausted => err,
+                else => null,
+            };
+        }
+        var call_context = context.operator_frame();
+        for (call.params, 0..) |parameter, index| {
+            call_context = try self.evaluator.extend_context(
+                call_context,
+                parameter,
+                values[index],
+            );
+        }
+        return call_context;
+    }
+
+    const BoundedPowerSetPrefix = struct {
+        lower: value.Set,
+        optional_offset: u32,
+        optional_count: u32,
+        candidate_offset: u32,
+        total_count: u32,
+        valid_count: u32,
+
+        fn invalid_count(self: BoundedPowerSetPrefix) u32 {
+            assert(self.valid_count <= self.total_count);
+            return self.total_count - self.valid_count;
+        }
+    };
+
+    fn constant_bounded_power_set_prefix(
+        self: *const ActionExecutor,
+        choice: BoundedPowerSetChoose,
+        context: Context,
+    ) Error!?BoundedPowerSetPrefix {
+        if (choice.element_filter != null) return null;
+        const base = (try self.constant_prefix_domain(
+            choice.base,
+            context,
+        )) orelse return null;
+        const upper = if (choice.upper) |compiled|
+            (try self.constant_prefix_domain(compiled, context)) orelse
+                return null
+        else
+            base;
+        const lower = if (choice.lower) |compiled|
+            (try self.constant_prefix_domain(compiled, context)) orelse
+                return null
+        else
+            Value{ .set_v = .{ .offset = base.set_v.offset, .len = 0 } };
+        assert(base == .set_v);
+        assert(upper == .set_v);
+        assert(lower == .set_v);
+        if (base.set_v.len > 30) return null;
+
+        const total_count = @as(u32, 1) << @intCast(base.set_v.len);
+        const lower_items = lower.set_v.items(self.eval_pool);
+        var valid = true;
+        for (lower_items) |item| {
+            if (!base.set_v.contains(self.eval_pool, item) or
+                !upper.set_v.contains(self.eval_pool, item))
+            {
+                valid = false;
+                break;
+            }
+        }
+
+        const optional = try self.eval_pool.alloc_values(base.set_v.len);
+        var optional_count: u32 = 0;
+        if (valid) {
+            for (base.set_v.items(self.eval_pool)) |item| {
+                if (!upper.set_v.contains(self.eval_pool, item) or
+                    lower.set_v.contains(self.eval_pool, item))
+                {
+                    continue;
+                }
+                optional[optional_count] = item;
+                optional_count += 1;
+            }
+        }
+        assert(lower.set_v.len + optional_count <= base.set_v.len);
+        const candidate_storage = try self.eval_pool.alloc_values(
+            lower.set_v.len + optional_count,
+        );
+        @memcpy(candidate_storage[0..lower.set_v.len], lower_items);
+        return .{
+            .lower = lower.set_v,
+            .optional_offset = value_offset(self.eval_pool, optional.ptr),
+            .optional_count = optional_count,
+            .candidate_offset = value_offset(
+                self.eval_pool,
+                candidate_storage.ptr,
+            ),
+            .total_count = total_count,
+            .valid_count = if (valid)
+                @as(u32, 1) << @intCast(optional_count)
+            else
+                0,
+        };
+    }
+
+    fn bounded_power_set_prefix_candidate(
+        self: *const ActionExecutor,
+        prefix: BoundedPowerSetPrefix,
+        mask: u32,
+    ) Value {
+        assert(mask < prefix.valid_count);
+        var candidate_len = prefix.lower.len;
+        const optional = self.eval_pool.values[prefix.optional_offset .. prefix.optional_offset + prefix.optional_count];
+        for (optional, 0..) |item, bit| {
+            if (mask & (@as(u32, 1) << @intCast(bit)) == 0) continue;
+            self.eval_pool.values[prefix.candidate_offset + candidate_len] =
+                item;
+            candidate_len += 1;
+        }
+        assert(candidate_len <= prefix.lower.len + prefix.optional_count);
+        return .{ .set_v = .{
+            .offset = prefix.candidate_offset,
+            .len = candidate_len,
+        } };
+    }
+
+    fn action_prefix_count(
+        self: *const ActionExecutor,
+        steps: []const ActionStep,
+        continuation: ?*const Continuation,
+        context: Context,
+    ) Error!u32 {
+        const previous_context_floor = self.evaluator.pin_context_pool();
+        defer self.evaluator.unpin_context_pool(previous_context_floor);
+        if (steps.len == 0) {
+            const next = continuation orelse return 1;
+            const next_context = if (next.return_context) |caller|
+                caller.restore_locals(context)
+            else
+                context;
+            return self.action_prefix_count(
+                next.steps,
+                next.next,
+                next_context,
+            );
+        }
+
+        const step = steps[0];
+        const rest = steps[1..];
+        return switch (step) {
+            .mark_action => self.action_prefix_count(
+                rest,
+                continuation,
+                context,
+            ),
+            .branch => |branch| blk: {
+                assert(branch.options.len > 0);
+                const next = Continuation{
+                    .steps = rest,
+                    .next = continuation,
+                };
+                const next_ptr = if (rest.len == 0)
+                    continuation
+                else
+                    &next;
+                var count: u32 = 0;
+                const pool_snapshot = self.eval_pool.snapshot();
+                const context_snapshot = self.evaluator.context_snapshot();
+                for (branch.options) |option| {
+                    const option_count = try self.action_prefix_count(
+                        option,
+                        next_ptr,
+                        context,
+                    );
+                    count = std.math.add(u32, count, option_count) catch
+                        return Error.StateSpaceExhausted;
+                    self.eval_pool.restore(pool_snapshot);
+                    self.evaluator.restore_context_pool(context_snapshot);
+                }
+                break :blk count;
+            },
+            .choose => |choice| blk: {
+                const pool_snapshot = self.eval_pool.snapshot();
+                const context_snapshot = self.evaluator.context_snapshot();
+                const domain = (try self.constant_prefix_domain(
+                    choice.domain,
+                    context,
+                )) orelse {
+                    self.eval_pool.restore(pool_snapshot);
+                    self.evaluator.restore_context_pool(context_snapshot);
+                    break :blk 1;
+                };
+                const items = domain.set_v.items(self.eval_pool);
+                if (items.len == 0) {
+                    self.eval_pool.restore(pool_snapshot);
+                    self.evaluator.restore_context_pool(context_snapshot);
+                    break :blk 1;
+                }
+                const next = Continuation{
+                    .steps = rest,
+                    .next = continuation,
+                    .return_context = context,
+                };
+                const next_ptr = if (rest.len == 0 and continuation == null)
+                    null
+                else
+                    &next;
+                const item_pool_snapshot = self.eval_pool.snapshot();
+                const item_context_snapshot = self.evaluator.context_snapshot();
+                var count: u32 = 0;
+                for (items) |item| {
+                    const item_context = try self.evaluator.extend_context(
+                        context,
+                        choice.var_name,
+                        item,
+                    );
+                    const item_count = try self.action_prefix_count(
+                        choice.body_steps,
+                        next_ptr,
+                        item_context,
+                    );
+                    count = std.math.add(u32, count, item_count) catch
+                        return Error.StateSpaceExhausted;
+                    self.eval_pool.restore(item_pool_snapshot);
+                    self.evaluator.restore_context_pool(item_context_snapshot);
+                }
+                self.eval_pool.restore(pool_snapshot);
+                self.evaluator.restore_context_pool(context_snapshot);
+                break :blk count;
+            },
+            .bounded_power_set_choose => |choice| blk: {
+                const pool_snapshot = self.eval_pool.snapshot();
+                const context_snapshot = self.evaluator.context_snapshot();
+                const prefix = (try self.constant_bounded_power_set_prefix(
+                    choice,
+                    context,
+                )) orelse {
+                    self.eval_pool.restore(pool_snapshot);
+                    self.evaluator.restore_context_pool(context_snapshot);
+                    break :blk 1;
+                };
+                const next = Continuation{
+                    .steps = rest,
+                    .next = continuation,
+                    .return_context = context,
+                };
+                const next_ptr = if (rest.len == 0 and continuation == null)
+                    null
+                else
+                    &next;
+                const candidate_pool_snapshot = self.eval_pool.snapshot();
+                const candidate_context_snapshot =
+                    self.evaluator.context_snapshot();
+                var count = prefix.invalid_count();
+                var mask: u32 = 0;
+                while (mask < prefix.valid_count) : (mask += 1) {
+                    const candidate = self.bounded_power_set_prefix_candidate(
+                        prefix,
+                        mask,
+                    );
+                    const candidate_context = try self.evaluator.extend_context(
+                        context,
+                        choice.var_name,
+                        candidate,
+                    );
+                    const candidate_count = try self.action_prefix_count(
+                        choice.body_steps,
+                        next_ptr,
+                        candidate_context,
+                    );
+                    count = std.math.add(u32, count, candidate_count) catch
+                        return Error.StateSpaceExhausted;
+                    self.eval_pool.restore(candidate_pool_snapshot);
+                    self.evaluator.restore_context_pool(
+                        candidate_context_snapshot,
+                    );
+                }
+                self.eval_pool.restore(pool_snapshot);
+                self.evaluator.restore_context_pool(context_snapshot);
+                break :blk count;
+            },
+            .let_bind => |binding| blk: {
+                const next_context = (try self.constant_let_context(
+                    binding,
+                    context,
+                )) orelse break :blk 1;
+                break :blk self.action_prefix_count(
+                    rest,
+                    continuation,
+                    next_context,
+                );
+            },
+            .call => |call| blk: {
+                const call_context = (try self.constant_call_context(
+                    call,
+                    context,
+                )) orelse break :blk 1;
+                const next = Continuation{
+                    .steps = rest,
+                    .next = continuation,
+                    .return_context = context,
+                };
+                const next_ptr = if (rest.len == 0 and continuation == null)
+                    null
+                else
+                    &next;
+                break :blk self.action_prefix_count(
+                    call.body_steps,
+                    next_ptr,
+                    call_context,
+                );
+            },
+            else => 1,
+        };
+    }
+
+    fn execute_action_prefix(
+        self: *const ActionExecutor,
+        steps: []const ActionStep,
+        continuation: ?*const Continuation,
+        context: Context,
+        s0: *StateStore.State,
+        out_states: *StateBuffer,
+        remaining: *u32,
+        action_mask: u64,
+    ) Error!void {
+        const previous_context_floor = self.evaluator.pin_context_pool();
+        defer self.evaluator.unpin_context_pool(previous_context_floor);
+        if (steps.len == 0) {
+            if (continuation) |next| {
+                const next_context = if (next.return_context) |caller|
+                    caller.restore_locals(context)
+                else
+                    context;
+                return self.execute_action_prefix(
+                    next.steps,
+                    next.next,
+                    next_context,
+                    s0,
+                    out_states,
+                    remaining,
+                    action_mask,
+                );
+            }
+            assert(remaining.* == 0);
+            return self.execute_steps(
+                &.{},
+                null,
+                context,
+                s0,
+                out_states,
+                false,
+                action_mask,
+            );
+        }
+
+        const step = steps[0];
+        const rest = steps[1..];
+        switch (step) {
+            .mark_action => |marker| {
+                const marker_mask = try self.fairness_marker_mask(
+                    marker,
+                    context,
+                    s0,
+                );
+                return self.execute_action_prefix(
+                    rest,
+                    continuation,
+                    context,
+                    s0,
+                    out_states,
+                    remaining,
+                    action_mask | marker_mask,
+                );
+            },
+            .branch => |branch| {
+                assert(branch.options.len > 0);
+                const next = Continuation{
+                    .steps = rest,
+                    .next = continuation,
+                };
+                const next_ptr = if (rest.len == 0)
+                    continuation
+                else
+                    &next;
+                const pool_snapshot = self.eval_pool.snapshot();
+                const context_snapshot = self.evaluator.context_snapshot();
+                for (branch.options) |option| {
+                    const option_count = try self.action_prefix_count(
+                        option,
+                        next_ptr,
+                        context,
+                    );
+                    self.eval_pool.restore(pool_snapshot);
+                    self.evaluator.restore_context_pool(context_snapshot);
+                    if (remaining.* < option_count) {
+                        return self.execute_action_prefix(
+                            option,
+                            next_ptr,
+                            context,
+                            s0,
+                            out_states,
+                            remaining,
+                            action_mask,
+                        );
+                    }
+                    remaining.* -= option_count;
+                }
+                unreachable;
+            },
+            .choose => |choice| {
+                const pool_snapshot = self.eval_pool.snapshot();
+                const context_snapshot = self.evaluator.context_snapshot();
+                const domain = (try self.constant_prefix_domain(
+                    choice.domain,
+                    context,
+                )) orelse {
+                    self.eval_pool.restore(pool_snapshot);
+                    self.evaluator.restore_context_pool(context_snapshot);
+                    assert(remaining.* == 0);
+                    return self.execute_steps(
+                        steps,
+                        continuation,
+                        context,
+                        s0,
+                        out_states,
+                        false,
+                        action_mask,
+                    );
+                };
+                const items = domain.set_v.items(self.eval_pool);
+                if (items.len == 0) {
+                    self.eval_pool.restore(pool_snapshot);
+                    self.evaluator.restore_context_pool(context_snapshot);
+                    assert(remaining.* == 0);
+                    return self.execute_steps(
+                        steps,
+                        continuation,
+                        context,
+                        s0,
+                        out_states,
+                        false,
+                        action_mask,
+                    );
+                }
+                const next = Continuation{
+                    .steps = rest,
+                    .next = continuation,
+                    .return_context = context,
+                };
+                const next_ptr = if (rest.len == 0 and continuation == null)
+                    null
+                else
+                    &next;
+                const item_pool_snapshot = self.eval_pool.snapshot();
+                const item_context_snapshot = self.evaluator.context_snapshot();
+                for (items) |item| {
+                    const item_context = try self.evaluator.extend_context(
+                        context,
+                        choice.var_name,
+                        item,
+                    );
+                    const item_count = try self.action_prefix_count(
+                        choice.body_steps,
+                        next_ptr,
+                        item_context,
+                    );
+                    self.eval_pool.restore(item_pool_snapshot);
+                    self.evaluator.restore_context_pool(item_context_snapshot);
+                    if (remaining.* < item_count) {
+                        const selected_context = try self.evaluator.extend_context(
+                            context,
+                            choice.var_name,
+                            item,
+                        );
+                        return self.execute_action_prefix(
+                            choice.body_steps,
+                            next_ptr,
+                            selected_context,
+                            s0,
+                            out_states,
+                            remaining,
+                            action_mask,
+                        );
+                    }
+                    remaining.* -= item_count;
+                }
+                unreachable;
+            },
+            .bounded_power_set_choose => |choice| {
+                const pool_snapshot = self.eval_pool.snapshot();
+                const context_snapshot = self.evaluator.context_snapshot();
+                const prefix = (try self.constant_bounded_power_set_prefix(
+                    choice,
+                    context,
+                )) orelse {
+                    self.eval_pool.restore(pool_snapshot);
+                    self.evaluator.restore_context_pool(context_snapshot);
+                    assert(remaining.* == 0);
+                    return self.execute_steps(
+                        steps,
+                        continuation,
+                        context,
+                        s0,
+                        out_states,
+                        false,
+                        action_mask,
+                    );
+                };
+                if (remaining.* < prefix.invalid_count()) {
+                    remaining.* = 0;
+                    return;
+                }
+                remaining.* -= prefix.invalid_count();
+                const next = Continuation{
+                    .steps = rest,
+                    .next = continuation,
+                    .return_context = context,
+                };
+                const next_ptr = if (rest.len == 0 and continuation == null)
+                    null
+                else
+                    &next;
+                const candidate_pool_snapshot = self.eval_pool.snapshot();
+                const candidate_context_snapshot =
+                    self.evaluator.context_snapshot();
+                var mask: u32 = 0;
+                while (mask < prefix.valid_count) : (mask += 1) {
+                    const candidate = self.bounded_power_set_prefix_candidate(
+                        prefix,
+                        mask,
+                    );
+                    const candidate_context = try self.evaluator.extend_context(
+                        context,
+                        choice.var_name,
+                        candidate,
+                    );
+                    const candidate_count = try self.action_prefix_count(
+                        choice.body_steps,
+                        next_ptr,
+                        candidate_context,
+                    );
+                    self.eval_pool.restore(candidate_pool_snapshot);
+                    self.evaluator.restore_context_pool(
+                        candidate_context_snapshot,
+                    );
+                    if (remaining.* < candidate_count) {
+                        const selected =
+                            self.bounded_power_set_prefix_candidate(prefix, mask);
+                        const selected_context = try self.evaluator.extend_context(
+                            context,
+                            choice.var_name,
+                            selected,
+                        );
+                        return self.execute_action_prefix(
+                            choice.body_steps,
+                            next_ptr,
+                            selected_context,
+                            s0,
+                            out_states,
+                            remaining,
+                            action_mask,
+                        );
+                    }
+                    remaining.* -= candidate_count;
+                }
+                unreachable;
+            },
+            .let_bind => |binding| {
+                const next_context = (try self.constant_let_context(
+                    binding,
+                    context,
+                )) orelse {
+                    assert(remaining.* == 0);
+                    return self.execute_steps(
+                        steps,
+                        continuation,
+                        context,
+                        s0,
+                        out_states,
+                        false,
+                        action_mask,
+                    );
+                };
+                return self.execute_action_prefix(
+                    rest,
+                    continuation,
+                    next_context,
+                    s0,
+                    out_states,
+                    remaining,
+                    action_mask,
+                );
+            },
+            .call => |call| {
+                const call_context = (try self.constant_call_context(
+                    call,
+                    context,
+                )) orelse {
+                    assert(remaining.* == 0);
+                    return self.execute_steps(
+                        steps,
+                        continuation,
+                        context,
+                        s0,
+                        out_states,
+                        false,
+                        action_mask,
+                    );
+                };
+                const next = Continuation{
+                    .steps = rest,
+                    .next = continuation,
+                    .return_context = context,
+                };
+                const next_ptr = if (rest.len == 0 and continuation == null)
+                    null
+                else
+                    &next;
+                return self.execute_action_prefix(
+                    call.body_steps,
+                    next_ptr,
+                    call_context,
+                    s0,
+                    out_states,
+                    remaining,
+                    action_mask,
+                );
+            },
+            else => {
+                assert(remaining.* == 0);
+                return self.execute_steps(
+                    steps,
+                    continuation,
+                    context,
+                    s0,
+                    out_states,
+                    false,
+                    action_mask,
+                );
+            },
+        }
     }
 
     fn eval_direct_generated_expr(
@@ -2742,14 +3594,7 @@ pub const ActionExecutor = struct {
             context,
             state,
         );
-        const upper_value = try self.eval_compiled_expr(
-            choice.upper,
-            context,
-            state,
-        );
-        if (!base_value.is_set_like() or !upper_value.is_set_like()) {
-            return Error.TypeError;
-        }
+        if (!base_value.is_set_like()) return Error.TypeError;
         const base = try self.evaluator.materialize_set(
             base_value,
             context,
@@ -2757,13 +3602,21 @@ pub const ActionExecutor = struct {
             self.eval_pool,
             &self.source_state_store.values_pool,
         );
-        const upper = try self.evaluator.materialize_set(
-            upper_value,
-            context,
-            state,
-            self.eval_pool,
-            &self.source_state_store.values_pool,
-        );
+        const upper = if (choice.upper) |compiled| upper: {
+            const upper_value = try self.eval_compiled_expr(
+                compiled,
+                context,
+                state,
+            );
+            if (!upper_value.is_set_like()) return Error.TypeError;
+            break :upper try self.evaluator.materialize_set(
+                upper_value,
+                context,
+                state,
+                self.eval_pool,
+                &self.source_state_store.values_pool,
+            );
+        } else base;
         if (base != .set_v or upper != .set_v) return Error.TypeError;
         if (base.set_v.len > 30) return Error.OutOfMemory;
 
@@ -2792,12 +3645,25 @@ pub const ActionExecutor = struct {
         const upper_set = upper.set_v;
         const lower_set = lower.set_v;
         const lower_items = lower_set.items(self.eval_pool);
+        const subset_placeholder = Value{ .set_v = .{
+            .offset = base.set_v.offset,
+            .len = 0,
+        } };
         for (lower_items) |item| {
             if (!base.set_v.contains(self.eval_pool, item) or
                 !upper_set.contains(self.eval_pool, item))
             {
                 return;
             }
+            if (choice.element_filter) |filter|
+                if (!try self.power_set_element_allowed(
+                    filter,
+                    choice.var_name,
+                    subset_placeholder,
+                    context,
+                    state,
+                    item,
+                )) return;
         }
 
         const optional = try self.eval_pool.alloc_values(base.set_v.len);
@@ -2808,6 +3674,15 @@ pub const ActionExecutor = struct {
             {
                 continue;
             }
+            if (choice.element_filter) |filter|
+                if (!try self.power_set_element_allowed(
+                    filter,
+                    choice.var_name,
+                    subset_placeholder,
+                    context,
+                    state,
+                    item,
+                )) continue;
             optional[optional_count] = item;
             optional_count += 1;
         }
@@ -2861,6 +3736,39 @@ pub const ActionExecutor = struct {
                 if (probe.*) return;
             }
         }
+    }
+
+    fn power_set_element_allowed(
+        self: *const ActionExecutor,
+        filter: ElementFilter,
+        subset_name: []const u8,
+        subset_placeholder: Value,
+        context: Context,
+        state: ?*StateStore.State,
+        item: Value,
+    ) Error!bool {
+        const snapshot = self.eval_pool.snapshot();
+        const context_snapshot = self.evaluator.context_snapshot();
+        defer self.eval_pool.restore(snapshot);
+        defer self.evaluator.restore_context_pool(context_snapshot);
+        // Generated helpers retain lexical depths from the original
+        // `subset -> element` quantifier nesting. The subset cannot be observed
+        // by a recognized filter, but its frame must remain present.
+        const subset_context = try self.evaluator.extend_context(
+            context,
+            subset_name,
+            subset_placeholder,
+        );
+        const element_context = try self.evaluator.extend_context(
+            subset_context,
+            filter.var_name,
+            item,
+        );
+        return self.eval_compiled_bool(
+            filter.predicate,
+            element_context,
+            state,
+        );
     }
 
     fn execute_steps(
@@ -3061,23 +3969,6 @@ pub const ActionExecutor = struct {
                 },
                 .condition => |e| {
                     if (!try self.eval_compiled_bool(e, current_ctx, s0)) {
-                        if (self.diagnostics and
-                            std.c.getenv(
-                                "TLZIG_ACTION_DIAGNOSTICS",
-                            ) != null)
-                        {
-                            if (e.generated) |generated| {
-                                std.debug.print(
-                                    "action condition rejected: expression={d} kind={s}\n",
-                                    .{ generated.identity, @tagName(e.expr.*) },
-                                );
-                            } else {
-                                std.debug.print(
-                                    "action condition rejected: interpreted kind={s}\n",
-                                    .{@tagName(e.expr.*)},
-                                );
-                            }
-                        }
                         return;
                     }
                     current_steps = rest;
@@ -3641,19 +4532,13 @@ pub const ActionExecutor = struct {
         if (s0) |parent| {
             @memcpy(new_state.values, parent.values);
             if (self.source_state_store == self.candidate_store) {
-                new_state.borrowed_mask = parent.borrowed_mask;
                 new_state.borrowed_pool = parent.borrowed_pool;
             } else {
-                new_state.borrowed_mask = if (new_state.values.len == 64)
-                    std.math.maxInt(u64)
-                else
-                    (@as(u64, 1) << @as(u6, @intCast(new_state.values.len))) - 1;
                 new_state.borrowed_pool = &self.source_state_store.values_pool;
-                assert(parent.borrowed_mask == 0);
+                assert(parent.borrowed_pool == null);
             }
         } else {
             @memset(new_state.values, Value{ .bool_v = false });
-            new_state.borrowed_mask = 0;
             new_state.borrowed_pool = null;
         }
 
@@ -3693,7 +4578,6 @@ pub const ActionExecutor = struct {
                 }
             }
             new_state.changed_mask |= variable_bit;
-            new_state.borrowed_mask &= ~variable_bit;
             new_state.values[variable_index] = try assigned.value.clone(
                 source_pool,
                 &self.candidate_store.values_pool,
@@ -3775,7 +4659,7 @@ test "action compiler branches only existential assignments" {
     defer arena.deinit();
     var module_parser = parser.Parser.init(&arena, source);
     const module = try module_parser.parse_module();
-    const evaluator = try Evaluator.init(
+    var evaluator = try Evaluator.init(
         module,
         &arena,
         overrides.OverrideContext.default(),
@@ -3810,6 +4694,13 @@ test "action compiler enumerates bounded power-set choices directly" {
         \\VARIABLE x
         \\D == {1, 2, 3}
         \\Init == x = {}
+        \\Direct == \E r \in SUBSET D: x' = r
+        \\Eligible == \E r \in SUBSET D:
+        \\              /\ \A e \in r: e # 3
+        \\              /\ x' = r
+        \\Dependent == \E r \in SUBSET D:
+        \\               /\ \A e \in r: e \in r
+        \\               /\ x' = r
         \\Next == \E r \in SUBSET D:
         \\          /\ r \subseteq {1, 2}
         \\          /\ {1} \subseteq r
@@ -3833,7 +4724,202 @@ test "action compiler enumerates bounded power-set choices directly" {
     try std.testing.expectEqual(@as(usize, 1), compiled.steps.len);
     try std.testing.expect(compiled.steps[0] == .bounded_power_set_choose);
     const choice = compiled.steps[0].bounded_power_set_choose;
+    try std.testing.expect(choice.upper != null);
     try std.testing.expect(choice.lower != null);
+    try std.testing.expect(choice.element_filter == null);
     try std.testing.expectEqual(@as(usize, 1), choice.body_steps.len);
     try std.testing.expect(choice.body_steps[0] == .assign_prime);
+
+    var store = try StateStore.init(
+        &arena,
+        module.variables,
+        16,
+        256,
+        64,
+    );
+    const initial_index = try store.alloc_state();
+    store.get(initial_index).values[0] = .{ .set_v = .{
+        .offset = 0,
+        .len = 0,
+    } };
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var eval_pool = try ValuePool.init(&eval_arena, 1024, 64);
+    const executor = ActionExecutor{
+        .evaluator = &evaluator,
+        .source_state_store = &store,
+        .candidate_store = &store,
+        .eval_pool = &eval_pool,
+    };
+    try std.testing.expectEqual(
+        @as(u32, 8),
+        try executor.top_level_action_count(compiled),
+    );
+    var out = try StateBuffer.init(&arena, 4);
+    var enabled_count: u32 = 0;
+    for (0..8) |action_index| {
+        out.clear();
+        try executor.execute_next_action(
+            compiled,
+            @intCast(action_index),
+            initial_index,
+            &out,
+        );
+        try std.testing.expect(out.items.len <= 1);
+        enabled_count += @intCast(out.items.len);
+    }
+    try std.testing.expectEqual(@as(u32, 2), enabled_count);
+
+    const direct = evaluator.find_definition("Direct").?;
+    const direct_compiled = try compiler.compile_next(direct.body);
+    try std.testing.expectEqual(@as(usize, 1), direct_compiled.steps.len);
+    try std.testing.expect(
+        direct_compiled.steps[0] == .bounded_power_set_choose,
+    );
+    const direct_choice = direct_compiled.steps[0].bounded_power_set_choose;
+    try std.testing.expect(direct_choice.upper == null);
+    try std.testing.expect(direct_choice.lower == null);
+    try std.testing.expect(direct_choice.element_filter == null);
+    try std.testing.expectEqual(
+        @as(u32, 8),
+        try executor.top_level_action_count(direct_compiled),
+    );
+    var direct_count: u32 = 0;
+    for (0..8) |action_index| {
+        out.clear();
+        try executor.execute_next_action(
+            direct_compiled,
+            @intCast(action_index),
+            initial_index,
+            &out,
+        );
+        try std.testing.expectEqual(@as(usize, 1), out.items.len);
+        direct_count += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 8), direct_count);
+
+    const eligible = evaluator.find_definition("Eligible").?;
+    const eligible_compiled = try compiler.compile_next(eligible.body);
+    try std.testing.expectEqual(@as(usize, 1), eligible_compiled.steps.len);
+    try std.testing.expect(
+        eligible_compiled.steps[0] == .bounded_power_set_choose,
+    );
+    const eligible_choice = eligible_compiled.steps[0].bounded_power_set_choose;
+    try std.testing.expect(eligible_choice.upper == null);
+    try std.testing.expect(eligible_choice.lower == null);
+    try std.testing.expect(eligible_choice.element_filter != null);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        eligible_choice.body_steps.len,
+    );
+    try std.testing.expect(eligible_choice.body_steps[0] == .assign_prime);
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        try executor.top_level_action_count(eligible_compiled),
+    );
+    out.clear();
+    try executor.execute_next_action(
+        eligible_compiled,
+        0,
+        initial_index,
+        &out,
+    );
+    try std.testing.expectEqual(@as(usize, 4), out.items.len);
+
+    const dependent = evaluator.find_definition("Dependent").?;
+    const dependent_compiled = try compiler.compile_next(dependent.body);
+    try std.testing.expectEqual(@as(usize, 1), dependent_compiled.steps.len);
+    try std.testing.expect(
+        dependent_compiled.steps[0] == .bounded_power_set_choose,
+    );
+    const dependent_choice = dependent_compiled.steps[0].bounded_power_set_choose;
+    try std.testing.expect(dependent_choice.element_filter == null);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        dependent_choice.body_steps.len,
+    );
+}
+
+test "simulation action prefixes descend through LET and constant calls" {
+    const parser = @import("parser.zig");
+    const overrides = @import("overrides.zig");
+    const source =
+        \\---------------- MODULE ConstantCallActions ----------------
+        \\VARIABLE x
+        \\D == {1, 2}
+        \\DoNextUnique == \E v \in D : x' = v
+        \\=============================================================
+        \\
+    ;
+    var arena = try Arena.init(8 * 1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    var evaluator = try Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    const compiler = try ActionCompiler.init(&arena, evaluator);
+    const action_definition = evaluator.find_definition("DoNextUnique").?;
+    const action_body = try compiler.compile_next(action_definition.body);
+    try std.testing.expectEqual(@as(usize, 1), action_body.steps.len);
+    try std.testing.expect(action_body.steps[0] == .choose);
+    const domain_definition = evaluator.find_definition("D").?;
+    const let_expression = try compiler.compile_expr(domain_definition.body);
+    const wrapped_steps = [_]ActionStep{
+        .{ .let_bind = .{
+            .name = "LocalD",
+            .expr = let_expression,
+            .operator_arity = null,
+        } },
+        .{ .call = .{
+            .name = "DoNextUnique",
+            .params = &.{},
+            .args = &.{},
+            .state_args = &.{},
+            .body_steps = action_body.steps,
+        } },
+    };
+    const compiled = CompiledNext{ .steps = &wrapped_steps };
+
+    var store = try StateStore.init(
+        &arena,
+        module.variables,
+        8,
+        128,
+        64,
+    );
+    const initial_index = try store.alloc_state();
+    store.get(initial_index).values[0] = .{ .int_v = 0 };
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var eval_pool = try ValuePool.init(&eval_arena, 1024, 64);
+    const executor = ActionExecutor{
+        .evaluator = &evaluator,
+        .source_state_store = &store,
+        .candidate_store = &store,
+        .eval_pool = &eval_pool,
+    };
+
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        try executor.top_level_action_count(compiled),
+    );
+    var out = try StateBuffer.init(&arena, 4);
+    var seen: u2 = 0;
+    for (0..2) |action_index| {
+        out.clear();
+        try executor.execute_next_action(
+            compiled,
+            @intCast(action_index),
+            initial_index,
+            &out,
+        );
+        try std.testing.expectEqual(@as(usize, 1), out.items.len);
+        const selected = store.get(out.items[0]).values[0].int_v;
+        try std.testing.expect(selected == 1 or selected == 2);
+        seen |= @as(u2, 1) << @intCast(selected - 1);
+    }
+    try std.testing.expectEqual(@as(u2, 0b11), seen);
 }

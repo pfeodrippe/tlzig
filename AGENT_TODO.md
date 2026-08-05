@@ -10,7 +10,10 @@ TLAPS proof-only modules are intentionally outside the product scope.
 - [~] In progress
 - [x] Done
 
-## Validation snapshot (2026-08-03)
+## Validation snapshot (2026-08-04)
+- [x] Advance the repository-local official macOS AArch64 Zig master snapshot
+  to `0.17.0-dev.1552+79dc16a0e`; verify the published archive SHA-256
+  `7523163087e3e576b4833d0e3bdc8b51b25a41d38e7521337e79835ca7f574e0`.
 - [x] Pin the official macOS AArch64 Zig master snapshot
   `0.17.0-dev.1543+6db520a4c`; verify the published archive SHA-256
   `226a8168e7823eb402120c327787a75f9dd84b166dc2870c963dfb2cbe735f59`;
@@ -189,6 +192,19 @@ TLAPS proof-only modules are intentionally outside the product scope.
   observe the overlay; repeated/nested EXCEPT paths must retain TLA+ update
   order; and equality, fingerprinting, canonicalization, and final
   materialization must agree without pointer-identity shortcuts.
+- [x] Close `ElevatorSafetyMedium.cfg` exhaustively. TLC-auto and tlzig both
+  complete with exactly `17,997,111` distinct states. Generic ReleaseFast
+  tlzig took `95.723s` versus TLC's `66.358s`; the strict generated model has
+  `22` operators, `fallback_count = 0`, and completed in `43.49s` (`1.53x`
+  faster than TLC) while retiring `6.168T` instructions with a `3.60GB` peak
+  footprint. The opt-in benchmark passed independently at `86.910s` TLC-auto
+  versus `42.139s` tlzig-AOT-auto (`2.06x`) with exact distinct counts. Its
+  explicit `402,653,184` canonical-value bound avoids the benchmark's smaller
+  default cap without changing ordinary rows.
+- [x] Close Dijkstra Mutex `Safety-4-processors/MC.cfg` exhaustively. Both
+  engines completed at exact `146,157,716/33,288,512` generated/distinct
+  states; TLC-auto took `60.670s` and generic ReleaseFast tlzig-auto took
+  `58.101s` (`1.04x` faster).
 - [ ] Implement typed lazy patches only when the representation can satisfy
   that contract and remove reconstruction work. Merely merging the existing
   clone and hash loops has already measured slower and must not be revived.
@@ -3262,3 +3278,686 @@ allocation-free Zig operator overrides, and
   writes into append-only candidate pools remain unsafe across failed action
   branches; any accepted design must provide bounded rollback or a typed patch
   lifetime before removing the current reconstruct/clone/hash traversals.
+
+## 2026-08-03 Exact Fairness Edge Markers
+
+- [x] Profile the exact `cf1s_folklore` temporal run. Strict AOT spent `83.4%`
+  of samples rebuilding fairness masks by reevaluating TLA+ action predicates
+  over every committed edge after exploration.
+- [x] Reuse exploration-time action masks only when a structural proof finds
+  every primitive fairness action explicitly under the same existential
+  domain in `Next`. Aliases, conjunctions, universal quantification, and every
+  unsupported shape retain exact semantic replay. This is model-independent
+  and contains no user-operator dispatch.
+- [x] Keep Debug/ReleaseSafe verification mandatory for eligible shapes and
+  expose `TLZIG_VERIFY_FAIRNESS_MARKERS=1` for ReleaseFast audits. The full
+  `cf1s` audit compared `14,666,114` edges with zero mismatches, missing bits,
+  or extra bits. A conjunctive-fairness regression test proves that ambiguous
+  named actions are rejected by the fast path.
+- [x] Preserve exact temporal completion and
+  `22,438,432/2,057,174` generated/distinct counts. Direct strict AOT improved
+  from `38.94s` to `8.22s` (`4.74x`); the maintained paired benchmark reports
+  TLC-auto `16.515s` versus tlzig-auto `8.008s` (`2.06x`). Register `cf1s` as
+  a default all-core AOT benchmark with `11` operators, `3` temporal-native
+  definitions, and `fallback_count = 0`.
+
+## 2026-08-04 Allocation-Free Materialization
+
+- [x] Profile the strict `c1cs` AOT path and identify evaluator set
+  materialization as a generic allocation defect. Temporary `ArrayList`
+  buffers used `page_allocator` recursively, producing repeated
+  `mmap`/`munmap`, `2,984s` of system CPU, and more than `60 million` page
+  reclaims before the old run was stopped after `351.13s`.
+- [x] Add evaluator-local, per-worker, arena-backed high-water scratch frames.
+  The frames are recursion-safe, require no shared lock, and stage values,
+  secondary results, names, and sequence lengths without hot runtime
+  allocation.
+- [x] Convert record-set, tuple-set, union, recursive set-filter, Cartesian,
+  and sorted-sequence materialization to scratch or exact preallocation.
+  Record and Cartesian builders now preflight aggregate storage before
+  retaining `ValuePool` slices, preventing backing-array growth from leaving
+  stale destination pointers. `src/eval.zig` has zero `page_allocator` and
+  zero `ArrayList` sites.
+- [x] Preserve the exact temporal `cf1s_folklore` gate at
+  `22,438,432/2,057,174`; the fresh paired ReleaseFast result is TLC-auto
+  `16.441s` versus strict tlzig AOT `7.880s` (`2.09x`). All `227`
+  assertion-enabled tests pass.
+- [x] Preserve exact set-heavy and sorted-sequence behavior after removing the
+  last evaluator-local temporary lists. Bosco completes at
+  `29,223,200/1,072,452`, with TLC-auto `59.007s` versus strict tlzig AOT
+  `8.114s`; an isolated tlzig repeat is `7.81s`. MCBinarySearch completes at
+  `34,383/27,953`, with TLC-auto `2.199s` versus tlzig AOT `1.007s`.
+- [x] Recheck bounded `c1cs` with strict AOT. The run reached the explicit
+  two-million-state limit at `42,013,184/2,000,000` in `17.97s`, using
+  `2.51 GB` peak RSS and only `4.21s` system CPU. The preceding post-first-fix
+  ten-million-state run completed its bound in `97.19s`; `c1cs` remains open
+  because neither result is exhaustive parity.
+- [x] Run a historical all-core `EWD840_anim` exhaustive diagnostic with a
+  strict 22-operator, one-temporal-native, zero-fallback artifact. TLC timed
+  out after 300 seconds at `1,983,728,622/52,032,023` with `7,038,064` queued;
+  tlzig reached its explicit twenty-million-state cap at
+  `255,340,261/20,000,000` in `26.115s`. The later manifest audit establishes
+  that this is a simulation model, so these figures are throughput data rather
+  than its required compatibility verdict.
+- [ ] Continue the 8-row finite exhaustive backlog. Bounded throughput is useful
+  evidence but must never be reported as exact correctness.
+
+## 2026-08-04 Named Filtered Power-Set Correctness
+
+- [x] Generate strict `MC_HDiskSynod` and reproduce an AOT-only false
+  `HInv4` violation on its first initial state. Interpreted tlzig and Java TLC
+  accept the same state, proving this was generated-code semantics rather than
+  an upstream model result.
+- [x] Trace the failure to lexical arguments in a quantifier over the named
+  zero-arity `MajoritySet` definition. Its filter helper expects only `D`, but
+  the ordinary filtered-power-set runtime prepended caller arguments `p` and
+  `bk`; ReleaseFast consequently tested the wrong value without a Debug arity
+  assertion.
+- [x] Add a structurally selected isolated-filter entry point for zero-arity
+  definition chains. Direct set filters retain caller arguments and therefore
+  keep the existing entry point. No model/operator name selects either path.
+- [x] Add one codegen regression containing both named and direct filtered
+  power-set domains. All `228` assertion-enabled tests pass, and a Debug
+  DiskPaxos AOT run reaches the same 10-state bound as interpreted tlzig with
+  generated helper-arity assertions enabled.
+- [x] Regenerate strict DiskPaxos with `30` operators and zero fallback. The
+  repaired all-core run reaches `104,887,762/10,000,000` in `52.05s` without
+  a false invariant. A fresh 60-second pair records TLC at
+  `2,361,454/302,250` before timeout and tlzig at its explicit
+  `19,134,362/2,000,000` cap in `8.958s`; keep the row bounded.
+- [x] Audit stored generated artifacts for the old runtime call. None contain
+  the affected call shape; the regenerated DiskPaxos artifact contains 13
+  explicit isolated-filter calls.
+- [x] Pass the complete default ReleaseFast benchmark after the lexical-frame
+  fix. Every enabled artifact regenerates with zero fallback, every configured
+  semantic/count contract passes, and every strict AOT row is faster than its
+  paired TLC-auto run. Representative TLC/tlzig times are Slush
+  `25.645s/19.057s`, MCBinarySearch `1.948s/1.030s`, GameOfLife
+  `1.700s/0.701s`, `cf1s` `16.871s/7.750s`, Bosco `61.298s/8.157s`,
+  ClientCentric `2.431s/0.486s`, and SingleLog `2.234s/0.164s`.
+
+## 2026-08-04 Sailfish2 Bounded Audit
+
+- [x] Generate strict `TLCSailfish2` with `36` operators, one native temporal
+  definition, and zero fallback. The generated model accepts and explores the
+  configuration without a semantic error.
+- [x] Separate canonical density from scratch allocation. The model stores
+  approximately 200 canonical `Value` nodes per state: an 8 GB arena filled at
+  `673,643` states and a 20 GB arena filled at `1,579,290`; a 30 GB arena
+  reached the explicit two-million-state bound with `13.55 GB` peak RSS.
+- [x] Record a fresh all-core bounded pair. TLC reached
+  `399,821/162,226` generated/distinct states in 60 seconds with `123,966`
+  queued. Strict tlzig reached `3,780,221/2,000,000` in `26.604s`.
+- [ ] Keep `TLCSailfish2.cfg` in the 8-row finite backlog. Closing it requires a
+  denser canonical representation or a larger-memory exhaustive run with a
+  conclusive TLC outcome and matching tlzig distinct-state count.
+
+## 2026-08-04 Module-Qualified Built-In Overrides
+
+- [x] Reproduce strict `TestMCReachability` failing before exploration while
+  Java TLC accepts the same configuration. Its imported assumptions failed
+  with `TypeError` because generated `GraphName` evaluated the TLA body of
+  `IOUtils!IOEnv` instead of the Community Modules native override.
+- [x] Add module-qualified `IOUtils!IOEnv` and `IOUtils!atoi` dispatch to the
+  native registry and generated compiler. Generated wrappers retain operator
+  arity and higher-order use, carry source provenance, and dispatch only when
+  the definition comes from `IOUtils.tla`; unrelated user operators named
+  `IOEnv` or `atoi` remain generated TLA code.
+- [x] Add a codegen regression covering both module-qualified dispatch and the
+  same-name user-operator case. All `229` assertion-enabled tests pass.
+- [x] Regenerate `TestMCReachability` with `57` generated operators, `4`
+  native definitions, and zero fallback. A fresh all-core pair records TLC at
+  `376,820/252,366` before its 60-second timeout and strict tlzig at its
+  explicit `15,719,199/10,000,000` generated/distinct cap in `32.783s`.
+- [ ] Keep `TestMCReachability.cfg` in the 8-row finite backlog. The initialization
+  compatibility gap is closed, but neither engine completed the exhaustive
+  temporal state space.
+
+## 2026-08-04 Recursive Canonical Subvalue Sharing
+
+- [x] Identify the generic c1cs memory cliff. The top-level canonical-value
+  cache stopped inserting at `1,572,864/2,097,152` entries, after which every
+  changed function or set miss cloned its complete nested representation.
+  Canonical storage grew from `51.4 million` values at two million states to
+  `266.6 million` at eight million states.
+- [x] Canonicalize concrete sets, functions, tuples, and records bottom-up.
+  Repeated domains, message records, and nested sets now share immutable
+  canonical offsets across states. Selection is solely by `Value` shape; the
+  runtime contains no user-model names or semantics.
+- [x] Raise the bounded production interner ceiling from `2,097,152` to
+  `8,388,608` slots, and to `16,777,216` only when the configured state bound
+  exceeds 64 Mi. Temporal graph runs retain the `2,097,152`-slot ceiling
+  because c1cs showed neutral throughput and lower total RSS once recursive
+  sharing is active. The table remains fixed-size during parallel exploration,
+  preserving lock-free reads and stable published entries.
+- [x] Measure the same strict c1cs AOT path in ReleaseFast. At two million
+  states the new path uses `3,517,358` canonical values and `1.10 GB` peak RSS
+  versus about `51.4 million` and `2.51 GB`; wall time is `17.54s` versus
+  `17.97s`. With the final graph-aware table, twelve million states use
+  `27,464,951` values and `5.00 GB` peak RSS in `106.04s`, while recording
+  `70,512,089` temporal graph edges.
+- [x] Pass all `229` assertion-enabled tests and the complete default
+  ReleaseFast benchmark. Every strict artifact regenerates with zero fallback,
+  all exact distinct-state and configured-outcome contracts pass, and every
+  strict all-core row remains faster than TLC. Representative TLC/tlzig times
+  from the final graph-aware run are EWD998Small `3.774s/1.870s`, cf1s
+  `15.046s/7.326s`, Bosco `55.485s/7.497s`, ClientCentric
+  `2.356s/0.454s`, and SingleLog `2.020s/0.172s`.
+- [x] Re-audit `MCNanoLarge.cfg`. At the same ten-million-state boundary,
+  canonical storage falls from `689,774,468` to `13,045,263` values, peak RSS
+  from `16.28 GB` to `3.25 GB`, and wall time from `26.36s` to `23.68s`. A
+  thirty-million-state run reaches `46,167,175/30,000,000` in `64.20s` with
+  `8.12 GB` RSS and `16,174,006` queued.
+- [x] Re-audit `TLCSailfish2.cfg`. At two million states, canonical storage
+  falls from roughly 400 million to `60,180,882` values, peak RSS from
+  `13.55 GB` to `2.70 GB`, and wall time from `26.604s` to `23.62s`. The run
+  still has `1,590,436` queued.
+- [x] Re-audit `APLamportMutex.cfg`. The old path exhausted `536,870,912`
+  canonical values at `29,082,375` states after `84.011s`; the new path reaches
+  forty million states in `63.24s` with `13,082,908` values. At the
+  130-million-state bound, adaptive large-run sizing lowers the 120-million
+  checkpoint from `194,790,406` to `35,057,430` values, improves wall time
+  from `259.70s` to `208.66s`, and lowers peak process footprint from
+  `40.37 GB` to `33.97 GB`. The frontier remains open.
+- [x] Re-audit `MultiPaxos_MC.cfg`. At twenty million states, canonical
+  storage falls from `373,537,046` to `26,169,746` values, peak RSS from
+  `15.55 GB` to `6.14 GB`, and wall time from `209.40s` to `193.33s`. The run
+  still has `3,830,790` queued. This historical bounded result is superseded
+  by the exact closure below.
+- [x] Re-audit the low-density `EnvironmentController.cfg` temporal row with
+  graph-aware sizing. The final repeat reaches
+  `112,409,658/20,000,000` in `268.42s`, with `2,830,058` queued and
+  `11.80 GB` RSS. This is lower memory but not a claimed speedup over the
+  historical `247.00s` sample; keep it as a throughput-variance target.
+- [ ] Keep Sailfish2 and Lamport mutex open until both engines
+  finish with conclusive matching outcomes and exact distinct-state parity for
+  successful exhaustive runs. NanoLarge and MultiPaxos are now closed below.
+
+## 2026-08-04 Cross-Pool State-Set Membership
+
+- [x] Generate strict `APc1cs.cfg` AOT: `22` generated operators, one standard
+  native operator, and zero fallback.
+- [x] Profile the ReleaseFast all-core artifact. Recursive aggregate cloning,
+  string copying, and fingerprinting dominate; the hottest generated predicate
+  cloned state variable `bcastMsg` for every `msg \in bcastMsg` test.
+- [x] Add generic direct-variable membership lowering. Generated
+  `element \in stateSet` and `element \notin stateSet` now call the existing
+  complete cross-pool `Value.member_cross_pool` implementation, including
+  current and primed reads, without materializing the state set in the eval
+  pool. No model name or user semantics are present in the runtime or codegen.
+- [x] Remove collisions for cached materialized current/primed variables by
+  indexing all 128 legal slots directly. Snapshot restoration still invalidates
+  every entry whose aggregate storage was rewound.
+- [x] Add runtime and codegen regressions. The runtime test proves cross-pool
+  membership leaves the eval-pool snapshot unchanged; the codegen test proves
+  direct state-set membership selects the specialized generic helper. All 229
+  assertion-enabled tests pass.
+- [x] Measure the identical twenty-million-state boundary before and after.
+  ReleaseFast tlzig improves from `173.12s` to `141.97s` (`1.22x`), user CPU
+  from `2,566.58s` to `1,897.48s`, and retired instructions from `38.37T` to
+  `28.12T`. The improved run reaches `452,005,985/20,000,000` with
+  `11,677,559` queued and `6.80 GB` peak RSS.
+- [x] Record fresh paired TLC evidence. TLC-auto reaches `18,496,258` distinct
+  states at 183 seconds with `10,595,893` queued and `8.91 GB` observed peak
+  RSS; tlzig averages about `1.39x` its distinct-state throughput over these
+  bounded runs.
+- [x] Pass the complete default ReleaseFast benchmark after the new lowering.
+  Every strict artifact regenerates with zero fallback, every exact distinct
+  count and configured-outcome contract passes, and every AOT all-core row
+  remains faster than TLC.
+- [ ] Keep `APc1cs.cfg` in the 8-row finite backlog. Both frontiers are expanding;
+  only matching exhaustive completion can close the correctness row.
+
+## 2026-08-04 Infinite Corpus Wrappers
+
+- [x] Prove that `APCRDT.cfg` is intentionally infinite: `Increment(n)` can
+  increase `counter[n][n] \in Nat` without bound. A successful exhaustive state
+  count cannot exist in TLC or tlzig.
+- [x] Prove that `APReplicatedLog.cfg` is intentionally infinite: enabled
+  `WriteTx(n, tx)` actions can append to `log \in Seq(Transaction)` forever.
+- [x] Generate both wrappers as strict AOT. Each reports eight generated
+  operators, one standard native operator, and zero fallback.
+- [x] Record large bounded invariant evidence. `APCRDT` reaches 100 million
+  distinct states in 270 seconds with `28,964,052` queued and no violation;
+  TLC reaches `84,398,731` at 300 seconds with `24,777,057` queued.
+  `APReplicatedLog` reaches ten million distinct states in `10.80s` with
+  `5,003,163` queued and no violation; TLC reaches `138,892,346` at 300 seconds
+  with `69,456,028` queued.
+- [x] Retain exact finite-companion closure for the shared semantic paths:
+  `MCCRDT.cfg` has exact `25,000` distinct states and
+  `MCReplicatedLog.cfg` exact `1,363` in both engines.
+- [x] Prove both unbounded FIFO annotation wrappers are also infinite. Repeated
+  `BufRcv` transitions append to `q`, and neither `APInnerFIFO.cfg` nor
+  `APInnerFIFOInstanced.cfg` supplies a queue-length constraint.
+- [x] Generate both FIFO wrappers as strict AOT: 16 generated operators, one
+  standard native operator, and zero fallback each. Fresh five-million-state
+  runs preserve their invariants in `5.71s` and `5.38s`, with about 1.47 million
+  states still queued.
+- [x] Retain exact FIFO finite-companion closure. `MCInnerFIFO.cfg` completes at
+  exact `9,660/3,864` generated/distinct states in both engines, and
+  `APMCInnerFIFO.cfg` reaches the same configured bound-violation outcome.
+- [x] Remove the five infinite wrappers from the finite exhaustive-evidence
+  backlog. The current finite backlog is 8 configurations; the wrappers remain
+  supported nonterminating models, not falsely claimed exhaustive successes.
+
+## 2026-08-04 ABA Exact Temporal Closure
+
+- [x] Generate strict `aba_asyn_byz.cfg` AOT with 15 generated operators, four
+  standard temporal/native definitions, and zero fallback.
+- [x] Cross the previous arbitrary five-million-state cap. The BFS queue peaks
+  and drains before the ten-million limit, then tlzig completes all three
+  configured temporal properties.
+- [x] Establish exact TLC base-state parity at `5,843,977` distinct states.
+  tlzig reports `85,121,584` raw generated successors versus TLC's
+  `85,612,896`; this is duplicate-edge accounting on the same complete graph.
+- [x] Record ReleaseFast resources: `139.36s` wall time and `3.36 GB` peak RSS.
+  TLC completed the base graph but had not finished temporal analysis after
+  240 seconds, making tlzig at least `1.72x` faster to the successful verdict.
+- [x] Remove `aba_asyn_byz.cfg` from the finite exhaustive backlog.
+
+## 2026-08-04 Elevator Large Exact Temporal Closure
+
+- [x] Regenerate strict `ElevatorLivenessLarge.cfg` AOT with 22 generated
+  operators, three standard temporal/native definitions, and zero fallback.
+- [x] Complete tlzig at exact `230,803/50,653` generated/distinct states,
+  including the configured temporal property, in `1.68s` with `270 MB` peak RSS.
+- [x] Run default Java TLC to its full successful verdict. It completes at
+  `230,899/50,653` in `1,951.17s` (`32min 30s`) with `18.33 GB` peak RSS, so
+  tlzig is `1,161x` faster end to end at exact distinct-state parity.
+- [x] Profile TLC's liveness phase. Eight `LiveWorker` threads spend
+  `checkSccs`/`checkComponent` repeatedly seeking and reading disk-backed
+  `TableauDiskGraph` nodes through `BufferedRandomAccessFile`. TLC checks an
+  intermediate 302,912-node product for `11min 47s`, then the final
+  405,224-node product for `20min 38s`; tlzig traverses its contiguous in-memory
+  temporal graph once.
+- [x] Remove `ElevatorLivenessLarge.cfg` from the finite exhaustive backlog.
+  The current finite backlog is 8 configurations.
+
+## 2026-08-04 Elevator Large Exact Safety Closure
+
+- [x] Generate strict `ElevatorSafetyLarge.cfg` AOT with 22 generated
+  operators, two standard native definitions, and zero fallback.
+- [x] Complete tlzig with no violation at `545,380,491/59,007,145`
+  generated/distinct states in `112.97s`, using `11.36 GB` peak RSS.
+- [x] Complete Java TLC with no violation at
+  `545,537,067/59,007,145` generated/distinct states in `157.14s`, using
+  `11.21 GB` peak RSS. The exact reachable-state count matches; the raw
+  generated difference is duplicate action-witness accounting.
+- [x] Record the honest ReleaseFast all-core speedup: tlzig is `1.39x` faster
+  end to end while retiring `18.31T` instructions versus TLC's `23.82T`.
+- [x] Add the strict row to the maintained benchmark as opt-in. Its
+  59-million-state pair would consume most of the default benchmark budget.
+- [x] Remove `ElevatorSafetyLarge.cfg` from the finite exhaustive backlog. The
+  current finite backlog is 8 configurations.
+
+## 2026-08-04 MultiPaxos Exact Symmetry Closure
+
+- [x] Generate strict `MultiPaxos_MC.cfg` AOT with 60 generated operators, one
+  standard native definition, and zero fallback.
+- [x] Complete tlzig and Java TLC without error at the exact same `37,078,209`
+  quotient states. tlzig reports `101,402,513` raw generated successors and
+  TLC `101,413,181`; the `10,668` difference is duplicate action-witness
+  accounting rather than a reachable-state mismatch.
+- [x] Identify a generic parallel-symmetry defect: candidate canonicalization
+  received the checker-level cache, which is intentionally disabled with
+  multiple workers, instead of each worker's private candidate and canonical
+  hash caches. No model name or user semantics select the repaired path.
+- [x] Route hashes through the cache matching each value's pool and add an
+  assertion-enabled regression proving that both private cache tables are
+  populated while producing the same fingerprint as the uncached path.
+- [x] Improve ReleaseFast tlzig from `312.16s` to `254.14s` (`1.23x`) and
+  retired instructions from `58.84T` to `48.02T`, while preserving exact
+  states. TLC takes `292.63s`, so repaired tlzig is `1.15x` faster.
+- [x] Register the exact 37-million-state pair as an opt-in benchmark with a
+  strict zero-fallback AOT artifact and exact distinct-state comparison.
+- [x] Remove `MultiPaxos_MC.cfg` from the finite exhaustive backlog. The
+  current finite backlog is 8 configurations.
+
+## 2026-08-04 EWD998 N=4 Extended Frontier
+
+- [x] Regenerate `EWD998.cfg` as strict AOT with 33 generated operators, four
+  standard native definitions, and zero fallback.
+- [x] Complete all-core ReleaseFast exploration at `2,613,583,722` generated
+  transitions, `248,006,200` distinct states, and `2,083,298,801` graph edges.
+- [x] Add fatal benchmark diagnostics for generated, distinct, and queued
+  counts without allocating an unused result string on the error path.
+- [x] Fix generic strict-AOT `UNCHANGED NamedOperator` lowering. Zero-arity
+  named operators now receive an empty argument slice instead of inheriting
+  the enclosing action's parameters. ReleaseSafe exposed the violated arity
+  contract; ReleaseFast had silently produced a false `TDSpec` rejection.
+- [x] Differentially close constrained temporal N=2 and N=3. TLC/tlzig exact
+  distinct counts are `6,876` and `1,520,618`; both `Liveness` and `TDSpec`
+  pass under interpreted, ReleaseSafe AOT, and ReleaseFast AOT execution.
+- [x] Add the N=2 temporal regression to the default all-core paired benchmark.
+  A fresh run measured TLC-auto `1.000s` versus tlzig AOT `0.051s` with exact
+  `6,876` distinct states and zero generated fallback.
+- [x] Complete strict-AOT N=4 exploration and both temporal properties after
+  the fix. The paired Java TLC reference run is still completing its final
+  disk-backed liveness pass; do not claim final TLC count parity until it exits.
+- [x] Raise the opt-in benchmark to 250 million states and 2.2 billion graph
+  edges through generic resource-limit plumbing; keep it out of the default
+  benchmark because the complete pair is intentionally long-running.
+- [x] Add `scripts/tlc_graph_count.py` to count and validate live TLC
+  `ptrs_N` records without loading graph nodes. Its parser is covered by short,
+  long-natural, tableau, and partial-live-record tests.
+- [x] Re-run the complete default ReleaseFast benchmark on Zig
+  `0.17.0-dev.1552+79dc16a0e`: `95/95` build steps pass, including every
+  strict zero-fallback AOT row and the new EWD998 temporal regression.
+
+## 2026-08-04 Simulation-Mode Corpus Classification
+
+- [x] Read the examples manifests instead of treating every `.cfg` as an
+  exhaustive-search model. `EWD687a_anim.cfg` and `EWD840_anim.cfg` both
+  declare 100-trace simulation mode with an expected safety failure.
+- [x] Make the paired auditor pass TLC `-simulate num=100` for manifest-declared
+  simulation models and invoke tlzig with the same trace count, depth, and seed.
+- [x] Remove the two animation models from the finite exhaustive backlog. The
+  current finite backlog is 8 configurations; neither is now a compatibility
+  gap.
+- [x] Implement bounded seeded simulation in tlzig. It uses normal initial-state
+  generation, checks state/action constraints and every generated successor,
+  evaluates invariants and safety properties, preserves deadlock semantics, and
+  retries randomly ordered actions that have no successor.
+- [x] Implement TLC-compatible maximum-prefix action decomposition for generic
+  disjunctions and constant-domain bounded existentials. The selector is
+  allocation-free and contains no user-model names or semantics.
+- [x] Implement dynamic `TLCGet("level")` semantics in interpreted and generated
+  execution. The value is zero outside state evaluation and otherwise the
+  current state's one-based trace level, matching Java TLC.
+- [x] Pair the manifest-declared outcomes in ReleaseFast. `EWD840_anim.cfg`
+  finds `AnimInv` in both engines at TLC-auto `0.740s` versus tlzig `0.364s`;
+  `EWD687a_anim.cfg` finds `InterestingBehavior` at `0.719s` versus `0.058s`.
+- [x] Evaluate temporal properties over successful finite simulation traces.
+  The existing temporal engine now checks each sampled trace after folding
+  repeated states and adding TLC-compatible stuttering edges. Java-validated
+  pass/fail regressions cover terminal-stuttering semantics.
+- [x] Reuse post-initial state slots after each checked trace. Canonical values
+  remain stable and interned, while state storage is bounded by the initial set
+  plus one trace instead of trace-count times trace-depth.
+- [x] Give manifest simulation audits a one-million-state resource floor.
+  `EWD840_anim.cfg` has more than 262,000 valid initial states, so the ordinary
+  200,000-state short exhaustive bound rejected it before the first trace.
+
+## 2026-08-04 Compact State Metadata And HDisk Frontier
+
+- [x] Remove the per-state `borrowed_mask`. Candidate ownership is exactly the
+  complement of `changed_mask` when `borrowed_pool` is present, while committed
+  canonical states have no borrowed pool. A layout assertion fixes
+  `StateStore.State` at 40 bytes instead of 48 bytes.
+- [x] Add mixed-pool assertions proving unchanged slots read from the canonical
+  pool and changed slots read from the candidate pool. All 238 assertion-enabled
+  tests pass.
+- [x] Measure the identical strict-AOT `MC_HDiskSynod` 30-million-state command
+  before and after the accepted layout change. Peak RSS falls from `11.79 GB`
+  to `11.53 GB`; normalized retired work falls from `74,010.751` to
+  `73,851.001` instructions per generated successor. Wall samples are
+  `148.32s` and `141.20s`, but only the memory and normalized-instruction
+  reductions are treated as stable evidence.
+- [x] Prototype and reject moving `borrowed_pool` from each state into the
+  shared candidate `ValuePool`. Although this produced a 32-byte state and a
+  lower `11.30 GB` peak RSS, the complete benchmark exposed an
+  `IndexOutOfBounds` regression in `Barrier`. The unsafe compaction was removed;
+  `Barrier` again completes at exact `194/64` generated/distinct counts.
+- [x] Pass the complete default ReleaseFast benchmark after retaining only the
+  40-byte representation. Every exact/outcome contract reaches the final row,
+  every generated artifact reports zero fallbacks, and all AOT rows remain
+  faster than paired TLC. Slush Medium is exact at
+  `65,138,523/9,886,336`, with TLC-auto `24.616s` versus tlzig `15.668s`.
+- [x] Extend strict-AOT `MC_HDiskSynod` to 60 million distinct states. It
+  reaches `762,972,247/60,000,000` in `328.86s`, with `17,633,057` queued,
+  `15.69 GB` maximum RSS, `22.51 GB` peak process footprint, and no invariant
+  failure.
+- [ ] Keep `MC_HDiskSynod.cfg` in the 8-row finite backlog. Its frontier is
+  still expanding. Exact closure now requires compact canonical top-level state
+  values, not merely a larger fixed state bound; the design must retain
+  per-state mixed-pool ownership and pass `Barrier` plus the full parity gate.
+
+## 2026-08-04 Slush Large Extended Frontier
+
+- [x] Generate `SlushLarge.cfg` as strict AOT from the unmodified upstream
+  model: 35 generated operators, one standard native definition, and zero
+  fallbacks.
+- [x] Extend the all-core ReleaseFast frontier through 60 million, 100 million,
+  and 150 million distinct states without an invariant failure. The largest run
+  reaches `1,127,388,186/150,000,000` generated/distinct in `355.52s`; its queue
+  peaks around 120 million states and contracts to `13,479,765` at the bound.
+  Maximum RSS is `22.71 GB` and peak process footprint is `36.60 GB`.
+- [x] Record a fresh isolated Java TLC all-core sample using the same upstream
+  cfg and `-Xmx32g`. At 300.20s TLC has generated `515,331,878` states, found
+  `73,858,271` distinct, and retained `12,412,406` queued.
+- [x] Report bounded throughput honestly: tlzig averages about `421.9K`
+  distinct states/s versus TLC's `246.0K` (`1.71x`), and about `3.17M`
+  generated states/s versus `1.72M` (`1.84x`). Neither run is an exhaustive
+  correctness verdict.
+- [x] Close `SlushLarge.cfg` at exact TLC parity after the frontier drains at
+  `1,968,189,705/244,335,240` generated/distinct states.
+
+## 2026-08-04 Compact Tagged Value Representation
+
+- [x] Reorder the generic `GeneratedOperator` payload to remove alignment
+  padding. `GeneratedOperator` is now 16 bytes instead of 24 bytes and the
+  tagged `Value` union is 24 bytes instead of 32 bytes. Compile-time tests fix
+  both layout contracts; this is a generic representation change with no
+  model-specific semantics.
+- [x] Update canonical-capacity calculations for the compact element size. A
+  24 GiB arena can now retain `536,870,912` canonical values instead of
+  `402,653,184`, while a 1 GiB arena retains `22,369,621` instead of
+  `16,777,216`.
+- [x] Repeat the identical strict-AOT SlushLarge 150-million-state ReleaseFast
+  command. The compact run reaches `1,126,825,444/150,000,000`
+  generated/distinct states in `288.04s`, versus `1,127,388,186/150,000,000`
+  in `355.52s` before compaction: a controlled `1.23x` wall-time speedup. Peak
+  process footprint falls from `36.60 GB` to `30.42 GB`; maximum RSS varies
+  upward from `22.71 GB` to `24.71 GB`, and retired instructions vary upward
+  from `44.75T` to `45.75T`, so only wall time and process footprint are claimed
+  as improvements. The queue still contains `13,582,113` states at the bound,
+  so this remains bounded evidence rather than exhaustive correctness.
+- [x] Pass all 239 assertion-enabled tests, the ReleaseFast build, generated
+  pattern and MDBTLA structural audits, and the complete default ReleaseFast
+  benchmark after compaction. Every generated artifact reports zero fallback,
+  every configured exact/outcome contract passes, and every strict-AOT row is
+  faster than its paired TLC-auto row.
+- [x] Re-run the contracting SlushLarge frontier at a safely enlarged state
+  bound. It completes in `498.83s` at exact Java TLC generated/distinct parity;
+  TLC-auto takes `678.10s`, so strict-AOT tlzig is `1.36x` faster.
+
+## 2026-08-04 Unbounded AP Lamport Wrapper Classification
+
+- [x] Prove from the upstream source that `APLamportMutex.cfg` is not a finite
+  exhaustive model. `Clock == Nat \ {0}`, `ReceiveRequest` increments clocks,
+  and the cfg omits the source-documented `ClockConstraint` required for finite
+  model checking.
+- [x] Preserve positive bounded evidence for the valid unbounded wrapper: TLC
+  reached `96,045,036` states while still queued, and strict zero-fallback tlzig
+  reached explicit 40-million and 130-million state bounds without a semantic
+  rejection. No exhaustive count is claimed for either engine.
+- [x] Retain exhaustive Lamport coverage through `MCLamportMutex.cfg`, whose
+  configured state constraint completes in both engines at exact
+  `2,729,079/724,274` generated/distinct parity.
+- [x] Reduce the genuinely finite exhaustive-evidence backlog from 10 to 8
+  configurations rather than spending further runs on an infinite graph.
+
+## 2026-08-04 Slush Large Exact Closure
+
+- [x] Complete strict zero-fallback tlzig with no invariant failure at
+  `1,968,189,705/244,335,240` generated/distinct states, zero queued states,
+  and graph depth 59.
+- [x] Complete Java TLC on the unmodified upstream cfg at the exact same
+  generated and distinct counts and successful verdict.
+- [x] Record honest all-core performance: tlzig ReleaseFast takes `498.83s`
+  versus TLC-auto `678.10s`, a `1.36x` tlzig speedup. Retired instructions are
+  `81.23T` versus `95.44T`.
+- [x] Record the memory tradeoff: tlzig uses `49.80 GB` peak footprint and
+  `26.04 GB` maximum RSS, versus TLC's `20.16 GB` and `20.22 GB`.
+- [x] Add SlushLarge as an opt-in strict-AOT benchmark with exact generated and
+  distinct comparisons. It remains disabled by default because the complete
+  pair takes about twenty minutes.
+- [x] Remove SlushLarge from the finite exhaustive backlog; eight finite rows
+  remain.
+
+## 2026-08-04 Direct SUBSET Actions And Failure Diagnostics
+
+- [x] Lower direct bounded `\E subset \in SUBSET base: Action` choices into
+  subset enumeration without constructing the complete power-set value.
+- [x] Push a pure leading `\A element \in subset: Predicate(element)` guard
+  into the base set when the predicate does not reference the chosen subset.
+  Preserve lexical frame depth with a placeholder subset binding and retain
+  the ordinary path for dependent predicates.
+- [x] Add direct, filtered, and dependent action-compiler regressions. All 239
+  assertion-enabled tests pass in ReleaseFast.
+- [x] Measure the identical strict-AOT N=3 four-million-state boundary. Wall
+  time improves from `307.24s` to `18.48s` (`16.63x`) and retired instructions
+  from `62.399T` to `2.779T` (`22.46x`).
+- [x] Make parallel invariant failures elect one diagnostic owner before
+  printing. The N=2 failure log now contains one invariant name, one violation
+  summary, and one trace instead of interleaved traces from many workers.
+- [x] Add `EnvironmentControllerN2Safety` to the default strict-AOT benchmark.
+  Both engines find the same age-43 `TypeOK` violation: TLC-auto takes `1.393s`
+  at `592,015/126,903`, while tlzig takes `0.185s` at
+  `490,665/106,399` (`7.53x`). The harness enforces a 30,000-state early-stop
+  tolerance and the generated artifact has 36 operators, one standard native
+  built-in, and zero fallback.
+- [x] Keep the unmodified N=3 cfg in the eight-row finite backlog. tlzig finds
+  the same source-level violation, but the direct TLC run was interrupted
+  before its verdict; the reduced pair is not claimed as exhaustive N=3
+  parity.
+
+## 2026-08-04 KeyValueStore Safety Family
+
+- [x] Generate strict AOT artifacts for `MCKVSSafetySmall`, Medium, and Large.
+  They contain 11/12/12 generated operators, one standard native built-in,
+  and zero fallback.
+- [x] Close Small exactly at `56,349,379/3,409,605` generated/distinct states.
+  Isolated ReleaseFast timing is TLC `19.81s` versus tlzig `6.96s` (`2.85x`),
+  and RSS is 4.87 GB versus 1.18 GB.
+- [x] Close symmetry-reduced Medium exactly at
+  `365,609,473/17,220,672`. Isolated timing is TLC `90.47s` versus tlzig
+  `40.44s` (`2.24x`); the maintained benchmark records
+  `100.824s/43.512s` (`2.32x`) at the same exact count.
+- [x] Add Small to the default strict-AOT benchmark and Medium as an opt-in
+  exact row. Both compare generated and distinct counts.
+- [x] Add the full `MCKVsnap.cfg` safety-and-liveness model to the default
+  strict-AOT benchmark. TLC and tlzig complete at the exact same
+  `63,082/32,293` generated/distinct counts; ReleaseFast takes `2.177s` versus
+  `0.241s` (`9.03x`). The artifact has 33 generated operators, two standard
+  native definitions, and zero fallback.
+- [x] Run isolated all-core Large frontiers on the unmodified cfg. TLC reaches
+  `367,297,806/32,849,147` at 120 seconds with `15,883,975` queued; tlzig
+  reaches `426,483,296/40,000,000` in `76.02s` with `20,314,356` queued.
+  tlzig has `1.92x` higher distinct throughput, `1.83x` higher generated
+  throughput, and lower observed RSS.
+- [ ] Keep `MCKVSSafetyLarge.cfg` in the eight-row finite backlog. The bounded
+  run is faster and semantically clean, but both frontiers are still growing.
+
+## 2026-08-04 Current MDBTLA Exhaustive Revalidation
+
+- [x] Rerun `MultiShardTxn Storage exhaustive` all-core in ReleaseFast against
+  the current strict AOT artifact. TLC and tlzig complete at exactly
+  `1,078,623` distinct states; TLC takes `32.756s` and tlzig `8.652s`
+  (`3.79x`). The `9,390,226/8,723,634` generated-count difference is duplicate
+  successor accounting; both successful runs close the same quotient graph.
+- [x] Rerun `RC/no-prepare-block exhaustive` at exact `17,057,584` distinct
+  states. TLC takes `179.949s` and strict zero-fallback AOT tlzig takes
+  `80.513s` (`2.24x`); the artifact contains 67 generated operators and no
+  native user definition.
+- [x] Rerun `RC/no-prepare-block-or-ww exhaustive` at exact `18,764,120`
+  distinct states. TLC takes `193.182s` and strict zero-fallback AOT tlzig
+  takes `94.507s` (`2.04x`); its 67 generated operators also contain no native
+  user definition.
+- [x] Rerun `RC/with-prepare-block exhaustive` with exact generated/distinct
+  parity at `89,960,594/15,738,792`. TLC takes `164.528s` and strict
+  zero-fallback AOT tlzig takes `69.726s` (`2.36x`).
+- [x] Rerun `RC/snapshot exhaustive` with exact generated/distinct parity at
+  `405,005,930/67,629,092`. TLC takes `685.901s` and strict zero-fallback AOT
+  tlzig takes `315.854s` (`2.17x`).
+- [x] Complete the current MultiShard exhaustive matrix. Storage and all four
+  RC companions have fresh exact all-core evidence; every tlzig row is faster
+  and every generated artifact has zero fallback and no native user operator.
+- [x] Rerun the full upstream `SingleShardTxn/ShardTxn.cfg` plus all four
+  reduced companions. The full model matches exactly at
+  `14,931,205/5,502,547`; TLC takes `157.304s` and tlzig `38.931s` (`4.04x`).
+- [x] Rerun the full temporal `SingleLog/MCMDBProps.cfg`. Both engines complete
+  at exact `3,101,918/269,881` generated/distinct counts; TLC takes
+  `1,331.490s` and strict zero-fallback AOT tlzig takes `11.402s` (`116.77x`).
+- [x] Close fresh current-code evidence for all 11 TLC-valid upstream MDBTLA
+  cfgs. Successful exhaustive rows have exact distinct parity, first-error
+  upstream rows have matching deadlock/violation outcomes, and every paired
+  strict-AOT tlzig row is faster. Keep the two TLC-invalid cfgs classified as
+  invalid rather than inventing tlzig behavior for them.
+
+## 2026-08-04 Symmetry And Fairness Labels
+
+- [x] Diagnose the `MCKVsnap` termination mismatch as a tlzig bug rather than
+  a TLC/model violation. The alleged cycles were singleton implicit-stuttering
+  loops with a transaction at `READ`, `UPDATE`, or `COMMIT`; the corresponding
+  `WF_vars(t(self))` action was enabled, so those loops are unfair.
+- [x] Check the alleged counterexample directly against the specification. For
+  every transaction whose `pc` is not `Done`, exactly one of `START`, `READ`,
+  `UPDATE`, or `COMMIT` is enabled, and every branch changes `pc[self]`.
+  Consequently `WF_vars(t(self))` excludes an infinite stuttering suffix until
+  every transaction reaches `Done`, which proves `Termination` for this finite
+  model. TLC likewise evaluates liveness action predicates on the concrete
+  parent/successor pair before taking the successor's symmetry fingerprint
+  (`LiveCheck.addNextState`). TLC warns that symmetry is not sound for liveness
+  in general, but that warning does not validate tlzig's former counterexample.
+- [x] Isolate symmetry as the trigger. The no-symmetry control completed at
+  `365,596/189,664`, while the symmetry quotient retained TLC's exact
+  `63,082/32,293` count but previously produced a false temporal violation.
+- [x] Finalize each fairness mask as the concrete `<A>_v` transition label
+  before symmetry canonicalization. Quotient analysis now consumes the stored
+  label and never re-evaluates an action against independently renamed state
+  representatives. Unsupported marker shapes are evaluated on the concrete
+  parent/candidate pair before merging, without a spec-specific override.
+- [x] Add a generic regression where two symmetry-equivalent transitions with
+  different bound process names merge into one quotient target. Forcing the
+  old replay produces the marker mismatch and false violation; the fixed path
+  completes. Add a second regression where two differently labeled concrete
+  transitions from the same parent deduplicate to one quotient edge; its mask
+  must retain both labels. The assertion-enabled ReleaseSafe gate passes.
+- [x] Regenerate strict `MCKVsnap` AOT (`33` generated operators, `2` standard
+  native definitions, `0` fallbacks) and rerun the paired all-core ReleaseFast
+  benchmark. TLC and tlzig both complete at exact `63,082/32,293`; TLC takes
+  `2.114s`, tlzig takes `0.136s`, and the measured tlzig speedup is `15.5x`.
+  This is historical quotient evidence only; it is not a sound liveness
+  baseline because plain orbit-state symmetry can change temporal semantics.
+- [x] Repeat the focused strict-AOT ReleaseFast pair after the regression
+  expansion: exact `63,082/32,293`, TLC `2.060s`, tlzig `0.142s` (`14.5x`).
+  This result has the same historical/unsafe qualification.
+
+## 2026-08-04 Sound Temporal Symmetry Policy
+
+- [x] Test tlzig against TLC's ignored `April29dMC` regression. The source and
+  Java test document that the model satisfies `[]<>(x=a) /\ []<>(x=b)` without
+  symmetry, while the orbit quotient produces a bogus counterexample. Before
+  this policy fix, tlzig reproduced that false violation at `5/2`; its explicit
+  no-symmetry control completed at `8/4`.
+- [x] Disable orbit-state symmetry reduction by default whenever a configured
+  property requires temporal graph checking. Safety-only runs retain symmetry.
+  Library-only compatibility tests may explicitly set
+  `allow_unsafe_temporal_symmetry`; normal parsed cfg files cannot silently opt
+  into the unsound mode.
+- [x] Add a standalone two-value regression equivalent to `April29d`: a
+  symmetry-configured run must disable the quotient, complete at four concrete
+  states, and satisfy the recurrence property. The ReleaseSafe suite passes
+  all `249/249` tests.
+- [x] Classify nested recurrence structurally. An outer `[]` is safety only
+  when its operand, including recursively resolved named definitions, contains
+  no `<>` or `~>`. The regression uses `EventuallyZero == <>(x = 0)` and
+  `Recurrence == []EventuallyZero`, with `WF_x(Next)` to exclude the otherwise
+  legal infinite stuttering suffix at `x = 1`.
+- [x] Recognize `WF_` and `SF_` applications nested beneath temporal aliases.
+  `FairNext == WF_x(Next); BoxedFairness == []FairNext` now has an isolated
+  regression proving that it uses the temporal graph and completes correctly.
+- [x] Replace temporal+symmetry benchmark comparisons with sound no-symmetry
+  TLC baselines. `MCKVsnap` is exact at `365,596/189,664`; ReleaseFast TLC is
+  `6.345s` and strict AOT tlzig is `0.672s` (`9.44x`). `SingleShardTxn/small` is
+  exact at `78,245/33,787`; TLC is `2.543s` and tlzig is `0.136s` (`18.7x`).
+- [x] Remove duplicate TLC executions from generated benchmark rows. Preferred
+  generated specs now run TLC once to produce the semantic baseline, then run
+  only strict AOT tlzig and compare its outcome/counts to that baseline. The
+  EWD998 N=2 temporal anchor remains exact at `6,876` distinct states and takes
+  `0.871s` in TLC versus `0.049s` in AOT tlzig (`17.8x`).
+- [ ] Implement a permutation-labeled lifted liveness graph before safely
+  re-enabling temporal symmetry reduction. A plain orbit-state graph cannot
+  preserve path-sensitive predicates because quotient paths can stitch edges
+  through inconsistent permutations.

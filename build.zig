@@ -56,7 +56,22 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_tests = b.addRunArtifact(tests);
-    b.step("test", "Run unit tests").dependOn(&run_tests.step);
+    const benchmark_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    benchmark_tests.root_module.addImport("tlzig", tlzig_module);
+    benchmark_tests.root_module.addImport(
+        "generated_model",
+        generated_model_module,
+    );
+    const run_benchmark_tests = b.addRunArtifact(benchmark_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_benchmark_tests.step);
 
     const bench = b.addExecutable(.{
         .name = "benchmark",
@@ -91,7 +106,6 @@ pub fn build(b: *std.Build) void {
         b.path("vendor/tlaplus/tlatools/org.lamport.tlatools"),
     );
     build_tlc.step.dependOn(&tlc_test_class.step);
-    run_bench.step.dependOn(&build_tlc.step);
     const benchmark_filter = b.option(
         []const u8,
         "benchmark-filter",
@@ -102,14 +116,28 @@ pub fn build(b: *std.Build) void {
         "benchmark-include-long",
         "Include opt-in long benchmark specs and generated benchmark rows",
     ) orelse false;
+    const benchmark_tlzig_only = b.option(
+        bool,
+        "benchmark-tlzig-only",
+        "Run tlzig benchmark columns without starting Java TLC",
+    ) orelse false;
+    if (!benchmark_tlzig_only) {
+        run_bench.step.dependOn(&build_tlc.step);
+    }
     if (benchmark_filter) |filter| {
         run_bench.addArg(filter);
     }
     if (benchmark_include_long) {
         run_bench.addArg("--include-long");
     }
-    if (generated_model_path == null) {
-        run_bench.addArg("--skip-prefer-generated");
+    if (benchmark_tlzig_only) {
+        run_bench.addArgs(&.{
+            "--tlzig-only",
+            "--write-tlzig-baseline",
+        });
+    }
+    if (generated_model_path == null and !benchmark_tlzig_only) {
+        run_bench.addArg("--tlc-baseline-prefer-generated");
     }
     const benchmark_step = b.step("benchmark", "Benchmark tlzig vs Java TLC");
     benchmark_step.dependOn(&run_bench.step);
@@ -122,6 +150,14 @@ pub fn build(b: *std.Build) void {
                 .tla = "vendor/tlaplus-examples/specifications/SlushProtocol/Slush.tla",
                 .cfg = "vendor/tlaplus-examples/specifications/SlushProtocol/SlushMedium.cfg",
                 .filter = "Slush Medium",
+            },
+            .{
+                .name = "benchmark_slush_large_aot",
+                .model_path = "generated_models/slush_large.zig",
+                .tla = "vendor/tlaplus-examples/specifications/SlushProtocol/Slush.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/SlushProtocol/SlushLarge.cfg",
+                .filter = "Slush Large",
+                .default_enabled = false,
             },
             .{
                 .name = "benchmark_mc_binary_search_aot",
@@ -176,6 +212,21 @@ pub fn build(b: *std.Build) void {
                 .filter = "EWD998Small",
             },
             .{
+                .name = "benchmark_ewd998_n2_temporal_aot",
+                .model_path = "generated_models/ewd998_n2_temporal.zig",
+                .tla = "vendor/tlaplus-examples/specifications/ewd998/EWD998.tla",
+                .cfg = "benchmark_configs/EWD998N2Temporal.cfg",
+                .filter = "EWD998 N2 Temporal",
+            },
+            .{
+                .name = "benchmark_ewd998_original_large_aot",
+                .model_path = "generated_models/ewd998.zig",
+                .tla = "vendor/tlaplus-examples/specifications/ewd998/EWD998.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/ewd998/EWD998.cfg",
+                .filter = "EWD998 Original Large",
+                .default_enabled = false,
+            },
+            .{
                 .name = "benchmark_ewd998_chan_small_aot",
                 .model_path = "generated_models/ewd998_chan_small.zig",
                 .tla = "vendor/tlaplus-examples/specifications/ewd998/EWD998Chan.tla",
@@ -197,6 +248,29 @@ pub fn build(b: *std.Build) void {
                 .tla = "vendor/tlaplus-examples/specifications/MultiCarElevator/Elevator.tla",
                 .cfg = "vendor/tlaplus-examples/specifications/MultiCarElevator/ElevatorLivenessMedium.cfg",
                 .filter = "ElevatorLivenessMedium",
+            },
+            .{
+                .name = "benchmark_cf1s_folklore_aot",
+                .model_path = "generated_models/cf1s_folklore.zig",
+                .tla = "vendor/tlaplus-examples/specifications/cf1s-folklore/cf1s_folklore.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/cf1s-folklore/cf1s_folklore.cfg",
+                .filter = "cf1s folklore",
+            },
+            .{
+                .name = "benchmark_elevator_safety_medium_aot",
+                .model_path = "generated_models/elevator_safety_medium.zig",
+                .tla = "vendor/tlaplus-examples/specifications/MultiCarElevator/Elevator.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/MultiCarElevator/ElevatorSafetyMedium.cfg",
+                .filter = "ElevatorSafetyMedium",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_elevator_safety_large_aot",
+                .model_path = "generated_models/elevator_safety_large.zig",
+                .tla = "vendor/tlaplus-examples/specifications/MultiCarElevator/Elevator.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/MultiCarElevator/ElevatorSafetyLarge.cfg",
+                .filter = "ElevatorSafetyLarge",
+                .default_enabled = false,
             },
             .{
                 .name = "benchmark_spantree_test5_aot",
@@ -221,6 +295,35 @@ pub fn build(b: *std.Build) void {
                 .filter = "Bosco",
             },
             .{
+                .name = "benchmark_environment_controller_n2_safety_aot",
+                .model_path = "generated_models/environment_controller_n2_safety.zig",
+                .tla = "vendor/tlaplus-examples/specifications/detector_chan96/EnvironmentController.tla",
+                .cfg = "benchmark_configs/EnvironmentControllerN2Safety.cfg",
+                .filter = "EnvironmentControllerN2Safety",
+            },
+            .{
+                .name = "benchmark_mc_kvs_safety_small_aot",
+                .model_path = "generated_models/mc_kvs_safety_small.zig",
+                .tla = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVS.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVSSafetySmall.cfg",
+                .filter = "MCKVSSafetySmall",
+            },
+            .{
+                .name = "benchmark_mc_kvs_safety_medium_aot",
+                .model_path = "generated_models/mc_kvs_safety_medium.zig",
+                .tla = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVS.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVSSafetyMedium.cfg",
+                .filter = "MCKVSSafetyMedium",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_mc_kvsnap_aot",
+                .model_path = "generated_models/mc_kvsnap.zig",
+                .tla = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVsnap.tla",
+                .cfg = "benchmark_configs/MCKVsnap_no_sym.cfg",
+                .filter = "MCKVsnap",
+            },
+            .{
                 .name = "benchmark_btree_aot",
                 .model_path = "generated_models/btree.zig",
                 .tla = "vendor/tlaplus-examples/specifications/btree/btree.tla",
@@ -234,6 +337,21 @@ pub fn build(b: *std.Build) void {
                 .tla = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNano.tla",
                 .cfg = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNanoMedium.cfg",
                 .filter = "NanoMedium",
+                .default_enabled = false,
+            },
+            .{
+                .name = "benchmark_nano_hash5_small_aot",
+                .model_path = "generated_models/nano_hash5_small.zig",
+                .tla = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNano.tla",
+                .cfg = "benchmark_configs/MCNanoHash5Small.cfg",
+                .filter = "NanoHash5Small",
+            },
+            .{
+                .name = "benchmark_nano_large_aot",
+                .model_path = "generated_models/nano_large.zig",
+                .tla = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNano.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/NanoBlockchain/MCNanoLarge.cfg",
+                .filter = "NanoLarge",
                 .default_enabled = false,
             },
             .{
@@ -359,23 +477,16 @@ pub fn build(b: *std.Build) void {
                 .name = "benchmark_mdbtla_single_shard_txn_full_aot",
                 .model_path = "generated_models/mdbtla_single_shard_txn_full.zig",
                 .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
-                .cfg = "vendor/MDBTLA/SingleShardTxn/ShardTxn.cfg",
+                .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_no_sym.cfg",
                 .filter = "SingleShardTxn ShardTxn",
                 .default_enabled = false,
-            },
-            .{
-                .name = "benchmark_mdbtla_single_shard_txn_small_aot",
-                .model_path = "generated_models/mdbtla_single_shard_txn_small.zig",
-                .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
-                .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_small.cfg",
-                .filter = "SingleShardTxn ShardTxn/small",
             },
             .{
                 .name = "benchmark_mdbtla_single_shard_txn_small_no_sym_aot",
                 .model_path = "generated_models/mdbtla_single_shard_txn_small_no_sym.zig",
                 .tla = "vendor/MDBTLA/SingleShardTxn/ShardTxn.tla",
                 .cfg = "benchmark_configs/MDBTLA/SingleShardTxn/ShardTxn_small_no_sym.cfg",
-                .filter = "SingleShardTxn ShardTxn/small no-sym",
+                .filter = "SingleShardTxn ShardTxn/small",
             },
             .{
                 .name = "benchmark_mdbtla_single_shard_txn_small_safety_aot",
@@ -432,7 +543,9 @@ pub fn build(b: *std.Build) void {
             run_generated_benchmark.step.dependOn(
                 previous_generated_benchmark,
             );
-            run_generated_benchmark.step.dependOn(&build_tlc.step);
+            if (!benchmark_tlzig_only) {
+                run_generated_benchmark.step.dependOn(&build_tlc.step);
+            }
             benchmark_step.dependOn(&run_generated_benchmark.step);
             previous_generated_benchmark = &run_generated_benchmark.step;
         }
@@ -509,6 +622,7 @@ fn addGeneratedBenchmark(
         "--label-suffix",
         " [AOT]",
         "--auto-only",
+        "--tlzig-only",
     });
     return run_bench;
 }

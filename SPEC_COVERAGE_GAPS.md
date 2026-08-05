@@ -1,6 +1,6 @@
 # TLA+ Specification Coverage
 
-Last updated: 2026-07-28
+Last updated: 2026-08-04
 
 ## Goal
 
@@ -64,6 +64,377 @@ exhaustively. Many have independent exact long-run evidence; the remainder
 stay explicitly open. Audit timings are not performance evidence because the
 two paired jobs intentionally share the machine.
 
+### Reconciled Bounded Backlog (2026-08-03)
+
+The `53` bounded rows above are a historical short-gate count, not the current
+unresolved count. Later JSONL manifests provide conclusive exact,
+outcome-exact, semantic-exact, or stochastic evidence for `24` of them.
+Completed benchmark/semantic audits provide exact evidence for three more:
+`SingleLog/MCMDBProps` (`269,881` distinct), `SingleShardTxn/ShardTxn`
+(`5,502,547` distinct), and `MCInnerSerial` (`195` distinct). The conservative
+reconciliation now also includes the exact Slush Medium benchmark and the
+2026-08-03 exhaustive LCS Medium and Elevator Safety Medium runs. The
+unresolved finite exhaustive-evidence backlog is therefore **8 configurations**:
+
+- `KeyValueStore/MCKVSSafetyLarge.cfg`
+- `TLC/TestMCReachability.cfg`
+- `c1cs/APc1cs.cfg`
+- `c1cs/c1cs.cfg`
+- `dag-consensus/TLCSailfish2.cfg`
+- `detector_chan96/EnvironmentController.cfg`
+- `diskpaxos/MC_HDiskSynod.cfg`
+- `ewd998/EWD998.cfg`
+
+These are bounded evidence gaps, not known compatibility failures. They must
+remain open until both engines finish with matching successful distinct counts
+or matching configured violation/deadlock outcomes.
+
+The KeyValueStore safety family now has two exact strict-AOT anchors. Small
+completes in both engines at `56,349,379/3,409,605` generated/distinct states;
+isolated ReleaseFast timing is TLC `19.81s` versus tlzig `6.96s` (`2.85x`),
+with 4.87 GB versus 1.18 GB maximum RSS. Medium exercises the `TxId` symmetry
+used by Large and completes exactly at `365,609,473/17,220,672`; TLC takes
+`90.47s` versus tlzig `40.44s` (`2.24x`), with 5.63 GB versus 3.75 GB RSS.
+The maintained benchmark records the same exact Medium count at
+`100.824s/43.512s` (`2.32x`). Small is default-enabled and Medium is opt-in.
+
+`MCKVsnap.cfg` adds symmetry, the `TypeOK` and `SnapshotIsolation` invariants,
+and the temporal `Termination` property. Because TLC documents symmetry
+reduction as unsound for liveness, tlzig now automatically explores the
+concrete graph when a temporal property and symmetry are both configured. The
+paired benchmark uses `benchmark_configs/MCKVsnap_no_sym.cfg` for equivalent
+TLC semantics. TLC and strict zero-fallback AOT tlzig complete exactly at
+`365,596/189,664`; the current ReleaseFast pair takes `6.345s` and `0.672s`
+respectively (`9.44x`). Its generated artifact contains 32 generated operators,
+two standard native definitions, and zero fallback. A
+2026-08-04 regression briefly reported a false liveness violation while
+retaining the exact quotient-state count. The cause was generic: tlzig
+re-evaluated a fairness action against independently chosen parent/child
+symmetry representatives, after canonicalization had renamed the concrete
+child. Fairness masks are now finalized as `<A>_v` labels on concrete
+transitions before quotient-edge merging. A standalone symmetric regression
+forces two differently named transitions to merge into one quotient target;
+it fails under the old replay and passes under the concrete-label path. A
+second regression verifies that multiple concrete labels are OR-merged when
+their transitions deduplicate to one quotient edge. No KeyValueStore name or
+semantics is present in the runtime fix. The alleged
+counterexample is also impossible directly from the model: each non-`Done`
+transaction has an enabled `t(self)` step that changes `pc[self]`, so
+`WF_vars(t(self))` rules out every pre-termination stuttering loop. This agrees
+with TLC's rule of evaluating liveness actions on concrete successor states
+before symmetry fingerprinting.
+
+`MCKVSSafetyLarge.cfg` generates a strict 12-operator artifact with one
+standard native built-in and zero fallback. At TLC's 120-second checkpoint,
+Java has reached `367,297,806/32,849,147` generated/distinct states with
+`15,883,975` queued. tlzig reaches its explicit 40-million-state boundary at
+`426,483,296/40,000,000` in `76.02s`, with `20,314,356` queued. This is
+`1.92x` higher distinct throughput and `1.83x` higher generated throughput,
+while RSS is 8.02 GB versus TLC's observed 11.55 GB. Both queues are growing,
+so Large remains in the eight-row backlog rather than being mislabeled exact.
+
+`SlushLarge.cfg` now has substantially deeper strict-AOT evidence. The
+unmodified model generates 35 operators with one standard native definition
+and zero fallback. tlzig reaches `1,127,388,186/150,000,000`
+generated/distinct states in `355.52s`, with no invariant failure and
+`13,479,765` queued after the frontier starts contracting. Peak RSS is
+`22.71 GB` and peak process footprint is `36.60 GB`. A fresh isolated TLC-auto
+sample reaches `515,331,878/73,858,271` generated/distinct in `300.20s`, with
+`12,412,406` queued. Average bounded distinct throughput favors tlzig by
+`1.71x`, but neither engine completed, so the row remains in the finite backlog.
+
+A generic tagged-value compaction has since reduced `Value` from 32 to 24
+bytes without changing model semantics. On the identical strict-AOT
+150-million-state command, tlzig reaches
+`1,126,825,444/150,000,000` in `288.04s`, a controlled `1.23x` speedup over
+the old layout. Peak process footprint falls from `36.60 GB` to `30.42 GB`.
+Maximum RSS and retired instructions do not improve on this sample, so they are
+not presented as wins. The queue still contains `13,582,113` states and the
+run ends at the explicit state bound. The complete ReleaseFast benchmark and
+all 239 assertion-enabled tests pass with the compact representation.
+
+The enlarged run closes SlushLarge exhaustively. Strict zero-fallback tlzig
+and Java TLC both complete successfully at exactly
+`1,968,189,705/244,335,240` generated/distinct states, with zero states left
+queued and graph depth 59. ReleaseFast tlzig takes `498.83s`; TLC-auto takes
+`678.10s`, making tlzig `1.36x` faster at exact parity. tlzig uses `49.80 GB`
+peak process footprint and `26.04 GB` maximum RSS; TLC uses `20.16 GB` and
+`20.22 GB`, respectively. The row is registered as an opt-in strict-AOT
+benchmark because the complete pair takes about twenty minutes and approaches
+the memory limit of a 48 GiB machine.
+
+Two additional valid configurations use simulation mode rather than exhaustive
+search:
+
+- `ewd687a/EWD687a_anim.cfg`
+- `ewd840/EWD840_anim.cfg`
+
+Their corpus manifests require 100 traces and expect a safety failure. Seeded
+tlzig simulation now uses TLC's maximum-prefix action decomposition, checks
+constraints and invariants on every generated successor, and finds the same
+configured violations. Fresh all-core paired runs report `outcome-exact` for
+both rows. Successful traces now use the ordinary temporal engine over a
+TLC-compatible finite behavior graph: repeated states are folded and every
+trace state receives a stuttering edge.
+
+`FiniteMonotonic/APCRDT.cfg` and `APReplicatedLog.cfg` are tracked separately
+because their reachable state spaces are infinite, not because either checker
+rejects them. `Increment(n)` increases a `Nat` counter without a bound, and
+`WriteTx(n, tx)` can append to the replicated log forever. Exhaustive completion
+and a final distinct-state count therefore do not exist for either engine.
+The same classification applies to `SpecifyingSystems/FIFO/APInnerFIFO.cfg`
+and `APInnerFIFOInstanced.cfg`: repeated `BufRcv` actions append to `q` with no
+queue-length constraint.
+
+Fresh exhaustive evidence recorded on 2026-08-03:
+
+- `MCLeastCircularSubstringMedium.cfg`: exact
+  `1,017,073/1,007,232` generated/distinct states; TLC-auto `16.229s`,
+  tlzig-auto ReleaseFast `2.682s` (`6.05x` faster).
+- `ElevatorSafetyMedium.cfg`: exact `17,997,111` distinct states and successful
+  completion in both engines. TLC generated `120,792,180` states in `66.358s`;
+  tlzig generated `120,668,970` in `95.723s`. The generated-state difference
+  is duplicate successor accounting; the exact distinct state set and outcome
+  close correctness, while the `0.693x` performance ratio remains a real
+  optimization target for the generic runtime. Strict AOT closes that target:
+  the isolated benchmark passed at `86.910s` TLC-auto versus `42.139s`
+  tlzig-AOT-auto (`2.06x`) with the same exact distinct count and zero
+  generated fallback.
+- The paired-audit timeout now applies the requested full timeout to a single
+  configured module mapping. The shorter resolution timeout is reserved for
+  genuinely ambiguous alternate module candidates.
+- Dijkstra Mutex `Safety-4-processors/MC.cfg`: exact
+  `146,157,716/33,288,512` generated/distinct states. TLC-auto completed in
+  `60.670s`; generic ReleaseFast tlzig-auto completed in `58.101s` (`1.04x`
+  faster).
+- `cf1s_folklore.cfg`: exact temporal completion at
+  `22,438,432/2,057,174` generated/distinct states. The maintained strict-AOT
+  benchmark reports TLC-auto `16.441s` versus tlzig-auto `7.880s` (`2.09x`
+  faster), with `11` generated operators, `3` temporal-native definitions,
+  and zero fallback. This removes the row from the bounded backlog.
+
+`APc1cs.cfg` remains open, but its previous strict-AOT throughput blocker is
+fixed. The generated artifact contains `22` generated operators, one standard
+native operator, and zero fallback. Direct membership in a state variable now
+uses the generic cross-pool set implementation instead of cloning the complete
+state set into the eval pool. At the same twenty-million-distinct-state bound,
+tlzig ReleaseFast improved from `173.12s` to `141.97s` (`1.22x`), while user CPU
+fell from `2,566.58s` to `1,897.48s` and retired instructions from `38.37T` to
+`28.12T`. The improved run generated `452,005,985` states, retained
+`11,677,559` queued states, and used `6.80 GB` peak RSS. In a fresh isolated
+TLC-auto run, TLC reached `18,496,258` distinct states at its 183-second
+checkpoint with `10,595,893` queued and `8.91 GB` observed peak RSS. This is
+about `1.39x` higher average distinct-state throughput for tlzig over the
+bounded runs, but neither engine completed, so this is not exhaustive
+correctness evidence.
+
+`c1cs.cfg` remains open. A 300-second all-core audit reached a TLC periodic
+temporal checkpoint over a reported `8,862,895`-state current graph; that line
+was not a completed base-state count, and neither engine completed within the
+paired bound. Generic bottom-up canonicalization now shares repeated concrete
+sets, functions, tuples, and records inside changed variables. At the
+two-million-state boundary this reduced canonical storage from about
+`51.4 million` to `3,517,358` `Value` nodes and peak RSS from the prior
+`2.51 GB` reference to `1.10 GB`; ReleaseFast wall time was `17.54s` versus
+`17.97s`. The final graph-aware cache policy uses the smaller 2 Mi table for
+temporal runs; a larger strict-AOT run reached
+`255,411,639/12,000,000` generated/distinct states in `106.04s`, with
+`6,661,257` queued, only `27,464,951` canonical values, and `5.00 GB` peak
+RSS. This is a major general representation improvement, but the expanding
+frontier remains bounded rather than exact.
+
+`EWD840_anim.cfg` is closed in its manifest-declared simulation mode. With 100
+traces, depth 100, and seed `6074329268192498505`, both engines find `AnimInv`.
+The post-temporal paired ReleaseFast audit records TLC-auto `0.740s` and tlzig
+`0.364s`, a `2.03x` tlzig speedup. The old exhaustive frontiers exercised a mode the
+manifest does not request and remain historical throughput data only.
+
+`MC_HDiskSynod.cfg` remains open, but a strict-AOT-only correctness gap found
+during the extended audit is fixed. A quantifier over the named zero-arity
+`MajoritySet` definition incorrectly prepended the caller's lexical arguments
+when evaluating the set filter, causing generated `HInv4` to fail on the first
+initial state while interpreted tlzig and TLC accepted it. Named filtered
+power-set domains now evaluate their definition filter with only its own bound
+subset; direct filters still receive captured caller arguments. The post-fix
+60-second pair reached TLC `2,361,454/302,250` before timeout and tlzig's
+explicit two-million-state cap at `19,134,362/2,000,000` in `8.958s`. A larger
+tlzig run reached `104,887,762/10,000,000` in `52.05s` without a false
+invariant. These remain bounded results.
+
+The frontier has since been extended to 60 million distinct states with the
+same strict zero-fallback artifact. tlzig reaches
+`762,972,247/60,000,000` generated/distinct states in `328.86s`, with
+`17,633,057` queued and no invariant failure. Peak RSS is `15.69 GB` and peak
+process footprint is `22.51 GB`. A generic state-layout change removes the
+redundant borrowed-variable mask, shrinking state metadata from 48 to 40 bytes;
+the identical 30-million-state command lowers peak RSS from `11.79 GB` to
+`11.53 GB`. A more aggressive shared borrowed-pool prototype was rejected
+after the complete benchmark exposed a `Barrier` semantic regression. The row
+therefore remains bounded rather than being mislabeled exact.
+
+`TLCSailfish2.cfg` remains open after a strict zero-fallback AOT audit. Its
+36 generated operators and one native temporal definition now reach the
+two-million-state cap at `3,784,909/2,000,000` in `23.62s`; TLC reached
+`399,821/162,226` in 60 seconds with `123,966` states still queued. Before
+recursive canonical subvalue sharing, this boundary stored about 400 million
+`Value` nodes and used `13.55 GB` peak RSS. The new generic representation
+stores `60,180,882` values and uses `2.70 GB` peak RSS, reductions of about
+85% and 80%, respectively. The model still has `1,590,436` states queued, so
+this remains bounded rather than exhaustive parity.
+
+`APCRDT.cfg` and `APReplicatedLog.cfg` both generate strict AOT with eight
+generated operators, one standard native operator, and zero fallback. For
+`APCRDT`, tlzig reached 100 million distinct states in 270 seconds with
+`28,964,052` queued and no invariant violation; TLC reached `84,398,731`
+distinct states after 300 seconds with `24,777,057` queued. For
+`APReplicatedLog`, tlzig reached ten million distinct states in `10.80s` with
+`5,003,163` queued and no invariant violation; TLC reached `138,892,346`
+distinct states after 300 seconds with `69,456,028` queued. These are expected
+nonterminating frontiers. Exact finite companion configurations close the
+shared semantic paths: `MCCRDT.cfg` completes at `25,000` distinct states and
+`MCReplicatedLog.cfg` at `1,363` in both engines.
+
+Both APInnerFIFO variants generate strict AOT with `16` generated operators,
+one standard native operator, and zero fallback. Fresh five-million-state runs
+preserve their configured channel invariants and complete the bounds in
+`5.71s` and `5.38s`, with about `1.47 million` states still queued. The prior
+TLC runs reached `110,256,118` and `109,437,857` distinct states after 240
+seconds with more than 32 million queued, as expected for the unbounded queue.
+The finite `MCInnerFIFO.cfg` companion completes exactly at `9,660/3,864`
+generated/distinct states in both engines; `APMCInnerFIFO.cfg` also reaches the
+same configured queue-bound violation outcome in both engines.
+
+`ElevatorLivenessLarge.cfg` is closed with paired successful temporal verdicts
+and exact `50,653` base-state parity. Current strict AOT emits `22` generated
+operators, three standard temporal/native definitions, and zero fallback;
+tlzig completes at `230,803/50,653` in `1.68s` with `270 MB` peak RSS. Default
+Java TLC completes at `230,899/50,653` in `1,951.17s` (`32min 30s`) with
+`18.33 GB` peak RSS, making tlzig `1,161x` faster end to end. TLC spends
+`11min 47s` on an intermediate 302,912-node temporal product and `20min 38s`
+on the final 405,224-node product. A Java thread dump shows all eight
+`LiveWorker`s repeatedly seeking and reading `TableauDiskGraph` nodes through
+`BufferedRandomAccessFile` in `checkSccs`; tlzig uses its contiguous in-memory
+temporal graph.
+
+`ElevatorSafetyLarge.cfg` is also closed with paired successful invariant
+verdicts and exact `59,007,145` distinct-state parity. Strict AOT emits `22`
+generated operators, two standard native definitions, and zero fallback.
+ReleaseFast tlzig completes at `545,380,491/59,007,145` in `112.97s` with
+`11.36 GB` peak RSS; Java TLC completes at
+`545,537,067/59,007,145` in `157.14s` with `11.21 GB` peak RSS. The raw
+generated difference is duplicate action-witness accounting. tlzig is `1.39x`
+faster at the exact reachable-state count, and the row is retained as an
+opt-in benchmark because the complete pair takes about four and a half minutes.
+
+`APLamportMutex.cfg` is valid but intentionally unbounded, not a finite
+exhaustive-evidence gap. `LamportMutex.tla` defines `Clock == Nat \ {0}` and
+`ReceiveRequest` increases a process clock by one; the source explicitly
+requires `ClockConstraint` to keep model checking finite, but the Apalache cfg
+does not configure that constraint. TLC reached `96,045,036` distinct states
+with `2,722,247` queued after 360 seconds.
+The old tlzig representation reached `29,082,375` distinct states in
+`84.011s` and then filled its `536,870,912`-value canonical pool. Recursive
+subvalue sharing removes that failure. With the ordinary cache size, strict
+AOT reaches `139,200,806/40,000,000` generated/distinct states in `63.24s`,
+using only `13,082,908` canonical values. For state bounds above 64 Mi, the
+generic interner now provisions 16 Mi slots. At 120 million states this lowers
+canonical storage from `194,790,406` to `35,057,430` values; the identical
+130-million-state bound improves from `259.70s` to `208.66s`, and peak process
+footprint falls from `40.37 GB` to `33.97 GB`. These bounded runs establish
+accepted exploration rather than an impossible exhaustive count. The finite
+`MCLamportMutex.cfg`, which configures `ClockConstraint`, has paired exact
+evidence at `2,729,079/724,274` generated/distinct states.
+
+`EnvironmentController.cfg` remains bounded. TLC reached `2,691,395` distinct
+states with `243,996` queued in 240 seconds. Fresh strict zero-fallback AOT
+reached `112,675,153/20,000,000` generated/distinct states in `247.00s`, with
+`2,848,141` states queued and `12.01 GB` peak RSS. Both engines accept and
+explore the model, but the partial frontiers do not establish parity. The
+post-sharing graph-aware repeat reached `112,409,658/20,000,000` in `268.42s`,
+with `2,830,058` queued and `11.80 GB` peak RSS. CPU work was within 0.6% of
+the larger-table repeat, but the historical `247.00s` wall sample remains
+faster; no performance win is claimed for this low-density row.
+
+Direct action lowering now recognizes bounded `SUBSET` choices without
+materializing the complete power set, and conservatively pushes a leading
+element-local universal guard into the base set. On the identical N=3 strict
+AOT four-million-state boundary, wall time falls from `307.24s` to `18.48s`
+(`16.63x`) and retired instructions from `62.399T` to `2.779T` (`22.46x`).
+The optimized N=3 run then exposes a real upstream `TypeOK` violation at
+approximately `456,440,685/47,087,903` generated/distinct states: a message
+addressed to a failed process reaches age `43` although `maxAge` is `42`.
+
+The reduced `EnvironmentControllerN2Safety.cfg` proves that this is not a
+tlzig-only result. Java TLC and strict zero-fallback AOT tlzig both report the
+same age-43 `TypeOK` violation. The default ReleaseFast benchmark records TLC
+at `592,015/126,903` in `1.393s` and tlzig at `490,665/106,399` in `0.185s`,
+a `7.53x` tlzig speedup; the 16.2% distinct-count difference is expected from
+parallel early-stop scheduling and is bounded by an explicit 30,000-state
+regression tolerance. The original N=3 cfg remains in the finite backlog:
+its direct Java run was interrupted at `31,408,710/5,093,688` after `544.63s`
+before reaching a verdict, so reduced paired evidence is not presented as an
+exhaustive N=3 closure.
+
+`TestMCReachability.cfg` now passes initialization through strict AOT. The
+generated compiler previously evaluated the TLA body of the Community Modules
+`IOUtils!IOEnv` operator instead of TLC's native module override, causing its
+imported graph assumptions to fail with `TypeError`. Module-qualified native
+overrides now preserve their source-module identity and do not capture a user
+operator with the same unqualified name. The post-fix all-core pair reached
+TLC `376,820/252,366` before its 60-second timeout and strict zero-fallback
+tlzig's explicit ten-million-state cap at `15,719,199/10,000,000` in
+`32.783s`. The semantic rejection is fixed; the row remains bounded because
+both frontiers are incomplete.
+
+`MultiPaxos_MC.cfg` is closed exhaustively. Fresh strict AOT emits `60`
+generated operators, one standard native definition, and zero fallback. TLC
+and tlzig both complete without error at exactly `37,078,209` quotient states;
+tlzig reports `101,402,513` raw generated successors and TLC `101,413,181`, a
+`10,668` duplicate-action-witness accounting difference. Before the generic
+symmetry-cache repair, tlzig completed in `312.16s`, behind TLC's `292.63s`.
+Passing each worker's private candidate and canonical hash caches through
+symmetry canonicalization reduces tlzig to `254.14s`, retired instructions
+from `58.84T` to `48.02T`, and cycles from `14.00T` to `11.43T`. The repaired
+run is `1.15x` faster than TLC at exact distinct-state parity and uses
+`10.21 GB` peak RSS versus TLC's `11.17 GB`.
+
+`MCNanoLarge.cfg` is closed exhaustively. Strict AOT emits `51` generated
+operators, one native built-in, and zero fallback. TLC and tlzig both complete
+at exact `258,355,199/120,130,843` generated/distinct states. ReleaseFast
+TLC-auto takes `331.332s`; tlzig-AOT-auto takes `218.574s`, making tlzig
+`1.52x` faster. The closure also found and fixed a generic deferred-operator
+bug: syntactically unprimed generated calls now retain partial next-state
+assignments when an operator-valued argument can close over primed state.
+
+`aba_asyn_byz.cfg` is closed. Strict AOT emits `15` generated operators, four
+standard temporal/native definitions, and zero fallback. tlzig completes the
+base graph and all three temporal properties at exact TLC base-state parity:
+`5,843,977` distinct states. It reports `85,121,584` raw generated successors
+versus TLC's `85,612,896`, a duplicate-edge accounting difference, and finishes
+in `139.36s` with `3.36 GB` peak RSS. TLC completed the same base graph but had
+not finished its temporal-product analysis after 240 seconds, so tlzig is at
+least `1.72x` faster to the successful temporal verdict on this row.
+
+`EWD687a_anim.cfg` is closed in its manifest-declared simulation mode. Both
+engines find `InterestingBehavior` with 100 traces, depth 100, and seed
+`6074329268192498505`. The post-temporal paired ReleaseFast audit records
+TLC-auto `0.719s` and tlzig `0.058s`, a `12.4x` tlzig speedup. Java TLC first
+reports the invariant violation; SVG alias exceptions in its trace are
+rendering diagnostics, not the model outcome. Historical exhaustive frontiers
+used the wrong mode and are not coverage evidence for this model.
+
+`EWD998.cfg` now completes strict-AOT exploration at `2,613,583,722` generated
+transitions, `248,006,200` distinct states, and `2,083,298,801` graph edges.
+It emits `33` generated operators, four native built-ins, and zero fallback.
+The earlier strict-AOT temporal mismatch was a generic code-generation defect:
+`UNCHANGED` on a zero-arity named operator inherited the enclosing action's
+arguments. ReleaseSafe caught the arity violation; generated code now passes an
+empty argument slice. Constrained N=2 and N=3 temporal differentials match TLC
+at exact `6,876` and `1,520,618` distinct states and pass both configured
+temporal properties. The corrected N=4 strict-AOT run also completes both
+properties. Its Java TLC reference run remains in the final disk-backed
+liveness pass, so final paired TLC count evidence is still open.
+
 The two non-model harnesses are retained visibly in the manifest:
 
 - CarTalkPuzzle Toolbox Model 3 evaluates and prints the combinatorial
@@ -114,6 +485,40 @@ the long rows, including:
 | SingleLog MCMDBProps | 269,881 | 1,434.504s | 99.42s | 14.4x |
 | SingleShardTxn ShardTxn | 5,502,547 | 179.117s | 24.286s | 7.38x |
 
+The current 2026-08-04 strict-AOT rerun also closes Storage exhaustive at
+exactly `1,078,623` distinct states: TLC takes `32.756s` and tlzig takes
+`8.652s` (`3.79x`). TLC reports `9,390,226` generated successors while tlzig
+reports `8,723,634`; this is duplicate-successor accounting, not a quotient
+state-set difference. Both engines finish successfully and the strict artifact
+contains 37 generated operators, no native user definition, and zero fallback.
+The current RC/no-prepare-block exhaustive pair likewise completes at exactly
+`17,057,584` distinct states: TLC takes `179.949s` and strict AOT tlzig takes
+`80.513s` (`2.24x`). Its 67 generated operators contain no native user
+definition and zero fallback.
+RC/no-prepare-block-or-ww completes at exactly `18,764,120` distinct states:
+TLC takes `193.182s` and strict AOT tlzig takes `94.507s` (`2.04x`), again
+with 67 generated operators, no native user definition, and zero fallback.
+RC/with-prepare-block completes with exact generated and distinct parity at
+`89,960,594/15,738,792`; TLC takes `164.528s` and strict AOT tlzig takes
+`69.726s` (`2.36x`). Its 67 generated operators also contain no native user
+definition and zero fallback.
+Finally, RC/snapshot completes with exact generated and distinct parity at
+`405,005,930/67,629,092`; TLC takes `685.901s` and strict AOT tlzig takes
+`315.854s` (`2.17x`). The complete current MultiShard exhaustive matrix is
+therefore exact and every strict AOT row is faster than its paired TLC run.
+The current full upstream `SingleShardTxn/ShardTxn.cfg` pair also has exact
+generated and distinct parity at `14,931,205/5,502,547`. TLC takes `157.304s`
+and strict AOT tlzig takes `38.931s`, a `4.04x` speedup. Its four maintained
+reduced safety/symmetry companions also complete with exact counts.
+The current `SingleLog/MCMDBProps.cfg` temporal pair completes with exact
+generated and distinct parity at `3,101,918/269,881`. TLC takes `1,331.490s`
+and strict AOT tlzig takes `11.402s`, a `116.77x` speedup. The artifact contains
+40 generated operators, three standard native definitions, and zero fallback.
+Together with the default benchmark's current short-row outcomes and exact
+ClientCentric/MDBLinearizability results, all 11 TLC-valid upstream MDBTLA cfgs
+now have fresh current-code all-core evidence; the other two remain
+evidence-backed TLC-invalid inputs.
+
 The MCMDBProps TLC timing is the completed baseline for the unchanged upstream
 model; its current one-core TLC rerun was still incomplete at 300 seconds.
 SingleShardTxn is a fresh paired 2026-07-12 run. Both current tlzig AOT runs
@@ -136,13 +541,14 @@ The default ReleaseFast benchmark keeps heavy exhaustive rows opt-in. The base
 runner skips generated-preferred models; each strict zero-fallback AOT row runs
 TLC-auto once and tlzig-AOT-auto once in the same comparison, so there is no
 interpreted tlzig duplicate and no dependency on an untracked baseline file.
-The latest completed run on 2026-07-28 stayed within the five-minute guideline
+The latest completed run on 2026-08-04 stayed within the five-minute guideline
 and passed generation, compilation, and every configured comparison. TLC-auto
-versus tlzig-AOT-auto was ClientCentric `2.328s` vs `0.429s`, Storage `1.428s`
-vs `0.163s`, RC/snapshot `2.404s` vs `0.249s`, SingleShardTxn/small `2.353s`
-vs `0.155s`, SingleLog MDBLinearizability `2.040s` vs `0.156s`,
-MCBinarySearch `2.755s` vs `1.311s`, Slush Medium `24.807s` vs `18.591s`, and
-GameOfLife `2.573s` vs `0.788s`. Completed rows retain exact distinct counts.
+versus tlzig-AOT-auto was ClientCentric `2.431s` vs `0.486s`, RC/snapshot
+`2.411s` vs `0.242s`, SingleShardTxn/small `2.673s` vs `0.154s`, SingleLog
+MDBLinearizability `2.234s` vs `0.164s`, MCBinarySearch `1.948s` vs `1.030s`,
+Slush Medium `25.645s` vs `19.057s`, GameOfLife `1.700s` vs `0.701s`,
+`cf1s_folklore` `16.871s` vs `7.750s`, and Bosco `61.298s` vs `8.157s`.
+Completed rows retain exact distinct counts.
 Configured first-error rows compare semantic outcome because parallel frontier
 order can reach different valid witnesses and partial state counts.
 
@@ -197,6 +603,20 @@ order can reach different valid witnesses and partial state counts.
   recursion arguments. GameOfLife strict AOT remained exact at
   `131,072/65,536` and improved from `2.575s` to `0.794s` in the focused run;
   the fresh TLC comparison was `1.624s`.
+- Evaluator materialization uses evaluator-local, per-worker high-water
+  scratch frames for temporary values, names, lengths, and result staging.
+  Record sets, tuple filters, unions, Cartesian products, and sorted sequence
+  generation preflight their exact `ValuePool` requirements before retaining
+  destination slices. `src/eval.zig` now contains no `page_allocator` or
+  `ArrayList` path. The change removes per-call `mmap`/`munmap` traffic without
+  introducing shared locks or model-specific semantics. Post-change exact
+  gates include Bosco at `29,223,200/1,072,452` and MCBinarySearch at
+  `34,383/27,953` generated/distinct states.
+- Filtered power-set codegen distinguishes direct filters, which may capture
+  the current operator arguments, from zero-arity named definition chains,
+  whose filter helper has an independent lexical frame. Runtime entry points
+  make that choice explicit, and Debug generated code asserts the resulting
+  helper arity. The regression fixture covers both forms in one module.
 - Generated lazy-operator closures honor required-argument masks when
   capturing lexical slots. An unused missing LET binding is represented by an
   inert slot instead of causing `UndefinedSymbol`; required bindings still
@@ -365,7 +785,7 @@ order can reach different valid witnesses and partial state counts.
 ## Reproduction
 
 ```sh
-tools/zig-aarch64-macos-0.17.0-dev.1543+6db520a4c/zig build
+tools/zig-aarch64-macos-0.17.0-dev.1552+79dc16a0e/zig build
 python3 scripts/audit_spec_coverage.py \
   --corpus specs \
   --corpus vendor/tlaplus-examples/specifications \

@@ -11,6 +11,10 @@ const Error = @import("err.zig").Error;
 
 pub const generated_model_abi_version: u32 = 2;
 
+const variable_count_max = 64;
+const materialized_variable_cache_count = variable_count_max * 2;
+const MaterializedVariableCacheMask = u128;
+
 pub const NamedValue = struct {
     name: []const u8,
     value: Value,
@@ -22,6 +26,7 @@ pub const CallContext = struct {
         *ValuePool,
         []const u8,
         []const Value,
+        ?*State,
     ) Error!Value;
     pub const CachedCall = *const fn (
         *const anyopaque,
@@ -55,6 +60,8 @@ pub const CallContext = struct {
     generated_cache: []?Value,
     generated_cache_pool: *ValuePool,
     generated_cache_frozen: bool,
+    late_generated_cache: []?Value = &.{},
+    late_generated_cache_pool: ?*ValuePool = null,
     models: *const ModelTable,
     memo_context: ?*const anyopaque = null,
     cached_call: ?CachedCall = null,
@@ -64,8 +71,8 @@ pub const CallContext = struct {
     native_context: *const anyopaque,
     native_call: NativeCall,
     max_seq_len: u32,
-    materialized_variable_cache: [8]MaterializedVariableCacheEntry = undefined,
-    materialized_variable_cache_mask: u8 = 0,
+    materialized_variable_cache: [materialized_variable_cache_count]MaterializedVariableCacheEntry = undefined,
+    materialized_variable_cache_mask: MaterializedVariableCacheMask = 0,
 };
 
 pub inline fn enabled_bool(context: *const CallContext) bool {
@@ -234,9 +241,10 @@ fn materialized_variable(
     index: u32,
     primed: bool,
 ) Error!Value {
-    if (index >= 64) return Error.TypeError;
-    const slot: u3 = @truncate(index *% 2 + @intFromBool(primed));
-    const slot_bit = @as(u8, 1) << slot;
+    if (index >= variable_count_max) return Error.TypeError;
+    const slot: u7 = @intCast(index * 2 + @intFromBool(primed));
+    std.debug.assert(slot < materialized_variable_cache_count);
+    const slot_bit = @as(MaterializedVariableCacheMask, 1) << slot;
     if (context.materialized_variable_cache_mask & slot_bit != 0) {
         const entry = context.materialized_variable_cache[slot];
         if (entry.variable_index == index and entry.primed == primed) {
@@ -300,8 +308,9 @@ fn restore_eval_pool(
 ) void {
     var valid = context.materialized_variable_cache_mask;
     while (valid != 0) {
-        const slot: u3 = @truncate(@ctz(valid));
-        const slot_bit = @as(u8, 1) << slot;
+        const slot: u7 = @intCast(@ctz(valid));
+        std.debug.assert(slot < materialized_variable_cache_count);
+        const slot_bit = @as(MaterializedVariableCacheMask, 1) << slot;
         valid &= ~slot_bit;
         const entry = context.materialized_variable_cache[slot];
         if (entry.value_count > snapshot.value_count or
@@ -403,6 +412,32 @@ pub fn variable_not_member_bool(
     set_value: Value,
 ) Error!bool {
     return !try variable_member_bool(context, index, set_value);
+}
+
+pub fn variable_contains_bool(
+    context: *CallContext,
+    index: u32,
+    element: Value,
+) Error!bool {
+    var set_pool: *const ValuePool = context.eval_pool;
+    const set_value = if (context.read_primed)
+        try resolve_primed_variable(context, index, &set_pool)
+    else
+        try resolve_current_variable(context, index, &set_pool);
+    if (!set_value.is_set_like()) return Error.TypeError;
+    return set_value.member_cross_pool(
+        set_pool,
+        element,
+        context.eval_pool,
+    );
+}
+
+pub fn variable_not_contains_bool(
+    context: *CallContext,
+    index: u32,
+    element: Value,
+) Error!bool {
+    return !try variable_contains_bool(context, index, element);
 }
 
 pub fn variable_subset_equal_bool(
@@ -595,21 +630,19 @@ pub fn unchanged_variable(
     context: *CallContext,
     index: u32,
 ) Error!bool {
-    const current = context.state orelse return Error.TypeError;
-    const next = context.next_state orelse return Error.TypeError;
-    if (index >= current.values.len or index >= next.values.len) {
-        return Error.TypeError;
-    }
-    if (index < 64 and
-        (next.changed_mask & (@as(u64, 1) << @intCast(index))) == 0)
-    {
-        return true;
-    }
+    var current_pool: *const ValuePool = context.eval_pool;
+    const current = try resolve_current_variable(
+        context,
+        index,
+        &current_pool,
+    );
+    var next_pool: *const ValuePool = context.eval_pool;
+    const next = try resolve_primed_variable(context, index, &next_pool);
     return Value.eql_cross_pool(
-        current.values[index],
-        current.value_pool(index, context.state_pool),
-        next.values[index],
-        next.value_pool(index, context.state_pool),
+        current,
+        current_pool,
+        next,
+        next_pool,
     );
 }
 
@@ -617,22 +650,20 @@ pub fn unchanged_variables(
     context: *CallContext,
     indices: []const u32,
 ) Error!bool {
-    const current = context.state orelse return Error.TypeError;
-    const next = context.next_state orelse return Error.TypeError;
     for (indices) |index| {
-        if (index >= current.values.len or index >= next.values.len) {
-            return Error.TypeError;
-        }
-        if (index < 64 and
-            (next.changed_mask & (@as(u64, 1) << @intCast(index))) == 0)
-        {
-            continue;
-        }
+        var current_pool: *const ValuePool = context.eval_pool;
+        const current = try resolve_current_variable(
+            context,
+            index,
+            &current_pool,
+        );
+        var next_pool: *const ValuePool = context.eval_pool;
+        const next = try resolve_primed_variable(context, index, &next_pool);
         if (!Value.eql_cross_pool(
-            current.values[index],
-            current.value_pool(index, context.state_pool),
-            next.values[index],
-            next.value_pool(index, context.state_pool),
+            current,
+            current_pool,
+            next,
+            next_pool,
         )) return false;
     }
     return true;
@@ -679,10 +710,30 @@ pub fn cached_definition(
     context: *CallContext,
     index: u32,
 ) Error!?Value {
+    std.debug.assert(
+        context.late_generated_cache.len == 0 or
+            context.late_generated_cache.len == context.generated_cache.len,
+    );
+    std.debug.assert(
+        (context.late_generated_cache.len == 0) ==
+            (context.late_generated_cache_pool == null),
+    );
     if (index >= context.generated_cache.len) return Error.TypeError;
-    const value = context.generated_cache[index] orelse return null;
-    if (context.generated_cache_pool == context.eval_pool) return value;
-    return try value.clone(context.generated_cache_pool, context.eval_pool);
+    if (context.generated_cache[index]) |value_v| {
+        if (context.generated_cache_pool == context.eval_pool) return value_v;
+        return try value_v.clone(
+            context.generated_cache_pool,
+            context.eval_pool,
+        );
+    }
+    if (index >= context.late_generated_cache.len) return null;
+    const value_v = context.late_generated_cache[index] orelse return null;
+    const cache_pool = context.late_generated_cache_pool orelse
+        return Error.AssertionFailed;
+    std.debug.assert(cache_pool != context.eval_pool);
+    std.debug.assert(cache_pool.value_count <= cache_pool.value_cap);
+    std.debug.assert(cache_pool.string_count <= cache_pool.string_cap);
+    return try value_v.clone(cache_pool, context.eval_pool);
 }
 
 pub fn put_cached_definition(
@@ -690,26 +741,57 @@ pub fn put_cached_definition(
     index: u32,
     value: Value,
 ) Error!Value {
+    std.debug.assert(
+        context.late_generated_cache.len == 0 or
+            context.late_generated_cache.len == context.generated_cache.len,
+    );
+    std.debug.assert(
+        (context.late_generated_cache.len == 0) ==
+            (context.late_generated_cache_pool == null),
+    );
     if (index >= context.generated_cache.len) return Error.TypeError;
     if (context.generated_cache[index]) |_| return value;
-    // Workers share one immutable cache populated by assumptions and Init.
-    // A cold definition remains valid after the cache is frozen; evaluate it
-    // in the caller's bounded scratch pool without mutating shared storage.
-    if (context.generated_cache_frozen) return value;
-    context.generated_cache[index] = try value.clone(
+    if (!context.generated_cache_frozen) {
+        context.generated_cache[index] = try value.clone(
+            context.eval_pool,
+            context.generated_cache_pool,
+        );
+        return value;
+    }
+    if (index >= context.late_generated_cache.len) return value;
+    if (context.late_generated_cache[index] != null) return value;
+    const cache_pool = context.late_generated_cache_pool orelse
+        return Error.AssertionFailed;
+    std.debug.assert(cache_pool != context.eval_pool);
+    std.debug.assert(!cache_pool.growable);
+    std.debug.assert(cache_pool.value_count <= cache_pool.value_cap);
+    std.debug.assert(cache_pool.string_count <= cache_pool.string_cap);
+    const snapshot = cache_pool.snapshot();
+    context.late_generated_cache[index] = value.clone(
         context.eval_pool,
-        context.generated_cache_pool,
-    );
+        cache_pool,
+    ) catch {
+        cache_pool.restore(snapshot);
+        return value;
+    };
+    std.debug.assert(cache_pool.value_count <= cache_pool.value_cap);
+    std.debug.assert(cache_pool.string_count <= cache_pool.string_cap);
+    if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+        std.debug.print("generated late cache filled slot {d}\n", .{index});
+    }
     return value;
 }
 
-test "frozen generated cache leaves cold definitions uncached" {
+test "frozen generated cache fills a bounded local late cache" {
     const Arena = @import("arena.zig").Arena;
     var arena = try Arena.init(1024 * 1024);
     defer arena.deinit();
     var pool = try ValuePool.init(&arena, 64, 64);
+    var late_pool = try ValuePool.init(&arena, 64, 64);
+    late_pool.growable = false;
     var models = try ModelTable.init(&arena, 4);
     var generated_cache = [_]?Value{null};
+    var late_generated_cache = [_]?Value{null};
     var context = CallContext{
         .eval_pool = &pool,
         .state_pool = &pool,
@@ -724,18 +806,75 @@ test "frozen generated cache leaves cold definitions uncached" {
         .generated_cache = &generated_cache,
         .generated_cache_pool = &pool,
         .generated_cache_frozen = true,
+        .late_generated_cache = &late_generated_cache,
+        .late_generated_cache_pool = &late_pool,
         .models = &models,
         .native_context = undefined,
         .native_call = test_native_call,
         .max_seq_len = 4,
     };
 
-    const value = Value{ .int_v = 17 };
+    const snapshot = pool.snapshot();
+    const offset = try pool.push_values(&.{.{ .int_v = 17 }});
+    const value = Value{ .tuple_v = .{ .offset = offset, .len = 1 } };
     try std.testing.expectEqual(
         value,
         try put_cached_definition(&context, 0, value),
     );
     try std.testing.expectEqual(@as(?Value, null), generated_cache[0]);
+    try std.testing.expect(late_generated_cache[0] != null);
+    pool.restore(snapshot);
+    const cached = (try cached_definition(&context, 0)).?;
+    try std.testing.expectEqual(
+        @as(i64, 17),
+        cached.tuple_v.items(&pool)[0].int_v,
+    );
+}
+
+test "frozen generated cache rolls back a rejected late entry" {
+    const Arena = @import("arena.zig").Arena;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 64, 64);
+    var late_pool = try ValuePool.init(&arena, 1, 1);
+    late_pool.growable = false;
+    var models = try ModelTable.init(&arena, 4);
+    var generated_cache = [_]?Value{null};
+    var late_generated_cache = [_]?Value{null};
+    var context = CallContext{
+        .eval_pool = &pool,
+        .state_pool = &pool,
+        .state = null,
+        .next_state = null,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &pool,
+        .generated_cache_frozen = true,
+        .late_generated_cache = &late_generated_cache,
+        .late_generated_cache_pool = &late_pool,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+
+    const offset = try pool.push_values(&.{
+        .{ .int_v = 17 },
+        .{ .int_v = 23 },
+    });
+    const value = Value{ .tuple_v = .{ .offset = offset, .len = 2 } };
+    const late_snapshot = late_pool.snapshot();
+    try std.testing.expectEqual(
+        value,
+        try put_cached_definition(&context, 0, value),
+    );
+    try std.testing.expectEqual(@as(?Value, null), late_generated_cache[0]);
+    try std.testing.expectEqual(late_snapshot, late_pool.snapshot());
 }
 
 pub fn cached_function_apply(
@@ -934,6 +1073,7 @@ pub fn native(
         context.eval_pool,
         name,
         args,
+        context.state,
     );
 }
 
@@ -1118,6 +1258,13 @@ pub fn arguments_contain_state_path_operator(
         {
             return true;
         }
+    }
+    return false;
+}
+
+pub fn arguments_contain_generated_operator(args: []const Value) bool {
+    for (args) |argument| {
+        if (argument == .generated_operator_v) return true;
     }
     return false;
 }
@@ -5292,6 +5439,45 @@ pub fn quantify_filtered_power_set(
     filter_predicate: OperatorFn,
     predicate: OperatorFn,
 ) Error!Value {
+    return quantify_filtered_power_set_impl(
+        context,
+        operator_args,
+        base_value,
+        kind,
+        filter_predicate,
+        predicate,
+        true,
+    );
+}
+
+pub fn quantify_filtered_power_set_isolated_filter(
+    context: *CallContext,
+    operator_args: []const Value,
+    base_value: Value,
+    kind: QuantifierKind,
+    filter_predicate: OperatorFn,
+    predicate: OperatorFn,
+) Error!Value {
+    return quantify_filtered_power_set_impl(
+        context,
+        operator_args,
+        base_value,
+        kind,
+        filter_predicate,
+        predicate,
+        false,
+    );
+}
+
+fn quantify_filtered_power_set_impl(
+    context: *CallContext,
+    operator_args: []const Value,
+    base_value: Value,
+    kind: QuantifierKind,
+    filter_predicate: OperatorFn,
+    predicate: OperatorFn,
+    filter_uses_operator_args: bool,
+) Error!Value {
     if (operator_args.len + 1 > 64) return Error.NotImplemented;
     const base = try materialize_iterable(context, base_value);
     if (base != .set_v or base.set_v.len > 63) {
@@ -5316,9 +5502,13 @@ pub fn quantify_filtered_power_set(
             .offset = subset_offset,
             .len = item_count,
         } };
+        const filter_args = if (filter_uses_operator_args)
+            operator_args
+        else
+            &.{};
         const accepted = try boolean(try call_bound(
             context,
-            operator_args,
+            filter_args,
             &.{subset},
             filter_predicate,
         ));
@@ -7508,15 +7698,25 @@ test "materialized variable cache follows value-pool restores" {
 
     const status = Value{ .string_v = try source_pool.push_string("ready") };
     const tuple_offset = try source_pool.push_values(&.{status});
-    var state_values = [_]Value{.{ .tuple_v = .{
+    const set_offset = try source_pool.push_values(&.{
+        .{ .int_v = 1 },
+        .{ .int_v = 2 },
+    });
+    const tuple_value = Value{ .tuple_v = .{
         .offset = tuple_offset,
         .len = 1,
-    } }};
+    } };
+    var state_values = [_]Value{
+        tuple_value,
+        .{ .set_v = .{ .offset = set_offset, .len = 2 } },
+        .{ .int_v = 2 },
+        .{ .int_v = 3 },
+        tuple_value,
+    };
     var current_state = State{
         .level = 0,
         .pred = 0,
         .changed_mask = 0,
-        .borrowed_mask = 0,
         .borrowed_pool = null,
         .values = &state_values,
     };
@@ -7541,11 +7741,22 @@ test "materialized variable cache follows value-pool restores" {
     };
 
     const empty = eval_pool.snapshot();
+    try std.testing.expect(try variable_contains_bool(
+        &context,
+        1,
+        .{ .int_v = 2 },
+    ));
+    try std.testing.expectEqual(empty, eval_pool.snapshot());
     const first = try variable(&context, 0);
     const cached = eval_pool.snapshot();
     const second = try variable(&context, 0);
     try std.testing.expect(value_same_representation(first, second));
     try std.testing.expectEqual(cached, eval_pool.snapshot());
+
+    _ = try variable(&context, 4);
+    const two_variables_cached = eval_pool.snapshot();
+    _ = try variable(&context, 0);
+    try std.testing.expectEqual(two_variables_cached, eval_pool.snapshot());
 
     _ = try eval_pool.push_value(.{ .int_v = 7 });
     restore_eval_pool(&context, cached);
@@ -7555,7 +7766,7 @@ test "materialized variable cache follows value-pool restores" {
 
     restore_eval_pool(&context, empty);
     try std.testing.expectEqual(
-        @as(u8, 0),
+        @as(MaterializedVariableCacheMask, 0),
         context.materialized_variable_cache_mask,
     );
     _ = try variable(&context, 0);
@@ -7625,7 +7836,6 @@ test "state path operators apply without cloning intermediate functions" {
         .level = 0,
         .pred = 0,
         .changed_mask = 0,
-        .borrowed_mask = 0,
         .borrowed_pool = null,
         .values = &state_values,
     };
@@ -7658,8 +7868,12 @@ test "state path operators apply without cloning intermediate functions" {
     try std.testing.expect(
         arguments_contain_state_path_operator(&.{path}),
     );
+    try std.testing.expect(arguments_contain_generated_operator(&.{path}));
     try std.testing.expect(
         !arguments_contain_state_path_operator(&.{.{ .int_v = 1 }}),
+    );
+    try std.testing.expect(
+        !arguments_contain_generated_operator(&.{.{ .int_v = 1 }}),
     );
     try std.testing.expectEqual(@as(u32, 4), eval_pool.value_count);
     try std.testing.expectEqual(
@@ -7702,7 +7916,6 @@ test "power set membership accepts symbolic range state values across pools" {
         .level = 0,
         .pred = 0,
         .changed_mask = 0,
-        .borrowed_mask = 0,
         .borrowed_pool = null,
         .values = &state_values,
     };
@@ -7913,7 +8126,6 @@ test "fused EXCEPT equality localizes nested updater operands" {
         .level = 0,
         .pred = 0,
         .changed_mask = 0,
-        .borrowed_mask = 0,
         .borrowed_pool = null,
         .values = &current_values,
     };
@@ -7921,7 +8133,6 @@ test "fused EXCEPT equality localizes nested updater operands" {
         .level = 1,
         .pred = 0,
         .changed_mask = 1,
-        .borrowed_mask = 0,
         .borrowed_pool = null,
         .values = &next_values,
     };
@@ -8013,7 +8224,6 @@ test "generated finite values use only the value pool" {
         .level = 0,
         .pred = 0,
         .changed_mask = 0,
-        .borrowed_mask = 0,
         .borrowed_pool = null,
         .values = current_values[0..],
     };
@@ -8021,7 +8231,6 @@ test "generated finite values use only the value pool" {
         .level = 1,
         .pred = 0,
         .changed_mask = 0,
-        .borrowed_mask = 0,
         .borrowed_pool = null,
         .values = next_values[0..],
     };
@@ -8030,6 +8239,21 @@ test "generated finite values use only the value pool" {
     try std.testing.expect(try unchanged_variables(&context, &.{ 0, 1 }));
     next_state.changed_mask = @as(u64, 1) << 1;
     try std.testing.expect(try unchanged_variable(&context, 1));
+    // A canonical state's changed mask belongs to its stored witness edge,
+    // not necessarily to the edge currently replayed by temporal checking.
+    next_state.changed_mask = 0;
+    next_values[1] = .{ .int_v = 3 };
+    try std.testing.expect(!try unchanged_variable(&context, 1));
+    next_values[1] = .{ .int_v = 2 };
+
+    const partial_values = [_]Value{ .{ .int_v = 1 }, .{ .int_v = 4 } };
+    context.partial_mask = @as(u64, 1) << 1;
+    context.partial_values = &partial_values;
+    context.partial_value_pools = &.{ null, null };
+    try std.testing.expect(!try unchanged_variable(&context, 1));
+    context.partial_mask = 0;
+    context.partial_values = &.{};
+    context.partial_value_pools = &.{};
     context.state = null;
     context.next_state = null;
 
@@ -8277,6 +8501,7 @@ fn test_native_call(
     _: *ValuePool,
     _: []const u8,
     _: []const Value,
+    _: ?*State,
 ) Error!Value {
     return Error.UndefinedSymbol;
 }

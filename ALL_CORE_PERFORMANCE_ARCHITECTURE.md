@@ -595,3 +595,105 @@ Until all seven conditions are implemented together, eager localization and
 materialization remain the correct ownership boundary. A partial patch would
 trade measured CPU work for dangling references, stale primed reads, or
 candidate-pool leakage and is therefore not an acceptable optimization.
+
+`ElevatorSafetyMedium.cfg` now provides a second large, structurally different
+all-core gate. Java TLC and tlzig complete with exactly `17,997,111` distinct
+states. The generic ReleaseFast executable took `95.723s`, while strict AOT
+with 22 generated operators and zero fallback took `43.49s`, retired `6.168T`
+instructions, and peaked at `3.60GB`; TLC-auto took `66.358s`. AOT therefore
+removes 54.6% of generic wall time and beats TLC by 1.53x without runtime
+model-name dispatch. The row is opt-in because its exhaustive paired run adds
+roughly two minutes to the suite.
+
+The isolated generated benchmark independently passed at `86.910s` TLC-auto
+versus `42.139s` tlzig-AOT-auto (`2.06x`) with exact distinct counts. The
+benchmark declares a `402,653,184` canonical-value cap for this row; the
+smaller shared default remains unchanged for ordinary models.
+
+Temporal exploration now retains exact action-edge masks without a second
+full-graph evaluator pass when the compiler can prove the fairness relation is
+an explicit subset of `Next`: primitive action calls must occur under matching
+existential domains and disjunctions. The proof is deliberately conservative.
+Aliases, conjunction-valued fairness predicates, universal quantification,
+and unknown AST shapes run the prior exact semantic replay. Debug and
+ReleaseSafe always replay and assert equality; ReleaseFast can force the same
+audit with `TLZIG_VERIFY_FAIRNESS_MARKERS=1`.
+
+On `cf1s_folklore`, the forced audit compared all `14,666,114` committed edges
+and found zero mismatches, missing bits, or extra bits. Exact temporal counts
+remain `22,438,432/2,057,174`. Removing the redundant replay reduced direct
+strict AOT from `38.94s` and `773.9B` retired instructions to `8.22s` and
+`325.4B` instructions. The maintained all-core benchmark reports TLC
+`16.515s` versus strict tlzig `8.008s`, a `2.06x` speedup, with zero generated
+fallback and no model-specific runtime semantics.
+
+Evaluator materialization now follows the same per-worker ownership rule as
+the exploration pipeline. Each evaluator owns 64 recursion-indexed high-water
+scratch frames allocated from its private arena. A frame stores primary and
+secondary `Value` columns, field-name slices, and integer length columns.
+Growth is geometric and retained by that evaluator; ordinary calls only
+increment and decrement a bounded depth index. There is no global allocator,
+mutex, or cross-worker mutable buffer.
+
+Builders with nested aggregate output preflight the exact additional
+`ValuePool` count before taking writable slices. This matters beyond allocator
+cost: a growable pool replaces its backing array, so record-set, Cartesian,
+and sorted-sequence generators must prove capacity before retaining a
+destination pointer. Recursive set filters stage result roots in scratch and
+copy them only after nested evaluation is complete. The evaluator source now
+contains no `page_allocator` or `ArrayList` path.
+
+The `c1cs` profile made the effect observable. Before the scratch conversion,
+a strict AOT run was stopped after `351.13s` with approximately `2,984s` of
+system CPU and more than `60 million` page reclaims. A stronger post-change
+run reached a ten-million-state bound in `97.19s`; a fresh two-million-state
+gate completed its bound in `17.97s`, with `2.51 GB` peak RSS and `4.21s`
+system CPU. These are bounded performance results, not an exhaustive `c1cs`
+correctness claim. Exact `cf1s_folklore` counts remain unchanged, with the
+fresh paired result at TLC `16.441s` versus tlzig `7.880s`.
+
+Direct generated membership in a state variable now remains cross-pool.
+Expressions such as `message \in messages` previously cloned the complete
+canonical state set into the worker's eval pool before each test. Codegen now
+selects the generic `variable_contains_bool` path, which delegates to the full
+cross-pool `Value.member_cross_pool` implementation for concrete and symbolic
+set forms. On strict `APc1cs`, the identical twenty-million-state ReleaseFast
+boundary improved from `173.12s` to `141.97s`; retired instructions fell from
+`38.37T` to `28.12T`. The paired bounded TLC run reached only `18,496,258`
+distinct states at 183 seconds, while tlzig reached 20 million in 142 seconds.
+
+`ElevatorLivenessLarge.cfg` is an exact temporal architecture gate. Strict
+tlzig completes all `230,803/50,653` generated/distinct base states and the
+configured liveness property in `1.68s`, using `270 MB` peak RSS. Default TLC
+completes at `230,899/50,653` in `1,951.17s`, using `18.33 GB`: a `1,161x`
+end-to-end speedup at exact distinct-state parity. TLC first spends `11min 47s`
+checking an intermediate 302,912-node temporal product and then `20min 38s`
+checking the final 405,224-node product. A Java thread dump places all eight
+`LiveWorker` threads in `checkSccs`/`checkComponent`, repeatedly seeking and
+reading `TableauDiskGraph` nodes through `BufferedRandomAccessFile`. tlzig's
+graph is contiguous and in-memory.
+
+Paired benchmark and corpus-audit commands now pass TLC's official
+`-lncheck final` strategy. This preserves the mandatory complete-graph temporal
+verdict while avoiding redundant periodic liveness checks; it makes the Java
+baseline faster and keeps long paired audits within a single temporal pass.
+
+`ElevatorSafetyLarge.cfg` is now an exact large safety gate. Strict tlzig and
+Java TLC both complete with `59,007,145` distinct states and no invariant
+violation. tlzig takes `112.97s` for `545,380,491` raw generated successors;
+TLC takes `157.14s` for `545,537,067`. The raw delta is duplicate action-witness
+accounting, while the reachable-state set is exact. tlzig is `1.39x` faster,
+retires `18.31T` instructions versus TLC's `23.82T`, and uses comparable peak
+RSS (`11.36 GB` versus `11.21 GB`). The benchmark keeps this pair opt-in and
+uses 4,096-state candidate batches to stream the model's 390,625 initial states
+without reserving scratch for the entire initial relation.
+
+Parallel symmetry canonicalization now uses the same worker-private hash-cache
+ownership as candidate evaluation. Values in the worker candidate pool use its
+candidate cache, while immutable committed aggregates use its canonical cache;
+the checker-level shared cache remains disabled in multi-worker execution.
+This is selected only by value-pool identity, with no model-specific dispatch.
+On the full `MultiPaxos_MC.cfg` quotient graph, exact distinct-state parity is
+`37,078,209`. The change lowers strict ReleaseFast tlzig from `312.16s` to
+`254.14s`, instructions from `58.84T` to `48.02T`, and cycles from `14.00T` to
+`11.43T`. TLC takes `292.63s`, making tlzig `1.15x` faster after the repair.

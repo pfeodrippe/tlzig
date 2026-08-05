@@ -850,6 +850,112 @@ const generated_cache_entry_string_budget: u32 = 64 * 1024;
 const generated_cache_total_value_budget: u32 = 64 * 1024;
 const generated_cache_total_string_budget: u32 = 1024 * 1024;
 
+const materialize_scratch_depth_max = 64;
+const materialize_scratch_initial_capacity = 64;
+
+const MaterializeScratchFrame = struct {
+    values: []Value,
+    secondary_values: []Value,
+    names: [][]const u8,
+    lengths: []u32,
+
+    fn ensure(
+        self: *MaterializeScratchFrame,
+        arena: *Arena,
+        count: usize,
+    ) !void {
+        if (count <= self.values.len) return;
+        var capacity = self.values.len;
+        assert(capacity > 0);
+        while (capacity < count) {
+            capacity = std.math.mul(usize, capacity, 2) catch
+                return Error.OutOfMemory;
+        }
+        self.values = try arena.alloc(Value, capacity);
+        self.secondary_values = try arena.alloc(Value, capacity);
+        self.names = try arena.alloc([]const u8, capacity);
+        self.lengths = try arena.alloc(u32, capacity);
+    }
+
+    fn ensure_secondary_preserve(
+        self: *MaterializeScratchFrame,
+        arena: *Arena,
+        count: usize,
+        preserve: usize,
+    ) !void {
+        assert(preserve <= self.secondary_values.len);
+        if (count <= self.secondary_values.len) return;
+        var capacity = self.secondary_values.len;
+        assert(capacity > 0);
+        while (capacity < count) {
+            capacity = std.math.mul(usize, capacity, 2) catch
+                return Error.OutOfMemory;
+        }
+        const grown = try arena.alloc(Value, capacity);
+        @memcpy(grown[0..preserve], self.secondary_values[0..preserve]);
+        self.secondary_values = grown;
+    }
+};
+
+const MaterializeScratch = struct {
+    arena: *Arena,
+    frames: []MaterializeScratchFrame,
+    depth: u8,
+
+    fn init(arena: *Arena) !*MaterializeScratch {
+        const scratch = try arena.alloc_object(MaterializeScratch);
+        const frames = try arena.alloc(
+            MaterializeScratchFrame,
+            materialize_scratch_depth_max,
+        );
+        for (frames) |*frame| {
+            frame.* = .{
+                .values = try arena.alloc(
+                    Value,
+                    materialize_scratch_initial_capacity,
+                ),
+                .secondary_values = try arena.alloc(
+                    Value,
+                    materialize_scratch_initial_capacity,
+                ),
+                .names = try arena.alloc(
+                    []const u8,
+                    materialize_scratch_initial_capacity,
+                ),
+                .lengths = try arena.alloc(
+                    u32,
+                    materialize_scratch_initial_capacity,
+                ),
+            };
+        }
+        scratch.* = .{
+            .arena = arena,
+            .frames = frames,
+            .depth = 0,
+        };
+        return scratch;
+    }
+
+    fn acquire(
+        self: *MaterializeScratch,
+        count: usize,
+    ) Error!*MaterializeScratchFrame {
+        assert(self.depth <= self.frames.len);
+        if (self.depth == self.frames.len) return Error.NotImplemented;
+        const frame = &self.frames[self.depth];
+        self.depth += 1;
+        errdefer self.depth -= 1;
+        try frame.ensure(self.arena, count);
+        return frame;
+    }
+
+    fn release(self: *MaterializeScratch) void {
+        assert(self.depth > 0);
+        assert(self.depth <= self.frames.len);
+        self.depth -= 1;
+    }
+};
+
 pub const Evaluator = struct {
     module: ast.Module,
     constants: []const Constant,
@@ -874,8 +980,11 @@ pub const Evaluator = struct {
     generated_cache: []?Value,
     generated_cache_rollback: []?Value,
     generated_cache_frozen: bool,
+    late_generated_cache_pool: *ValuePool,
+    late_generated_cache: []?Value,
     generated_state_memo_required: bool,
     context_pool: *ContextPool,
+    materialize_scratch: *MaterializeScratch,
     /// Error context stored via pointer so all by-value copies share state.
     err_ctx: *ErrorContext,
 
@@ -939,8 +1048,21 @@ pub const Evaluator = struct {
             module.definitions.len,
         );
         @memset(generated_cache_rollback, null);
+        const late_generated_cache_pool = try arena.alloc_object(ValuePool);
+        late_generated_cache_pool.* = try ValuePool.init(
+            arena,
+            generated_cache_entry_value_budget,
+            generated_cache_entry_string_budget,
+        );
+        late_generated_cache_pool.growable = false;
+        const late_generated_cache = try arena.alloc(
+            ?Value,
+            module.definitions.len,
+        );
+        @memset(late_generated_cache, null);
         const context_pool = try arena.alloc_object(ContextPool);
         context_pool.* = try ContextPool.init(arena);
+        const materialize_scratch = try MaterializeScratch.init(arena);
         const constant_slots = try arena.alloc(?Value, module.constants.len);
         @memset(constant_slots, null);
         var override_registry = overrides.default_registry(override_ctx);
@@ -977,8 +1099,11 @@ pub const Evaluator = struct {
             .generated_cache = generated_cache,
             .generated_cache_rollback = generated_cache_rollback,
             .generated_cache_frozen = false,
+            .late_generated_cache_pool = late_generated_cache_pool,
+            .late_generated_cache = late_generated_cache,
             .generated_state_memo_required = generated_state_memo_required,
             .context_pool = context_pool,
+            .materialize_scratch = materialize_scratch,
             .err_ctx = err_ctx,
         };
     }
@@ -1027,8 +1152,21 @@ pub const Evaluator = struct {
             self.module.definitions.len,
         );
         @memset(generated_cache_rollback, null);
+        const late_generated_cache_pool = try arena.alloc_object(ValuePool);
+        late_generated_cache_pool.* = try ValuePool.init(
+            arena,
+            generated_cache_entry_value_budget,
+            generated_cache_entry_string_budget,
+        );
+        late_generated_cache_pool.growable = false;
+        const late_generated_cache = try arena.alloc(
+            ?Value,
+            self.module.definitions.len,
+        );
+        @memset(late_generated_cache, null);
         const context_pool = try arena.alloc_object(ContextPool);
         context_pool.* = try ContextPool.init(arena);
+        const materialize_scratch = try MaterializeScratch.init(arena);
         const constant_slots = try arena.alloc(
             ?Value,
             self.module.constants.len,
@@ -1050,7 +1188,10 @@ pub const Evaluator = struct {
         copy.generated_cache = generated_cache;
         copy.generated_cache_rollback = generated_cache_rollback;
         copy.generated_cache_frozen = false;
+        copy.late_generated_cache_pool = late_generated_cache_pool;
+        copy.late_generated_cache = late_generated_cache;
         copy.context_pool = context_pool;
+        copy.materialize_scratch = materialize_scratch;
         copy.constant_slots = constant_slots;
         copy.err_ctx = err_ctx;
         return copy;
@@ -1143,9 +1284,15 @@ pub const Evaluator = struct {
     ) void {
         assert(source.generated_cache_frozen);
         assert(source.generated_cache_pool != self.generated_cache_pool);
+        assert(source.generated_cache.len == self.generated_cache.len);
+        assert(source.late_generated_cache.len == self.late_generated_cache.len);
+        assert(source.late_generated_cache_pool != source.generated_cache_pool);
+        assert(!source.late_generated_cache_pool.growable);
         self.generated_cache = source.generated_cache;
         self.generated_cache_pool = source.generated_cache_pool;
         self.generated_cache_frozen = true;
+        self.late_generated_cache = source.late_generated_cache;
+        self.late_generated_cache_pool = source.late_generated_cache_pool;
     }
 
     pub fn localize_generated_cache_from(
@@ -3201,36 +3348,60 @@ pub const Evaluator = struct {
         }
         const bv = sf.vars[var_idx];
         const domain = try self.eval_set_materialized(bv.domain, ctx, s0, eval_pool, state_pool);
-        var items = std.ArrayList(Value).empty;
-        defer items.deinit(std.heap.page_allocator);
-        try items.appendSlice(std.heap.page_allocator, domain.set_v.items(eval_pool));
-        var tuples = std.ArrayList(Value).empty;
-        defer tuples.deinit(std.heap.page_allocator);
-        for (items.items) |it| {
+        const domain_items = domain.set_v.items(eval_pool);
+        const scratch = try self.materialize_scratch.acquire(domain_items.len);
+        defer self.materialize_scratch.release();
+        @memcpy(scratch.values[0..domain_items.len], domain_items);
+        var tuple_count: usize = 0;
+        for (scratch.values[0..domain_items.len]) |it| {
             const new_ctx = try self.extend_context(ctx, bv.name, it);
             const nested = try self.eval_set_filter_tuples(sf, var_idx + 1, new_ctx, s0, eval_pool, state_pool);
             if (var_idx + 1 < sf.vars.len) {
                 if (nested != .set_v) return Error.TypeError;
-                var sub = std.ArrayList(Value).empty;
-                defer sub.deinit(std.heap.page_allocator);
-                try sub.appendSlice(std.heap.page_allocator, nested.set_v.items(eval_pool));
-                for (sub.items) |t| {
-                    var tuple_items = std.ArrayList(Value).empty;
-                    defer tuple_items.deinit(std.heap.page_allocator);
-                    try tuple_items.appendSlice(std.heap.page_allocator, t.tuple_v.items(eval_pool));
-                    const extended = try eval_pool.alloc_values(@intCast(tuple_items.items.len + 1));
+                const nested_items = nested.set_v.items(eval_pool);
+                var required_values: u64 = 0;
+                for (nested_items) |tuple| {
+                    if (tuple != .tuple_v) return Error.TypeError;
+                    required_values = std.math.add(
+                        u64,
+                        required_values,
+                        @as(u64, tuple.tuple_v.len) + 1,
+                    ) catch return Error.OutOfMemory;
+                }
+                try eval_pool.ensure_value_capacity(required_values);
+                for (nested.set_v.items(eval_pool)) |t| {
+                    const tuple_items = t.tuple_v.items(eval_pool);
+                    const extended = try eval_pool.alloc_values(
+                        @intCast(tuple_items.len + 1),
+                    );
                     extended[0] = it;
-                    @memcpy(extended[1..], tuple_items.items);
-                    try tuples.append(std.heap.page_allocator, Value{ .tuple_v = make_tuple(eval_pool, extended) });
+                    @memcpy(extended[1..], tuple_items);
+                    try scratch.ensure_secondary_preserve(
+                        self.materialize_scratch.arena,
+                        tuple_count + 1,
+                        tuple_count,
+                    );
+                    scratch.secondary_values[tuple_count] = Value{
+                        .tuple_v = make_tuple(eval_pool, extended),
+                    };
+                    tuple_count += 1;
                 }
             } else if (nested.is_truthy()) {
                 const single = try eval_pool.alloc_values(1);
                 single[0] = it;
-                try tuples.append(std.heap.page_allocator, Value{ .tuple_v = make_tuple(eval_pool, single) });
+                try scratch.ensure_secondary_preserve(
+                    self.materialize_scratch.arena,
+                    tuple_count + 1,
+                    tuple_count,
+                );
+                scratch.secondary_values[tuple_count] = Value{
+                    .tuple_v = make_tuple(eval_pool, single),
+                };
+                tuple_count += 1;
             }
         }
-        const dest = try eval_pool.alloc_values(@intCast(tuples.items.len));
-        @memcpy(dest, tuples.items);
+        const dest = try eval_pool.alloc_values(@intCast(tuple_count));
+        @memcpy(dest, scratch.secondary_values[0..tuple_count]);
         return Value{ .set_v = try make_set(eval_pool, dest) };
     }
 
@@ -3249,34 +3420,93 @@ pub const Evaluator = struct {
         )) return null;
         const symbolic_domain = (try eval_symbolic_set(self, bv.domain, ctx, s0, eval_pool, state_pool)) orelse return null;
 
-        var lengths = std.ArrayList(u32).empty;
-        defer lengths.deinit(std.heap.page_allocator);
-        const codomain = (try extract_sequence_codomain_and_lengths(eval_pool, symbolic_domain, &lengths)) orelse return null;
-        if (lengths.items.len == 0) return null;
-
-        const codomain_mat = try self.materialize_set(codomain, ctx, s0, eval_pool, state_pool);
+        const shape = extract_sequence_set_shape(
+            eval_pool,
+            symbolic_domain,
+        ) orelse return null;
+        const codomain_mat = try self.materialize_set(
+            shape.codomain,
+            ctx,
+            s0,
+            eval_pool,
+            state_pool,
+        );
         if (codomain_mat != .set_v) return null;
-        var values = std.ArrayList(Value).empty;
-        defer values.deinit(std.heap.page_allocator);
-        try values.appendSlice(std.heap.page_allocator, codomain_mat.set_v.items(eval_pool));
-        sort_values(eval_pool, values.items) orelse return null;
-
-        var generated = std.ArrayList(Value).empty;
-        defer generated.deinit(std.heap.page_allocator);
-        var current = std.ArrayList(Value).empty;
-        defer current.deinit(std.heap.page_allocator);
-        for (lengths.items) |len| {
-            try generate_sorted_sequences(eval_pool, values.items, len, 0, &current, &generated);
+        const codomain_items = codomain_mat.set_v.items(eval_pool);
+        const scratch_capacity = @max(
+            @max(shape.length_count, codomain_items.len),
+            @as(usize, shape.max_length),
+        );
+        const scratch = try self.materialize_scratch.acquire(scratch_capacity);
+        defer self.materialize_scratch.release();
+        const lengths = scratch.lengths[0..shape.length_count];
+        const function_sets = symbolic_domain.union_v.set(eval_pool).set_v.items(eval_pool);
+        assert(function_sets.len == lengths.len);
+        for (function_sets, 0..) |set, index| {
+            assert(set == .function_set_v);
+            lengths[index] = sequence_domain_size(
+                eval_pool,
+                set.function_set_v.domain(eval_pool),
+            ) orelse return null;
         }
+        const values = scratch.values[0..codomain_items.len];
+        @memcpy(values, codomain_items);
+        sort_values(eval_pool, values) orelse return null;
 
-        const dest = try eval_pool.alloc_values(@intCast(generated.items.len));
-        @memcpy(dest, generated.items);
+        var generated_count: u64 = 0;
+        var sequence_storage_count: u64 = 0;
+        for (lengths) |len| {
+            const count = try sorted_sequence_count(values.len, len);
+            generated_count = std.math.add(
+                u64,
+                generated_count,
+                count,
+            ) catch return Error.OutOfMemory;
+            const per_sequence_storage = std.math.mul(
+                u64,
+                2,
+                len,
+            ) catch return Error.OutOfMemory;
+            sequence_storage_count = std.math.add(
+                u64,
+                sequence_storage_count,
+                std.math.mul(
+                    u64,
+                    count,
+                    per_sequence_storage,
+                ) catch return Error.OutOfMemory,
+            ) catch return Error.OutOfMemory;
+        }
+        if (generated_count > std.math.maxInt(u32)) return Error.OutOfMemory;
+        const required_values = std.math.add(
+            u64,
+            generated_count,
+            sequence_storage_count,
+        ) catch return Error.OutOfMemory;
+        try eval_pool.ensure_value_capacity(required_values);
+
+        const generated = try eval_pool.alloc_values(@intCast(generated_count));
+        var generated_index: usize = 0;
+        for (lengths) |len| {
+            const current = scratch.secondary_values[0..len];
+            try generate_sorted_sequences(
+                eval_pool,
+                values,
+                current,
+                0,
+                0,
+                generated,
+                &generated_index,
+            );
+        }
+        assert(generated_index == generated.len);
+
         // Generation is lexicographic over nondecreasing value indices, so
         // each sequence is produced exactly once. Running make_set here would
         // perform a quadratic equality scan over an already-canonical set.
         return Value{ .set_v = .{
-            .offset = value_offset(eval_pool, dest.ptr),
-            .len = @intCast(dest.len),
+            .offset = value_offset(eval_pool, generated.ptr),
+            .len = @intCast(generated.len),
         } };
     }
 
@@ -3408,20 +3638,20 @@ pub const Evaluator = struct {
                 return Value{ .set_v = try make_set(eval_pool, dest) };
             },
             .record_set_v => |rs| {
-                var domains = std.ArrayList(Value).empty;
-                defer domains.deinit(std.heap.page_allocator);
-                var names = std.ArrayList([]const u8).empty;
-                defer names.deinit(std.heap.page_allocator);
+                const scratch = try self.materialize_scratch.acquire(rs.len);
+                defer self.materialize_scratch.release();
+                const domains = scratch.values[0..rs.len];
+                const names = scratch.names[0..rs.len];
                 var i: u32 = 0;
                 while (i < rs.len) : (i += 1) {
                     const d = rs.field_domain(eval_pool, i);
                     const mat = try self.materialize_set(d, ctx, s0, eval_pool, state_pool);
                     if (mat != .set_v) return Error.TypeError;
-                    try domains.append(std.heap.page_allocator, mat);
-                    try names.append(std.heap.page_allocator, rs.field_name(eval_pool, i).slice(eval_pool));
+                    domains[i] = mat;
+                    names[i] = rs.field_name(eval_pool, i).slice(eval_pool);
                 }
                 var count: u64 = 1;
-                for (domains.items) |d| {
+                for (domains) |d| {
                     count *= d.set_v.len;
                     if (count > std.math.maxInt(u32)) return Error.OutOfMemory;
                 }
@@ -3433,10 +3663,10 @@ pub const Evaluator = struct {
                     var tmp = combo;
                     var fi: u32 = 0;
                     while (fi < rs.len) : (fi += 1) {
-                        const items = domains.items[fi].set_v.items(eval_pool);
+                        const items = domains[fi].set_v.items(eval_pool);
                         const vi: usize = @intCast(tmp % items.len);
                         tmp /= items.len;
-                        const name = try eval_pool.push_string(names.items[fi]);
+                        const name = try eval_pool.push_string(names[fi]);
                         fields_dest[fi * 2] = Value{ .string_v = name };
                         fields_dest[fi * 2 + 1] = items[vi];
                     }
@@ -3446,25 +3676,26 @@ pub const Evaluator = struct {
             },
             .tuple_set_v => |ts| {
                 const ss = ts.sets(eval_pool);
-                var domains = std.ArrayList(Value).empty;
-                defer domains.deinit(std.heap.page_allocator);
-                for (ss) |s| {
+                const scratch = try self.materialize_scratch.acquire(ss.len);
+                defer self.materialize_scratch.release();
+                const domains = scratch.values[0..ss.len];
+                for (ss, 0..) |s, index| {
                     const mat = try self.materialize_set(s, ctx, s0, eval_pool, state_pool);
                     if (mat != .set_v) return Error.TypeError;
-                    try domains.append(std.heap.page_allocator, mat);
+                    domains[index] = mat;
                 }
                 var count: u64 = 1;
-                for (domains.items) |d| {
+                for (domains) |d| {
                     count *= d.set_v.len;
                     if (count > std.math.maxInt(u32)) return Error.OutOfMemory;
                 }
-                try eval_pool.ensure_value_capacity(count + count * domains.items.len);
+                try eval_pool.ensure_value_capacity(count + count * domains.len);
                 const dest = try eval_pool.alloc_values(@intCast(count));
                 var combo: u64 = 0;
                 while (combo < count) : (combo += 1) {
-                    const tuple_dest = try eval_pool.alloc_values(@intCast(domains.items.len));
+                    const tuple_dest = try eval_pool.alloc_values(@intCast(domains.len));
                     var tmp = combo;
-                    for (domains.items, 0..) |d, fi| {
+                    for (domains, 0..) |d, fi| {
                         const items = d.set_v.items(eval_pool);
                         const vi: usize = @intCast(tmp % items.len);
                         tmp /= items.len;
@@ -3523,23 +3754,22 @@ pub const Evaluator = struct {
                 const inner = u.set(eval_pool);
                 const mat = try self.materialize_set(inner, ctx, s0, eval_pool, state_pool);
                 if (mat != .set_v) return Error.TypeError;
-                var sets = std.ArrayList(Value).empty;
-                defer sets.deinit(std.heap.page_allocator);
-                try sets.appendSlice(std.heap.page_allocator, mat.set_v.items(eval_pool));
-                var materialized = std.ArrayList(Value).empty;
-                defer materialized.deinit(std.heap.page_allocator);
+                const sets = mat.set_v.items(eval_pool);
+                const scratch = try self.materialize_scratch.acquire(sets.len);
+                defer self.materialize_scratch.release();
+                const materialized = scratch.values[0..sets.len];
                 var total: u64 = 0;
-                for (sets.items) |s| {
+                for (sets, 0..) |s, index| {
                     const smat = try self.materialize_set(s, ctx, s0, eval_pool, state_pool);
                     if (smat != .set_v) return Error.TypeError;
-                    try materialized.append(std.heap.page_allocator, smat);
+                    materialized[index] = smat;
                     total += smat.set_v.len;
                     if (total > std.math.maxInt(u32)) return Error.OutOfMemory;
                 }
                 const dest = try eval_pool.alloc_values(@intCast(total));
                 var pos: u32 = 0;
-                const disjoint = function_sets_have_distinct_domain_sizes(eval_pool, sets.items);
-                for (materialized.items) |smat| {
+                const disjoint = function_sets_have_distinct_domain_sizes(eval_pool, sets);
+                for (materialized) |smat| {
                     const items = smat.set_v.items(eval_pool);
                     for (items) |it| {
                         if (disjoint) {
@@ -3627,20 +3857,37 @@ pub const Evaluator = struct {
             const empty = try eval_pool.alloc_values(0);
             return Value{ .set_v = try make_set(eval_pool, empty) };
         }
-        var domains = std.ArrayList(Value).empty;
-        defer domains.deinit(std.heap.page_allocator);
-        var names = std.ArrayList([]const u8).empty;
-        defer names.deinit(std.heap.page_allocator);
-        for (rs.fields) |f| {
+        const scratch = try self.materialize_scratch.acquire(rs.fields.len);
+        defer self.materialize_scratch.release();
+        const domains = scratch.values[0..rs.fields.len];
+        const names = scratch.names[0..rs.fields.len];
+        for (rs.fields, 0..) |f, index| {
             const d = try self.eval_set_materialized(f.domain, ctx, s0, eval_pool, state_pool);
-            try domains.append(std.heap.page_allocator, d);
-            try names.append(std.heap.page_allocator, f.name);
+            domains[index] = d;
+            names[index] = f.name;
         }
         var count: u64 = 1;
-        for (domains.items) |d| {
-            count *= d.set_v.len;
-            if (count > eval_pool.value_cap) return Error.OutOfMemory;
+        for (domains) |d| {
+            count = std.math.mul(
+                u64,
+                count,
+                d.set_v.len,
+            ) catch return Error.OutOfMemory;
         }
+        if (count > std.math.maxInt(u32)) return Error.OutOfMemory;
+        const field_storage = std.math.mul(
+            u64,
+            count,
+            std.math.mul(
+                u64,
+                rs.fields.len,
+                2,
+            ) catch return Error.OutOfMemory,
+        ) catch return Error.OutOfMemory;
+        try eval_pool.ensure_value_capacity(
+            std.math.add(u64, count, field_storage) catch
+                return Error.OutOfMemory,
+        );
         const dest = try eval_pool.alloc_values(@intCast(count));
         var combo: u64 = 0;
         while (combo < count) : (combo += 1) {
@@ -3648,10 +3895,12 @@ pub const Evaluator = struct {
             var tmp = combo;
             var i: u32 = 0;
             while (i < rs.fields.len) : (i += 1) {
-                const items = domains.items[i].set_v.items(eval_pool);
+                const items = domains[i].set_v.items(eval_pool);
                 const vi: usize = @intCast(tmp % items.len);
                 tmp /= items.len;
-                fields_dest[i * 2] = Value{ .string_v = try eval_pool.push_string(names.items[i]) };
+                fields_dest[i * 2] = Value{
+                    .string_v = try eval_pool.push_string(names[i]),
+                };
                 fields_dest[i * 2 + 1] = items[vi];
             }
             dest[combo] = Value{ .record_v = make_record(eval_pool, fields_dest) };
@@ -4023,16 +4272,6 @@ pub const Evaluator = struct {
         const b = right.set_v.items(eval_pool);
         return switch (sb.op) {
             .cartesian_op => {
-                // Flatten nested \X: collect all component sets, then product.
-                var components = std.ArrayList(Value).empty;
-                defer components.deinit(std.heap.page_allocator);
-                collect_cartesian_sets(eval_pool, left, &components) catch return Error.TypeError;
-                collect_cartesian_sets(eval_pool, right, &components) catch return Error.TypeError;
-                if (components.items.len > 1) {
-                    const product = try self.cartesian_product(eval_pool, components.items);
-                    return Value{ .set_v = try make_set(eval_pool, product) };
-                }
-                // Fallback: simple 2-way product.
                 const product = try self.cartesian_product(eval_pool, &[_]Value{ left, right });
                 return Value{ .set_v = try make_set(eval_pool, product) };
             },
@@ -4263,7 +4502,24 @@ pub const Evaluator = struct {
         }
         const flat_len: u32 = first_elem_len + @as(u32, @intCast(sets.len - 1));
         var count: u64 = 1;
-        for (sets) |s| count *= s.set_v.len;
+        for (sets) |s| {
+            if (s != .set_v) return error.TypeError;
+            count = std.math.mul(
+                u64,
+                count,
+                s.set_v.len,
+            ) catch return error.OutOfMemory;
+        }
+        if (count > std.math.maxInt(u32)) return error.OutOfMemory;
+        const tuple_storage = std.math.mul(
+            u64,
+            count,
+            flat_len,
+        ) catch return error.OutOfMemory;
+        try eval_pool.ensure_value_capacity(
+            std.math.add(u64, count, tuple_storage) catch
+                return error.OutOfMemory,
+        );
         const dest = try eval_pool.alloc_values(@intCast(count));
         var combo: u64 = 0;
         while (combo < count) : (combo += 1) {
@@ -4486,6 +4742,27 @@ pub const Evaluator = struct {
                     }
                     return err;
                 };
+            }
+            if (std.mem.eql(u8, name, "TLCGet")) {
+                var argument_storage: [64]Value = undefined;
+                const values = try self.eval_application_arguments(
+                    ap.args,
+                    ctx,
+                    s0,
+                    eval_pool,
+                    state_pool,
+                    &argument_storage,
+                );
+                const level: u32 = if (s0) |state_v|
+                    state_v.level + 1
+                else
+                    0;
+                return try overrides.tlc_get_at_level(
+                    self.override_registry.ctx,
+                    eval_pool,
+                    values,
+                    level,
+                );
             }
             if (self.override_registry.find(name)) |func| {
                 var argument_storage: [64]Value = undefined;
@@ -4805,7 +5082,6 @@ pub const Evaluator = struct {
             .level = current.level + 1,
             .pred = current.pred,
             .changed_mask = 0,
-            .borrowed_mask = 0,
             .borrowed_pool = null,
             .values = next_values,
         };
@@ -4851,7 +5127,10 @@ pub const Evaluator = struct {
         uses_primed: bool,
     ) Error!Value {
         assert(self.module.variables.len <= 64);
-        const skip_partial_values = !uses_primed and current_state != null;
+        // A syntactically unprimed expression can force an operator-valued
+        // argument which closes over a primed state reference.
+        const skip_partial_values = current_state != null and
+            !generated_call_uses_partial_values(uses_primed, args);
         const partial_mask = if (skip_partial_values)
             0
         else
@@ -4883,13 +5162,15 @@ pub const Evaluator = struct {
             .generated_cache = self.generated_cache,
             .generated_cache_pool = self.generated_cache_pool,
             .generated_cache_frozen = self.generated_cache_frozen,
+            .late_generated_cache = self.late_generated_cache,
+            .late_generated_cache_pool = self.late_generated_cache_pool,
             .models = self.models,
             .memo_context = self,
             .cached_call = generated_cached_call,
             .put_cached_call = generated_put_cached_call,
             .cached_stable_call = generated_cached_stable_call,
             .put_cached_stable_call = generated_put_cached_stable_call,
-            .native_context = &self.override_registry,
+            .native_context = self,
             .native_call = generated_native_call,
             .max_seq_len = self.override_registry.ctx.max_seq_len,
         };
@@ -4907,7 +5188,9 @@ pub const Evaluator = struct {
         uses_primed: bool,
     ) Error!bool {
         assert(self.module.variables.len <= 64);
-        const skip_partial_values = !uses_primed and current_state != null;
+        // Keep partial assignments available to deferred operator arguments.
+        const skip_partial_values = current_state != null and
+            !generated_call_uses_partial_values(uses_primed, args);
         const partial_mask = if (skip_partial_values)
             0
         else
@@ -4939,13 +5222,15 @@ pub const Evaluator = struct {
             .generated_cache = self.generated_cache,
             .generated_cache_pool = self.generated_cache_pool,
             .generated_cache_frozen = self.generated_cache_frozen,
+            .late_generated_cache = self.late_generated_cache,
+            .late_generated_cache_pool = self.late_generated_cache_pool,
             .models = self.models,
             .memo_context = self,
             .cached_call = generated_cached_call,
             .put_cached_call = generated_put_cached_call,
             .cached_stable_call = generated_cached_stable_call,
             .put_cached_stable_call = generated_put_cached_stable_call,
-            .native_context = &self.override_registry,
+            .native_context = self,
             .native_call = generated_native_call,
             .max_seq_len = self.override_registry.ctx.max_seq_len,
         };
@@ -6395,6 +6680,14 @@ pub const Evaluator = struct {
     }
 };
 
+inline fn generated_call_uses_partial_values(
+    uses_primed: bool,
+    args: []const Value,
+) bool {
+    return uses_primed or
+        generated_runtime.arguments_contain_generated_operator(args);
+}
+
 inline fn name_eql(left: []const u8, right: []const u8) bool {
     if (left.len != right.len) return false;
     if (left.ptr == right.ptr) return true;
@@ -6432,13 +6725,26 @@ fn generated_native_call(
     pool: *ValuePool,
     name: []const u8,
     args: []const Value,
+    current_state: ?*StateStore.State,
 ) Error!Value {
-    const registry: *const overrides.Registry = @ptrCast(
+    const evaluator: *const Evaluator = @ptrCast(
         @alignCast(context),
     );
-    const function = registry.find(name) orelse
+    if (std.mem.eql(u8, name, "TLCGet")) {
+        const level: u32 = if (current_state) |state_v|
+            state_v.level + 1
+        else
+            0;
+        return overrides.tlc_get_at_level(
+            evaluator.override_registry.ctx,
+            pool,
+            args,
+            level,
+        );
+    }
+    const function = evaluator.override_registry.find(name) orelse
         return Error.UndefinedSymbol;
-    return function(registry.ctx, pool, args);
+    return function(evaluator.override_registry.ctx, pool, args);
 }
 
 fn generated_cached_call(
@@ -6782,26 +7088,41 @@ fn is_seq_application(expr: *ast.Expr) bool {
         std.mem.eql(u8, application.func.ident, "Seq");
 }
 
-fn extract_sequence_codomain_and_lengths(pool: *ValuePool, seq_set: Value, lengths: *std.ArrayList(u32)) Error!?Value {
+const SequenceSetShape = struct {
+    codomain: Value,
+    length_count: usize,
+    max_length: u32,
+};
+
+fn extract_sequence_set_shape(
+    pool: *ValuePool,
+    seq_set: Value,
+) ?SequenceSetShape {
     if (seq_set != .union_v) return null;
     const inner = seq_set.union_v.set(pool);
     if (inner != .set_v) return null;
 
     var codomain: ?Value = null;
+    var max_length: u32 = 0;
     const sets = inner.set_v.items(pool);
+    if (sets.len == 0) return null;
     for (sets) |set| {
         if (set != .function_set_v) return null;
         const fs = set.function_set_v;
         const len = sequence_domain_size(pool, fs.domain(pool)) orelse return null;
+        max_length = @max(max_length, len);
         const fs_codomain = fs.codomain(pool);
         if (codomain) |existing| {
             if (!existing.eql(fs_codomain, pool)) return null;
         } else {
             codomain = fs_codomain;
         }
-        try lengths.append(std.heap.page_allocator, len);
     }
-    return codomain;
+    return SequenceSetShape{
+        .codomain = codomain.?,
+        .length_count = sets.len,
+        .max_length = max_length,
+    };
 }
 
 fn sequence_domain_size(pool: *ValuePool, domain: Value) ?u32 {
@@ -6836,23 +7157,62 @@ fn sort_values(pool: *ValuePool, items: []Value) ?void {
     }
 }
 
+fn sorted_sequence_count(
+    value_count: usize,
+    target_len: u32,
+) Error!u64 {
+    if (target_len == 0) return 1;
+    if (value_count == 0) return 0;
+
+    const n = @as(u128, value_count) + @as(u128, target_len) - 1;
+    const k = @min(
+        @as(u128, target_len),
+        @as(u128, value_count - 1),
+    );
+    var count: u128 = 1;
+    var i: u128 = 1;
+    while (i <= k) : (i += 1) {
+        count = std.math.mul(
+            u128,
+            count,
+            n - k + i,
+        ) catch return Error.OutOfMemory;
+        count /= i;
+        if (count > std.math.maxInt(u32)) return Error.OutOfMemory;
+    }
+    return @intCast(count);
+}
+
 fn generate_sorted_sequences(
     eval_pool: *ValuePool,
     values: []const Value,
-    target_len: u32,
+    current: []Value,
     start: usize,
-    current: *std.ArrayList(Value),
-    generated: *std.ArrayList(Value),
+    depth: usize,
+    generated: []Value,
+    generated_index: *usize,
 ) Error!void {
-    if (current.items.len == target_len) {
-        try generated.append(std.heap.page_allocator, try make_sequence_function(eval_pool, current.items));
+    if (depth == current.len) {
+        assert(generated_index.* < generated.len);
+        generated[generated_index.*] = try make_sequence_function(
+            eval_pool,
+            current,
+        );
+        generated_index.* += 1;
         return;
     }
     var i = start;
     while (i < values.len) : (i += 1) {
-        try current.append(std.heap.page_allocator, values[i]);
-        try generate_sorted_sequences(eval_pool, values, target_len, i, current, generated);
-        current.items.len -= 1;
+        current[depth] = values[i];
+        try generate_sorted_sequences(
+            eval_pool,
+            values,
+            current,
+            i,
+            depth + 1,
+            generated,
+            generated_index,
+        );
     }
 }
 
@@ -6872,11 +7232,6 @@ fn make_sequence_function(eval_pool: *ValuePool, items: []const Value) Error!Val
         .offset = entries_offset,
         .len = len,
     } };
-}
-
-fn collect_cartesian_sets(pool: *ValuePool, val: Value, out: *std.ArrayList(Value)) !void {
-    _ = pool;
-    try out.append(std.heap.page_allocator, val);
 }
 
 fn eval_union_all(eval_pool: *ValuePool, operand: Value) Error!Value {
@@ -8031,6 +8386,20 @@ test "generated expression availability ignores unused captures" {
     );
     try std.testing.expectEqual(Value{ .bool_v = false }, values[0]);
     try std.testing.expectEqual(Value{ .int_v = 7 }, values[1]);
+}
+
+test "generated calls retain partial assignments for deferred arguments" {
+    const primed_reference = try generated_runtime.state_reference(0, true);
+
+    try std.testing.expect(generated_call_uses_partial_values(
+        false,
+        &.{primed_reference},
+    ));
+    try std.testing.expect(generated_call_uses_partial_values(true, &.{}));
+    try std.testing.expect(!generated_call_uses_partial_values(
+        false,
+        &.{.{ .int_v = 1 }},
+    ));
 }
 
 test "state bindings preserve local stack lookup and lexical shadowing" {

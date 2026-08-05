@@ -181,7 +181,19 @@ pub fn emit_module_with_options(
                     definition_index,
                 );
             },
-            .native => native_count += 1,
+            .native => {
+                native_count += 1;
+                if (module_native_override_name(definition)) |native_name| {
+                    try emit_module_native_operator(
+                        &output,
+                        allocator,
+                        module,
+                        definition,
+                        definition_index,
+                        native_name,
+                    );
+                }
+            },
             .unsupported => {
                 fallback_count += 1;
                 try unsupported.append(allocator, definition.name);
@@ -503,6 +515,7 @@ fn definition_kind(
     definition: ast.Definition,
 ) DefinitionKind {
     if (!is_codegen_definition_name(definition.name) or
+        module_native_override_name(definition) != null or
         is_native_override(definition.name) or
         direct_native_name(module, definition.name) != null)
     {
@@ -1880,6 +1893,44 @@ fn emit_operator(
     try append(output, allocator, "}\n\n");
 }
 
+fn emit_module_native_operator(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    definition: ast.Definition,
+    definition_index: usize,
+    native_name: []const u8,
+) !void {
+    const function_name = try zig_operator_name(allocator, definition_index);
+    defer allocator.free(function_name);
+    const source_path = if (definition.source_path.len > 0)
+        definition.source_path
+    else
+        module.name;
+    const wrapper = try std.fmt.allocPrint(
+        allocator,
+        "// TLA+ source: {s}:{d}\n" ++
+            "// TLA+ operator: {s}\n" ++
+            "// Native module override: {s}\n" ++
+            "pub fn {s}(context: *runtime.CallContext, args: []const Value) Error!Value {{\n" ++
+            "    std.debug.assert(args.len == {d});\n" ++
+            "    std.debug.assert(context.eval_pool.value_count <= context.eval_pool.value_cap);\n" ++
+            "    return try runtime.native(context, \"{s}\", args);\n" ++
+            "}}\n\n",
+        .{
+            source_path,
+            definition.source_line,
+            definition.name,
+            native_name,
+            function_name,
+            definition.params.len,
+            native_name,
+        },
+    );
+    defer allocator.free(wrapper);
+    try append(output, allocator, wrapper);
+}
+
 fn emit_top_level_function(
     output: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -2209,28 +2260,28 @@ fn emit_boolean_expr(
             try append(output, allocator, if (value) "true" else "false");
         },
         .ident => |name| {
-            if (find_definition_index(module, name)) |index| {
-                const definition = module.definitions[index];
-                if (definition.params.len == 0 and
-                    !definition.is_function and
-                    !is_native_override(name) and
-                    constant_substitution_name(module, name) == null and
-                    definition_kind(module, definition) == .generated and
-                    definition_is_boolean(module, definition))
-                {
-                    const function_name = try zig_boolean_operator_name(
-                        allocator,
-                        index,
-                    );
-                    defer allocator.free(function_name);
-                    const call = try std.fmt.allocPrint(
-                        allocator,
-                        "try {s}(context, &.{{}})",
-                        .{function_name},
-                    );
-                    defer allocator.free(call);
-                    try append(output, allocator, call);
-                    return;
+            if (resolved_definition_name(module, name)) |target_name| {
+                if (find_definition_index(module, target_name)) |index| {
+                    const definition = module.definitions[index];
+                    if (definition.params.len == 0 and
+                        !definition.is_function and
+                        definition_kind(module, definition) == .generated and
+                        definition_is_boolean(module, definition))
+                    {
+                        const function_name = try zig_boolean_operator_name(
+                            allocator,
+                            index,
+                        );
+                        defer allocator.free(function_name);
+                        const call = try std.fmt.allocPrint(
+                            allocator,
+                            "try {s}(context, &.{{}})",
+                            .{function_name},
+                        );
+                        defer allocator.free(call);
+                        try append(output, allocator, call);
+                        return;
+                    }
                 }
             }
             try append(output, allocator, "try runtime.boolean(");
@@ -2279,54 +2330,51 @@ fn emit_boolean_expr(
                         }
                     }
                 }
-                if (find_definition_index(
+                if (resolved_definition_name(
                     module,
                     application.func.ident,
-                )) |index| {
-                    const definition = module.definitions[index];
-                    if (!is_native_override(application.func.ident) and
-                        constant_substitution_name(
-                            module,
-                            application.func.ident,
-                        ) == null and
-                        definition_kind(module, definition) == .generated and
-                        (!definition.is_function or
-                            application.args.len ==
-                                definition_body_params(definition).len) and
-                        definition_is_boolean(module, definition))
-                    {
-                        const function_name = if (definition.is_function)
-                            try zig_function_apply_boolean_name(
+                )) |target_name| {
+                    if (find_definition_index(module, target_name)) |index| {
+                        const definition = module.definitions[index];
+                        if (definition_kind(module, definition) == .generated and
+                            (!definition.is_function or
+                                application.args.len ==
+                                    definition_body_params(definition).len) and
+                            definition_is_boolean(module, definition))
+                        {
+                            const function_name = if (definition.is_function)
+                                try zig_function_apply_boolean_name(
+                                    allocator,
+                                    index,
+                                )
+                            else
+                                try zig_boolean_operator_name(
+                                    allocator,
+                                    index,
+                                );
+                            defer allocator.free(function_name);
+                            const prefix = try std.fmt.allocPrint(
                                 allocator,
-                                index,
-                            )
-                        else
-                            try zig_boolean_operator_name(
-                                allocator,
-                                index,
+                                "try {s}(context, &[_]Value{{",
+                                .{function_name},
                             );
-                        defer allocator.free(function_name);
-                        const prefix = try std.fmt.allocPrint(
-                            allocator,
-                            "try {s}(context, &[_]Value{{",
-                            .{function_name},
-                        );
-                        defer allocator.free(prefix);
-                        try append(output, allocator, prefix);
-                        for (application.args, 0..) |argument, arg_index| {
-                            if (arg_index > 0) {
-                                try append(output, allocator, ", ");
+                            defer allocator.free(prefix);
+                            try append(output, allocator, prefix);
+                            for (application.args, 0..) |argument, arg_index| {
+                                if (arg_index > 0) {
+                                    try append(output, allocator, ", ");
+                                }
+                                try emit_expr(
+                                    output,
+                                    allocator,
+                                    module,
+                                    argument,
+                                    params,
+                                );
                             }
-                            try emit_expr(
-                                output,
-                                allocator,
-                                module,
-                                argument,
-                                params,
-                            );
+                            try append(output, allocator, "})");
+                            return;
                         }
-                        try append(output, allocator, "})");
-                        return;
                     }
                 }
             }
@@ -3169,7 +3217,10 @@ fn emit_expr(
                 try append(
                     output,
                     allocator,
-                    "try runtime.quantify_filtered_power_set(context, args, ",
+                    if (filtered.filter_uses_operator_args)
+                        "try runtime.quantify_filtered_power_set(context, args, "
+                    else
+                        "try runtime.quantify_filtered_power_set_isolated_filter(context, args, ",
                 );
                 try emit_expr(
                     output,
@@ -4150,6 +4201,14 @@ fn emit_expr(
                     try append(output, allocator, "try ");
                     try append(output, allocator, function_name);
                     try append(output, allocator, "(context, &[_]Value{");
+                } else if (module_native_override_name(definition)) |native_name| {
+                    const prefix = try std.fmt.allocPrint(
+                        allocator,
+                        "try runtime.native(context, \"{s}\", &[_]Value{{",
+                        .{native_name},
+                    );
+                    defer allocator.free(prefix);
+                    try append(output, allocator, prefix);
                 } else if (direct_native_name(module, definition.name)) |native_name| {
                     const prefix = try std.fmt.allocPrint(
                         allocator,
@@ -4371,12 +4430,42 @@ fn definition_kind_shallow(
     definition: ast.Definition,
 ) DefinitionKind {
     if (!is_codegen_definition_name(definition.name) or
+        module_native_override_name(definition) != null or
         is_native_override(definition.name))
     {
         return .native;
     }
     if (direct_native_name(module, definition.name) != null) return .native;
     return .generated;
+}
+
+fn module_native_override_name(definition: ast.Definition) ?[]const u8 {
+    const file_name = std.fs.path.basename(definition.source_path);
+    const unqualified = operator_unqualified_name(definition.name);
+    const entries = [_]struct {
+        module_file: []const u8,
+        operator: []const u8,
+        native_name: []const u8,
+    }{
+        .{
+            .module_file = "IOUtils.tla",
+            .operator = "IOEnv",
+            .native_name = "IOUtils!IOEnv",
+        },
+        .{
+            .module_file = "IOUtils.tla",
+            .operator = "atoi",
+            .native_name = "IOUtils!atoi",
+        },
+    };
+    for (entries) |entry| {
+        if (std.mem.eql(u8, file_name, entry.module_file) and
+            std.mem.eql(u8, unqualified, entry.operator))
+        {
+            return entry.native_name;
+        }
+    }
+    return null;
 }
 
 fn is_codegen_definition_name(name: []const u8) bool {
@@ -4850,13 +4939,13 @@ fn expr_supported_active(
             ) orelse break :blk false;
             if (target.params.len != application.args.len) {
                 if (target.params.len != 0 or
-                    !operator_supported_active(
+                    (!operator_supported_active(
                         module,
                         target,
                         depth + 1,
                         active,
                         active_len,
-                    ))
+                    ) and module_native_override_name(target) == null))
                 {
                     break :blk false;
                 }
@@ -4879,6 +4968,7 @@ fn expr_supported_active(
                 active,
                 active_len,
             ) and
+                module_native_override_name(target) == null and
                 !native_operator(target.name))
             {
                 break :blk false;
@@ -4935,6 +5025,7 @@ fn definition_value_supported(
     if (builtin_value_runtime_name(resolved_name) != null) return true;
     const definition = find_definition(module, resolved_name) orelse
         return false;
+    if (module_native_override_name(definition) != null) return true;
     return operator_supported_active(
         module,
         definition,
@@ -8307,7 +8398,7 @@ fn emit_unchanged_term(
         ) orelse unreachable;
         break :blk try std.fmt.allocPrint(
             allocator,
-            "(try runtime.unchanged_expression(context, args, op_{d}))",
+            "(try runtime.unchanged_expression(context, &.{{}}, op_{d}))",
             .{definition_index},
         );
     };
@@ -10637,6 +10728,7 @@ fn resolved_definition_name(
 const FilteredPowerSetDomain = struct {
     filter_expr: *const ast.Expr,
     base: *const ast.Expr,
+    filter_uses_operator_args: bool,
 };
 
 fn quantifier_constant_domain_index(
@@ -10668,6 +10760,7 @@ fn filtered_power_set_domain(
 ) ?FilteredPowerSetDomain {
     if (quantifier.vars.len != 1) return null;
     var domain = quantifier.vars[0].domain;
+    var followed_definition = false;
     var depth: u8 = 0;
     while (domain.* == .ident and depth < 16) : (depth += 1) {
         const definition_name = resolved_definition_name(
@@ -10677,6 +10770,7 @@ fn filtered_power_set_domain(
         const definition = find_definition(module, definition_name) orelse
             return null;
         if (definition.params.len != 0) return null;
+        followed_definition = true;
         domain = definition.body;
     }
     if (domain.* != .set_filter) return null;
@@ -10691,6 +10785,7 @@ fn filtered_power_set_domain(
     return .{
         .filter_expr = domain,
         .base = filter_domain.unary.operand,
+        .filter_uses_operator_args = !followed_definition,
     };
 }
 
@@ -11583,6 +11678,26 @@ fn emit_variable_path_membership(
     binary: *const ast.Binary,
     params: []const []const u8,
 ) error{OutOfMemory}!bool {
+    if (binary.right.* == .ident and
+        param_index(params, binary.right.ident) == null)
+    {
+        const variable = variable_index(module, binary.right.ident) orelse
+            return false;
+        const function_name = if (binary.op == .in)
+            "variable_contains_bool"
+        else
+            "variable_not_contains_bool";
+        const prefix = try std.fmt.allocPrint(
+            allocator,
+            "try runtime.{s}(context, {d}, ",
+            .{ function_name, variable },
+        );
+        defer allocator.free(prefix);
+        try append(output, allocator, prefix);
+        try emit_expr(output, allocator, module, binary.left, params);
+        try append(output, allocator, ")");
+        return true;
+    }
     if (binary.right.* != .apply) return false;
     const variable = variable_application_index_scoped(
         module,
@@ -12876,6 +12991,44 @@ test "emit hereditary power-set filters symbolically without fallbacks" {
     ) != null);
 }
 
+test "named filtered power-set domains isolate definition arguments" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------- MODULE GeneratedNamedPowerSetFilter ----------------
+        \\EXTENDS FiniteSets
+        \\CONSTANT Disk
+        \\IsMajority(D) == Cardinality(D) * 2 > 3
+        \\MajoritySet == {D \in SUBSET Disk : IsMajority(D)}
+        \\Named(p) == \E D \in MajoritySet : p \in D
+        \\Direct(p) == \E D \in {S \in SUBSET Disk : p \in S} : p \in D
+        \\========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Named", "Direct" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.quantify_filtered_power_set_isolated_filter(context, args,",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.quantify_filtered_power_set(context, args,",
+    ) != null);
+}
+
 test "direct Boolean state-path filters stream the bound value" {
     const Arena = @import("arena.zig").Arena;
     const parser = @import("parser.zig");
@@ -13313,6 +13466,67 @@ test "state variable comparisons avoid materializing named operands" {
     ) != null);
 }
 
+test "module-qualified native overrides do not capture user operators" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedModuleOverrides ----------------------
+        \\IOEnv == 0
+        \\atoi(x) == x
+        \\Use == IOEnv + atoi(7)
+        \\============================================================================
+        \\
+    ;
+
+    var native_arena = try Arena.init(1024 * 1024);
+    defer native_arena.deinit();
+    var native_parser = parser.Parser.init(&native_arena, source);
+    const native_module = try native_parser.parse_module();
+    const native_definitions = @constCast(native_module.definitions);
+    native_definitions[0].source_path = "modules/IOUtils.tla";
+    native_definitions[1].source_path = "modules/IOUtils.tla";
+    const native_result = try emit_module_with_roots(
+        std.testing.allocator,
+        native_module,
+        &.{"Use"},
+    );
+    defer native_result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), native_result.generated_count);
+    try std.testing.expectEqual(@as(u32, 2), native_result.native_count);
+    try std.testing.expectEqual(@as(u32, 0), native_result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        native_result.source,
+        "runtime.native(context, \"IOUtils!IOEnv\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        native_result.source,
+        "runtime.native(context, \"IOUtils!atoi\"",
+    ) != null);
+
+    var user_arena = try Arena.init(1024 * 1024);
+    defer user_arena.deinit();
+    var user_parser = parser.Parser.init(&user_arena, source);
+    const user_module = try user_parser.parse_module();
+    const user_result = try emit_module_with_roots(
+        std.testing.allocator,
+        user_module,
+        &.{"Use"},
+    );
+    defer user_result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 3), user_result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), user_result.native_count);
+    try std.testing.expectEqual(@as(u32, 0), user_result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        user_result.source,
+        "IOUtils!",
+    ) == null);
+}
+
 test "state set relations avoid cloning generated variables" {
     const Arena = @import("arena.zig").Arena;
     const parser = @import("parser.zig");
@@ -13321,6 +13535,7 @@ test "state set relations avoid cloning generated variables" {
         \\VARIABLES f, messages
         \\TypeInvariant == /\ f \in {1, 2}
         \\                 /\ messages \subseteq {1, 2}
+        \\Contained == 1 \in messages
         \\=========================================================================
         \\
     ;
@@ -13328,16 +13543,16 @@ test "state set relations avoid cloning generated variables" {
     defer arena.deinit();
     var module_parser = parser.Parser.init(&arena, source);
     const module = try module_parser.parse_module();
-    try std.testing.expectEqual(@as(usize, 1), module.definitions.len);
+    try std.testing.expectEqual(@as(usize, 2), module.definitions.len);
     const result = try emit_module_with_roots(
         std.testing.allocator,
         module,
-        &.{"TypeInvariant"},
+        &.{ "TypeInvariant", "Contained" },
     );
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u32, 0), result.native_count);
-    try std.testing.expectEqual(@as(u32, 1), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 2), result.generated_count);
     try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -13348,6 +13563,11 @@ test "state set relations avoid cloning generated variables" {
         u8,
         result.source,
         "runtime.variable_subset_equal_bool(context, 1",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_contains_bool(context, 1",
     ) != null);
 }
 
@@ -13397,6 +13617,42 @@ test "UNCHANGED computed expressions use generated primed evaluation" {
     var tree = try std.zig.Ast.parse(std.testing.allocator, source_z, .{});
     defer tree.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+}
+
+test "UNCHANGED named operators do not inherit enclosing arguments" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedUnchangedArity ----------------------
+        \\VARIABLE x
+        \\Derived == x + 1
+        \\Action(i) == UNCHANGED Derived
+        \\=============================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Action"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.unchanged_expression(context, &.{}, op_0)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.unchanged_expression(context, args, op_0)",
+    ) == null);
 }
 
 test "state variable EXCEPT lowers to a cross-pool update" {
@@ -13769,6 +14025,50 @@ test "configured operator replacement wins over direct native lowering" {
     try std.testing.expect(
         std.mem.indexOf(u8, result.source, "pub fn op_0(") != null,
     );
+}
+
+test "configured boolean operator replacement calls boolean helper" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE ConfiguredBoolean ---------------------
+        \\CONSTANT Predicate(_)
+        \\PredicateImpl(value) == value = 1
+        \\Check == Predicate(1) /\ TRUE
+        \\====================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    var module = try module_parser.parse_module();
+    module.config_replacements = &.{
+        .{
+            .name = "Predicate",
+            .value = "PredicateImpl",
+            .kind = .alias,
+            .is_substitution = true,
+        },
+    };
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{"Check"},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "_bool(context, &[_]Value{Value{ .int_v = 1 }})",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.boolean(try op_0(context",
+    ) == null);
 }
 
 test "bounded sorted sequences use direct generic generation" {

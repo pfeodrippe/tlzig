@@ -299,10 +299,10 @@ values used during expression evaluation.
 
 ```sh
 # Build the engine.
-./tools/zig-aarch64-macos-0.17.0-dev.1543+6db520a4c/zig build
+./tools/zig-aarch64-macos-0.17.0-dev.1552+79dc16a0e/zig build
 
 # Run tests.
-./tools/zig-aarch64-macos-0.17.0-dev.1543+6db520a4c/zig build test
+./tools/zig-aarch64-macos-0.17.0-dev.1552+79dc16a0e/zig build test
 
 # Check a spec.
 ./zig-out/bin/tlzig --spec SPEC.tla --cfg CFG.cfg --max-states N

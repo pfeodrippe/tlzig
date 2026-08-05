@@ -39,7 +39,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     var default_cfg = false;
     var max_states: u32 = 100_000;
     var max_successors: u32 = 65_536;
+    var max_graph_edges: ?u32 = null;
     var state_values_per_state: u32 = 60;
+    var state_value_cap_override: ?u32 = null;
     var max_seq_len: u32 = 5;
     var max_nat: i64 = 10;
     var min_int: i64 = -10;
@@ -50,6 +52,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     var progress_interval_states: u64 = 0;
     var unlimited_memory = false;
     var emit_zig_path: ?[]const u8 = null;
+    var simulation_trace_count: ?u64 = null;
+    var simulation_trace_depth: u32 = 100;
+    var simulation_seed: u64 = 0x544c_5a49_475f_5349;
     var type_invariants = std.ArrayList([]const u8).empty;
     defer type_invariants.deinit(std.heap.page_allocator);
 
@@ -68,9 +73,17 @@ pub fn main(init: std.process.Init.Minimal) void {
             if (it.next()) |v| {
                 max_successors = std.fmt.parseInt(u32, v, 10) catch 65_536;
             }
+        } else if (std.mem.eql(u8, arg, "--max-graph-edges")) {
+            if (it.next()) |v| {
+                max_graph_edges = std.fmt.parseInt(u32, v, 10) catch 0;
+            }
         } else if (std.mem.eql(u8, arg, "--state-values-per-state")) {
             if (it.next()) |v| {
                 state_values_per_state = std.fmt.parseInt(u32, v, 10) catch 60;
+            }
+        } else if (std.mem.eql(u8, arg, "--state-value-cap")) {
+            if (it.next()) |v| {
+                state_value_cap_override = std.fmt.parseInt(u32, v, 10) catch 0;
             }
         } else if (std.mem.eql(u8, arg, "--max-seq-len")) {
             if (it.next()) |v| {
@@ -109,6 +122,27 @@ pub fn main(init: std.process.Init.Minimal) void {
             if (it.next()) |v| {
                 progress_interval_states = std.fmt.parseInt(u64, v, 10) catch 0;
             }
+        } else if (std.mem.eql(u8, arg, "--simulate-traces")) {
+            if (it.next()) |v| {
+                simulation_trace_count = std.fmt.parseInt(u64, v, 10) catch {
+                    std.debug.print("invalid simulation trace count: {s}\n", .{v});
+                    std.process.exit(2);
+                };
+            }
+        } else if (std.mem.eql(u8, arg, "--simulate-depth")) {
+            if (it.next()) |v| {
+                simulation_trace_depth = std.fmt.parseInt(u32, v, 10) catch {
+                    std.debug.print("invalid simulation trace depth: {s}\n", .{v});
+                    std.process.exit(2);
+                };
+            }
+        } else if (std.mem.eql(u8, arg, "--seed")) {
+            if (it.next()) |v| {
+                simulation_seed = std.fmt.parseInt(u64, v, 0) catch {
+                    std.debug.print("invalid simulation seed: {s}\n", .{v});
+                    std.process.exit(2);
+                };
+            }
         } else if (std.mem.eql(u8, arg, "--unlimited-memory")) {
             unlimited_memory = true;
         } else if (std.mem.eql(u8, arg, "--emit-zig")) {
@@ -140,8 +174,16 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.debug.print("--max-successors must be greater than zero\n", .{});
         std.process.exit(1);
     }
+    if (max_graph_edges == 0) {
+        std.debug.print("--max-graph-edges must be greater than zero\n", .{});
+        std.process.exit(1);
+    }
     if (state_values_per_state == 0) {
         std.debug.print("--state-values-per-state must be greater than zero\n", .{});
+        std.process.exit(1);
+    }
+    if (state_value_cap_override == 0) {
+        std.debug.print("--state-value-cap must be greater than zero\n", .{});
         std.process.exit(1);
     }
 
@@ -318,22 +360,24 @@ pub fn main(init: std.process.Init.Minimal) void {
         @max(state_values_per_state, 160)
     else
         state_values_per_state;
-    const state_value_cap = tlzig.state.canonical_value_capacity(
-        arena_bytes,
-        max_states,
-        effective_values_per_state,
-    );
+    const state_value_cap = state_value_cap_override orelse
+        tlzig.state.canonical_value_capacity(
+            arena_bytes,
+            max_states,
+            effective_values_per_state,
+        );
     const state_string_cap = cap_u32(@min(
         @max(@as(u64, max_states) * 4, 500_000),
         8_000_000,
     ));
 
-    var ch = checker.Checker.init_generated_with_successor_limit(
+    var ch = checker.Checker.init_generated_with_resource_limits(
         &arena,
         module,
         cfg,
         max_states,
         max_successors,
+        max_graph_edges,
         eval_value_cap,
         eval_string_cap,
         state_value_cap,
@@ -353,7 +397,14 @@ pub fn main(init: std.process.Init.Minimal) void {
     ch.set_diagnostics(diagnostics);
     ch.set_progress_interval(progress_interval_states);
 
-    const result = ch.check() catch |err| {
+    const result = (if (simulation_trace_count) |trace_count|
+        ch.simulate(.{
+            .trace_count = trace_count,
+            .trace_depth = simulation_trace_depth,
+            .seed = simulation_seed,
+        })
+    else
+        ch.check()) catch |err| {
         std.debug.print("checking failed: {any}", .{err});
         if (ch.evaluator.err_ctx.context) |ctx| {
             std.debug.print(" -- context: {s} {s}", .{ ctx, ch.evaluator.err_ctx.detail orelse "" });

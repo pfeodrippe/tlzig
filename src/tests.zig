@@ -70,7 +70,6 @@ test "incremental state fingerprint matches full recomputation" {
         .level = 0,
         .pred = 0,
         .changed_mask = 0,
-        .borrowed_mask = 0,
         .borrowed_pool = null,
         .values = &old_values,
     };
@@ -78,7 +77,6 @@ test "incremental state fingerprint matches full recomputation" {
         .level = 1,
         .pred = 0,
         .changed_mask = 1 << 1,
-        .borrowed_mask = 0,
         .borrowed_pool = null,
         .values = &new_values,
     };

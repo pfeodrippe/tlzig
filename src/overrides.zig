@@ -147,6 +147,8 @@ pub fn atoi(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Val
 }
 
 const default_overrides = [_]OverrideEntry{
+    .{ .name = "IOUtils!IOEnv", .func = io_env_entry },
+    .{ .name = "IOUtils!atoi", .func = atoi },
     .{ .name = "\\o", .func = sequence_concat_entry },
     .{ .name = "@@", .func = ooverride_entry },
     .{ .name = ":>", .func = recordto_entry },
@@ -181,6 +183,15 @@ const default_overrides = [_]OverrideEntry{
     .{ .name = "WF_vars", .func = wf_vars },
     .{ .name = "SF_vars", .func = sf_vars },
 };
+
+fn io_env_entry(
+    ctx: OverrideContext,
+    pool: *ValuePool,
+    args: []const Value,
+) Error!Value {
+    if (args.len != 0) return Error.TypeError;
+    return io_env(ctx, pool);
+}
 
 fn sequence_concat_entry(
     ctx: OverrideContext,
@@ -954,9 +965,17 @@ fn java_time(_: OverrideContext, _: *ValuePool, _: []const Value) Error!Value {
     return Value{ .int_v = 0 };
 }
 
-fn tlc_get(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
+pub fn tlc_get_at_level(
+    _: OverrideContext,
+    pool: *ValuePool,
+    args: []const Value,
+    level: u32,
+) Error!Value {
     if (args.len == 1 and args[0] == .string_v) {
         const key = args[0].string_v.slice(pool);
+        if (std.mem.eql(u8, key, "level")) {
+            return Value{ .int_v = @intCast(level) };
+        }
         if (std.mem.eql(u8, key, "config")) {
             const fields = try pool.alloc_values(4);
             const fields_offset = value_offset(pool, fields.ptr);
@@ -983,6 +1002,10 @@ fn tlc_get(_: OverrideContext, pool: *ValuePool, args: []const Value) Error!Valu
         }
     }
     return Value{ .int_v = 0 };
+}
+
+fn tlc_get(ctx: OverrideContext, pool: *ValuePool, args: []const Value) Error!Value {
+    return tlc_get_at_level(ctx, pool, args, 0);
 }
 
 fn tlc_set(_: OverrideContext, _: *ValuePool, _: []const Value) Error!Value {

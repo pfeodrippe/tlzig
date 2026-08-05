@@ -911,7 +911,7 @@ test "multi-variable existential action expands every binding" {
     try std.testing.expect(compiled.steps[0] == .choose);
     try std.testing.expect(compiled.steps[0].choose.body_steps[0] == .choose);
 
-    var store = try @import("state.zig").StateStore.init(&arena, module.variables, 8, 256, 64);
+    var store = try @import("state.zig").StateStore.init(&arena, module.variables, 16, 256, 64);
     const s0_idx = try store.alloc_state();
     const s0 = store.get(s0_idx);
     s0.values[0] = .{ .int_v = 0 };
@@ -926,6 +926,10 @@ test "multi-variable existential action expands every binding" {
         .candidate_store = &store,
         .eval_pool = &eval_pool,
     };
+    try std.testing.expectEqual(
+        @as(u32, 4),
+        try executor.top_level_action_count(compiled),
+    );
     var out = try action.StateBuffer.init(&arena, 32);
     try executor.execute_next(compiled, s0_idx, &out);
     try std.testing.expectEqual(@as(usize, 4), out.items.len);
@@ -938,6 +942,23 @@ test "multi-variable existential action expands every binding" {
         seen |= @as(u4, 1) << @intCast(x * 2 + y);
     }
     try std.testing.expectEqual(@as(u4, 0b1111), seen);
+
+    var selected_seen: u4 = 0;
+    for (0..4) |action_index| {
+        out.clear();
+        try executor.execute_next_action(
+            compiled,
+            @intCast(action_index),
+            s0_idx,
+            &out,
+        );
+        try std.testing.expectEqual(@as(usize, 1), out.items.len);
+        const next = store.get(out.items[0]);
+        const x: u2 = @intCast(next.values[0].int_v - 1);
+        const y: u2 = @intCast(next.values[1].int_v - 3);
+        selected_seen |= @as(u4, 1) << @intCast(x * 2 + y);
+    }
+    try std.testing.expectEqual(@as(u4, 0b1111), selected_seen);
 }
 
 test "parameterized LET operator remains in action scope" {
@@ -1060,6 +1081,102 @@ test "spec-shaped temporal property is checked from initial states" {
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
 }
 
+test "simulation checks a successful temporal property on finite traces" {
+    const source =
+        \\---------------- MODULE TestSimulationTemporalPass ----------------
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Next == x' = 1
+        \\EventuallyInitial == <> (x = 0)
+        \\===================================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = null,
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{"EventuallyInitial"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.simulate(.{
+        .trace_count = 2,
+        .trace_depth = 2,
+        .seed = 123,
+    });
+    try std.testing.expectEqual(@as(u64, 5), result.distinct);
+}
+
+test "simulation reports a temporal violation under terminal stuttering" {
+    const source =
+        \\---------------- MODULE TestSimulationTemporalFail ----------------
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Next == x' = 1
+        \\EventuallyMissing == <> (x = 2)
+        \\===================================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = null,
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{"EventuallyMissing"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expectError(
+        error.PropertyViolated,
+        model_checker.simulate(.{
+            .trace_count = 1,
+            .trace_depth = 2,
+            .seed = 123,
+        }),
+    );
+}
+
 test "weak fairness does not count a matching stuttering action" {
     const source =
         \\---------------------- MODULE TestWeakFairnessStutter ----------------------
@@ -1102,6 +1219,7 @@ test "weak fairness does not count a matching stuttering action" {
         1,
     );
     defer model_checker.deinit();
+    try std.testing.expect(model_checker.fairness_markers_exact);
     const result = try model_checker.check();
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
 }
@@ -1342,8 +1460,494 @@ test "weak fairness evaluates conjunctive action semantics on graph edges" {
         1,
     );
     defer model_checker.deinit();
+    try std.testing.expect(!model_checker.fairness_markers_exact);
     const result = try model_checker.check();
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "symmetry preserves concrete fairness labels across quotient edges" {
+    const source =
+        \\---------------------- MODULE TestSymmetryFairness ----------------------
+        \\EXTENDS TLC
+        \\CONSTANT P
+        \\VARIABLES mode, local
+        \\vars == <<mode, local>>
+        \\LocalWith(p, value) == [q \in P |-> IF q = p THEN value ELSE 0]
+        \\Init ==
+        \\    (\E p \in P : mode = "A" /\ local = LocalWith(p, 1))
+        \\    \/ (\E p \in P : mode = "B" /\ local = LocalWith(p, 2))
+        \\FinishA(p) ==
+        \\    /\ mode = "A"
+        \\    /\ local[p] = 0
+        \\    /\ mode' = "T"
+        \\    /\ local' = [local EXCEPT ![p] = 2]
+        \\FinishB(p) ==
+        \\    /\ mode = "B"
+        \\    /\ local[p] = 0
+        \\    /\ mode' = "T"
+        \\    /\ local' = [local EXCEPT ![p] = 1]
+        \\Next == (\E p \in P : FinishA(p)) \/ (\E p \in P : FinishB(p))
+        \\Spec ==
+        \\    /\ Init
+        \\    /\ [][Next]_vars
+        \\    /\ \A p \in P : WF_vars(FinishA(p))
+        \\    /\ \A p \in P : WF_vars(FinishB(p))
+        \\Termination == <>(mode = "T")
+        \\Symmetry == Permutations(P)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Termination"},
+        .constants = &.{.{
+            .name = "P",
+            .expr = "{p1, p2}",
+            .is_substitution = false,
+        }},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .symmetry_name = "Symmetry",
+        .check_deadlock = false,
+        .allow_unsafe_temporal_symmetry = true,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        16,
+        8192,
+        1024,
+        8192,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expect(model_checker.fairness_markers_exact);
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 3), result.distinct);
+}
+
+test "symmetry merges fairness labels on duplicate quotient edges" {
+    const source =
+        \\------------------ MODULE TestSymmetryFairnessMerge -------------------
+        \\EXTENDS TLC
+        \\CONSTANT P
+        \\VARIABLES mode, local
+        \\vars == <<mode, local>>
+        \\Init == mode = "S" /\ local = [p \in P |-> 0]
+        \\Go(p) ==
+        \\    /\ mode = "S"
+        \\    /\ mode' = "T"
+        \\    /\ local' = [local EXCEPT ![p] = 1]
+        \\Terminating == mode = "T" /\ UNCHANGED vars
+        \\Next == (\E p \in P : Go(p)) \/ Terminating
+        \\Spec ==
+        \\    /\ Init
+        \\    /\ [][Next]_vars
+        \\    /\ \A p \in P : WF_vars(Go(p))
+        \\Termination == <>(mode = "T")
+        \\Symmetry == Permutations(P)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Termination"},
+        .constants = &.{.{
+            .name = "P",
+            .expr = "{p1, p2}",
+            .is_substitution = false,
+        }},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .symmetry_name = "Symmetry",
+        .check_deadlock = false,
+        .allow_unsafe_temporal_symmetry = true,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        1024,
+        128,
+        1024,
+        128,
+        1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expect(model_checker.fairness_markers_exact);
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "temporal checking disables unsound symmetry quotient by default" {
+    const source =
+        \\---------------- MODULE TestSafeTemporalSymmetry ----------------
+        \\EXTENDS TLC
+        \\CONSTANTS P, p1, p2
+        \\VARIABLES x, y
+        \\vars == <<x, y>>
+        \\Init == x \in P /\ y = 0
+        \\Start == y = 0 /\ y' = 1 /\ UNCHANGED x
+        \\Stay == y = 1 /\ y' = 1 /\ UNCHANGED x
+        \\Switch ==
+        \\    /\ y = 1
+        \\    /\ y' = 1
+        \\    /\ \E other \in P \ {x} : x' = other
+        \\Step == Start \/ Stay \/ Switch
+        \\Spec == Init /\ [][Step]_vars /\ WF_vars(Step)
+        \\VisitsBoth == []<>(x = p1) /\ []<>(x = p2)
+        \\Symmetry == Permutations(P)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"VisitsBoth"},
+        .constants = &.{
+            .{
+                .name = "P",
+                .expr = "{p1, p2}",
+                .is_substitution = false,
+            },
+            .{
+                .name = "p1",
+                .expr = "p1",
+                .is_substitution = false,
+            },
+            .{
+                .name = "p2",
+                .expr = "p2",
+                .is_substitution = false,
+            },
+        },
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .symmetry_name = "Symmetry",
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        1024,
+        128,
+        1024,
+        128,
+        1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        model_checker.symmetry_permutations.len,
+    );
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 4), result.distinct);
+}
+
+test "standalone recurrence property uses the temporal graph" {
+    const source =
+        \\-------------------- MODULE TestRecurrence --------------------
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Next == x' = 1 - x
+        \\Spec == Init /\ [][Next]_x /\ WF_x(Next)
+        \\EventuallyZero == <>(x = 0)
+        \\Recurrence == []EventuallyZero
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Recurrence"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        1024,
+        128,
+        1024,
+        128,
+        1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expect(model_checker.graph_enabled);
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "boxed named fairness uses the temporal graph" {
+    const source =
+        \\-------------------- MODULE TestBoxedFairness --------------------
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Next == x' = 1 - x
+        \\Spec == Init /\ [][Next]_x /\ WF_x(Next)
+        \\FairNext == WF_x(Next)
+        \\BoxedFairness == []FairNext
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"BoxedFairness"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        1024,
+        128,
+        1024,
+        128,
+        1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expect(model_checker.graph_enabled);
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "weak fairness property rejects an enabled action avoided forever" {
+    const source =
+        \\---------------------- MODULE TestWeakFairnessProperty ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Advance == x = 0 /\ x' = 1
+        \\Idle == UNCHANGED x
+        \\Next == Advance \/ Idle
+        \\vars == <<x>>
+        \\Spec == Init /\ [][Next]_vars
+        \\Prop == WF_vars(Advance)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Prop"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expectEqual(@as(usize, 1), model_checker.fairness.len);
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        model_checker.assumption_fairness_count,
+    );
+    try std.testing.expectError(error.PropertyViolated, model_checker.check());
+}
+
+test "specification fairness satisfies the same fairness property" {
+    const source =
+        \\---------------------- MODULE TestAssumedFairnessProperty ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Advance == x = 0 /\ x' = 1
+        \\Idle == UNCHANGED x
+        \\Next == Advance \/ Idle
+        \\vars == <<x>>
+        \\Spec == Init /\ [][Next]_vars /\ WF_vars(Advance)
+        \\Prop == WF_vars(Advance)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Prop"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expectEqual(@as(usize, 2), model_checker.fairness.len);
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        model_checker.assumption_fairness_count,
+    );
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 2), result.distinct);
+}
+
+test "strong fairness rejects an action enabled infinitely often" {
+    const source =
+        \\---------------------- MODULE TestStrongFairnessProperty ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Advance == x = 0 /\ x' = 2
+        \\ToOne == x = 0 /\ x' = 1
+        \\ToZero == x = 1 /\ x' = 0
+        \\Toggle == ToOne \/ ToZero
+        \\Next == Advance \/ Toggle
+        \\vars == <<x>>
+        \\Spec == Init /\ [][Next]_vars /\ WF_vars(Toggle)
+        \\WeakFairnessProperty == WF_vars(Advance)
+        \\StrongFairnessProperty == SF_vars(Advance)
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const weak_cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{"WeakFairnessProperty"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var weak_checker = try checker.Checker.init(
+        &arena,
+        module,
+        weak_cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer weak_checker.deinit();
+    const weak_result = try weak_checker.check();
+    try std.testing.expectEqual(@as(u64, 3), weak_result.distinct);
+
+    const strong_cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{"StrongFairnessProperty"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var strong_checker = try checker.Checker.init(
+        &arena,
+        module,
+        strong_cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer strong_checker.deinit();
+    try std.testing.expectError(error.PropertyViolated, strong_checker.check());
 }
 
 test "eventually detects an avoiding cycle inside a larger SCC" {
@@ -3141,6 +3745,48 @@ test "TLCGet config exposes bfs mode record" {
         &state_pool,
     );
     try std.testing.expect(result.is_truthy());
+}
+
+test "TLCGet level follows the current state depth" {
+    const source =
+        \\---------------------- MODULE TestTLCGetLevel ----------------------
+        \\EXTENDS TLC
+        \\VARIABLE x
+        \\CurrentLevel == TLCGet("level")
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const evaluator = try eval.Evaluator.init(
+        module,
+        &arena,
+        overrides.OverrideContext.default(),
+    );
+    var pool = try value.ValuePool.init(&arena, 128, 128);
+    var state_store = try @import("state.zig").StateStore.init(
+        &arena,
+        module.variables,
+        1,
+        128,
+        128,
+    );
+    const state_index = try state_store.alloc_state();
+    const state = state_store.get(state_index);
+    state.level = 4;
+    state.values[0] = .{ .int_v = 0 };
+    const current_level = evaluator.find_definition("CurrentLevel") orelse
+        return error.UndefinedSymbol;
+    const result = try evaluator.eval_expr(
+        current_level.body,
+        eval.Context.empty(),
+        state,
+        &pool,
+        &state_store.values_pool,
+    );
+    try std.testing.expectEqual(@as(i64, 5), result.int_v);
 }
 
 test "module terminator tolerates one consumed equals pair" {

@@ -63,6 +63,7 @@ const ParallelState = struct {
     current_level: u32 = 0,
     done: bool = false,
     failure: ?Error = null,
+    failure_diagnostics_claimed: bool = false,
 };
 
 const TemporalWorkerContext = struct {
@@ -101,6 +102,30 @@ const ParallelTemporalState = struct {
     failure: ?Error = null,
 };
 
+const FairnessMarkerStats = struct {
+    mismatched_edges: u64 = 0,
+    missing_bits: u64 = 0,
+    extra_bits: u64 = 0,
+    matched_counts: [@bitSizeOf(u64)]u64 = @splat(0),
+
+    fn merge(self: *FairnessMarkerStats, other: FairnessMarkerStats) void {
+        self.mismatched_edges += other.mismatched_edges;
+        self.missing_bits += other.missing_bits;
+        self.extra_bits += other.extra_bits;
+        for (&self.matched_counts, other.matched_counts) |*count, other_count| {
+            count.* += other_count;
+        }
+    }
+};
+
+const ParallelFairnessMarkers = struct {
+    checker: *Checker,
+    verify_markers: bool,
+    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    next_index: u32 = 0,
+    failure: ?Error = null,
+};
+
 fn parallel_temporal_worker(
     parallel: *ParallelTemporalState,
     worker: *TemporalWorkerContext,
@@ -129,6 +154,42 @@ fn parallel_temporal_worker(
                 &worker.eval_pool,
                 parallel.evaluation,
                 index,
+            ) catch |err| {
+                assert(std.c.pthread_mutex_lock(&parallel.mutex) == .SUCCESS);
+                if (parallel.failure == null) parallel.failure = err;
+                assert(std.c.pthread_mutex_unlock(&parallel.mutex) == .SUCCESS);
+                return;
+            };
+        }
+    }
+}
+
+fn parallel_fairness_marker_worker(
+    parallel: *ParallelFairnessMarkers,
+    worker: *TemporalWorkerContext,
+    stats: *FairnessMarkerStats,
+) void {
+    const batch_size: u32 = 256;
+    const state_count = parallel.checker.state_store.count;
+    while (true) {
+        assert(std.c.pthread_mutex_lock(&parallel.mutex) == .SUCCESS);
+        if (parallel.failure != null or parallel.next_index >= state_count) {
+            assert(std.c.pthread_mutex_unlock(&parallel.mutex) == .SUCCESS);
+            return;
+        }
+        const start = parallel.next_index;
+        const end = @min(start +| batch_size, state_count);
+        parallel.next_index = end;
+        assert(std.c.pthread_mutex_unlock(&parallel.mutex) == .SUCCESS);
+
+        var parent_index = start;
+        while (parent_index < end) : (parent_index += 1) {
+            parallel.checker.recompute_fairness_parent_with(
+                &worker.evaluator,
+                &worker.eval_pool,
+                parent_index,
+                parallel.verify_markers,
+                stats,
             ) catch |err| {
                 assert(std.c.pthread_mutex_lock(&parallel.mutex) == .SUCCESS);
                 if (parallel.failure == null) parallel.failure = err;
@@ -280,6 +341,7 @@ fn parallel_worker(
                         &worker.eval_pool,
                         state_idx,
                         &worker.source_snapshot,
+                        parallel,
                     ) catch |err| break :blk err;
                 }
                 executor.execute_next(
@@ -294,7 +356,7 @@ fn parallel_worker(
                     &worker.candidate_store,
                     &worker.candidate_evaluator,
                     &worker.eval_pool,
-                    &worker.source_snapshot.values_pool,
+                    &worker.source_snapshot,
                     worker.prepared_fingerprints,
                     worker.prepared_view_ranks,
                     worker.prepared_edge_masks,
@@ -346,6 +408,7 @@ fn parallel_worker(
                         &worker.eval_pool,
                         &worker.new_states,
                         &worker.source_snapshot,
+                        parallel,
                     ) catch |err| {
                         commit_error = err;
                     };
@@ -445,6 +508,7 @@ fn parallel_worker(
                     &worker.eval_pool,
                     &worker.new_states,
                     &worker.source_snapshot,
+                    parallel,
                 ) catch |err| {
                     commit_error = err;
                 };
@@ -480,6 +544,7 @@ pub const FairnessCondition = struct {
     kind: enum { weak, strong },
     action: *ast.Expr,
     vars: *ast.Expr,
+    source: *ast.Expr,
     full_vars: bool = false,
     bindings: []const FairnessBinding = &.{},
 };
@@ -579,6 +644,68 @@ test "hash cache index mixes aggregate offsets from high identity bits" {
     );
 }
 
+test "symmetry fingerprints use private caches for both value pools" {
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var canonical_pool = try ValuePool.init(&arena, 32, 32);
+    var candidate_pool = try ValuePool.init(&arena, 32, 32);
+    var canonical_cache = try SymmetryHashCache.init(&arena, true);
+    var candidate_cache = try SymmetryHashCache.init(&arena, true);
+    var values = [_]Value{
+        .{ .model_v = 0 },
+        .{ .model_v = 1 },
+    };
+    const state_v = StateStore.State{
+        .level = 0,
+        .pred = 0,
+        .changed_mask = 0b10,
+        .borrowed_pool = &canonical_pool,
+        .values = &values,
+    };
+    try std.testing.expectEqual(
+        &canonical_pool,
+        state_v.value_pool(0, &candidate_pool),
+    );
+    try std.testing.expectEqual(
+        &candidate_pool,
+        state_v.value_pool(1, &candidate_pool),
+    );
+    const identity = [_]u32{ 0, 1 };
+    const swapped = [_]u32{ 1, 0 };
+    const permutations = [_][]const u32{ &identity, &swapped };
+    const cached = symmetry_fingerprint(
+        &candidate_pool,
+        &canonical_pool,
+        &candidate_cache,
+        &canonical_cache,
+        &state_v,
+        &permutations,
+    );
+
+    var direct_canonical = try SymmetryHashCache.init(&arena, false);
+    var direct_candidate = try SymmetryHashCache.init(&arena, false);
+    const direct = symmetry_fingerprint(
+        &candidate_pool,
+        &canonical_pool,
+        &direct_candidate,
+        &direct_canonical,
+        &state_v,
+        &permutations,
+    );
+    try std.testing.expectEqual(direct, cached);
+
+    var canonical_cached = false;
+    for (canonical_cache.entries) |entry| {
+        canonical_cached = canonical_cached or entry.occupied;
+    }
+    var candidate_cached = false;
+    for (candidate_cache.entries) |entry| {
+        candidate_cached = candidate_cached or entry.occupied;
+    }
+    try std.testing.expect(canonical_cached);
+    try std.testing.expect(candidate_cached);
+}
+
 fn value_identity(value_v: Value) u64 {
     const tag: u64 = @backingInt(value_v);
     return switch (value_v) {
@@ -630,7 +757,8 @@ fn starts_with(haystack: []const u8, needle: []const u8) bool {
 fn symmetry_fingerprint(
     default_pool: *const ValuePool,
     canonical_pool: *const ValuePool,
-    symmetry_hash_cache: *SymmetryHashCache,
+    default_hash_cache: *SymmetryHashCache,
+    canonical_hash_cache: *SymmetryHashCache,
     state_v: *const StateStore.State,
     permutations: []const []const u32,
 ) fingerprint.Fingerprint {
@@ -651,35 +779,26 @@ fn symmetry_fingerprint(
                 default_pool,
             );
             if (!best_hash_valid[variable_index]) {
-                best_hashes[variable_index] =
-                    if (value_pool == canonical_pool and
-                    symmetry_hash_cache.enabled)
-                        symmetry_hash_cache.hash_value(
-                            value_pool,
-                            value_v,
-                            best_permutation,
-                        )
-                    else
-                        fingerprint.hash_value_permuted(
-                            value_pool,
-                            value_v,
-                            best_permutation,
-                        );
+                best_hashes[variable_index] = symmetry_value_hash(
+                    default_pool,
+                    canonical_pool,
+                    default_hash_cache,
+                    canonical_hash_cache,
+                    value_pool,
+                    value_v,
+                    best_permutation,
+                );
                 best_hash_valid[variable_index] = true;
             }
-            const candidate_hash = if (value_pool == canonical_pool and
-                symmetry_hash_cache.enabled)
-                symmetry_hash_cache.hash_value(
-                    value_pool,
-                    value_v,
-                    candidate_permutation,
-                )
-            else
-                fingerprint.hash_value_permuted(
-                    value_pool,
-                    value_v,
-                    candidate_permutation,
-                );
+            const candidate_hash = symmetry_value_hash(
+                default_pool,
+                canonical_pool,
+                default_hash_cache,
+                canonical_hash_cache,
+                value_pool,
+                value_v,
+                candidate_permutation,
+            );
             if (candidate_hash > best_hashes[variable_index]) break;
             if (candidate_hash < best_hashes[variable_index]) {
                 best_permutation = candidate_permutation;
@@ -699,22 +818,48 @@ fn symmetry_fingerprint(
         );
         hash = fingerprint.hash_combine(
             hash,
-            if (value_pool == canonical_pool and
-                symmetry_hash_cache.enabled)
-                symmetry_hash_cache.hash_value(
-                    value_pool,
-                    value_v,
-                    best_permutation,
-                )
-            else
-                fingerprint.hash_value_permuted(
-                    value_pool,
-                    value_v,
-                    best_permutation,
-                ),
+            symmetry_value_hash(
+                default_pool,
+                canonical_pool,
+                default_hash_cache,
+                canonical_hash_cache,
+                value_pool,
+                value_v,
+                best_permutation,
+            ),
         );
     }
     return hash;
+}
+
+fn symmetry_value_hash(
+    default_pool: *const ValuePool,
+    canonical_pool: *const ValuePool,
+    default_hash_cache: *SymmetryHashCache,
+    canonical_hash_cache: *SymmetryHashCache,
+    value_pool: *const ValuePool,
+    value_v: Value,
+    permutation: ?[]const u32,
+) fingerprint.Fingerprint {
+    if (value_pool == canonical_pool and canonical_hash_cache.enabled) {
+        return canonical_hash_cache.hash_value(
+            value_pool,
+            value_v,
+            permutation,
+        );
+    }
+    if (value_pool == default_pool and default_hash_cache.enabled) {
+        return default_hash_cache.hash_value(
+            value_pool,
+            value_v,
+            permutation,
+        );
+    }
+    return fingerprint.hash_value_permuted(
+        value_pool,
+        value_v,
+        permutation,
+    );
 }
 
 const CanonicalValueEntry = struct {
@@ -729,8 +874,23 @@ fn effective_canonical_hash(hash: fingerprint.Fingerprint) fingerprint.Fingerpri
     return if (hash == 0) 0xdeadbeef else hash;
 }
 
-fn canonical_value_capacity(max_states: u32) u32 {
-    const capacity_limit: u64 = if (builtin.is_test) 1024 else 2_097_152;
+fn canonical_value_capacity(max_states: u32, graph_enabled: bool) u32 {
+    assert(max_states > 0);
+    // Once this table reaches its load limit, misses must clone complete
+    // nested values into the canonical pool. Large state spaces then consume
+    // substantially more memory than the bounded hash table saves. Keep the
+    // assertion-test table small, but provision production runs for millions
+    // of reusable variable values.
+    const safety_capacity_limit: u64 = if (builtin.is_test)
+        1024
+    else if (max_states > 64 * 1024 * 1024)
+        16_777_216
+    else
+        8_388_608;
+    const capacity_limit = if (graph_enabled)
+        @min(safety_capacity_limit, 2_097_152)
+    else
+        safety_capacity_limit;
     const target = @min(
         @as(u64, max_states) * 2,
         capacity_limit,
@@ -738,10 +898,111 @@ fn canonical_value_capacity(max_states: u32) u32 {
     var capacity: u32 = 1024;
     while (capacity < target) capacity *= 2;
     assert(std.math.isPowerOfTwo(capacity));
+    assert(capacity <= capacity_limit);
     return capacity;
 }
 
+const default_graph_edges_per_state: u32 = 32;
+
+fn graph_edge_capacity(
+    graph_enabled: bool,
+    max_states: u32,
+    explicit_capacity: ?u32,
+) Error!u32 {
+    assert(max_states > 0);
+    if (!graph_enabled) return 0;
+    if (explicit_capacity) |capacity| {
+        if (capacity == 0) return Error.ConfigError;
+        return capacity;
+    }
+    return std.math.mul(
+        u32,
+        max_states,
+        default_graph_edges_per_state,
+    ) catch Error.OutOfMemory;
+}
+
+const EdgeActionMasks = union(enum) {
+    none,
+    u8_values: []u8,
+    u16_values: []u16,
+    u32_values: []u32,
+    u64_values: []u64,
+
+    fn init(arena: *Arena, capacity: u32, bit_count: usize) !EdgeActionMasks {
+        assert(bit_count <= @bitSizeOf(u64));
+        if (bit_count == 0) return .none;
+        if (bit_count <= @bitSizeOf(u8)) {
+            return .{ .u8_values = try arena.alloc(u8, capacity) };
+        }
+        if (bit_count <= @bitSizeOf(u16)) {
+            return .{ .u16_values = try arena.alloc(u16, capacity) };
+        }
+        if (bit_count <= @bitSizeOf(u32)) {
+            return .{ .u32_values = try arena.alloc(u32, capacity) };
+        }
+        return .{ .u64_values = try arena.alloc(u64, capacity) };
+    }
+
+    fn get(self: EdgeActionMasks, index: u32) u64 {
+        return switch (self) {
+            .none => 0,
+            .u8_values => |values| values[index],
+            .u16_values => |values| values[index],
+            .u32_values => |values| values[index],
+            .u64_values => |values| values[index],
+        };
+    }
+
+    fn set(self: EdgeActionMasks, index: u32, mask: u64) void {
+        switch (self) {
+            .none => assert(mask == 0),
+            .u8_values => |values| {
+                assert(mask <= std.math.maxInt(u8));
+                values[index] = @intCast(mask);
+            },
+            .u16_values => |values| {
+                assert(mask <= std.math.maxInt(u16));
+                values[index] = @intCast(mask);
+            },
+            .u32_values => |values| {
+                assert(mask <= std.math.maxInt(u32));
+                values[index] = @intCast(mask);
+            },
+            .u64_values => |values| values[index] = mask,
+        }
+    }
+
+    fn merge(self: EdgeActionMasks, index: u32, mask: u64) void {
+        self.set(index, self.get(index) | mask);
+    }
+};
+
+test "temporal graph edge capacity supports explicit large-state limits" {
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        try graph_edge_capacity(false, 1, null),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 3_200),
+        try graph_edge_capacity(true, 100, null),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 1_800_000_000),
+        try graph_edge_capacity(true, 180_000_000, 1_800_000_000),
+    );
+    try std.testing.expectError(
+        Error.OutOfMemory,
+        graph_edge_capacity(true, 180_000_000, null),
+    );
+    try std.testing.expectError(
+        Error.ConfigError,
+        graph_edge_capacity(true, 1, 0),
+    );
+}
+
 const canonical_value_max_probe_count: usize = 64;
+const canonical_subvalue_variable_index = std.math.maxInt(u16);
 
 fn canonical_value_load_limit(capacity: usize) usize {
     assert(capacity > 0);
@@ -880,6 +1141,8 @@ pub const Checker = struct {
     };
 
     arena: *Arena,
+    exploration_arena: Arena,
+    exploration_storage_released: bool,
     state_store: StateStore,
     candidate_arena: *Arena,
     candidate_store: StateStore,
@@ -925,7 +1188,7 @@ pub const Checker = struct {
     succ_offsets: []u32,
     succ_counts: []u32,
     succ_edges: []u32,
-    edge_action_masks: []u64,
+    edge_action_masks: EdgeActionMasks,
     succ_count: u32,
     succ_cap: u32,
     graph_enabled: bool,
@@ -936,9 +1199,12 @@ pub const Checker = struct {
     // assume `idx < distinct`; callers must keep successor indices within this
     // bound, but we assert it defensively.
     max_states_limit: u32,
+    behavior_allows_stuttering: bool,
     // Fairness conditions extracted from the specification formula.
     fairness: []const FairnessCondition,
+    assumption_fairness_count: u8,
     fairness_markers: []const action.FairnessMarker,
+    fairness_markers_exact: bool,
     symmetry_permutations: []const []const u32,
     view_name: ?[]const u8,
     view_projection: ?ViewProjection,
@@ -970,6 +1236,7 @@ pub const Checker = struct {
             override_ctx,
             worker_count,
             @min(max_states, 65_536),
+            null,
             &.{},
             &.{},
         );
@@ -1003,6 +1270,7 @@ pub const Checker = struct {
             override_ctx,
             worker_count,
             @min(max_states, 65_536),
+            null,
             generated,
             generated_expressions,
         );
@@ -1037,6 +1305,43 @@ pub const Checker = struct {
             override_ctx,
             worker_count,
             max_successors,
+            null,
+            generated,
+            generated_expressions,
+        );
+    }
+
+    pub fn init_generated_with_resource_limits(
+        arena: *Arena,
+        module: ast.Module,
+        cfg: Config,
+        max_states: u32,
+        max_successors: u32,
+        max_graph_edges: ?u32,
+        eval_value_cap: u32,
+        eval_string_cap: u32,
+        state_value_cap: u32,
+        state_string_cap: u32,
+        eval_arena_bytes: u64,
+        override_ctx: overrides.OverrideContext,
+        worker_count: u16,
+        generated: []const generated_runtime.Operator,
+        generated_expressions: []const generated_runtime.Expression,
+    ) !Checker {
+        return init_internal(
+            arena,
+            module,
+            cfg,
+            max_states,
+            eval_value_cap,
+            eval_string_cap,
+            state_value_cap,
+            state_string_cap,
+            eval_arena_bytes,
+            override_ctx,
+            worker_count,
+            max_successors,
+            max_graph_edges,
             generated,
             generated_expressions,
         );
@@ -1055,12 +1360,15 @@ pub const Checker = struct {
         override_ctx: overrides.OverrideContext,
         worker_count: u16,
         max_successors: u32,
+        max_graph_edges: ?u32,
         generated: []const generated_runtime.Operator,
         generated_expressions: []const generated_runtime.Expression,
     ) !Checker {
         assert(worker_count > 0);
         assert(max_successors > 0);
         assert(max_successors <= max_states);
+        var exploration_arena = try Arena.init(16 * 1024 * 1024);
+        errdefer exploration_arena.deinit();
         var state_store = try StateStore.init(
             arena,
             module.variables,
@@ -1073,17 +1381,14 @@ pub const Checker = struct {
         // and temporarily duplicate multiple gigabytes on exhaustive models.
         state_store.values_pool.growable = false;
         try state_store.values_pool.enable_string_interning(131_072);
-        const queue = try StateQueue.init(arena, max_states);
-        const fp_set = try FpSet.init(arena, max_states * 2);
+        const queue = try StateQueue.init(&exploration_arena, max_states);
+        const fp_capacity = std.math.mul(u32, max_states, 2) catch
+            return Error.OutOfMemory;
+        const fp_set = try FpSet.init(&exploration_arena, fp_capacity);
         const symmetry_hash_cache = try SymmetryHashCache.init(
             arena,
             worker_count == 1,
         );
-        const canonical_value_entries = try arena.alloc(
-            CanonicalValueEntry,
-            canonical_value_capacity(max_states),
-        );
-        @memset(canonical_value_entries, .{});
         var evaluator = try Evaluator.init_generated(
             module,
             arena,
@@ -1164,26 +1469,50 @@ pub const Checker = struct {
             }
         }
         evaluator.freeze_definition_memo();
-        const symmetry_permutations = try evaluate_symmetry(
+        const configured_symmetry_permutations = try evaluate_symmetry(
             arena,
             cfg,
             &evaluator,
             &eval_pool,
             &state_store.values_pool,
         );
-        const state_fingerprints = if (symmetry_permutations.len == 0)
-            try arena.alloc(fingerprint.Fingerprint, max_states)
+        var has_temporal_property = false;
+        for (cfg.properties) |property_name| {
+            const property_definition = evaluator.find_definition(
+                property_name,
+            ) orelse continue;
+            if (classify_temporal(&evaluator, property_definition.body) != .safety) {
+                has_temporal_property = true;
+                break;
+            }
+        }
+        const temporal_symmetry_disabled = has_temporal_property and
+            configured_symmetry_permutations.len > 0 and
+            !cfg.allow_unsafe_temporal_symmetry;
+        const symmetry_permutations = if (temporal_symmetry_disabled)
+            &[_][]const u32{}
         else
-            try arena.alloc(fingerprint.Fingerprint, 0);
+            configured_symmetry_permutations;
+        if (temporal_symmetry_disabled) {
+            std.debug.print(
+                "Temporal checking disabled unsafe symmetry reduction; " ++
+                    "exploring the concrete state graph.\n",
+                .{},
+            );
+        }
+        const state_fingerprints = if (symmetry_permutations.len == 0)
+            try exploration_arena.alloc(fingerprint.Fingerprint, max_states)
+        else
+            try exploration_arena.alloc(fingerprint.Fingerprint, 0);
         const view_capacity: u32 = if (cfg.view_name != null)
             max_states
         else
             0;
-        const view_witness_ranks = try arena.alloc(u64, view_capacity);
+        const view_witness_ranks = try exploration_arena.alloc(u64, view_capacity);
         @memset(view_witness_ranks, std.math.maxInt(u64));
-        const view_bfs_orders = try arena.alloc(u32, view_capacity);
+        const view_bfs_orders = try exploration_arena.alloc(u32, view_capacity);
         @memset(view_bfs_orders, std.math.maxInt(u32));
-        const view_queue_scratch = try arena.alloc(u32, view_capacity);
+        const view_queue_scratch = try exploration_arena.alloc(u32, view_capacity);
         const eval_pool_base = eval_pool.snapshot();
 
         const candidate_arena = try arena.alloc_object(Arena);
@@ -1353,7 +1682,7 @@ pub const Checker = struct {
                 print_definition_tail(module);
                 return Error.UndefinedSymbol;
             };
-            if (classify_temporal(def.body) == .safety) {
+            if (classify_temporal(&evaluator, def.body) == .safety) {
                 try safety_property_exprs.append(std.heap.page_allocator, def.body);
             } else {
                 try property_exprs.append(std.heap.page_allocator, def.body);
@@ -1377,24 +1706,28 @@ pub const Checker = struct {
         const graph_enabled = properties.len > 0 or
             std.c.getenv("TLZIG_DUMP_GRAPH") != null or
             std.c.getenv("TLZIG_DUMP_INITIAL_STATES") != null;
+        const canonical_value_entries = try exploration_arena.alloc(
+            CanonicalValueEntry,
+            canonical_value_capacity(max_states, graph_enabled),
+        );
+        @memset(canonical_value_entries, .{});
         const graph_states: u32 = if (graph_enabled) max_states else 0;
-        const succ_cap: u32 = if (graph_enabled)
-            std.math.mul(u32, max_states, 32) catch
-                return Error.OutOfMemory
-        else
-            0;
+        const succ_cap = try graph_edge_capacity(
+            graph_enabled,
+            max_states,
+            max_graph_edges,
+        );
         const succ_offsets = try arena.alloc(u32, graph_states + 1);
         @memset(succ_offsets, 0);
         const succ_counts = try arena.alloc(u32, graph_states);
         @memset(succ_counts, 0);
         const succ_edges = try arena.alloc(u32, succ_cap);
-        const edge_action_masks = try arena.alloc(u64, succ_cap);
         const canonical_states = try arena.alloc(bool, graph_states);
         @memset(canonical_states, false);
         const initial_states = try arena.alloc(bool, graph_states);
         @memset(initial_states, false);
 
-        const fairness = if (graph_enabled)
+        const assumption_fairness = if (graph_enabled)
             if (spec_name_v) |sn|
                 try extract_fairness(
                     arena,
@@ -1407,9 +1740,37 @@ pub const Checker = struct {
                 &[_]FairnessCondition{}
         else
             &[_]FairnessCondition{};
+        const property_fairness = if (graph_enabled)
+            try extract_fairness_exprs(
+                arena,
+                &evaluator,
+                &eval_pool,
+                &state_store.values_pool,
+                properties,
+            )
+        else
+            &[_]FairnessCondition{};
+        const fairness = try concat_fairness(
+            arena,
+            assumption_fairness,
+            property_fairness,
+        );
+        if (fairness.len > @bitSizeOf(u64)) return Error.NotImplemented;
         const fairness_markers = try build_fairness_markers(arena, fairness);
+        const edge_action_masks = try EdgeActionMasks.init(
+            arena,
+            succ_cap,
+            fairness.len,
+        );
+        const fairness_markers_exact = fairness_markers_cover_actions(
+            &evaluator,
+            fairness,
+            next_expr_v,
+        );
         return Checker{
             .arena = arena,
+            .exploration_arena = exploration_arena,
+            .exploration_storage_released = false,
             .state_store = state_store,
             .candidate_arena = candidate_arena,
             .candidate_store = candidate_store,
@@ -1461,8 +1822,14 @@ pub const Checker = struct {
             .canonical_states = canonical_states,
             .initial_states = initial_states,
             .max_states_limit = max_states,
+            .behavior_allows_stuttering = if (spec_parts_v) |parts|
+                parts.allows_stuttering
+            else
+                false,
             .fairness = fairness,
+            .assumption_fairness_count = @intCast(assumption_fairness.len),
             .fairness_markers = fairness_markers,
+            .fairness_markers_exact = fairness_markers_exact,
             .symmetry_permutations = symmetry_permutations,
             .view_name = cfg.view_name,
             .view_projection = view_projection,
@@ -1473,8 +1840,27 @@ pub const Checker = struct {
     }
 
     pub fn deinit(self: *Checker) void {
+        if (!self.exploration_storage_released) {
+            self.exploration_arena.deinit();
+            self.exploration_storage_released = true;
+        }
         self.eval_arena.deinit();
         self.candidate_arena.deinit();
+    }
+
+    fn release_exploration_storage_for_temporal(self: *Checker) void {
+        assert(!self.exploration_storage_released);
+        assert(self.queue.is_empty());
+        if (std.c.getenv("TLZIG_DUMP_FINGERPRINTS") != null) return;
+        const released_bytes = self.exploration_arena.used();
+        self.exploration_arena.deinit();
+        self.exploration_storage_released = true;
+        if (self.progress_interval_states > 0) {
+            std.debug.print(
+                "Temporal analysis released exploration storage={d} bytes states={d} edges={d}\n",
+                .{ released_bytes, self.state_store.count, self.succ_count },
+            );
+        }
     }
 
     pub fn set_diagnostics(self: *Checker, enabled: bool) void {
@@ -1492,17 +1878,12 @@ pub const Checker = struct {
         self.candidate_store.values_pool.growable = growable;
     }
 
-    pub fn check(self: *Checker) !Result {
-        if (self.init_spec == null) {
-            assert(self.next_spec == null);
-            return Result{
-                .generated = 0,
-                .committed_generated = 0,
-                .distinct = 0,
-                .error_state = null,
-            };
-        }
-        assert(self.next_spec != null);
+    fn generate_initial_states(
+        self: *Checker,
+        executor: *ActionExecutor,
+        out_states: *StateBuffer,
+        edge_masks: []u64,
+    ) !void {
         const freeze_generated_cache =
             !self.evaluator.generated_cache_is_frozen();
         if (freeze_generated_cache) {
@@ -1511,23 +1892,6 @@ pub const Checker = struct {
                 &self.state_store.values_pool,
             );
         }
-
-        var out_states = try StateBuffer.init(self.arena, self.max_successors);
-        var compose_states = try StateBuffer.init(self.arena, self.max_successors);
-        const edge_masks = try self.arena.alloc(u64, self.max_successors);
-        var composition_generated: u64 = 0;
-
-        var executor = ActionExecutor{
-            .evaluator = &self.evaluator,
-            .source_state_store = &self.state_store,
-            .candidate_store = &self.candidate_store,
-            .eval_pool = &self.eval_pool,
-            .compose_states = &compose_states,
-            .composition_generated = &composition_generated,
-            .fairness_markers = self.fairness_markers,
-            .edge_action_masks = if (self.graph_enabled) edge_masks else null,
-            .diagnostics = self.diagnostics,
-        };
 
         self.candidate_store.reset(self.candidate_pool_base);
         self.symmetry_hash_cache.advance_generation();
@@ -1544,12 +1908,12 @@ pub const Checker = struct {
         );
         if (stream_initial) {
             executor.candidate_sink = .{
-                .target = &out_states,
+                .target = out_states,
                 .context = &initial_sink_context,
                 .consume = InitialCandidateSinkContext.consume,
             };
         }
-        executor.execute_init(self.init_spec.?, &out_states) catch |err| {
+        executor.execute_init(self.init_spec.?, out_states) catch |err| {
             if (self.diagnostics) {
                 std.debug.print(
                     "Init failed: {any}; eval={d}/{d} candidate-values={d}/{d} candidate-states={d}/{d} buffered={d}/{d}\n",
@@ -1571,7 +1935,7 @@ pub const Checker = struct {
         if (stream_initial and out_states.items.len > 0) {
             try InitialCandidateSinkContext.consume(
                 &initial_sink_context,
-                &out_states,
+                out_states,
             );
         } else if (!stream_initial) {
             self.successor_attempts += out_states.items.len;
@@ -1589,13 +1953,45 @@ pub const Checker = struct {
         if (!stream_initial) {
             try self.process_generated(
                 null,
-                &out_states,
+                out_states,
                 &self.candidate_store,
                 &self.candidate_evaluator,
                 edge_masks,
             );
         }
         self.eval_pool.restore(self.eval_pool_base);
+    }
+
+    pub fn check(self: *Checker) !Result {
+        assert(!self.exploration_storage_released);
+        if (self.init_spec == null) {
+            assert(self.next_spec == null);
+            return Result{
+                .generated = 0,
+                .committed_generated = 0,
+                .distinct = 0,
+                .error_state = null,
+            };
+        }
+        assert(self.next_spec != null);
+        var out_states = try StateBuffer.init(self.arena, self.max_successors);
+        var compose_states = try StateBuffer.init(self.arena, self.max_successors);
+        const edge_masks = try self.arena.alloc(u64, self.max_successors);
+        var composition_generated: u64 = 0;
+
+        var executor = ActionExecutor{
+            .evaluator = &self.evaluator,
+            .source_state_store = &self.state_store,
+            .candidate_store = &self.candidate_store,
+            .eval_pool = &self.eval_pool,
+            .compose_states = &compose_states,
+            .composition_generated = &composition_generated,
+            .fairness_markers = self.fairness_markers,
+            .edge_action_masks = if (self.graph_enabled) edge_masks else null,
+            .diagnostics = self.diagnostics,
+        };
+
+        try self.generate_initial_states(&executor, &out_states, edge_masks);
 
         if (self.worker_count == 1) {
             while (self.queue.dequeue()) |idx| {
@@ -1645,6 +2041,7 @@ pub const Checker = struct {
 
         // After exhaustive safety checking, verify temporal PROPERTIES.
         if (self.properties.len > 0) {
+            self.release_exploration_storage_for_temporal();
             try self.check_properties();
         }
 
@@ -1654,6 +2051,382 @@ pub const Checker = struct {
             .distinct = self.distinct,
             .error_state = null,
         };
+    }
+
+    pub fn simulate(
+        self: *Checker,
+        options: SimulationOptions,
+    ) !Result {
+        assert(!self.exploration_storage_released);
+        if (options.trace_count == 0 or options.trace_depth == 0) {
+            return Error.ConfigError;
+        }
+        if (self.init_spec == null) {
+            assert(self.next_spec == null);
+            return Error.ConfigError;
+        }
+        assert(self.next_spec != null);
+
+        var out_states = try StateBuffer.init(self.arena, self.max_successors);
+        var compose_states = try StateBuffer.init(self.arena, self.max_successors);
+        const edge_masks = try self.arena.alloc(u64, self.max_successors);
+        var composition_generated: u64 = 0;
+        var executor = ActionExecutor{
+            .evaluator = &self.evaluator,
+            .source_state_store = &self.state_store,
+            .candidate_store = &self.candidate_store,
+            .eval_pool = &self.eval_pool,
+            .compose_states = &compose_states,
+            .composition_generated = &composition_generated,
+            .fairness_markers = self.fairness_markers,
+            .edge_action_masks = null,
+            .diagnostics = self.diagnostics,
+        };
+
+        try self.generate_initial_states(&executor, &out_states, edge_masks);
+        const initial_count = self.state_store.count;
+        if (initial_count == 0) return Error.ConfigError;
+
+        var prng = std.Random.DefaultPrng.init(options.seed);
+        const random = prng.random();
+        const action_count = try executor.top_level_action_count(
+            self.next_spec.?,
+        );
+        assert(action_count > 0);
+        const action_order = try self.arena.alloc(u32, action_count);
+        const trace_state_capacity = std.math.add(
+            u32,
+            options.trace_depth,
+            1,
+        ) catch return Error.ConfigError;
+        const trace_states = try self.arena.alloc(u32, trace_state_capacity);
+        const trace_fingerprints = try self.arena.alloc(
+            fingerprint.Fingerprint,
+            trace_state_capacity,
+        );
+        const trace_canonical = try self.arena.alloc(
+            u32,
+            trace_state_capacity,
+        );
+        const trace_action_masks = try self.arena.alloc(
+            u64,
+            options.trace_depth,
+        );
+        executor.edge_action_masks = edge_masks;
+        var trace_index: u64 = 0;
+        while (trace_index < options.trace_count) : (trace_index += 1) {
+            var current = random.uintLessThan(u32, initial_count);
+            var trace_len: u32 = 1;
+            trace_states[0] = current;
+            trace_fingerprints[0] = fingerprint.hash_state_indexed(
+                &self.state_store.values_pool,
+                self.state_store.get(current),
+            );
+            var depth: u32 = 0;
+            while (depth < options.trace_depth) : (depth += 1) {
+                for (action_order, 0..) |*action_index, index| {
+                    action_index.* = @intCast(index);
+                }
+                random.shuffle(u32, action_order);
+
+                var enabled = false;
+                for (action_order) |action_index| {
+                    out_states.clear();
+                    self.candidate_store.reset(self.candidate_pool_base);
+                    self.symmetry_hash_cache.advance_generation();
+                    self.eval_pool.restore(self.eval_pool_base);
+                    composition_generated = 0;
+                    try executor.execute_next_action(
+                        self.next_spec.?,
+                        action_index,
+                        current,
+                        &out_states,
+                    );
+                    self.successor_attempts += out_states.items.len;
+                    self.committed_generated += composition_generated;
+
+                    try self.filter_simulation_candidates(
+                        current,
+                        &out_states,
+                        edge_masks,
+                    );
+                    if (out_states.items.len > 0) {
+                        enabled = true;
+                        break;
+                    }
+                }
+                const enabled_snapshot = self.eval_pool.snapshot();
+                self.check_enabled_invariants(current, enabled) catch |err| {
+                    self.eval_pool.restore(enabled_snapshot);
+                    return err;
+                };
+                self.eval_pool.restore(enabled_snapshot);
+                if (!enabled) {
+                    if (self.check_deadlock) {
+                        if (self.diagnostics) self.print_trace(current);
+                        return Error.Deadlock;
+                    }
+                    break;
+                }
+
+                const selected = random.uintLessThan(
+                    u32,
+                    @intCast(out_states.items.len),
+                );
+                const candidate_index = out_states.items[selected];
+                const selected_action_mask = edge_masks[selected];
+                const candidate = self.candidate_store.get(candidate_index);
+                current = try self.clone_candidate_state(
+                    candidate,
+                    &self.candidate_store,
+                    current,
+                    &self.symmetry_hash_cache,
+                );
+                self.distinct += 1;
+                self.committed_generated += 1;
+                assert(trace_len < trace_state_capacity);
+                trace_action_masks[trace_len - 1] = selected_action_mask;
+                trace_states[trace_len] = current;
+                trace_fingerprints[trace_len] =
+                    fingerprint.hash_state_indexed(
+                        &self.state_store.values_pool,
+                        self.state_store.get(current),
+                    );
+                trace_len += 1;
+            }
+            if (self.properties.len > 0) {
+                try self.check_simulation_trace_properties(
+                    trace_states[0..trace_len],
+                    trace_fingerprints[0..trace_len],
+                    trace_canonical[0..trace_len],
+                    trace_action_masks[0 .. trace_len - 1],
+                );
+            }
+            assert(self.state_store.count >= initial_count);
+            self.state_store.count = initial_count;
+        }
+
+        return .{
+            .generated = self.successor_attempts,
+            .committed_generated = self.committed_generated,
+            .distinct = self.distinct,
+            .error_state = null,
+        };
+    }
+
+    fn filter_simulation_candidates(
+        self: *Checker,
+        parent_idx: u32,
+        out_states: *StateBuffer,
+        edge_masks: []u64,
+    ) !void {
+        assert(parent_idx < self.state_store.count);
+        assert(edge_masks.len >= out_states.items.len);
+        const fairness_needs_parent = self.fairness_needs_candidate_parent();
+        var parent = if (self.action_constraints.len > 0 or
+            self.safety_properties.len > 0 or fairness_needs_parent)
+            try self.clone_parent_for_candidate_checks(
+                &self.state_store,
+                parent_idx,
+                &self.candidate_store,
+            )
+        else
+            null;
+        var kept_count: u32 = 0;
+        for (out_states.items, 0..) |candidate_index, prepared_index| {
+            assert(candidate_index < self.candidate_store.count);
+            const candidate = self.candidate_store.get(candidate_index);
+            candidate.pred = parent_idx;
+            candidate.level = self.state_store.get(parent_idx).level + 1;
+            const snapshot = self.eval_pool.snapshot();
+            const constraints_hold = try self.check_candidate_constraints(
+                candidate,
+                &self.candidate_store,
+                &self.candidate_evaluator,
+                &self.eval_pool,
+            );
+            if (!constraints_hold) {
+                self.eval_pool.restore(snapshot);
+                continue;
+            }
+            const action_constraints_hold =
+                if (self.action_constraints.len > 0)
+                    try self.check_candidate_action_constraints(
+                        &(parent orelse unreachable),
+                        candidate,
+                        &self.candidate_store,
+                        &self.candidate_evaluator,
+                        &self.eval_pool,
+                    )
+                else
+                    true;
+            if (!action_constraints_hold) {
+                self.eval_pool.restore(snapshot);
+                continue;
+            }
+            if (self.safety_properties.len > 0 and
+                !try self.check_safety_properties_with(
+                    &self.candidate_evaluator,
+                    &self.eval_pool,
+                    &self.candidate_store.values_pool,
+                    &(parent orelse unreachable),
+                    candidate,
+                ))
+            {
+                const failed = try self.clone_candidate_state(
+                    candidate,
+                    &self.candidate_store,
+                    parent_idx,
+                    &self.symmetry_hash_cache,
+                );
+                self.distinct += 1;
+                self.eval_pool.restore(snapshot);
+                std.debug.print(
+                    "PropertyViolated during simulation trace from state {d}\n",
+                    .{parent_idx},
+                );
+                if (self.diagnostics) self.print_trace(failed);
+                return Error.PropertyViolated;
+            }
+            if (self.graph_enabled and self.fairness.len > 0) {
+                edge_masks[prepared_index] =
+                    try self.candidate_fairness_angle_mask(
+                        &self.candidate_evaluator,
+                        &self.eval_pool,
+                        self.state_store.get(parent_idx),
+                        &self.state_store.values_pool,
+                        parent,
+                        candidate,
+                        &self.candidate_store.values_pool,
+                        edge_masks[prepared_index],
+                    );
+            }
+            const invariants_hold = try self.check_invariants_with(
+                &self.candidate_evaluator,
+                &self.eval_pool,
+                candidate,
+                &self.candidate_store.values_pool,
+            );
+            self.eval_pool.restore(snapshot);
+            if (!invariants_hold) {
+                const failed = try self.clone_candidate_state(
+                    candidate,
+                    &self.candidate_store,
+                    parent_idx,
+                    &self.symmetry_hash_cache,
+                );
+                self.distinct += 1;
+                std.debug.print(
+                    "InvariantViolated during simulation trace generated={d} selected={d}\n",
+                    .{ self.successor_attempts, self.distinct },
+                );
+                if (self.diagnostics) self.print_trace(failed);
+                return Error.InvariantViolated;
+            }
+            out_states.items[kept_count] = candidate_index;
+            edge_masks[kept_count] = edge_masks[prepared_index];
+            kept_count += 1;
+        }
+        out_states.items = out_states.storage[0..kept_count];
+    }
+
+    fn simulation_states_equal(
+        self: *Checker,
+        left_index: u32,
+        right_index: u32,
+    ) bool {
+        const left = self.state_store.get(left_index);
+        const right = self.state_store.get(right_index);
+        assert(left.values.len == right.values.len);
+        for (left.values, right.values, 0..) |left_value, right_value, index| {
+            const variable_index: u32 = @intCast(index);
+            if (!Value.eql_ordered_cross_pool(
+                left_value,
+                left.value_pool(
+                    variable_index,
+                    &self.state_store.values_pool,
+                ),
+                right_value,
+                right.value_pool(
+                    variable_index,
+                    &self.state_store.values_pool,
+                ),
+            )) return false;
+        }
+        return true;
+    }
+
+    fn check_simulation_trace_properties(
+        self: *Checker,
+        trace_states: []const u32,
+        trace_fingerprints: []const fingerprint.Fingerprint,
+        trace_canonical: []u32,
+        trace_action_masks: []const u64,
+    ) !void {
+        assert(self.graph_enabled);
+        assert(self.properties.len > 0);
+        assert(trace_states.len > 0);
+        assert(trace_fingerprints.len == trace_states.len);
+        assert(trace_canonical.len == trace_states.len);
+        assert(trace_action_masks.len + 1 == trace_states.len);
+        const state_count = self.state_store.count;
+        assert(state_count <= self.max_states_limit);
+        @memset(self.succ_counts[0..state_count], 0);
+        @memset(self.initial_states[0..state_count], false);
+        self.succ_count = 0;
+
+        for (trace_states, trace_fingerprints, 0..) |state_index, hash, index| {
+            assert(state_index < state_count);
+            trace_canonical[index] = state_index;
+            for (0..index) |prior| {
+                if (trace_fingerprints[prior] != hash) continue;
+                if (!self.simulation_states_equal(
+                    trace_states[prior],
+                    state_index,
+                )) continue;
+                trace_canonical[index] = trace_canonical[prior];
+                break;
+            }
+        }
+
+        for (trace_states, trace_canonical) |state_index, canonical| {
+            if (state_index != canonical) continue;
+            assert(self.succ_count < self.succ_cap);
+            const edge_begin = self.succ_count;
+            self.succ_offsets[canonical] = edge_begin;
+            self.succ_edges[self.succ_count] = canonical;
+            self.edge_action_masks.set(self.succ_count, 0);
+            self.succ_count += 1;
+
+            for (trace_canonical[0 .. trace_canonical.len - 1], 0..) |
+                source,
+                transition_index,
+            | {
+                if (source != canonical) continue;
+                const target = trace_canonical[transition_index + 1];
+                var existing = edge_begin;
+                while (existing < self.succ_count) : (existing += 1) {
+                    if (self.succ_edges[existing] != target) continue;
+                    self.edge_action_masks.merge(
+                        existing,
+                        trace_action_masks[transition_index],
+                    );
+                    break;
+                }
+                if (existing < self.succ_count) continue;
+                if (self.succ_count >= self.succ_cap) return Error.OutOfMemory;
+                self.succ_edges[self.succ_count] = target;
+                self.edge_action_masks.set(
+                    self.succ_count,
+                    trace_action_masks[transition_index],
+                );
+                self.succ_count += 1;
+            }
+            self.succ_counts[canonical] = self.succ_count - edge_begin;
+            assert(self.succ_counts[canonical] > 0);
+        }
+        self.initial_states[trace_canonical[0]] = true;
+        try self.check_properties();
     }
 
     fn check_parallel(self: *Checker) !void {
@@ -1891,7 +2664,7 @@ pub const Checker = struct {
         candidate_store: *StateStore,
         candidate_evaluator: *Evaluator,
         eval_pool: *ValuePool,
-        canonical_pool: *const ValuePool,
+        source_store: *StateStore,
         prepared_fingerprints: []fingerprint.Fingerprint,
         prepared_view_ranks: []u64,
         prepared_edge_masks: []u64,
@@ -1911,9 +2684,11 @@ pub const Checker = struct {
                 std.math.maxInt(u32));
         }
         var kept_count: u32 = 0;
+        const fairness_needs_parent = self.fairness_needs_candidate_parent();
         var candidate_parent = if (self.action_constraints.len > 0 or
-            self.safety_properties.len > 0)
+            self.safety_properties.len > 0 or fairness_needs_parent)
             try self.clone_parent_for_candidate_checks(
+                source_store,
                 parent_idx,
                 candidate_store,
             )
@@ -1952,13 +2727,26 @@ pub const Checker = struct {
             {
                 return Error.PropertyViolated;
             }
+            if (self.graph_enabled and self.fairness.len > 0) {
+                prepared_edge_masks[candidate_index] =
+                    try self.candidate_fairness_angle_mask(
+                        candidate_evaluator,
+                        eval_pool,
+                        source_store.get(parent_idx),
+                        &source_store.values_pool,
+                        candidate_parent,
+                        candidate,
+                        &candidate_store.values_pool,
+                        prepared_edge_masks[candidate_index],
+                    );
+            }
             const candidate_fp = try self.candidate_fingerprint(
                 parent_idx,
                 candidate_store,
                 candidate_evaluator,
                 eval_pool,
                 candidate,
-                canonical_pool,
+                &source_store.values_pool,
                 canonical_hash_cache,
                 candidate_hash_cache,
             );
@@ -2233,7 +3021,6 @@ pub const Checker = struct {
         state.level = candidate.level;
         state.pred = candidate.pred;
         state.changed_mask = candidate.changed_mask;
-        state.borrowed_mask = 0;
         state.borrowed_pool = null;
         @memcpy(state.values, canonical_values);
         return state_idx;
@@ -2250,7 +3037,6 @@ pub const Checker = struct {
         assert(state_v.values.len == canonical_values.len);
         state_v.pred = candidate.pred;
         state_v.changed_mask = candidate.changed_mask;
-        state_v.borrowed_mask = 0;
         state_v.borrowed_pool = null;
         @memcpy(state_v.values, canonical_values);
     }
@@ -2286,7 +3072,6 @@ pub const Checker = struct {
         }
         state_v.pred = candidate.pred;
         state_v.changed_mask = candidate.changed_mask;
-        state_v.borrowed_mask = 0;
         state_v.borrowed_pool = null;
     }
 
@@ -2296,6 +3081,7 @@ pub const Checker = struct {
         eval_pool: *ValuePool,
         new_states: *const StateBuffer,
         canonical_store: *StateStore,
+        parallel: *ParallelState,
     ) !void {
         for (new_states.items) |state_idx| {
             try self.check_canonical_state_invariants(
@@ -2303,6 +3089,7 @@ pub const Checker = struct {
                 eval_pool,
                 state_idx,
                 canonical_store,
+                parallel,
             );
         }
     }
@@ -2313,10 +3100,11 @@ pub const Checker = struct {
         eval_pool: *ValuePool,
         state_idx: u32,
         canonical_store: *StateStore,
+        parallel: *ParallelState,
     ) !void {
         assert(state_idx < canonical_store.count);
         const invariant_snapshot = eval_pool.snapshot();
-        const invariants_hold = self.check_invariants_with(
+        const failed_invariant = self.first_failed_invariant_with(
             evaluator,
             eval_pool,
             canonical_store.get(state_idx),
@@ -2326,12 +3114,32 @@ pub const Checker = struct {
             return err;
         };
         eval_pool.restore(invariant_snapshot);
-        if (invariants_hold) return;
+        const failed_index = failed_invariant orelse return;
+
+        parallel_lock(parallel);
+        const owns_diagnostics = !parallel.failure_diagnostics_claimed;
+        if (owns_diagnostics) {
+            parallel.failure_diagnostics_claimed = true;
+            parallel.failure = Error.InvariantViolated;
+        }
+        parallel_unlock(parallel);
+        if (!owns_diagnostics) return Error.InvariantViolated;
+
+        // Stop graph commits before reading counters for the diagnostic. The
+        // batch fast path publishes counters under parallel.mutex and cannot
+        // publish after the failure above.
+        parallel_commit_lock(parallel);
+        const generated = self.successor_attempts;
+        const distinct = self.distinct;
+        parallel_commit_unlock(parallel);
+        std.debug.print("Invariant false: {s}\n", .{
+            self.invariant_names[failed_index],
+        });
         std.debug.print(
             "InvariantViolated generated={d} distinct={d}\n",
-            .{ self.successor_attempts, self.distinct },
+            .{ generated, distinct },
         );
-        self.print_trace(state_idx);
+        if (self.diagnostics) self.print_trace(state_idx);
         return Error.InvariantViolated;
     }
 
@@ -2347,10 +3155,12 @@ pub const Checker = struct {
         // and enqueue newly discovered states. After this loop, out_states
         // contains canonical indices for graph edges.
         var kept_count: u32 = 0;
+        const fairness_needs_parent = self.fairness_needs_candidate_parent();
         var candidate_parent = if (parent_idx) |pidx|
             if (self.action_constraints.len > 0 or
-                self.safety_properties.len > 0)
+                self.safety_properties.len > 0 or fairness_needs_parent)
                 try self.clone_parent_for_candidate_checks(
+                    &self.state_store,
                     pidx,
                     candidate_store,
                 )
@@ -2410,6 +3220,22 @@ pub const Checker = struct {
                 if (self.diagnostics) self.print_trace(parent_idx.?);
                 return Error.PropertyViolated;
             }
+            if (parent_idx != null and
+                self.graph_enabled and
+                self.fairness.len > 0)
+            {
+                edge_masks[candidate_index] =
+                    try self.candidate_fairness_angle_mask(
+                        candidate_evaluator,
+                        &self.eval_pool,
+                        self.state_store.get(parent_idx.?),
+                        &self.state_store.values_pool,
+                        candidate_parent,
+                        candidate,
+                        &candidate_store.values_pool,
+                        edge_masks[candidate_index],
+                    );
+            }
             const fp = try self.candidate_fingerprint(
                 parent_idx,
                 candidate_store,
@@ -2458,7 +3284,7 @@ pub const Checker = struct {
                     self.successor_attempts,
                     self.distinct,
                 });
-                self.print_trace(state_idx);
+                if (self.diagnostics) self.print_trace(state_idx);
                 return Error.InvariantViolated;
             }
             if (is_new) {
@@ -2644,7 +3470,8 @@ pub const Checker = struct {
             return symmetry_fingerprint(
                 &candidate_store.values_pool,
                 canonical_pool,
-                &self.symmetry_hash_cache,
+                candidate_hash_cache,
+                canonical_hash_cache,
                 candidate,
                 self.symmetry_permutations,
             );
@@ -2724,7 +3551,12 @@ pub const Checker = struct {
             const count: u32 = @intCast(out_states.items.len);
             if (self.graph_enabled) {
                 assert(edge_masks.len >= count);
-                if (self.succ_count + count > self.succ_cap) {
+                assert(self.succ_count <= self.succ_cap);
+                if (count > self.succ_cap - self.succ_count) {
+                    std.debug.print(
+                        "temporal graph edge capacity exhausted: used={d} requested={d} capacity={d}\n",
+                        .{ self.succ_count, count, self.succ_cap },
+                    );
                     return Error.OutOfMemory;
                 }
                 self.succ_offsets[pidx] = self.succ_count;
@@ -2732,7 +3564,10 @@ pub const Checker = struct {
                 for (out_states.items, 0..) |idx, i| {
                     assert(idx < self.state_store.count);
                     self.succ_edges[self.succ_count + i] = idx;
-                    self.edge_action_masks[self.succ_count + i] = edge_masks[i];
+                    self.edge_action_masks.set(
+                        self.succ_count + @as(u32, @intCast(i)),
+                        edge_masks[i],
+                    );
                 }
                 self.succ_count += count;
             }
@@ -2800,7 +3635,6 @@ pub const Checker = struct {
         state.level = candidate.level;
         state.pred = candidate.pred;
         state.changed_mask = candidate.changed_mask;
-        state.borrowed_mask = 0;
         state.borrowed_pool = null;
         for (candidate.values, state.values, 0..) |source, *target, variable_index| {
             const changed = parent_idx == null or
@@ -2834,7 +3668,7 @@ pub const Checker = struct {
         source_pool: *const ValuePool,
         variable_index: u16,
         source_hash_cache: *SymmetryHashCache,
-    ) !Value {
+    ) Error!Value {
         const capacity = self.canonical_value_entries.len;
         if (capacity == 0) {
             return source.clone(
@@ -2861,17 +3695,20 @@ pub const Checker = struct {
             null,
         );
         const published_hash = effective_canonical_hash(hash);
+        if (self.find_canonical_value(
+            source,
+            source_pool,
+            variable_index,
+            hash,
+        )) |canonical| return canonical;
+
+        const canonical = try self.clone_canonical_value(
+            source,
+            source_pool,
+            source_hash_cache,
+        );
         if (self.canonical_value_count >= canonical_value_load_limit(capacity)) {
-            if (self.find_canonical_value(
-                source,
-                source_pool,
-                variable_index,
-                hash,
-            )) |canonical| return canonical;
-            return source.clone(
-                source_pool,
-                &self.state_store.values_pool,
-            );
+            return canonical;
         }
         const mixed_hash = fingerprint.hash_combine(published_hash, variable_index);
         const mask = capacity - 1;
@@ -2885,10 +3722,6 @@ pub const Checker = struct {
                 .acquire,
             );
             if (entry_hash == 0) {
-                const canonical = try source.clone(
-                    source_pool,
-                    &self.state_store.values_pool,
-                );
                 entry.value = canonical;
                 entry.variable_index = variable_index;
                 entry.value_count = self.state_store.values_pool.value_count;
@@ -2921,10 +3754,124 @@ pub const Checker = struct {
             }
             slot = (slot + 1) & mask;
         }
-        return source.clone(
-            source_pool,
-            &self.state_store.values_pool,
-        );
+        return canonical;
+    }
+
+    fn clone_canonical_value(
+        self: *Checker,
+        source: Value,
+        source_pool: *const ValuePool,
+        source_hash_cache: *SymmetryHashCache,
+    ) Error!Value {
+        const target_pool = &self.state_store.values_pool;
+        return switch (source) {
+            .set_v => |set| blk: {
+                const source_items = set.items(source_pool);
+                const target_items = try target_pool.alloc_values(
+                    @intCast(source_items.len),
+                );
+                for (source_items, target_items) |source_item, *target_item| {
+                    target_item.* = try self.intern_canonical_value(
+                        source_item,
+                        source_pool,
+                        canonical_subvalue_variable_index,
+                        source_hash_cache,
+                    );
+                }
+                const offset: u32 = @intCast(
+                    (@intFromPtr(target_items.ptr) -
+                        @intFromPtr(target_pool.values.ptr)) /
+                        @sizeOf(Value),
+                );
+                assert(offset + target_items.len <= target_pool.value_count);
+                break :blk Value{ .set_v = .{
+                    .offset = offset,
+                    .len = @intCast(target_items.len),
+                } };
+            },
+            .function_v => |function| blk: {
+                const canonical_domain = try self.intern_canonical_value(
+                    Value{ .set_v = function.domain },
+                    source_pool,
+                    canonical_subvalue_variable_index,
+                    source_hash_cache,
+                );
+                assert(canonical_domain == .set_v);
+                const source_entries = function.entries(source_pool);
+                const target_entries = try target_pool.alloc_values(
+                    @intCast(source_entries.len),
+                );
+                for (source_entries, target_entries) |source_entry, *target_entry| {
+                    target_entry.* = try self.intern_canonical_value(
+                        source_entry,
+                        source_pool,
+                        canonical_subvalue_variable_index,
+                        source_hash_cache,
+                    );
+                }
+                const offset: u32 = @intCast(
+                    (@intFromPtr(target_entries.ptr) -
+                        @intFromPtr(target_pool.values.ptr)) /
+                        @sizeOf(Value),
+                );
+                assert(offset + target_entries.len <= target_pool.value_count);
+                break :blk Value{ .function_v = .{
+                    .domain = canonical_domain.set_v,
+                    .offset = offset,
+                    .len = @intCast(target_entries.len),
+                } };
+            },
+            .tuple_v => |tuple| blk: {
+                const source_items = tuple.items(source_pool);
+                const target_items = try target_pool.alloc_values(
+                    @intCast(source_items.len),
+                );
+                for (source_items, target_items) |source_item, *target_item| {
+                    target_item.* = try self.intern_canonical_value(
+                        source_item,
+                        source_pool,
+                        canonical_subvalue_variable_index,
+                        source_hash_cache,
+                    );
+                }
+                const offset: u32 = @intCast(
+                    (@intFromPtr(target_items.ptr) -
+                        @intFromPtr(target_pool.values.ptr)) /
+                        @sizeOf(Value),
+                );
+                assert(offset + target_items.len <= target_pool.value_count);
+                break :blk Value{ .tuple_v = .{
+                    .offset = offset,
+                    .len = @intCast(target_items.len),
+                } };
+            },
+            .record_v => |record| blk: {
+                const source_fields = record.fields(source_pool);
+                const target_fields = try target_pool.alloc_values(
+                    @intCast(source_fields.len),
+                );
+                for (source_fields, target_fields) |source_field, *target_field| {
+                    target_field.* = try self.intern_canonical_value(
+                        source_field,
+                        source_pool,
+                        canonical_subvalue_variable_index,
+                        source_hash_cache,
+                    );
+                }
+                const offset: u32 = @intCast(
+                    (@intFromPtr(target_fields.ptr) -
+                        @intFromPtr(target_pool.values.ptr)) /
+                        @sizeOf(Value),
+                );
+                assert(offset + target_fields.len <= target_pool.value_count);
+                assert(target_fields.len % 2 == 0);
+                break :blk Value{ .record_v = .{
+                    .offset = offset,
+                    .len = @intCast(target_fields.len / 2),
+                } };
+            },
+            else => source.clone(source_pool, target_pool),
+        };
     }
 
     fn canonical_pool_at(
@@ -3052,16 +3999,18 @@ pub const Checker = struct {
 
     fn clone_parent_for_candidate_checks(
         self: *Checker,
+        source_store: *StateStore,
         parent_idx: u32,
         candidate_store: *StateStore,
     ) !?StateStore.State {
-        const source = self.state_store.get(parent_idx);
+        _ = self;
+        const source = source_store.get(parent_idx);
         const values = try candidate_store.values_pool.alloc_values(
             @intCast(source.values.len),
         );
         for (source.values, values) |value, *target| {
             target.* = try value.clone(
-                &self.state_store.values_pool,
+                &source_store.values_pool,
                 &candidate_store.values_pool,
             );
         }
@@ -3069,10 +4018,101 @@ pub const Checker = struct {
             .level = source.level,
             .pred = source.pred,
             .changed_mask = 0,
-            .borrowed_mask = 0,
             .borrowed_pool = null,
             .values = values,
         };
+    }
+
+    fn fairness_needs_candidate_parent(self: *const Checker) bool {
+        if (self.fairness.len == 0) return false;
+        if (!self.fairness_markers_exact) return true;
+        for (self.fairness) |condition| {
+            if (!condition.full_vars) return true;
+        }
+        return false;
+    }
+
+    fn candidate_fairness_angle_mask(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        source_parent: *StateStore.State,
+        source_pool: *const ValuePool,
+        candidate_parent: ?StateStore.State,
+        candidate: *StateStore.State,
+        candidate_pool: *ValuePool,
+        recorded_action_mask: u64,
+    ) Error!u64 {
+        assert(self.fairness.len > 0);
+        assert(self.fairness.len <= @bitSizeOf(u64));
+        assert(source_parent.values.len == candidate.values.len);
+        var candidate_parent_storage = candidate_parent;
+        const evaluation_parent = if (candidate_parent_storage) |*parent|
+            parent
+        else
+            null;
+        if (self.fairness_needs_candidate_parent()) {
+            assert(evaluation_parent != null);
+        }
+
+        var angle_mask: u64 = 0;
+        for (self.fairness, 0..) |condition, fairness_index| {
+            const bit = @as(u64, 1) << @intCast(fairness_index);
+            const action_matches = if (self.fairness_markers_exact)
+                recorded_action_mask & bit != 0
+            else
+                try self.eval_fairness_action_with_state_pool(
+                    evaluator,
+                    eval_pool,
+                    condition,
+                    evaluation_parent.?,
+                    candidate,
+                    candidate_pool,
+                );
+            if (!action_matches) continue;
+
+            const nonstuttering = if (condition.full_vars)
+                !states_equal_cross_pool(
+                    source_parent,
+                    source_pool,
+                    candidate,
+                    candidate_pool,
+                )
+            else
+                !try self.eval_vars_equal_with_state_pool(
+                    evaluator,
+                    eval_pool,
+                    condition.vars,
+                    Context.empty(),
+                    evaluation_parent.?,
+                    candidate,
+                    candidate_pool,
+                );
+            if (nonstuttering) angle_mask |= bit;
+        }
+        return angle_mask;
+    }
+
+    fn states_equal_cross_pool(
+        left: *const StateStore.State,
+        left_default_pool: *const ValuePool,
+        right: *const StateStore.State,
+        right_default_pool: *const ValuePool,
+    ) bool {
+        assert(left.values.len == right.values.len);
+        var changed = right.changed_mask;
+        while (changed != 0) {
+            const variable_index: u32 = @intCast(@ctz(changed));
+            changed &= changed - 1;
+            assert(variable_index < left.values.len);
+            if (!Value.eql_cross_pool(
+                left.values[variable_index],
+                left.value_pool(variable_index, left_default_pool),
+                right.values[variable_index],
+                right.value_pool(variable_index, right_default_pool),
+            )) return false;
+        }
+        return true;
     }
 
     fn check_candidate_action_constraints(
@@ -3213,15 +4253,280 @@ pub const Checker = struct {
 
     const TemporalKind = enum { safety, liveness, unsupported };
 
-    fn classify_temporal(expr: *ast.Expr) TemporalKind {
+    fn classify_temporal(
+        evaluator: *const Evaluator,
+        expr: *ast.Expr,
+    ) TemporalKind {
         switch (expr.*) {
             .unary => |u| {
-                if (u.op == .temporal_box) return .safety;
+                if (u.op == .temporal_box and
+                    !contains_liveness_operator(evaluator, u.operand, 0))
+                {
+                    return .safety;
+                }
             },
             .box_action => return .safety,
             else => {},
         }
         return .liveness;
+    }
+
+    fn contains_liveness_operator(
+        evaluator: *const Evaluator,
+        expr: *const ast.Expr,
+        depth: u8,
+    ) bool {
+        if (depth == 64) return true;
+        const next_depth = depth + 1;
+        return switch (expr.*) {
+            .unary => |unary| unary.op == .temporal_diamond or
+                contains_liveness_operator(evaluator, unary.operand, next_depth),
+            .binary => |binary| binary.op == .leads_to or
+                contains_liveness_operator(evaluator, binary.left, next_depth) or
+                contains_liveness_operator(evaluator, binary.right, next_depth),
+            .primed_expr => |operand| contains_liveness_operator(
+                evaluator,
+                operand,
+                next_depth,
+            ),
+            .unchanged_expr => |operand| contains_liveness_operator(
+                evaluator,
+                operand,
+                next_depth,
+            ),
+            .quantifier => |quantifier| blk: {
+                for (quantifier.vars) |variable| {
+                    if (contains_liveness_operator(
+                        evaluator,
+                        variable.domain,
+                        next_depth,
+                    )) break :blk true;
+                }
+                break :blk contains_liveness_operator(
+                    evaluator,
+                    quantifier.body,
+                    next_depth,
+                );
+            },
+            .choose => |choose| (choose.domain != null and
+                contains_liveness_operator(evaluator, choose.domain.?, next_depth)) or
+                contains_liveness_operator(evaluator, choose.body, next_depth),
+            .if_then_else => |conditional| contains_liveness_operator(
+                evaluator,
+                conditional.cond,
+                next_depth,
+            ) or contains_liveness_operator(
+                evaluator,
+                conditional.then_branch,
+                next_depth,
+            ) or contains_liveness_operator(
+                evaluator,
+                conditional.else_branch,
+                next_depth,
+            ),
+            .apply => |application| blk: {
+                if (application.func.* == .ident and
+                    (starts_with(application.func.ident, "WF_") or
+                        starts_with(application.func.ident, "SF_")))
+                {
+                    break :blk true;
+                }
+                if (application.func.* == .apply and
+                    application.func.apply.func.* == .ident and
+                    (std.mem.eql(
+                        u8,
+                        application.func.apply.func.ident,
+                        "WF_",
+                    ) or std.mem.eql(
+                        u8,
+                        application.func.apply.func.ident,
+                        "SF_",
+                    )))
+                {
+                    break :blk true;
+                }
+                if (contains_liveness_operator(
+                    evaluator,
+                    application.func,
+                    next_depth,
+                )) break :blk true;
+                for (application.args) |argument| {
+                    if (contains_liveness_operator(
+                        evaluator,
+                        argument,
+                        next_depth,
+                    )) break :blk true;
+                }
+                break :blk false;
+            },
+            .field => |field| contains_liveness_operator(
+                evaluator,
+                field.expr,
+                next_depth,
+            ),
+            .tuple, .set_enum => |items| blk: {
+                for (items) |item| {
+                    if (contains_liveness_operator(
+                        evaluator,
+                        item,
+                        next_depth,
+                    )) break :blk true;
+                }
+                break :blk false;
+            },
+            .record => |fields| blk: {
+                for (fields) |field| {
+                    if (contains_liveness_operator(
+                        evaluator,
+                        field.value,
+                        next_depth,
+                    )) break :blk true;
+                }
+                break :blk false;
+            },
+            .set_filter => |filter| blk: {
+                for (filter.vars) |variable| {
+                    if (contains_liveness_operator(
+                        evaluator,
+                        variable.domain,
+                        next_depth,
+                    )) break :blk true;
+                }
+                break :blk contains_liveness_operator(
+                    evaluator,
+                    filter.pred,
+                    next_depth,
+                );
+            },
+            .set_map => |map| blk: {
+                for (map.vars) |variable| {
+                    if (contains_liveness_operator(
+                        evaluator,
+                        variable.domain,
+                        next_depth,
+                    )) break :blk true;
+                }
+                break :blk contains_liveness_operator(
+                    evaluator,
+                    map.value,
+                    next_depth,
+                );
+            },
+            .set_binary => |set| contains_liveness_operator(
+                evaluator,
+                set.left,
+                next_depth,
+            ) or contains_liveness_operator(evaluator, set.right, next_depth),
+            .set_of_functions => |set| contains_liveness_operator(
+                evaluator,
+                set.domain,
+                next_depth,
+            ) or contains_liveness_operator(evaluator, set.codomain, next_depth),
+            .function_literal => |function| blk: {
+                for (function.vars) |variable| {
+                    if (contains_liveness_operator(
+                        evaluator,
+                        variable.domain,
+                        next_depth,
+                    )) break :blk true;
+                }
+                break :blk contains_liveness_operator(
+                    evaluator,
+                    function.body,
+                    next_depth,
+                );
+            },
+            .record_set => |set| blk: {
+                for (set.fields) |field| {
+                    if (contains_liveness_operator(
+                        evaluator,
+                        field.domain,
+                        next_depth,
+                    )) break :blk true;
+                }
+                break :blk false;
+            },
+            .except => |except| blk: {
+                if (contains_liveness_operator(
+                    evaluator,
+                    except.func,
+                    next_depth,
+                ) or contains_liveness_operator(
+                    evaluator,
+                    except.value,
+                    next_depth,
+                )) break :blk true;
+                for (except.steps) |step| switch (step) {
+                    .field => {},
+                    .index => |index| if (contains_liveness_operator(
+                        evaluator,
+                        index,
+                        next_depth,
+                    )) break :blk true,
+                };
+                break :blk false;
+            },
+            .let_in => |let| blk: {
+                for (let.defs) |definition| {
+                    if (contains_liveness_operator(
+                        evaluator,
+                        definition.body,
+                        next_depth,
+                    )) break :blk true;
+                }
+                break :blk contains_liveness_operator(
+                    evaluator,
+                    let.body,
+                    next_depth,
+                );
+            },
+            .case_expr => |case| blk: {
+                for (case.arms) |arm| {
+                    if (contains_liveness_operator(
+                        evaluator,
+                        arm.cond,
+                        next_depth,
+                    ) or contains_liveness_operator(
+                        evaluator,
+                        arm.value,
+                        next_depth,
+                    )) break :blk true;
+                }
+                break :blk case.otherwise != null and
+                    contains_liveness_operator(
+                        evaluator,
+                        case.otherwise.?,
+                        next_depth,
+                    );
+            },
+            .box_action => |action_v| contains_liveness_operator(
+                evaluator,
+                action_v.action,
+                next_depth,
+            ) or contains_liveness_operator(evaluator, action_v.vars, next_depth),
+            .lambda => |lambda| contains_liveness_operator(
+                evaluator,
+                lambda.body,
+                next_depth,
+            ),
+            .ident => |name| blk: {
+                const definition = evaluator.find_definition(
+                    evaluator.resolve_alias(name),
+                ) orelse break :blk false;
+                break :blk contains_liveness_operator(
+                    evaluator,
+                    definition.body,
+                    next_depth,
+                );
+            },
+            .bool_literal,
+            .int_literal,
+            .string_literal,
+            .primed,
+            .unchanged,
+            .at,
+            => false,
+        };
     }
 
     fn is_pure_state_expression(self: *Checker, expr: *ast.Expr) bool {
@@ -3387,6 +4692,7 @@ pub const Checker = struct {
         defer scc_data.deinit();
 
         var cache = PropertyCache.init(self.arena);
+        defer cache.deinit(std.heap.page_allocator);
         for (self.properties, 0..) |prop, property_index| {
             const results = try self.eval_temporal_property_all(prop, &scc_data, &cache);
             var initial_count: u32 = 0;
@@ -3428,15 +4734,17 @@ pub const Checker = struct {
             try self.keys.append(allocator, prop);
             try self.values.append(allocator, results);
         }
+
+        fn deinit(self: *PropertyCache, allocator: std.mem.Allocator) void {
+            assert(self.keys.items.len == self.values.items.len);
+            for (self.values.items) |results| allocator.free(results);
+            self.keys.deinit(allocator);
+            self.values.deinit(allocator);
+        }
     };
 
     const SccData = struct {
         scc_ids: []u32,
-        scc_count: u32,
-        scc_succ_offsets: []u32,
-        scc_succ_edges: []u32,
-        scc_states_offsets: []u32,
-        scc_states_edges: []u32,
         pred_offsets: []u32,
         pred_edges: []u32,
         fair_sccs: []bool,
@@ -3445,10 +4753,6 @@ pub const Checker = struct {
 
         fn deinit(self: SccData) void {
             self.allocator.free(self.scc_ids);
-            self.allocator.free(self.scc_succ_offsets);
-            self.allocator.free(self.scc_succ_edges);
-            self.allocator.free(self.scc_states_offsets);
-            self.allocator.free(self.scc_states_edges);
             self.allocator.free(self.pred_offsets);
             self.allocator.free(self.pred_edges);
             self.allocator.free(self.fair_sccs);
@@ -3456,123 +4760,104 @@ pub const Checker = struct {
         }
     };
 
-    fn scc_edge_key(from: u32, to: u32) u64 {
-        return (@as(u64, from) << 32) | @as(u64, to);
-    }
-
-    fn scc_edge_key_from(key: u64) u32 {
-        return @intCast(key >> 32);
-    }
-
-    fn scc_edge_key_to(key: u64) u32 {
-        return @intCast(key & 0xffff_ffff);
-    }
-
     fn build_scc_data(self: *Checker) !SccData {
         const n = self.state_store.count;
-        try self.recompute_fairness_edge_masks();
+        const verify_fairness_markers =
+            (builtin.mode == .debug or builtin.mode == .safe) or
+            std.c.getenv("TLZIG_VERIFY_FAIRNESS_MARKERS") != null;
+        // A symmetry quotient can rename the concrete child represented by an
+        // edge. Re-evaluating A against independently chosen representatives
+        // loses the transition label. Edge masks are therefore finalized as
+        // <A>_v on concrete transitions before canonicalization and are only
+        // replay-audited when no symmetry quotient is active.
+        if (verify_fairness_markers and
+            self.symmetry_permutations.len == 0)
+        {
+            try self.recompute_fairness_edge_masks();
+        }
+        const allocator = std.heap.page_allocator;
         const scc_ids = try self.compute_sccs();
+        errdefer allocator.free(scc_ids);
         var scc_count: u32 = 0;
         for (scc_ids) |id| {
             if (id + 1 > scc_count) scc_count = id + 1;
         }
-
-        const allocator = std.heap.page_allocator;
-
-        var scc_states_counts = try allocator.alloc(u32, scc_count);
-        defer allocator.free(scc_states_counts);
-        @memset(scc_states_counts, 0);
-        for (scc_ids) |id| {
-            scc_states_counts[id] += 1;
+        assert(scc_count > 0);
+        if (self.progress_interval_states > 0) {
+            std.debug.print("Temporal SCC discovery complete: sccs={d}\n", .{scc_count});
         }
 
-        var scc_states_offsets = try allocator.alloc(u32, scc_count + 1);
-        var total_states: u32 = 0;
-        for (0..scc_count) |i| {
-            scc_states_offsets[i] = total_states;
-            total_states += scc_states_counts[i];
-        }
-        scc_states_offsets[scc_count] = total_states;
-
-        var scc_states_edges = try allocator.alloc(u32, total_states);
-        var fill = try allocator.alloc(u32, scc_count);
-        defer allocator.free(fill);
-        @memcpy(fill, scc_states_offsets[0..scc_count]);
-        for (0..n) |i| {
-            const idx: u32 = @intCast(i);
-            const id = scc_ids[idx];
-            scc_states_edges[fill[id]] = idx;
-            fill[id] += 1;
-        }
-
-        var scc_succ_counts = try allocator.alloc(u32, scc_count);
-        defer allocator.free(scc_succ_counts);
-        @memset(scc_succ_counts, 0);
-        var scc_edge_keys = try allocator.alloc(u64, self.succ_count);
-        defer allocator.free(scc_edge_keys);
-        var scc_edge_count: u32 = 0;
-        for (0..n) |i| {
-            const idx: u32 = @intCast(i);
-            const from = scc_ids[idx];
-            for (self.successors(idx)) |succ| {
-                if (succ == idx) continue; // skip stuttering self-loops for liveness
-                const to = scc_ids[succ];
-                if (from == to) continue;
-                assert(scc_edge_count < scc_edge_keys.len);
-                scc_edge_keys[scc_edge_count] = scc_edge_key(from, to);
-                scc_edge_count += 1;
+        const fair_sccs = blk: {
+            const counts = try allocator.alloc(u32, scc_count);
+            defer allocator.free(counts);
+            @memset(counts, 0);
+            for (scc_ids) |id| {
+                assert(id < scc_count);
+                counts[id] += 1;
             }
-        }
-        const scc_edges = scc_edge_keys[0..scc_edge_count];
-        std.mem.sort(u64, scc_edges, {}, std.sort.asc(u64));
-        var unique_edge_count: u32 = 0;
-        var previous_key: ?u64 = null;
-        for (scc_edges) |key| {
-            if (previous_key != null and previous_key.? == key) continue;
-            const from = scc_edge_key_from(key);
-            assert(from < scc_count);
-            scc_succ_counts[from] += 1;
-            unique_edge_count += 1;
-            previous_key = key;
-        }
 
-        var scc_succ_offsets = try allocator.alloc(u32, scc_count + 1);
-        var total_edges: u32 = 0;
-        for (0..scc_count) |i| {
-            scc_succ_offsets[i] = total_edges;
-            total_edges += scc_succ_counts[i];
-        }
-        assert(total_edges == unique_edge_count);
-        scc_succ_offsets[scc_count] = total_edges;
+            const offsets = try allocator.alloc(u32, scc_count + 1);
+            defer allocator.free(offsets);
+            var total_states: u32 = 0;
+            for (0..scc_count) |i| {
+                offsets[i] = total_states;
+                total_states += counts[i];
+            }
+            assert(total_states == n);
+            offsets[scc_count] = total_states;
 
-        var scc_succ_edges = try allocator.alloc(u32, total_edges);
-        @memcpy(fill, scc_succ_offsets[0..scc_count]);
-        previous_key = null;
-        for (scc_edges) |key| {
-            if (previous_key != null and previous_key.? == key) continue;
-            const from = scc_edge_key_from(key);
-            const to = scc_edge_key_to(key);
-            assert(from < scc_count);
-            assert(to < scc_count);
-            scc_succ_edges[fill[from]] = to;
-            fill[from] += 1;
-            previous_key = key;
+            const states = try allocator.alloc(u32, total_states);
+            defer allocator.free(states);
+            const fill = try allocator.alloc(u32, scc_count);
+            defer allocator.free(fill);
+            @memcpy(fill, offsets[0..scc_count]);
+            for (0..n) |i| {
+                const idx: u32 = @intCast(i);
+                const id = scc_ids[idx];
+                assert(fill[id] < offsets[id + 1]);
+                states[fill[id]] = idx;
+                fill[id] += 1;
+            }
+            for (0..scc_count) |id| {
+                assert(fill[id] == offsets[id + 1]);
+            }
+            break :blk try self.compute_fair_sccs(
+                scc_ids,
+                scc_count,
+                offsets,
+                states,
+                allocator,
+            );
+        };
+        errdefer allocator.free(fair_sccs);
+        if (self.progress_interval_states > 0) {
+            std.debug.print("Temporal fairness classification complete\n", .{});
         }
-        for (0..scc_count) |i| {
-            assert(fill[i] == scc_succ_offsets[i + 1]);
-        }
-
-        const fair_sccs = try self.compute_fair_sccs(scc_ids, scc_count, scc_states_offsets, scc_states_edges, allocator);
-        const fair_region = try self.compute_fair_region(scc_ids, scc_count, scc_succ_offsets, scc_succ_edges, fair_sccs, n, allocator);
         const reverse = try self.build_reverse_graph(allocator, n);
+        errdefer {
+            allocator.free(reverse.offsets);
+            allocator.free(reverse.edges);
+        }
+        if (self.progress_interval_states > 0) {
+            std.debug.print(
+                "Temporal reverse graph complete: edges={d}\n",
+                .{reverse.edges.len},
+            );
+        }
+        const fair_region = try compute_fair_region(
+            scc_ids,
+            fair_sccs,
+            reverse.offsets,
+            reverse.edges,
+            allocator,
+        );
+        errdefer allocator.free(fair_region);
+        if (self.progress_interval_states > 0) {
+            std.debug.print("Temporal fair-region propagation complete\n", .{});
+        }
 
         return SccData{
             .scc_ids = scc_ids,
-            .scc_count = scc_count,
-            .scc_succ_offsets = scc_succ_offsets,
-            .scc_succ_edges = scc_succ_edges,
-            .scc_states_offsets = scc_states_offsets,
-            .scc_states_edges = scc_states_edges,
             .pred_offsets = reverse.offsets,
             .pred_edges = reverse.edges,
             .fair_sccs = fair_sccs,
@@ -3630,90 +4915,48 @@ pub const Checker = struct {
     }
 
     fn compute_fair_region(
-        self: *Checker,
-        scc_ids: []u32,
-        scc_count: u32,
-        scc_succ_offsets: []u32,
-        scc_succ_edges: []u32,
-        fair_sccs: []bool,
-        n: u64,
+        scc_ids: []const u32,
+        fair_sccs: []const bool,
+        pred_offsets: []const u32,
+        pred_edges: []const u32,
         allocator: std.mem.Allocator,
     ) Error![]bool {
-        _ = self;
-        const fair_region = try allocator.alloc(bool, n);
+        assert(scc_ids.len > 0);
+        assert(pred_offsets.len == scc_ids.len + 1);
+        assert(pred_offsets[scc_ids.len] == pred_edges.len);
+        const fair_region = try allocator.alloc(bool, scc_ids.len);
+        errdefer allocator.free(fair_region);
         @memset(fair_region, false);
-        var scc_can_reach_fair = try allocator.alloc(bool, scc_count);
-        defer allocator.free(scc_can_reach_fair);
-        @memset(scc_can_reach_fair, false);
-        var stack = try allocator.alloc(u32, scc_count);
-        defer allocator.free(stack);
-        var stack_len: u32 = 0;
+        const queue = try allocator.alloc(u32, scc_ids.len);
+        defer allocator.free(queue);
+        var queue_head: u32 = 0;
+        var queue_tail: u32 = 0;
 
-        const scc_edge_count = scc_succ_offsets[scc_count];
-        var pred_counts = try allocator.alloc(u32, scc_count);
-        defer allocator.free(pred_counts);
-        @memset(pred_counts, 0);
-        for (0..scc_count) |from_usize| {
-            const from: u32 = @intCast(from_usize);
-            const begin = scc_succ_offsets[from];
-            const end = scc_succ_offsets[from + 1];
-            for (scc_succ_edges[begin..end]) |succ| {
-                assert(succ < scc_count);
-                pred_counts[succ] += 1;
-            }
+        for (scc_ids, 0..) |scc_id, state_index| {
+            assert(scc_id < fair_sccs.len);
+            if (!fair_sccs[scc_id]) continue;
+            fair_region[state_index] = true;
+            queue[queue_tail] = @intCast(state_index);
+            queue_tail += 1;
         }
-
-        var pred_offsets = try allocator.alloc(u32, scc_count + 1);
-        defer allocator.free(pred_offsets);
-        var pred_total: u32 = 0;
-        for (pred_counts, 0..) |count, index| {
-            pred_offsets[index] = pred_total;
-            pred_total += count;
-        }
-        assert(pred_total == scc_edge_count);
-        pred_offsets[scc_count] = pred_total;
-
-        var pred_edges = try allocator.alloc(u32, pred_total);
-        defer allocator.free(pred_edges);
-        var pred_fill = try allocator.alloc(u32, scc_count);
-        defer allocator.free(pred_fill);
-        @memcpy(pred_fill, pred_offsets[0..scc_count]);
-        for (0..scc_count) |from_usize| {
-            const from: u32 = @intCast(from_usize);
-            const begin = scc_succ_offsets[from];
-            const end = scc_succ_offsets[from + 1];
-            for (scc_succ_edges[begin..end]) |succ| {
-                pred_edges[pred_fill[succ]] = from;
-                pred_fill[succ] += 1;
-            }
-        }
-        for (0..scc_count) |index| {
-            assert(pred_fill[index] == pred_offsets[index + 1]);
-        }
-
-        for (fair_sccs, 0..) |fair, id| {
-            if (fair) {
-                scc_can_reach_fair[id] = true;
-                stack[stack_len] = @intCast(id);
-                stack_len += 1;
-            }
-        }
-        while (stack_len > 0) {
-            stack_len -= 1;
-            const cur = stack[stack_len];
-            const pred_begin = pred_offsets[cur];
-            const pred_end = pred_offsets[cur + 1];
+        while (queue_head < queue_tail) {
+            const current = queue[queue_head];
+            queue_head += 1;
+            const pred_begin = pred_offsets[current];
+            const pred_end = pred_offsets[current + 1];
+            assert(pred_begin <= pred_end);
+            assert(pred_end <= pred_edges.len);
             for (pred_edges[pred_begin..pred_end]) |pred| {
-                if (scc_can_reach_fair[pred]) continue;
-                scc_can_reach_fair[pred] = true;
-                assert(stack_len < scc_count);
-                stack[stack_len] = pred;
-                stack_len += 1;
+                assert(pred < scc_ids.len);
+                if (fair_region[pred]) continue;
+                fair_region[pred] = true;
+                assert(queue_tail < queue.len);
+                queue[queue_tail] = pred;
+                queue_tail += 1;
             }
         }
-        for (scc_ids, 0..) |scc_id, i| {
-            if (scc_can_reach_fair[scc_id]) fair_region[i] = true;
-        }
+        assert(queue_head == queue_tail);
+        assert(queue_tail <= queue.len);
         return fair_region;
     }
 
@@ -3732,7 +4975,7 @@ pub const Checker = struct {
             const scc_id: u32 = @intCast(id);
             const begin = scc_states_offsets[scc_id];
             const end = scc_states_offsets[scc_id + 1];
-            if (end - begin > 1) {
+            if (self.behavior_allows_stuttering or end - begin > 1) {
                 fair_sccs[scc_id] = true;
                 continue;
             }
@@ -3745,15 +4988,20 @@ pub const Checker = struct {
                 }
             }
         }
-        if (self.fairness.len == 0) return fair_sccs;
+        const assumption_fairness =
+            self.fairness[0..self.assumption_fairness_count];
+        if (assumption_fairness.len == 0) return fair_sccs;
 
-        var enabled = try allocator.alloc([]bool, self.fairness.len);
+        var enabled = try allocator.alloc([]bool, assumption_fairness.len);
         defer allocator.free(enabled);
-        var has_angle = try allocator.alloc(bool, self.fairness.len * scc_count);
+        var has_angle = try allocator.alloc(
+            bool,
+            assumption_fairness.len * scc_count,
+        );
         defer allocator.free(has_angle);
         @memset(has_angle, false);
 
-        for (self.fairness, 0..) |fc, fi| {
+        for (assumption_fairness, 0..) |fc, fi| {
             enabled[fi] = try allocator.alloc(bool, n);
             @memset(enabled[fi], false);
             for (0..n) |s| {
@@ -3763,17 +5011,8 @@ pub const Checker = struct {
                 for (begin..end) |edge_index_usize| {
                     const edge_index: u32 = @intCast(edge_index_usize);
                     const succ = self.succ_edges[edge_index];
-                    const mask = self.edge_action_masks[edge_index];
+                    const mask = self.edge_action_masks.get(edge_index);
                     if ((mask & (@as(u64, 1) << @intCast(fi))) != 0) {
-                        // WF_v(A) and SF_v(A) are fairness conditions on
-                        // <A>_v, not A. A matching action that leaves v
-                        // unchanged is a stuttering step and cannot make the
-                        // fairness action enabled or fulfill it.
-                        if (!try self.fairness_edge_nonstuttering(
-                            fc,
-                            state_index,
-                            succ,
-                        )) continue;
                         enabled[fi][s] = true;
                         const from_scc = scc_ids[state_index];
                         const to_scc = scc_ids[succ];
@@ -3811,7 +5050,7 @@ pub const Checker = struct {
             const scc_id: u32 = @intCast(id);
             if (!fair_sccs[scc_id]) continue;
             var fair = true;
-            for (self.fairness, 0..) |fc, fi| {
+            for (assumption_fairness, 0..) |fc, fi| {
                 var all_enabled = true;
                 var any_enabled = false;
                 const begin = scc_states_offsets[scc_id];
@@ -3866,101 +5105,246 @@ pub const Checker = struct {
         return false;
     }
 
+    fn edge_matches_fairness_angle(
+        self: *Checker,
+        fairness_index: u8,
+        edge_index: u32,
+        parent_index: u32,
+        child_index: u32,
+    ) Error!bool {
+        assert(fairness_index < self.fairness.len);
+        assert(edge_index < self.succ_count);
+        const mask = @as(u64, 1) << @as(u6, @intCast(fairness_index));
+        _ = parent_index;
+        _ = child_index;
+        return (self.edge_action_masks.get(edge_index) & mask) != 0;
+    }
+
     fn recompute_fairness_edge_masks(self: *Checker) Error!void {
         if (self.fairness.len == 0) return;
         assert(self.fairness.len <= @bitSizeOf(u64));
-        var matched_counts: [@bitSizeOf(u64)]u64 = @splat(0);
-        for (0..self.state_store.count) |parent_index_usize| {
-            const parent_index: u32 = @intCast(parent_index_usize);
-            const parent = self.state_store.get(parent_index);
-            const edge_begin = self.succ_offsets[parent_index];
-            const edge_end = edge_begin + self.succ_counts[parent_index];
-            for (edge_begin..edge_end) |edge_index_usize| {
-                const edge_index: u32 = @intCast(edge_index_usize);
-                assert(edge_index < self.succ_count);
-                const child_index = self.succ_edges[edge_index];
-                assert(child_index < self.state_store.count);
-                const child = self.state_store.get(child_index);
-                var exact_mask: u64 = 0;
-                for (self.fairness, 0..) |condition, fairness_index| {
-                    const action_matches = self.eval_fairness_action(
-                        condition,
-                        parent,
-                        child,
-                    ) catch |err| {
-                        if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
-                            std.debug.print(
-                                "fairness action evaluation failed: index={d} parent={d} child={d} action={s} bindings={d} error={any}\n",
-                                .{
-                                    fairness_index,
-                                    parent_index,
-                                    child_index,
-                                    @tagName(condition.action.*),
-                                    condition.bindings.len,
-                                    err,
-                                },
-                            );
-                            for (condition.bindings) |binding| {
-                                std.debug.print(
-                                    "  binding {s}={s}\n",
-                                    .{ binding.name, @tagName(binding.value) },
-                                );
-                            }
-                        }
-                        return err;
-                    };
-                    if (!action_matches) continue;
-                    exact_mask |= @as(u64, 1) << @intCast(fairness_index);
-                    matched_counts[fairness_index] += 1;
-                }
-                self.edge_action_masks[edge_index] = exact_mask;
+        const verify_markers = self.fairness_markers_exact and
+            ((builtin.mode == .debug or builtin.mode == .safe) or
+                std.c.getenv("TLZIG_VERIFY_FAIRNESS_MARKERS") != null);
+        var stats = FairnessMarkerStats{};
+        if (self.worker_count == 1 or self.state_store.count < 256) {
+            for (0..self.state_store.count) |parent_index| {
+                try self.recompute_fairness_parent_with(
+                    &self.evaluator,
+                    &self.eval_pool,
+                    @intCast(parent_index),
+                    verify_markers,
+                    &stats,
+                );
             }
+        } else {
+            try self.recompute_fairness_edge_masks_parallel(
+                verify_markers,
+                &stats,
+            );
+        }
+        if (verify_markers) {
+            std.debug.print(
+                "FAIRNESS marker audit edges={d} mismatched={d} missing_bits={d} extra_bits={d}\n",
+                .{
+                    self.succ_count,
+                    stats.mismatched_edges,
+                    stats.missing_bits,
+                    stats.extra_bits,
+                },
+            );
         }
         if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
             for (self.fairness, 0..) |_, fairness_index| {
                 std.debug.print(
                     "FAIRNESS[{d}] exact matching edges={d}\n",
-                    .{ fairness_index, matched_counts[fairness_index] },
+                    .{ fairness_index, stats.matched_counts[fairness_index] },
                 );
             }
         }
     }
 
-    fn eval_fairness_action(
+    fn recompute_fairness_edge_masks_parallel(
         self: *Checker,
+        verify_markers: bool,
+        stats: *FairnessMarkerStats,
+    ) Error!void {
+        assert(self.worker_count > 1);
+        assert(self.state_store.count >= 256);
+        const allocator = std.heap.page_allocator;
+        const workers = try allocator.alloc(
+            TemporalWorkerContext,
+            self.worker_count,
+        );
+        defer allocator.free(workers);
+        var initialized: u16 = 0;
+        errdefer for (workers[0..initialized]) |*worker| worker.deinit();
+        for (workers) |*worker| {
+            try self.init_temporal_worker(worker);
+            initialized += 1;
+        }
+        defer for (workers) |*worker| worker.deinit();
+        initialized = 0;
+
+        const worker_stats = try allocator.alloc(
+            FairnessMarkerStats,
+            self.worker_count,
+        );
+        defer allocator.free(worker_stats);
+        @memset(worker_stats, FairnessMarkerStats{});
+        var parallel = ParallelFairnessMarkers{
+            .checker = self,
+            .verify_markers = verify_markers,
+        };
+        defer assert(
+            std.c.pthread_mutex_destroy(&parallel.mutex) == .SUCCESS,
+        );
+        const threads = try allocator.alloc(std.Thread, self.worker_count);
+        defer allocator.free(threads);
+        var spawned: u16 = 0;
+        errdefer for (threads[0..spawned]) |thread| thread.join();
+        for (workers, worker_stats, 0..) |*worker, *worker_stat, index| {
+            threads[index] = std.Thread.spawn(
+                .{},
+                parallel_fairness_marker_worker,
+                .{ &parallel, worker, worker_stat },
+            ) catch return Error.OutOfMemory;
+            spawned += 1;
+        }
+        assert(spawned == self.worker_count);
+        for (threads) |thread| thread.join();
+        spawned = 0;
+        if (parallel.failure) |err| return err;
+        assert(parallel.next_index >= self.state_store.count);
+        for (worker_stats) |worker_stat| stats.merge(worker_stat);
+    }
+
+    fn recompute_fairness_parent_with(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        parent_index: u32,
+        verify_markers: bool,
+        stats: *FairnessMarkerStats,
+    ) Error!void {
+        assert(parent_index < self.state_store.count);
+        const parent = self.state_store.get(parent_index);
+        const edge_begin = self.succ_offsets[parent_index];
+        const edge_end = edge_begin + self.succ_counts[parent_index];
+        for (edge_begin..edge_end) |edge_index_usize| {
+            const edge_index: u32 = @intCast(edge_index_usize);
+            assert(edge_index < self.succ_count);
+            const child_index = self.succ_edges[edge_index];
+            assert(child_index < self.state_store.count);
+            const child = self.state_store.get(child_index);
+            var exact_mask: u64 = 0;
+            for (self.fairness, 0..) |condition, fairness_index| {
+                const action_matches = self.eval_fairness_action_with(
+                    evaluator,
+                    eval_pool,
+                    condition,
+                    parent,
+                    child,
+                ) catch |err| {
+                    if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                        std.debug.print(
+                            "fairness action evaluation failed: index={d} parent={d} child={d} action={s} bindings={d} error={any}\n",
+                            .{
+                                fairness_index,
+                                parent_index,
+                                child_index,
+                                @tagName(condition.action.*),
+                                condition.bindings.len,
+                                err,
+                            },
+                        );
+                        for (condition.bindings) |binding| {
+                            std.debug.print(
+                                "  binding {s}={s}\n",
+                                .{ binding.name, @tagName(binding.value) },
+                            );
+                        }
+                    }
+                    return err;
+                };
+                if (!action_matches or
+                    !try self.fairness_edge_nonstuttering(
+                        condition,
+                        parent_index,
+                        child_index,
+                    )) continue;
+                exact_mask |= @as(u64, 1) << @intCast(fairness_index);
+                stats.matched_counts[fairness_index] += 1;
+            }
+            if (verify_markers) {
+                const recorded_mask = self.edge_action_masks.get(edge_index);
+                if (builtin.mode == .debug or builtin.mode == .safe) {
+                    assert(recorded_mask == exact_mask);
+                }
+                if (recorded_mask != exact_mask) stats.mismatched_edges += 1;
+                stats.missing_bits += @popCount(exact_mask & ~recorded_mask);
+                stats.extra_bits += @popCount(recorded_mask & ~exact_mask);
+            }
+            self.edge_action_masks.set(edge_index, exact_mask);
+        }
+    }
+
+    fn eval_fairness_action_with(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
         condition: FairnessCondition,
         parent: *StateStore.State,
         child: *StateStore.State,
     ) Error!bool {
-        const snap = self.eval_pool.snapshot();
-        defer self.eval_pool.restore(snap);
-        self.evaluator.reset_context_pool();
-        const context_snap = self.evaluator.context_snapshot();
-        defer self.evaluator.restore_context_pool(context_snap);
+        return self.eval_fairness_action_with_state_pool(
+            evaluator,
+            eval_pool,
+            condition,
+            parent,
+            child,
+            &self.state_store.values_pool,
+        );
+    }
+
+    fn eval_fairness_action_with_state_pool(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        condition: FairnessCondition,
+        parent: *StateStore.State,
+        child: *StateStore.State,
+        state_pool: *ValuePool,
+    ) Error!bool {
+        const snap = eval_pool.snapshot();
+        defer eval_pool.restore(snap);
+        evaluator.reset_context_pool();
+        const context_snap = evaluator.context_snapshot();
+        defer evaluator.restore_context_pool(context_snap);
 
         var context = Context.empty();
         for (condition.bindings) |binding| {
             const local_value = try binding.value.clone(
                 &self.state_store.values_pool,
-                &self.eval_pool,
+                eval_pool,
             );
-            context = try self.evaluator.extend_context(
+            context = try evaluator.extend_context(
                 context,
                 binding.name,
                 local_value,
             );
         }
 
-        self.evaluator.set_next_state(child);
-        defer self.evaluator.set_next_state(null);
-        self.evaluator.begin_state_evaluation(&self.eval_pool);
-        defer self.evaluator.end_state_evaluation();
-        const value_v = try self.evaluator.eval_expr(
+        evaluator.set_next_state(child);
+        defer evaluator.set_next_state(null);
+        evaluator.begin_state_evaluation(eval_pool);
+        defer evaluator.end_state_evaluation();
+        const value_v = try evaluator.eval_expr(
             condition.action,
             context,
             parent,
-            &self.eval_pool,
-            &self.state_store.values_pool,
+            eval_pool,
+            state_pool,
         );
         return value_v.is_truthy();
     }
@@ -4036,6 +5420,28 @@ pub const Checker = struct {
         a: *StateStore.State,
         b: *StateStore.State,
     ) Error!bool {
+        return self.eval_vars_equal_with_state_pool(
+            evaluator,
+            eval_pool,
+            vars_expr,
+            context,
+            a,
+            b,
+            &self.state_store.values_pool,
+        );
+    }
+
+    fn eval_vars_equal_with_state_pool(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        vars_expr: *ast.Expr,
+        context: Context,
+        a: *StateStore.State,
+        b: *StateStore.State,
+        state_pool: *ValuePool,
+    ) Error!bool {
+        _ = self;
         const snap = eval_pool.snapshot();
         defer eval_pool.restore(snap);
         evaluator.reset_context_pool();
@@ -4047,7 +5453,7 @@ pub const Checker = struct {
             context,
             a,
             eval_pool,
-            &self.state_store.values_pool,
+            state_pool,
         ) catch |err| {
             evaluator.end_state_evaluation();
             return err;
@@ -4060,7 +5466,7 @@ pub const Checker = struct {
             context,
             b,
             eval_pool,
-            &self.state_store.values_pool,
+            state_pool,
         );
         const equal = va.eql(vb, eval_pool);
         if (!equal and std.c.getenv("TLZIG_DUMP_LIVENESS") != null) {
@@ -4209,6 +5615,227 @@ pub const Checker = struct {
         } }, results);
     }
 
+    fn property_fairness_index(
+        self: *Checker,
+        source: *ast.Expr,
+    ) ?u8 {
+        var index: usize = self.assumption_fairness_count;
+        while (index < self.fairness.len) : (index += 1) {
+            if (self.fairness[index].source == source) return @intCast(index);
+        }
+        return null;
+    }
+
+    fn eval_fairness_property_all(
+        self: *Checker,
+        property_fairness_index_v: u8,
+        scc_data: *const SccData,
+        results: []bool,
+    ) Error!void {
+        const n = self.state_store.count;
+        assert(n > 0);
+        assert(results.len == n);
+        assert(scc_data.pred_offsets.len == n + 1);
+        assert(property_fairness_index_v >= self.assumption_fairness_count);
+        assert(property_fairness_index_v < self.fairness.len);
+        const allocator = std.heap.page_allocator;
+        const property_condition = self.fairness[property_fairness_index_v];
+
+        const property_enabled = try allocator.alloc(bool, n);
+        defer allocator.free(property_enabled);
+        @memset(property_enabled, false);
+        var enabled_state_count: u32 = 0;
+        for (0..n) |state_index_usize| {
+            const state_index: u32 = @intCast(state_index_usize);
+            const edge_begin = self.succ_offsets[state_index];
+            const edge_end = edge_begin + self.succ_counts[state_index];
+            for (edge_begin..edge_end) |edge_index_usize| {
+                const edge_index: u32 = @intCast(edge_index_usize);
+                const successor = self.succ_edges[edge_index];
+                if (!try self.edge_matches_fairness_angle(
+                    property_fairness_index_v,
+                    edge_index,
+                    state_index,
+                    successor,
+                )) continue;
+                property_enabled[state_index] = true;
+                enabled_state_count += 1;
+                break;
+            }
+        }
+        if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+            std.debug.print(
+                "FAIRNESS[{d}] property kind={s} enabled_states={d}\n",
+                .{
+                    property_fairness_index_v,
+                    @tagName(property_condition.kind),
+                    enabled_state_count,
+                },
+            );
+        }
+        if (enabled_state_count == 0) {
+            @memset(results, true);
+            return;
+        }
+        const allowed = try allocator.alloc(bool, n);
+        defer allocator.free(allowed);
+        switch (property_condition.kind) {
+            .weak => @memcpy(allowed, property_enabled),
+            .strong => @memset(allowed, true),
+        }
+        const scc_ids = try self.compute_sccs_filtered(
+            allowed,
+            property_fairness_index_v,
+        );
+        defer allocator.free(scc_ids);
+        var scc_count: u32 = 0;
+        for (scc_ids, allowed) |scc_id, is_allowed| {
+            if (!is_allowed) continue;
+            assert(scc_id != std.math.maxInt(u32));
+            scc_count = @max(scc_count, scc_id + 1);
+        }
+        assert(scc_count > 0);
+
+        const state_counts = try allocator.alloc(u32, scc_count);
+        defer allocator.free(state_counts);
+        @memset(state_counts, 0);
+        const cyclic = try allocator.alloc(bool, scc_count);
+        defer allocator.free(cyclic);
+        @memset(cyclic, self.behavior_allows_stuttering);
+        const property_any_enabled = try allocator.alloc(bool, scc_count);
+        defer allocator.free(property_any_enabled);
+        @memset(property_any_enabled, false);
+        const property_all_enabled = try allocator.alloc(bool, scc_count);
+        defer allocator.free(property_all_enabled);
+        @memset(property_all_enabled, true);
+
+        for (0..n) |state_index_usize| {
+            const state_index: u32 = @intCast(state_index_usize);
+            if (!allowed[state_index]) continue;
+            const scc_id = scc_ids[state_index];
+            state_counts[scc_id] += 1;
+            const edge_begin = self.succ_offsets[state_index];
+            const edge_end = edge_begin + self.succ_counts[state_index];
+            for (edge_begin..edge_end) |edge_index_usize| {
+                const edge_index: u32 = @intCast(edge_index_usize);
+                const successor = self.succ_edges[edge_index];
+                const property_angle = try self.edge_matches_fairness_angle(
+                    property_fairness_index_v,
+                    edge_index,
+                    state_index,
+                    successor,
+                );
+                if (!property_angle and successor == state_index) {
+                    cyclic[scc_id] = true;
+                }
+            }
+            property_any_enabled[scc_id] =
+                property_any_enabled[scc_id] or property_enabled[state_index];
+            property_all_enabled[scc_id] =
+                property_all_enabled[scc_id] and property_enabled[state_index];
+        }
+        for (state_counts, 0..) |count, scc_id| {
+            assert(count > 0);
+            if (count > 1) cyclic[scc_id] = true;
+        }
+
+        const globally_fair = try allocator.alloc(bool, scc_count);
+        defer allocator.free(globally_fair);
+        @memset(globally_fair, true);
+        const any_enabled = try allocator.alloc(bool, scc_count);
+        defer allocator.free(any_enabled);
+        const all_enabled = try allocator.alloc(bool, scc_count);
+        defer allocator.free(all_enabled);
+        const has_angle = try allocator.alloc(bool, scc_count);
+        defer allocator.free(has_angle);
+
+        for (
+            self.fairness[0..self.assumption_fairness_count],
+            0..,
+        ) |condition, assumption_index_usize| {
+            const assumption_index: u8 = @intCast(assumption_index_usize);
+            @memset(any_enabled, false);
+            @memset(all_enabled, true);
+            @memset(has_angle, false);
+            for (0..n) |state_index_usize| {
+                const state_index: u32 = @intCast(state_index_usize);
+                if (!allowed[state_index]) continue;
+                const scc_id = scc_ids[state_index];
+                var state_enabled = false;
+                const edge_begin = self.succ_offsets[state_index];
+                const edge_end = edge_begin + self.succ_counts[state_index];
+                for (edge_begin..edge_end) |edge_index_usize| {
+                    const edge_index: u32 = @intCast(edge_index_usize);
+                    const successor = self.succ_edges[edge_index];
+                    if (!try self.edge_matches_fairness_angle(
+                        assumption_index,
+                        edge_index,
+                        state_index,
+                        successor,
+                    )) continue;
+                    state_enabled = true;
+                    if (scc_ids[successor] != scc_id) continue;
+                    if (try self.edge_matches_fairness_angle(
+                        property_fairness_index_v,
+                        edge_index,
+                        state_index,
+                        successor,
+                    )) continue;
+                    has_angle[scc_id] = true;
+                }
+                any_enabled[scc_id] = any_enabled[scc_id] or state_enabled;
+                all_enabled[scc_id] = all_enabled[scc_id] and state_enabled;
+            }
+            for (globally_fair, 0..) |*is_fair, scc_id| {
+                if (!is_fair.*) continue;
+                const condition_holds = switch (condition.kind) {
+                    .weak => !all_enabled[scc_id] or has_angle[scc_id],
+                    .strong => !any_enabled[scc_id] or has_angle[scc_id],
+                };
+                is_fair.* = condition_holds;
+            }
+        }
+
+        const bad = try allocator.alloc(bool, n);
+        defer allocator.free(bad);
+        @memset(bad, false);
+        const work = try allocator.alloc(u32, n);
+        defer allocator.free(work);
+        var work_len: u32 = 0;
+        for (0..n) |state_index_usize| {
+            const state_index: u32 = @intCast(state_index_usize);
+            if (!allowed[state_index]) continue;
+            const scc_id = scc_ids[state_index];
+            const property_violated = switch (property_condition.kind) {
+                .weak => property_all_enabled[scc_id],
+                .strong => property_any_enabled[scc_id],
+            };
+            if (!cyclic[scc_id] or
+                !globally_fair[scc_id] or
+                !property_violated)
+            {
+                continue;
+            }
+            bad[state_index] = true;
+            work[work_len] = state_index;
+            work_len += 1;
+        }
+
+        while (work_len > 0) {
+            work_len -= 1;
+            const state_index = work[work_len];
+            const pred_begin = scc_data.pred_offsets[state_index];
+            const pred_end = scc_data.pred_offsets[state_index + 1];
+            for (scc_data.pred_edges[pred_begin..pred_end]) |predecessor| {
+                if (bad[predecessor]) continue;
+                bad[predecessor] = true;
+                work[work_len] = predecessor;
+                work_len += 1;
+            }
+        }
+        for (results, bad) |*result, is_bad| result.* = !is_bad;
+    }
+
     fn eval_temporal_property_all(
         self: *Checker,
         prop: *ast.Expr,
@@ -4241,15 +5868,12 @@ pub const Checker = struct {
             },
             .apply => |application| {
                 var resolved_temporal = false;
-                if (application.func.* == .ident and
-                    application.args.len == 1 and
-                    (starts_with(application.func.ident, "WF_") or
-                        starts_with(application.func.ident, "SF_")))
-                {
-                    // Fairness restricts the SCC/game graph. Re-evaluating
-                    // its action argument as a state expression would require
-                    // a missing next state and would double-apply fairness.
-                    @memset(results, true);
+                if (self.property_fairness_index(prop)) |fairness_index| {
+                    try self.eval_fairness_property_all(
+                        fairness_index,
+                        scc_data,
+                        results,
+                    );
                     resolved_temporal = true;
                 } else if (application.func.* == .ident and application.args.len == 0) {
                     const name = self.evaluator.resolve_alias(
@@ -4573,7 +6197,7 @@ pub const Checker = struct {
         defer std.heap.page_allocator.free(allowed);
         for (operand, 0..) |holds, state_index| allowed[state_index] = !holds;
 
-        const induced_scc_ids = try self.compute_sccs_filtered(allowed);
+        const induced_scc_ids = try self.compute_sccs_filtered(allowed, null);
         defer std.heap.page_allocator.free(induced_scc_ids);
         var induced_scc_count: u32 = 0;
         for (induced_scc_ids, 0..) |scc_id, state_index| {
@@ -4659,7 +6283,9 @@ pub const Checker = struct {
         }
         for (state_counts, 0..) |count, scc_id| {
             assert(count > 0);
-            if (count > 1) cyclic[scc_id] = true;
+            if (self.behavior_allows_stuttering or count > 1) {
+                cyclic[scc_id] = true;
+            }
             if (!cyclic[scc_id]) fair[scc_id] = false;
         }
 
@@ -4670,7 +6296,10 @@ pub const Checker = struct {
         const has_angle = try allocator.alloc(bool, scc_count);
         defer allocator.free(has_angle);
 
-        for (self.fairness, 0..) |condition, fairness_index| {
+        for (
+            self.fairness[0..self.assumption_fairness_count],
+            0..,
+        ) |condition, fairness_index| {
             assert(fairness_index < @bitSizeOf(u64));
             @memset(any_enabled, false);
             @memset(all_enabled, true);
@@ -4686,13 +6315,8 @@ pub const Checker = struct {
                 const edge_end = edge_begin + self.succ_counts[state_index];
                 for (edge_begin..edge_end) |edge_index_usize| {
                     const edge_index: u32 = @intCast(edge_index_usize);
-                    if ((self.edge_action_masks[edge_index] & action_mask) == 0) continue;
+                    if ((self.edge_action_masks.get(edge_index) & action_mask) == 0) continue;
                     const successor = self.succ_edges[edge_index];
-                    if (!try self.fairness_edge_nonstuttering(
-                        condition,
-                        state_index,
-                        successor,
-                    )) continue;
                     state_enabled = true;
                     if (allowed[successor] and scc_ids[successor] == scc_id) {
                         has_angle[scc_id] = true;
@@ -4751,10 +6375,14 @@ pub const Checker = struct {
         const allowed = try std.heap.page_allocator.alloc(bool, n);
         defer std.heap.page_allocator.free(allowed);
         @memset(allowed, true);
-        return self.compute_sccs_filtered(allowed);
+        return self.compute_sccs_filtered(allowed, null);
     }
 
-    fn compute_sccs_filtered(self: *Checker, allowed: []const bool) ![]u32 {
+    fn compute_sccs_filtered(
+        self: *Checker,
+        allowed: []const bool,
+        excluded_fairness_index: ?u8,
+    ) ![]u32 {
         const n = self.state_store.count;
         assert(n > 0);
         assert(allowed.len == n);
@@ -4807,11 +6435,21 @@ pub const Checker = struct {
                     node_stack_len += 1;
                     edge_indices[v] = 0;
                 }
-                const succs = self.successors(v);
                 const ei = edge_indices[v];
-                if (ei < succs.len) {
-                    const w = succs[ei];
+                const edge_count = self.succ_counts[v];
+                if (ei < edge_count) {
                     edge_indices[v] = ei + 1;
+                    const edge_index = self.succ_offsets[v] + ei;
+                    assert(edge_index < self.succ_count);
+                    const w = self.succ_edges[edge_index];
+                    if (excluded_fairness_index) |fairness_index| {
+                        if (try self.edge_matches_fairness_angle(
+                            fairness_index,
+                            edge_index,
+                            v,
+                            w,
+                        )) continue;
+                    }
                     if (!allowed[w]) continue;
                     if (indices[w] == 0) {
                         assert(v_stack_len < n);
@@ -4896,9 +6534,36 @@ pub const Checker = struct {
         st: *StateStore.State,
         state_pool: *ValuePool,
     ) !bool {
+        const failed_index = try self.first_failed_invariant_with(
+            evaluator,
+            eval_pool,
+            st,
+            state_pool,
+        ) orelse return true;
+        std.debug.print("Invariant false: {s}\n", .{
+            self.invariant_names[failed_index],
+        });
+        if (evaluator == &self.evaluator and
+            state_pool == &self.state_store.values_pool)
+        {
+            try self.print_first_false_conjunct(
+                self.invariants[failed_index],
+                st,
+            );
+        }
+        return false;
+    }
+
+    fn first_failed_invariant_with(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        st: *StateStore.State,
+        state_pool: *ValuePool,
+    ) !?usize {
         assert(self.invariant_names.len == self.invariants.len);
         assert(self.invariant_contains_enabled.len == self.invariants.len);
-        for (self.invariants, 0..) |inv, i| {
+        for (self.invariants, 0..) |_, i| {
             if (self.invariant_contains_enabled[i]) continue;
             const v = evaluator.eval_named_zero(
                 self.invariant_names[i],
@@ -4912,13 +6577,9 @@ pub const Checker = struct {
                 }
                 return err;
             };
-            if (!v.is_truthy()) {
-                std.debug.print("Invariant false: {s}\n", .{self.invariant_names[i]});
-                try self.print_first_false_conjunct(inv, st);
-                return false;
-            }
+            if (!v.is_truthy()) return i;
         }
-        return true;
+        return null;
     }
 
     fn check_enabled_invariants(self: *Checker, state_idx: u32, enabled: bool) !void {
@@ -4949,7 +6610,7 @@ pub const Checker = struct {
                     self.successor_attempts,
                     self.distinct,
                 });
-                self.print_trace(state_idx);
+                if (self.diagnostics) self.print_trace(state_idx);
                 return Error.InvariantViolated;
             }
         }
@@ -5098,6 +6759,7 @@ pub const Checker = struct {
     }
 
     pub fn dump_fingerprints(self: *Checker, path: [:0]const u8) !void {
+        if (self.exploration_storage_released) return Error.NotImplemented;
         if (self.state_fingerprints.len < self.state_store.count) {
             return Error.NotImplemented;
         }
@@ -5142,7 +6804,7 @@ pub const Checker = struct {
                 try writer.print("{d} {d} {d}\n", .{
                     source + 1,
                     target + 1,
-                    self.edge_action_masks[edge],
+                    self.edge_action_masks.get(edge),
                 });
             }
         }
@@ -5340,9 +7002,16 @@ pub const Result = struct {
     error_state: ?u32,
 };
 
+pub const SimulationOptions = struct {
+    trace_count: u64,
+    trace_depth: u32 = 100,
+    seed: u64 = 0x544c_5a49_475f_5349,
+};
+
 const SpecParts = struct {
     init: []const u8,
     next: *ast.Expr,
+    allows_stuttering: bool,
 };
 
 fn resolve_definition(module: ast.Module, name: []const u8) ?*ast.Expr {
@@ -5517,6 +7186,7 @@ fn collect_fairness(
                     .kind = if (is_weak) .weak else .strong,
                     .action = ap.args[0],
                     .vars = subscripted.args[0],
+                    .source = expr,
                     .full_vars = false,
                     .bindings = saved_bindings,
                 });
@@ -5534,6 +7204,7 @@ fn collect_fairness(
                         .kind = .weak,
                         .action = ap.args[0],
                         .vars = try expr_ident(arena, vars_name),
+                        .source = expr,
                         .full_vars = full_vars,
                         .bindings = saved_bindings,
                     });
@@ -5549,6 +7220,7 @@ fn collect_fairness(
                         .kind = .strong,
                         .action = ap.args[0],
                         .vars = try expr_ident(arena, vars_name),
+                        .source = expr,
                         .full_vars = full_vars,
                         .bindings = saved_bindings,
                     });
@@ -5696,6 +7368,49 @@ fn extract_fairness(
     return result;
 }
 
+fn extract_fairness_exprs(
+    arena: *Arena,
+    evaluator: *Evaluator,
+    eval_pool: *ValuePool,
+    state_pool: *ValuePool,
+    expressions: []const *ast.Expr,
+) ![]const FairnessCondition {
+    var list = std.ArrayList(FairnessCondition).empty;
+    defer list.deinit(std.heap.page_allocator);
+    for (expressions) |expression| {
+        var definition_path: [64]*ast.Expr = undefined;
+        definition_path[0] = expression;
+        try collect_fairness(
+            arena,
+            evaluator,
+            eval_pool,
+            state_pool,
+            expression,
+            &.{},
+            &list,
+            &definition_path,
+            1,
+        );
+    }
+    const result = try arena.alloc(FairnessCondition, list.items.len);
+    @memcpy(result, list.items);
+    return result;
+}
+
+fn concat_fairness(
+    arena: *Arena,
+    assumptions: []const FairnessCondition,
+    properties: []const FairnessCondition,
+) ![]const FairnessCondition {
+    const result = try arena.alloc(
+        FairnessCondition,
+        assumptions.len + properties.len,
+    );
+    @memcpy(result[0..assumptions.len], assumptions);
+    @memcpy(result[assumptions.len..], properties);
+    return result;
+}
+
 fn build_fairness_markers(
     arena: *Arena,
     fairness: []const FairnessCondition,
@@ -5711,6 +7426,228 @@ fn build_fairness_markers(
         };
     }
     return markers;
+}
+
+fn fairness_marker_action_shape(expr: *const ast.Expr, depth: u8) bool {
+    if (depth == 64) return false;
+    return switch (expr.*) {
+        .ident => true,
+        .apply => |ap| ap.func.* == .ident,
+        .quantifier => |quantifier| quantifier.kind == .exists and
+            fairness_marker_action_shape(quantifier.body, depth + 1),
+        .binary => |binary| binary.op == .or_op and
+            fairness_marker_action_shape(binary.left, depth + 1) and
+            fairness_marker_action_shape(binary.right, depth + 1),
+        else => false,
+    };
+}
+
+fn fairness_marker_expr_equal(
+    left: *const ast.Expr,
+    right: *const ast.Expr,
+    depth: u8,
+) bool {
+    if (left == right) return true;
+    if (depth == 64) return false;
+    return switch (left.*) {
+        .ident => |name| right.* == .ident and
+            std.mem.eql(u8, name, right.ident),
+        .bool_literal => |value| right.* == .bool_literal and
+            value == right.bool_literal,
+        .int_literal => |value| right.* == .int_literal and
+            value == right.int_literal,
+        .string_literal => |value| right.* == .string_literal and
+            std.mem.eql(u8, value, right.string_literal),
+        .apply => |application| blk: {
+            if (right.* != .apply or
+                application.args.len != right.apply.args.len or
+                !fairness_marker_expr_equal(
+                    application.func,
+                    right.apply.func,
+                    depth + 1,
+                ))
+            {
+                break :blk false;
+            }
+            for (application.args, right.apply.args) |left_arg, right_arg| {
+                if (!fairness_marker_expr_equal(
+                    left_arg,
+                    right_arg,
+                    depth + 1,
+                )) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn fairness_marker_quantifiers_equal(
+    left: *const ast.Quantifier,
+    right: *const ast.Quantifier,
+    depth: u8,
+) bool {
+    if (left.kind != .exists or
+        right.kind != .exists or
+        left.vars.len != right.vars.len)
+    {
+        return false;
+    }
+    for (left.vars, right.vars) |left_var, right_var| {
+        if (!std.mem.eql(u8, left_var.name, right_var.name) or
+            !fairness_marker_expr_equal(
+                left_var.domain,
+                right_var.domain,
+                depth + 1,
+            ))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn next_contains_fairness_action(
+    evaluator: *const Evaluator,
+    fairness_action: *const ast.Expr,
+    next_action: *const ast.Expr,
+    depth: u8,
+) bool {
+    if (depth == 64) return false;
+    if (fairness_marker_expr_equal(fairness_action, next_action, depth)) {
+        return switch (fairness_action.*) {
+            .ident => |name| blk: {
+                const resolved = evaluator.resolve_alias(name);
+                if (!std.mem.eql(u8, resolved, name)) break :blk false;
+                const definition = evaluator.find_definition(name) orelse
+                    break :blk false;
+                break :blk definition.params.len == 0;
+            },
+            .apply => |application| blk: {
+                if (application.func.* != .ident) break :blk false;
+                const name = application.func.ident;
+                const resolved = evaluator.resolve_alias(name);
+                if (!std.mem.eql(u8, resolved, name)) break :blk false;
+                const definition = evaluator.find_definition(name) orelse
+                    break :blk false;
+                break :blk definition.params.len == application.args.len;
+            },
+            else => false,
+        };
+    }
+    return switch (next_action.*) {
+        .ident => |name| blk: {
+            const resolved = evaluator.resolve_alias(name);
+            const definition = evaluator.find_definition(resolved) orelse
+                break :blk false;
+            if (definition.params.len != 0) break :blk false;
+            break :blk next_contains_fairness_action(
+                evaluator,
+                fairness_action,
+                definition.body,
+                depth + 1,
+            );
+        },
+        .binary => |binary| binary.op == .or_op and
+            (next_contains_fairness_action(
+                evaluator,
+                fairness_action,
+                binary.left,
+                depth + 1,
+            ) or next_contains_fairness_action(
+                evaluator,
+                fairness_action,
+                binary.right,
+                depth + 1,
+            )),
+        .quantifier => |quantifier| quantifier.kind == .exists and
+            next_contains_fairness_action(
+                evaluator,
+                fairness_action,
+                quantifier.body,
+                depth + 1,
+            ),
+        else => false,
+    };
+}
+
+fn fairness_marker_action_covered(
+    evaluator: *const Evaluator,
+    fairness_action: *const ast.Expr,
+    next_action: *const ast.Expr,
+    depth: u8,
+) bool {
+    if (depth == 64 or
+        !fairness_marker_action_shape(fairness_action, depth))
+    {
+        return false;
+    }
+    return switch (fairness_action.*) {
+        .ident, .apply => next_contains_fairness_action(
+            evaluator,
+            fairness_action,
+            next_action,
+            depth + 1,
+        ),
+        .quantifier => |fairness_quantifier| blk: {
+            var candidate = next_action;
+            var candidate_depth = depth;
+            while (candidate.* == .ident and candidate_depth < 64) {
+                const resolved = evaluator.resolve_alias(candidate.ident);
+                const definition = evaluator.find_definition(resolved) orelse
+                    break;
+                if (definition.params.len != 0) break;
+                candidate = definition.body;
+                candidate_depth += 1;
+            }
+            if (candidate.* != .quantifier or
+                !fairness_marker_quantifiers_equal(
+                    fairness_quantifier,
+                    candidate.quantifier,
+                    candidate_depth,
+                ))
+            {
+                break :blk false;
+            }
+            break :blk fairness_marker_action_covered(
+                evaluator,
+                fairness_quantifier.body,
+                candidate.quantifier.body,
+                candidate_depth + 1,
+            );
+        },
+        .binary => |binary| fairness_marker_action_covered(
+            evaluator,
+            binary.left,
+            next_action,
+            depth + 1,
+        ) and fairness_marker_action_covered(
+            evaluator,
+            binary.right,
+            next_action,
+            depth + 1,
+        ),
+        else => unreachable,
+    };
+}
+
+fn fairness_markers_cover_actions(
+    evaluator: *const Evaluator,
+    fairness: []const FairnessCondition,
+    next_action: ?*const ast.Expr,
+) bool {
+    const next = next_action orelse return fairness.len == 0;
+    for (fairness) |condition| {
+        if (!fairness_marker_action_covered(
+            evaluator,
+            condition.action,
+            next,
+            0,
+        )) {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn extract_spec_parts(module: ast.Module, spec_name: []const u8) !SpecParts {
@@ -5753,7 +7690,11 @@ fn extract_spec_parts_expr(
                     path,
                     next_depth,
                 )) |next| {
-                    return .{ .init = init, .next = next };
+                    return .{
+                        .init = init,
+                        .next = next,
+                        .allows_stuttering = true,
+                    };
                 }
             }
             return extract_spec_parts_expr(
@@ -6204,6 +8145,54 @@ test "spec extraction preserves a quantified next action" {
     try std.testing.expectEqual(ast.QuantifierKind.exists, parts.next.quantifier.kind);
     try std.testing.expectEqual(@as(usize, 1), parts.next.quantifier.vars.len);
     try std.testing.expectEqualStrings("n", parts.next.quantifier.vars[0].name);
+}
+
+test "fairness marker coverage accepts only compiler-marked action shapes" {
+    var left = ast.Expr{ .ident = "Left" };
+    var right = ast.Expr{ .ident = "Right" };
+    var disjunction = ast.Binary{
+        .op = .or_op,
+        .left = &left,
+        .right = &right,
+    };
+    var disjunction_expr = ast.Expr{ .binary = &disjunction };
+    try std.testing.expect(fairness_marker_action_shape(
+        &disjunction_expr,
+        0,
+    ));
+
+    var domain = ast.Expr{ .ident = "Domain" };
+    const variables = [_]ast.BoundVar{.{
+        .name = "item",
+        .domain = &domain,
+    }};
+    var existential = ast.Quantifier{
+        .kind = .exists,
+        .vars = &variables,
+        .body = &disjunction_expr,
+    };
+    var existential_expr = ast.Expr{ .quantifier = &existential };
+    try std.testing.expect(fairness_marker_action_shape(
+        &existential_expr,
+        0,
+    ));
+
+    var conjunction = ast.Binary{
+        .op = .and_op,
+        .left = &left,
+        .right = &right,
+    };
+    var conjunction_expr = ast.Expr{ .binary = &conjunction };
+    try std.testing.expect(!fairness_marker_action_shape(
+        &conjunction_expr,
+        0,
+    ));
+
+    existential.kind = .forall;
+    try std.testing.expect(!fairness_marker_action_shape(
+        &existential_expr,
+        0,
+    ));
 }
 
 test "spec extraction ignores boxed actions nested in fairness" {

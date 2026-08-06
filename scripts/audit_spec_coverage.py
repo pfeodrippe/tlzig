@@ -29,6 +29,8 @@ TLZIG_COUNT_RE = re.compile(r"generated=(\d+) distinct=(\d+)")
 SIMULATION_DEPTH = 100
 SIMULATION_SEED = 0x544C5A49475F5349
 SIMULATION_MAX_STATES = 1_000_000
+TLC_FINGERPRINT_INDEX = 0
+TLC_MODEL_CHECK_SEED = 0
 
 # Local cfgs exercise upstream modules without copying the TLA+ source.
 LOCAL_CONFIG_MODULES = {
@@ -261,7 +263,7 @@ def run_tlc(
                 str(SIMULATION_SEED),
             ]
             if simulation_trace_count is not None
-            else []
+            else ["-seed", str(TLC_MODEL_CHECK_SEED)]
         )
         argv = ["java", *java_options,
             f"-Xmx{xmx}",
@@ -269,6 +271,8 @@ def run_tlc(
             classpath,
             "-Dtlc2.tool.impl.Tool.cdot=true",
             "tlc2.TLC",
+            "-fp",
+            str(TLC_FINGERPRINT_INDEX),
             "-metadir",
             metadir,
             "-workers",
@@ -591,7 +595,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--corpus", action="append", dest="corpora")
     parser.add_argument("--filter")
-    parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help=(
+            "number of independent cfg audits; defaults to one because each "
+            "engine run uses all cores"
+        ),
+    )
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--resolve-timeout", type=int, default=10)
     parser.add_argument("--max-states", type=int, default=200_000)
@@ -607,9 +619,9 @@ def main() -> int:
     )
     parser.add_argument("--arena-bytes", type=int, default=1_073_741_824)
     parser.add_argument("--eval-arena-bytes", type=int, default=1_073_741_824)
-    parser.add_argument("--tlc-workers", default="1")
+    parser.add_argument("--tlc-workers", default="auto")
     parser.add_argument("--tlc-xmx", default="1536m")
-    parser.add_argument("--tlzig-workers", default="1")
+    parser.add_argument("--tlzig-workers", default="auto")
     parser.add_argument("--output", type=Path, default=ROOT / "coverage_results/primary.jsonl")
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument(

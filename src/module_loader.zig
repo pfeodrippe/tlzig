@@ -1008,6 +1008,7 @@ fn copy_expr(arena: *Arena, expr: *const ast.Expr, subs: []const ast.Substitutio
         .box_action => |ba| {
             const bp = try arena.alloc_object(ast.BoxAction);
             bp.* = .{
+                .kind = ba.kind,
                 .action = try copy_expr(arena, ba.action, subs),
                 .vars = try copy_expr(arena, ba.vars, subs),
             };

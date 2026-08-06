@@ -260,6 +260,7 @@ pub const IrCaseExpr = struct {
 };
 
 pub const IrBoxAction = struct {
+    kind: ast.BoxAction.Kind,
     action: *IrExpr,
     vars: *IrExpr,
 };
@@ -744,7 +745,7 @@ pub const Resolver = struct {
                 const action = try self.resolve(ba.action);
                 const vars = try self.resolve(ba.vars);
                 const irba = try self.arena.alloc_object(IrBoxAction);
-                irba.* = .{ .action = action, .vars = vars };
+                irba.* = .{ .kind = ba.kind, .action = action, .vars = vars };
                 return try self.alloc_expr(.{ .box_action = irba });
             },
 

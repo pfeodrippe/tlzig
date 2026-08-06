@@ -58,6 +58,10 @@ const ParallelState = struct {
         .{}
     else
         std.c.PTHREAD_MUTEX_INITIALIZER,
+    canonical_mutex: CommitMutex = if (builtin.os.tag == .macos)
+        .{}
+    else
+        std.c.PTHREAD_MUTEX_INITIALIZER,
     condition: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
     active: u32 = 0,
     current_level: u32 = 0,
@@ -83,6 +87,7 @@ const TemporalEvaluation = union(enum) {
     },
     enabled_action: *ast.Expr,
     box_action: struct {
+        kind: ast.BoxAction.Kind,
         action: *ast.Expr,
         vars: *ast.Expr,
     },
@@ -226,6 +231,22 @@ fn parallel_commit_unlock(parallel: *ParallelState) void {
         std.c.os_unfair_lock_unlock(&parallel.commit_mutex);
     } else {
         assert(std.c.pthread_mutex_unlock(&parallel.commit_mutex) == .SUCCESS);
+    }
+}
+
+fn parallel_canonical_lock(parallel: *ParallelState) void {
+    if (comptime builtin.os.tag == .macos) {
+        std.c.os_unfair_lock_lock(&parallel.canonical_mutex);
+    } else {
+        assert(std.c.pthread_mutex_lock(&parallel.canonical_mutex) == .SUCCESS);
+    }
+}
+
+fn parallel_canonical_unlock(parallel: *ParallelState) void {
+    if (comptime builtin.os.tag == .macos) {
+        std.c.os_unfair_lock_unlock(&parallel.canonical_mutex);
+    } else {
+        assert(std.c.pthread_mutex_unlock(&parallel.canonical_mutex) == .SUCCESS);
     }
 }
 
@@ -449,59 +470,98 @@ fn parallel_worker(
                 break :process_batch;
             }
 
-            parallel_commit_lock(parallel);
-            parallel_lock(parallel);
+            const parallel_graph_fast_path = checker.graph_enabled and
+                !deterministic_view and
+                !checker.has_enabled_invariants;
             var commit_error: ?Error = generation_error;
-            if (commit_error == null) commit_error = parallel.failure;
-            parallel_unlock(parallel);
-            if (commit_error == null and checker.check_deadlock and
-                worker.prepared_generated == 0)
-            {
-                if (checker.diagnostics) {
-                    std.debug.print(
-                        "Deadlock generated={d} distinct={d}\n",
-                        .{ checker.successor_attempts, checker.distinct },
-                    );
-                    checker.print_trace(state_idx);
-                }
-                commit_error = Error.Deadlock;
-            } else if (commit_error == null) {
-                checker.successor_attempts += worker.prepared_generated;
-                checker.committed_generated += worker.composition_generated;
-                if (checker.graph_enabled) {
-                    checker.succ_offsets[state_idx] = checker.succ_count;
-                }
-                checker.check_enabled_invariants(
-                    state_idx,
-                    worker.out_states.items.len > 0,
-                ) catch |err| {
-                    commit_error = err;
-                };
-                if (commit_error == null) {
-                    checker.process_prepared_generated(
+            if (parallel_graph_fast_path) {
+                parallel_lock(parallel);
+                if (commit_error == null) commit_error = parallel.failure;
+                parallel_unlock(parallel);
+                if (commit_error == null and checker.check_deadlock and
+                    worker.prepared_generated == 0)
+                {
+                    if (checker.diagnostics) {
+                        std.debug.print(
+                            "Deadlock generated={d} distinct={d}\n",
+                            .{ checker.successor_attempts, checker.distinct },
+                        );
+                        checker.print_trace(state_idx);
+                    }
+                    commit_error = Error.Deadlock;
+                } else if (commit_error == null) {
+                    parallel_commit_lock(parallel);
+                    checker.successor_attempts += worker.prepared_generated;
+                    checker.committed_generated += worker.composition_generated;
+                    parallel_commit_unlock(parallel);
+                    checker.process_prepared_graphed_parallel(
+                        parallel,
                         state_idx,
                         &worker.out_states,
                         &worker.new_states,
                         &worker.candidate_store,
                         worker.prepared_fingerprints,
-                        worker.prepared_view_ranks,
                         worker.prepared_edge_masks,
                         &worker.candidate_hash_cache,
+                        &worker.source_snapshot,
                     ) catch |err| {
                         commit_error = err;
                     };
                 }
-                // The canonical backing arrays are stable while workers run, but
-                // state and pool counters are mutated by every commit. Capture
-                // both while serialized so invariant readers use one immutable
-                // view after releasing the lock.
-                worker.source_snapshot = checker.state_store;
+            } else {
+                parallel_commit_lock(parallel);
+                parallel_lock(parallel);
+                if (commit_error == null) commit_error = parallel.failure;
+                parallel_unlock(parallel);
+                if (commit_error == null and checker.check_deadlock and
+                    worker.prepared_generated == 0)
+                {
+                    if (checker.diagnostics) {
+                        std.debug.print(
+                            "Deadlock generated={d} distinct={d}\n",
+                            .{ checker.successor_attempts, checker.distinct },
+                        );
+                        checker.print_trace(state_idx);
+                    }
+                    commit_error = Error.Deadlock;
+                } else if (commit_error == null) {
+                    checker.successor_attempts += worker.prepared_generated;
+                    checker.committed_generated += worker.composition_generated;
+                    if (checker.graph_enabled) {
+                        checker.succ_offsets[state_idx] = checker.succ_count;
+                    }
+                    checker.check_enabled_invariants(
+                        state_idx,
+                        worker.out_states.items.len > 0,
+                    ) catch |err| {
+                        commit_error = err;
+                    };
+                    if (commit_error == null) {
+                        checker.process_prepared_generated(
+                            state_idx,
+                            &worker.out_states,
+                            &worker.new_states,
+                            &worker.candidate_store,
+                            worker.prepared_fingerprints,
+                            worker.prepared_view_ranks,
+                            worker.prepared_edge_masks,
+                            &worker.candidate_hash_cache,
+                        ) catch |err| {
+                            commit_error = err;
+                        };
+                    }
+                    // The canonical backing arrays are stable while workers run,
+                    // but state and pool counters are mutated by every commit.
+                    // Capture both while serialized so invariant readers use one
+                    // immutable view after releasing the lock.
+                    worker.source_snapshot = checker.state_store;
+                }
+                parallel_commit_unlock(parallel);
             }
 
-            // Canonical publication is serialized, but invariant evaluation is
-            // read-only and may proceed in parallel. New states are not queued
-            // until every invariant has passed.
-            parallel_commit_unlock(parallel);
+            // Canonical publication is serialized in short critical sections,
+            // while invariant evaluation is read-only and proceeds in parallel.
+            // New states are not queued until every invariant has passed.
             if (commit_error == null and !deterministic_view) {
                 checker.check_new_state_invariants(
                     &worker.evaluator,
@@ -549,7 +609,35 @@ pub const FairnessCondition = struct {
     bindings: []const FairnessBinding = &.{},
 };
 
+const EventualAlwaysCondition = struct {
+    kind: ast.BoxAction.Kind,
+    action: *ast.Expr,
+    vars: *ast.Expr,
+    bindings: []const FairnessBinding = &.{},
+};
+
 pub const FairnessBinding = action.FairnessBinding;
+
+fn fairness_context(
+    evaluator: *Evaluator,
+    eval_pool: *ValuePool,
+    source_pool: *const ValuePool,
+    bindings: []const FairnessBinding,
+) Error!Context {
+    var context = Context.empty();
+    for (bindings) |binding| {
+        const local_value = try binding.value.clone(
+            source_pool,
+            eval_pool,
+        );
+        context = try evaluator.extend_context(
+            context,
+            binding.name,
+            local_value,
+        );
+    }
+    return context;
+}
 
 const SymmetryHashCache = struct {
     const Entry = struct {
@@ -742,6 +830,11 @@ fn value_identity(value_v: Value) u64 {
         .cup_v, .cap_v, .diff_v => |set| tag ^
             (@as(u64, set.left_offset) << 32) ^
             set.right_offset,
+        .set_delta_v => |set| tag ^
+            (@as(u64, set.base_offset) << 32) ^
+            set.additions_offset ^
+            (@as(u64, set.additions_len) << 16) ^
+            set.depth,
         .range_v => |range| tag ^
             @as(u64, @bitCast(range.lo)) ^
             (@as(u64, @bitCast(range.hi)) *%
@@ -870,6 +963,19 @@ const CanonicalValueEntry = struct {
     string_count: u32 = 0,
 };
 
+const canonical_value_segment_max = 4;
+
+const CanonicalValueSegment = struct {
+    entries: ?[]CanonicalValueEntry = null,
+    count: u32 = 0,
+};
+
+pub const CanonicalValueStats = struct {
+    entries: u32,
+    capacity: usize,
+    segments: u8,
+};
+
 fn effective_canonical_hash(hash: fingerprint.Fingerprint) fingerprint.Fingerprint {
     return if (hash == 0) 0xdeadbeef else hash;
 }
@@ -887,8 +993,32 @@ fn canonical_value_capacity(max_states: u32, graph_enabled: bool) u32 {
         16_777_216
     else
         8_388_608;
+    return canonical_value_capacity_with_limit(
+        max_states,
+        graph_enabled,
+        safety_capacity_limit,
+    );
+}
+
+fn canonical_value_capacity_with_limit(
+    max_states: u32,
+    graph_enabled: bool,
+    safety_capacity_limit: u64,
+) u32 {
+    assert(max_states > 0);
+    assert(safety_capacity_limit >= 1024);
+    assert(std.math.isPowerOfTwo(safety_capacity_limit));
+    // Small temporal graphs favor the cache-local 2 Mi-entry table. Large
+    // configured graphs need enough slots to avoid the much worse failure
+    // mode where every later aggregate miss clones a complete value tree.
+    const graph_capacity_limit: u64 = if (max_states > 64 * 1024 * 1024)
+        16_777_216
+    else if (max_states > 16 * 1024 * 1024)
+        8_388_608
+    else
+        2_097_152;
     const capacity_limit = if (graph_enabled)
-        @min(safety_capacity_limit, 2_097_152)
+        @min(safety_capacity_limit, graph_capacity_limit)
     else
         safety_capacity_limit;
     const target = @min(
@@ -900,6 +1030,33 @@ fn canonical_value_capacity(max_states: u32, graph_enabled: bool) u32 {
     assert(std.math.isPowerOfTwo(capacity));
     assert(capacity <= capacity_limit);
     return capacity;
+}
+
+test "large temporal graphs provision canonical aggregate reuse" {
+    try std.testing.expectEqual(
+        @as(u32, 2_097_152),
+        canonical_value_capacity_with_limit(
+            16 * 1024 * 1024,
+            true,
+            8_388_608,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 8_388_608),
+        canonical_value_capacity_with_limit(
+            30 * 1024 * 1024,
+            true,
+            8_388_608,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 16_777_216),
+        canonical_value_capacity_with_limit(
+            250 * 1024 * 1024,
+            true,
+            16_777_216,
+        ),
+    );
 }
 
 const default_graph_edges_per_state: u32 = 32;
@@ -1113,6 +1270,40 @@ fn view_projection_fingerprint(
 }
 
 pub const Checker = struct {
+    const FairnessEnabledProbeContext = struct {
+        checker: *Checker,
+        condition: FairnessCondition,
+        candidate_parent: ?StateStore.State,
+
+        fn matches(
+            raw_context: *anyopaque,
+            parent: *StateStore.State,
+            candidate: *StateStore.State,
+            source_store: *StateStore,
+            candidate_store: *StateStore,
+        ) Error!bool {
+            const context: *FairnessEnabledProbeContext = @ptrCast(
+                @alignCast(raw_context),
+            );
+            const checker = context.checker;
+            assert(source_store == &checker.state_store);
+            assert(candidate_store == &checker.candidate_store);
+            if (context.condition.full_vars) {
+                return !states_equal_cross_pool(
+                    parent,
+                    &source_store.values_pool,
+                    candidate,
+                    &candidate_store.values_pool,
+                );
+            }
+            return !try checker.fairness_vars_equal_in_candidate_pool(
+                context.condition,
+                &(context.candidate_parent orelse unreachable),
+                candidate,
+            );
+        }
+    };
+
     const InitialCandidateSinkContext = struct {
         checker: *Checker,
         candidate_store: *StateStore,
@@ -1155,13 +1346,15 @@ pub const Checker = struct {
     view_bfs_orders: []u32,
     view_queue_scratch: []u32,
     symmetry_hash_cache: SymmetryHashCache,
-    canonical_value_entries: []CanonicalValueEntry,
+    canonical_value_segments: [canonical_value_segment_max]CanonicalValueSegment,
+    canonical_value_segment_count: u8,
     canonical_value_count: u32,
     evaluator: Evaluator,
     init_spec: ?action.CompiledInit,
     next_spec: ?action.CompiledNext,
     invariants: []const *ast.Expr,
     invariant_names: []const []const u8,
+    last_invariant_failure_name: ?[]const u8,
     invariant_contains_enabled: []const bool,
     has_enabled_invariants: bool,
     constraints: []const *ast.Expr,
@@ -1202,9 +1395,13 @@ pub const Checker = struct {
     behavior_allows_stuttering: bool,
     // Fairness conditions extracted from the specification formula.
     fairness: []const FairnessCondition,
+    fairness_actions: []const action.CompiledNext,
+    fairness_enabled_masks: []u64,
     assumption_fairness_count: u8,
     fairness_markers: []const action.FairnessMarker,
     fairness_markers_exact: bool,
+    eventual_always: []const EventualAlwaysCondition,
+    eventual_always_edge_masks: EdgeActionMasks,
     symmetry_permutations: []const []const u32,
     view_name: ?[]const u8,
     view_projection: ?ViewProjection,
@@ -1711,6 +1908,10 @@ pub const Checker = struct {
             canonical_value_capacity(max_states, graph_enabled),
         );
         @memset(canonical_value_entries, .{});
+        var canonical_value_segments = std.mem.zeroes(
+            [canonical_value_segment_max]CanonicalValueSegment,
+        );
+        canonical_value_segments[0].entries = canonical_value_entries;
         const graph_states: u32 = if (graph_enabled) max_states else 0;
         const succ_cap = try graph_edge_capacity(
             graph_enabled,
@@ -1756,16 +1957,66 @@ pub const Checker = struct {
             property_fairness,
         );
         if (fairness.len > @bitSizeOf(u64)) return Error.NotImplemented;
-        const fairness_markers = try build_fairness_markers(arena, fairness);
+        const fairness_actions = try arena.alloc(
+            action.CompiledNext,
+            fairness.len,
+        );
+        for (fairness, fairness_actions) |condition, *compiled| {
+            compiled.* = try compiler.compile_next(condition.action);
+        }
+        const fairness_enabled_masks = try arena.alloc(u64, graph_states);
+        @memset(fairness_enabled_masks, 0);
+        const fairness_marker_build = try build_fairness_markers(
+            arena,
+            &evaluator,
+            fairness,
+            next_expr_v,
+        );
+        const fairness_markers = fairness_marker_build.markers;
         const edge_action_masks = try EdgeActionMasks.init(
             arena,
             succ_cap,
             fairness.len,
         );
-        const fairness_markers_exact = fairness_markers_cover_actions(
-            &evaluator,
-            fairness,
-            next_expr_v,
+        // A marker reached inside action composition describes an intermediate
+        // transition,
+        // not necessarily the composed edge from the original state to B's
+        // result. Re-evaluate fairness on final graph edges in that case.
+        const fairness_markers_exact = fairness_marker_build.complete and
+            if (compiled_next) |next|
+                !action.steps_contain_composition(next.steps)
+            else
+                true;
+        if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+            std.debug.print(
+                "FAIRNESS markers={d} complete={}\n",
+                .{ fairness_markers.len, fairness_markers_exact },
+            );
+        }
+        const eventual_always = if (graph_enabled)
+            if (spec_name_v) |spec_name|
+                try extract_eventual_always_conditions(
+                    arena,
+                    &evaluator,
+                    &eval_pool,
+                    &state_store.values_pool,
+                    spec_name,
+                )
+            else
+                &[_]EventualAlwaysCondition{}
+        else
+            &[_]EventualAlwaysCondition{};
+        if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+            std.debug.print(
+                "EVENTUAL_ALWAYS specification={s} conditions={d}\n",
+                .{ spec_name_v orelse "<none>", eventual_always.len },
+            );
+        }
+        if (eventual_always.len > @bitSizeOf(u64)) return Error.NotImplemented;
+        const eventual_always_edge_masks = try EdgeActionMasks.init(
+            arena,
+            succ_cap,
+            eventual_always.len,
         );
         return Checker{
             .arena = arena,
@@ -1783,13 +2034,15 @@ pub const Checker = struct {
             .view_bfs_orders = view_bfs_orders,
             .view_queue_scratch = view_queue_scratch,
             .symmetry_hash_cache = symmetry_hash_cache,
-            .canonical_value_entries = canonical_value_entries,
+            .canonical_value_segments = canonical_value_segments,
+            .canonical_value_segment_count = 1,
             .canonical_value_count = 0,
             .evaluator = evaluator,
             .init_spec = compiled_init,
             .next_spec = compiled_next,
             .invariants = invariants,
             .invariant_names = invariant_names,
+            .last_invariant_failure_name = null,
             .invariant_contains_enabled = invariant_contains_enabled,
             .has_enabled_invariants = has_enabled_invariants,
             .constraints = constraints,
@@ -1827,9 +2080,13 @@ pub const Checker = struct {
             else
                 false,
             .fairness = fairness,
+            .fairness_actions = fairness_actions,
+            .fairness_enabled_masks = fairness_enabled_masks,
             .assumption_fairness_count = @intCast(assumption_fairness.len),
             .fairness_markers = fairness_markers,
             .fairness_markers_exact = fairness_markers_exact,
+            .eventual_always = eventual_always,
+            .eventual_always_edge_masks = eventual_always_edge_masks,
             .symmetry_permutations = symmetry_permutations,
             .view_name = cfg.view_name,
             .view_projection = view_projection,
@@ -1876,6 +2133,22 @@ pub const Checker = struct {
         self.scratch_growable = growable;
         self.eval_pool.growable = growable;
         self.candidate_store.values_pool.growable = growable;
+    }
+
+    pub fn invariant_failure_name(self: *const Checker) ?[]const u8 {
+        return self.last_invariant_failure_name;
+    }
+
+    pub fn canonical_value_stats(self: *const Checker) CanonicalValueStats {
+        return .{
+            .entries = self.canonical_value_count,
+            .capacity = self.canonical_value_capacity_total(),
+            .segments = @atomicLoad(
+                u8,
+                &self.canonical_value_segment_count,
+                .acquire,
+            ),
+        };
     }
 
     fn generate_initial_states(
@@ -2239,6 +2512,20 @@ pub const Checker = struct {
             candidate.pred = parent_idx;
             candidate.level = self.state_store.get(parent_idx).level + 1;
             const snapshot = self.eval_pool.snapshot();
+            if (self.graph_enabled and self.fairness.len > 0) {
+                const recorded_angle =
+                    try self.candidate_recorded_fairness_angle_mask(
+                        &self.candidate_evaluator,
+                        &self.eval_pool,
+                        self.state_store.get(parent_idx),
+                        &self.state_store.values_pool,
+                        parent,
+                        candidate,
+                        &self.candidate_store.values_pool,
+                        edge_masks[prepared_index],
+                    );
+                edge_masks[prepared_index] = recorded_angle;
+            }
             const constraints_hold = try self.check_candidate_constraints(
                 candidate,
                 &self.candidate_store,
@@ -2300,6 +2587,8 @@ pub const Checker = struct {
                         &self.candidate_store.values_pool,
                         edge_masks[prepared_index],
                     );
+                self.fairness_enabled_masks[parent_idx] |=
+                    edge_masks[prepared_index];
             }
             const invariants_hold = try self.check_invariants_with(
                 &self.candidate_evaluator,
@@ -2459,6 +2748,7 @@ pub const Checker = struct {
             assert(std.c.pthread_mutex_destroy(&parallel.mutex) == .SUCCESS);
             if (comptime builtin.os.tag != .macos) {
                 assert(std.c.pthread_mutex_destroy(&parallel.commit_mutex) == .SUCCESS);
+                assert(std.c.pthread_mutex_destroy(&parallel.canonical_mutex) == .SUCCESS);
             }
         }
         if (self.queue.peek()) |idx| {
@@ -2701,6 +2991,20 @@ pub const Checker = struct {
             candidate.level = self.state_store.get(parent_idx).level + 1;
             const snapshot = eval_pool.snapshot();
             defer eval_pool.restore(snapshot);
+            if (self.graph_enabled and self.fairness.len > 0) {
+                const recorded_angle =
+                    try self.candidate_recorded_fairness_angle_mask(
+                        candidate_evaluator,
+                        eval_pool,
+                        source_store.get(parent_idx),
+                        &source_store.values_pool,
+                        candidate_parent,
+                        candidate,
+                        &candidate_store.values_pool,
+                        prepared_edge_masks[candidate_index],
+                    );
+                prepared_edge_masks[candidate_index] = recorded_angle;
+            }
             if (!try self.check_candidate_constraints(
                 candidate,
                 candidate_store,
@@ -2739,6 +3043,8 @@ pub const Checker = struct {
                         &candidate_store.values_pool,
                         prepared_edge_masks[candidate_index],
                     );
+                self.fairness_enabled_masks[parent_idx] |=
+                    prepared_edge_masks[candidate_index];
             }
             const candidate_fp = try self.candidate_fingerprint(
                 parent_idx,
@@ -2879,6 +3185,113 @@ pub const Checker = struct {
         try self.record_successors(parent_idx, out_states, prepared_edge_masks);
     }
 
+    fn process_prepared_graphed_parallel(
+        self: *Checker,
+        parallel: *ParallelState,
+        parent_idx: u32,
+        out_states: *StateBuffer,
+        new_states: *StateBuffer,
+        candidate_store: *StateStore,
+        prepared_fingerprints: []const fingerprint.Fingerprint,
+        prepared_edge_masks: []u64,
+        candidate_hash_cache: *SymmetryHashCache,
+        canonical_snapshot: *StateStore,
+    ) !void {
+        assert(self.graph_enabled);
+        assert(self.view_name == null);
+        assert(!self.has_enabled_invariants);
+        assert(out_states.items.len <= prepared_fingerprints.len);
+        assert(out_states.items.len <= prepared_edge_masks.len);
+        assert(new_states.items.len == 0);
+
+        var kept_count: u32 = 0;
+        for (out_states.items, 0..) |*candidate_index, prepared_index| {
+            const candidate = candidate_store.get(candidate_index.*);
+            const state_fingerprint = prepared_fingerprints[prepared_index];
+            var canonical = self.fp_set.find(state_fingerprint);
+            var is_new = false;
+            if (canonical == null) {
+                assert(candidate.values.len <= 64);
+                var canonical_values: [64]Value = undefined;
+                for (candidate.values, 0..) |source, variable_index| {
+                    const changed = candidate.changed_mask &
+                        (@as(u64, 1) << @intCast(variable_index)) != 0;
+                    canonical_values[variable_index] = if (changed)
+                        try self.intern_canonical_value_parallel(
+                            parallel,
+                            source,
+                            &candidate_store.values_pool,
+                            @intCast(variable_index),
+                            self.state_store.get(parent_idx)
+                                .values[variable_index],
+                            candidate_hash_cache,
+                        )
+                    else
+                        self.state_store.get(parent_idx).values[variable_index];
+                }
+
+                parallel_commit_lock(parallel);
+                canonical = self.fp_set.find(state_fingerprint);
+                if (canonical == null) {
+                    const permanent_idx = self.store_prepared_candidate_state(
+                        candidate,
+                        canonical_values[0..candidate.values.len],
+                    ) catch |err| {
+                        parallel_commit_unlock(parallel);
+                        return err;
+                    };
+                    if (self.state_fingerprints.len > 0) {
+                        self.state_fingerprints[permanent_idx] =
+                            state_fingerprint;
+                    }
+                    assert(self.fp_set.put_with_index(
+                        state_fingerprint,
+                        permanent_idx,
+                    ) == null);
+                    self.distinct += 1;
+                    assert(self.distinct <= self.max_states_limit);
+                    self.canonical_states[permanent_idx] = true;
+                    canonical = permanent_idx;
+                    is_new = true;
+                }
+                parallel_commit_unlock(parallel);
+            }
+
+            const state_idx = canonical.?;
+            if (is_new) try new_states.append(state_idx);
+            if (deduplicate_successor(
+                out_states.items[0..kept_count],
+                prepared_edge_masks[0..kept_count],
+                state_idx,
+                prepared_edge_masks[prepared_index],
+            )) continue;
+            candidate_index.* = state_idx;
+            out_states.items[kept_count] = state_idx;
+            prepared_edge_masks[kept_count] =
+                prepared_edge_masks[prepared_index];
+            kept_count += 1;
+        }
+        out_states.shrink(kept_count);
+
+        parallel_canonical_lock(parallel);
+        parallel_commit_lock(parallel);
+        self.committed_generated += kept_count;
+        self.record_successors(
+            parent_idx,
+            out_states,
+            prepared_edge_masks,
+        ) catch |err| {
+            parallel_commit_unlock(parallel);
+            parallel_canonical_unlock(parallel);
+            return err;
+        };
+        canonical_snapshot.* = self.state_store;
+        assert(canonical_snapshot.count >= self.distinct);
+        self.maybe_report_progress();
+        parallel_commit_unlock(parallel);
+        parallel_canonical_unlock(parallel);
+    }
+
     fn process_prepared_ungraphed_parallel(
         self: *Checker,
         parallel: *ParallelState,
@@ -2931,6 +3344,8 @@ pub const Checker = struct {
                             source,
                             &candidate_store.values_pool,
                             @intCast(variable_index),
+                            self.state_store.get(parent_idx)
+                                .values[variable_index],
                             candidate_hash_cache,
                         ) catch |err| return err
                     else
@@ -2965,7 +3380,6 @@ pub const Checker = struct {
                     ) == null);
                     self.distinct += 1;
                     assert(self.distinct <= self.max_states_limit);
-                    self.maybe_report_progress();
                     canonical = permanent_idx;
                     is_new = true;
                 } else if (self.view_name != null and
@@ -3002,10 +3416,13 @@ pub const Checker = struct {
         }
         out_states.shrink(kept_count);
         if (new_states.items.len > 0) {
+            parallel_canonical_lock(parallel);
             parallel_commit_lock(parallel);
             canonical_snapshot.* = self.state_store;
             assert(canonical_snapshot.count >= self.distinct);
+            self.maybe_report_progress();
             parallel_commit_unlock(parallel);
+            parallel_canonical_unlock(parallel);
         }
         return kept_count;
     }
@@ -3061,10 +3478,11 @@ pub const Checker = struct {
             const changed = candidate.changed_mask &
                 (@as(u64, 1) << @intCast(variable_index)) != 0;
             target.* = if (changed)
-                try self.intern_canonical_value(
+                try self.intern_canonical_value_from_parent(
                     source,
                     &candidate_store.values_pool,
                     @intCast(variable_index),
+                    parent.values[variable_index],
                     candidate_hash_cache,
                 )
             else
@@ -3121,6 +3539,8 @@ pub const Checker = struct {
         if (owns_diagnostics) {
             parallel.failure_diagnostics_claimed = true;
             parallel.failure = Error.InvariantViolated;
+            self.last_invariant_failure_name =
+                self.invariant_names[failed_index];
         }
         parallel_unlock(parallel);
         if (!owns_diagnostics) return Error.InvariantViolated;
@@ -3177,6 +3597,23 @@ pub const Checker = struct {
                 candidate.level = self.state_store.get(pidx).level + 1;
             }
             const snap = self.eval_pool.snapshot();
+            if (parent_idx != null and
+                self.graph_enabled and
+                self.fairness.len > 0)
+            {
+                const recorded_angle =
+                    try self.candidate_recorded_fairness_angle_mask(
+                        candidate_evaluator,
+                        &self.eval_pool,
+                        self.state_store.get(parent_idx.?),
+                        &self.state_store.values_pool,
+                        candidate_parent,
+                        candidate,
+                        &candidate_store.values_pool,
+                        edge_masks[candidate_index],
+                    );
+                edge_masks[candidate_index] = recorded_angle;
+            }
             const constraints_hold = try self.check_candidate_constraints(
                 candidate,
                 candidate_store,
@@ -3235,6 +3672,8 @@ pub const Checker = struct {
                         &candidate_store.values_pool,
                         edge_masks[candidate_index],
                     );
+                self.fairness_enabled_masks[parent_idx.?] |=
+                    edge_masks[candidate_index];
             }
             const fp = try self.candidate_fingerprint(
                 parent_idx,
@@ -3616,11 +4055,15 @@ pub const Checker = struct {
                 self.state_store.values_pool.string_count,
                 self.state_store.values_pool.string_cap,
                 self.canonical_value_count,
-                self.canonical_value_entries.len,
+                self.canonical_value_capacity_total(),
                 self.succ_count,
                 self.succ_cap,
             },
         );
+    }
+
+    pub fn queued_state_count(self: *const Checker) u32 {
+        return self.queue.len();
     }
 
     fn clone_candidate_state(
@@ -3641,10 +4084,14 @@ pub const Checker = struct {
                 (candidate.changed_mask &
                     (@as(u64, 1) << @intCast(variable_index))) != 0;
             if (changed) {
-                target.* = try self.intern_canonical_value(
+                target.* = try self.intern_canonical_value_from_parent(
                     source,
                     &candidate_store.values_pool,
                     @intCast(variable_index),
+                    if (parent_idx) |index|
+                        self.state_store.get(index).values[variable_index]
+                    else
+                        null,
                     candidate_hash_cache,
                 );
                 if (builtin.mode == .debug or builtin.mode == .safe) {
@@ -3669,7 +4116,24 @@ pub const Checker = struct {
         variable_index: u16,
         source_hash_cache: *SymmetryHashCache,
     ) Error!Value {
-        const capacity = self.canonical_value_entries.len;
+        return self.intern_canonical_value_from_parent(
+            source,
+            source_pool,
+            variable_index,
+            null,
+            source_hash_cache,
+        );
+    }
+
+    fn intern_canonical_value_from_parent(
+        self: *Checker,
+        source: Value,
+        source_pool: *const ValuePool,
+        variable_index: u16,
+        parent: ?Value,
+        source_hash_cache: *SymmetryHashCache,
+    ) Error!Value {
+        const capacity = self.canonical_value_capacity_total();
         if (capacity == 0) {
             return source.clone(
                 source_pool,
@@ -3687,8 +4151,7 @@ pub const Checker = struct {
             else => {},
         }
         assert(capacity > 0);
-        assert(std.math.isPowerOfTwo(capacity));
-        assert(self.canonical_value_count <= canonical_value_load_limit(capacity));
+        assert(self.canonical_value_count <= self.canonical_value_load_limit_total());
         const hash = source_hash_cache.hash_value(
             source_pool,
             source,
@@ -3702,20 +4165,34 @@ pub const Checker = struct {
             hash,
         )) |canonical| return canonical;
 
-        const canonical = try self.clone_canonical_value(
-            source,
-            source_pool,
-            source_hash_cache,
-        );
-        if (self.canonical_value_count >= canonical_value_load_limit(capacity)) {
+        const canonical = if (parent) |parent_value|
+            try self.clone_canonical_set_delta(
+                source,
+                source_pool,
+                parent_value,
+                source_hash_cache,
+            ) orelse try self.clone_canonical_value(
+                source,
+                source_pool,
+                source_hash_cache,
+            )
+        else
+            try self.clone_canonical_value(
+                source,
+                source_pool,
+                source_hash_cache,
+            );
+        const segment = try self.canonical_value_insertion_segment() orelse
             return canonical;
-        }
+        const entries = segment.entries.?;
+        assert(entries.len > 0);
+        assert(std.math.isPowerOfTwo(entries.len));
         const mixed_hash = fingerprint.hash_combine(published_hash, variable_index);
-        const mask = capacity - 1;
+        const mask = entries.len - 1;
         var slot: usize = @intCast(mixed_hash & mask);
         var probes: usize = 0;
-        while (probes < @min(capacity, canonical_value_max_probe_count)) : (probes += 1) {
-            const entry = &self.canonical_value_entries[slot];
+        while (probes < @min(entries.len, canonical_value_max_probe_count)) : (probes += 1) {
+            const entry = &entries[slot];
             const entry_hash = @atomicLoad(
                 fingerprint.Fingerprint,
                 &entry.hash,
@@ -3726,8 +4203,10 @@ pub const Checker = struct {
                 entry.variable_index = variable_index;
                 entry.value_count = self.state_store.values_pool.value_count;
                 entry.string_count = self.state_store.values_pool.string_count;
+                segment.count += 1;
                 self.canonical_value_count += 1;
-                assert(self.canonical_value_count <= canonical_value_load_limit(capacity));
+                assert(segment.count <= canonical_value_load_limit(entries.len));
+                assert(self.canonical_value_count <= self.canonical_value_load_limit_total());
                 @atomicStore(
                     fingerprint.Fingerprint,
                     &entry.hash,
@@ -3755,6 +4234,200 @@ pub const Checker = struct {
             slot = (slot + 1) & mask;
         }
         return canonical;
+    }
+
+    fn canonical_value_insertion_segment(
+        self: *Checker,
+    ) Error!?*CanonicalValueSegment {
+        var segment_count = @atomicLoad(
+            u8,
+            &self.canonical_value_segment_count,
+            .acquire,
+        );
+        assert(segment_count > 0);
+        assert(segment_count <= canonical_value_segment_max);
+        const segment = &self.canonical_value_segments[segment_count - 1];
+        const entries = segment.entries.?;
+        if (segment.count < canonical_value_load_limit(entries.len)) {
+            return segment;
+        }
+        if (segment_count == canonical_value_segment_max) return null;
+        assert(!self.exploration_storage_released);
+
+        const next_entries = try self.exploration_arena.alloc(
+            CanonicalValueEntry,
+            entries.len,
+        );
+        @memset(next_entries, .{});
+        self.canonical_value_segments[segment_count] = .{
+            .entries = next_entries,
+            .count = 0,
+        };
+        segment_count += 1;
+        @atomicStore(
+            u8,
+            &self.canonical_value_segment_count,
+            segment_count,
+            .release,
+        );
+        return &self.canonical_value_segments[segment_count - 1];
+    }
+
+    fn canonical_value_capacity_total(self: *const Checker) usize {
+        const segment_count = @atomicLoad(
+            u8,
+            &self.canonical_value_segment_count,
+            .acquire,
+        );
+        assert(segment_count > 0);
+        assert(segment_count <= canonical_value_segment_max);
+        var capacity: usize = 0;
+        for (self.canonical_value_segments[0..segment_count]) |segment| {
+            capacity += segment.entries.?.len;
+        }
+        return capacity;
+    }
+
+    fn canonical_value_load_limit_total(self: *const Checker) usize {
+        const segment_count = @atomicLoad(
+            u8,
+            &self.canonical_value_segment_count,
+            .acquire,
+        );
+        assert(segment_count > 0);
+        assert(segment_count <= canonical_value_segment_max);
+        var limit: usize = 0;
+        for (self.canonical_value_segments[0..segment_count]) |segment| {
+            limit += canonical_value_load_limit(segment.entries.?.len);
+        }
+        return limit;
+    }
+
+    const canonical_set_delta_min_length: u32 = 4;
+    const canonical_set_delta_max_additions: u32 = 16;
+    const canonical_set_delta_max_depth: u16 = 32;
+
+    fn clone_canonical_set_delta(
+        self: *Checker,
+        source: Value,
+        source_pool: *const ValuePool,
+        parent: Value,
+        source_hash_cache: *SymmetryHashCache,
+    ) Error!?Value {
+        if (source != .set_v) return null;
+        const source_set = source.set_v;
+        if (source_set.len < canonical_set_delta_min_length) return null;
+
+        const parent_count = canonical_set_count(
+            parent,
+            &self.state_store.values_pool,
+        ) orelse return null;
+        if (parent_count > source_set.len) return null;
+        const parent_depth: u16 = switch (parent) {
+            .set_v => 0,
+            .set_delta_v => |delta| delta.depth,
+            else => return null,
+        };
+        if (parent_depth >= canonical_set_delta_max_depth) return null;
+
+        const source_items = source_set.items(source_pool);
+        var source_index: u32 = 0;
+        if (!canonical_set_matches_ordered_prefix(
+            parent,
+            &self.state_store.values_pool,
+            source_items,
+            source_pool,
+            &source_index,
+        )) return null;
+        assert(source_index == parent_count);
+        const addition_count = source_set.len - parent_count;
+        if (addition_count > canonical_set_delta_max_additions) return null;
+        if (addition_count == 0) return parent;
+
+        const target_pool = &self.state_store.values_pool;
+        const base_offset = try target_pool.push_value(parent);
+        const additions_offset = target_pool.value_count;
+        const additions = try target_pool.alloc_values(addition_count);
+        var addition_index: u32 = 0;
+        for (source_items[parent_count..]) |item| {
+            assert(addition_index < additions.len);
+            additions[addition_index] = try self.intern_canonical_value(
+                item,
+                source_pool,
+                canonical_subvalue_variable_index,
+                source_hash_cache,
+            );
+            addition_index += 1;
+        }
+        assert(addition_index == addition_count);
+        return Value{ .set_delta_v = .{
+            .base_offset = base_offset,
+            .additions_offset = additions_offset,
+            .additions_len = @intCast(addition_count),
+            .depth = parent_depth + 1,
+        } };
+    }
+
+    fn canonical_set_matches_ordered_prefix(
+        set_value: Value,
+        set_pool: *const ValuePool,
+        source_items: []const Value,
+        source_pool: *const ValuePool,
+        source_index: *u32,
+    ) bool {
+        return switch (set_value) {
+            .set_v => |set| blk: {
+                for (set.items(set_pool)) |item| {
+                    if (source_index.* >= source_items.len) break :blk false;
+                    if (!Value.eql_ordered_cross_pool(
+                        item,
+                        set_pool,
+                        source_items[source_index.*],
+                        source_pool,
+                    )) break :blk false;
+                    source_index.* += 1;
+                }
+                break :blk true;
+            },
+            .set_delta_v => |delta| blk: {
+                if (!canonical_set_matches_ordered_prefix(
+                    delta.base(set_pool),
+                    set_pool,
+                    source_items,
+                    source_pool,
+                    source_index,
+                )) break :blk false;
+                break :blk canonical_set_matches_ordered_prefix(
+                    .{ .set_v = delta.additions(set_pool) },
+                    set_pool,
+                    source_items,
+                    source_pool,
+                    source_index,
+                );
+            },
+            else => false,
+        };
+    }
+
+    fn canonical_set_count(
+        set_value: Value,
+        pool: *const ValuePool,
+    ) ?u32 {
+        return switch (set_value) {
+            .set_v => |set| set.len,
+            .set_delta_v => |delta| blk: {
+                const base_count = canonical_set_count(
+                    delta.base(pool),
+                    pool,
+                ) orelse break :blk null;
+                break :blk std.math.add(
+                    u32,
+                    base_count,
+                    delta.additions_len,
+                ) catch null;
+            },
+            else => null,
+        };
     }
 
     fn clone_canonical_value(
@@ -3900,39 +4573,48 @@ pub const Checker = struct {
         variable_index: u16,
         hash: fingerprint.Fingerprint,
     ) ?Value {
-        const capacity = self.canonical_value_entries.len;
-        assert(capacity > 0);
-        assert(std.math.isPowerOfTwo(capacity));
+        const segment_count = @atomicLoad(
+            u8,
+            &self.canonical_value_segment_count,
+            .acquire,
+        );
+        assert(segment_count > 0);
+        assert(segment_count <= canonical_value_segment_max);
         const published_hash = effective_canonical_hash(hash);
         const mixed_hash = fingerprint.hash_combine(published_hash, variable_index);
-        const mask = capacity - 1;
-        var slot: usize = @intCast(mixed_hash & mask);
-        var probes: usize = 0;
-        while (probes < @min(capacity, canonical_value_max_probe_count)) : (probes += 1) {
-            const entry = &self.canonical_value_entries[slot];
-            const entry_hash = @atomicLoad(
-                fingerprint.Fingerprint,
-                &entry.hash,
-                .acquire,
-            );
-            if (entry_hash == 0) return null;
-            if (entry_hash == published_hash and
-                entry.variable_index == variable_index)
-            {
-                var canonical_pool = self.canonical_pool_at(entry);
-                if (Value.eql_ordered_cross_pool(
-                    source,
-                    source_pool,
-                    entry.value,
-                    &canonical_pool,
-                ) or Value.eql_cross_pool(
-                    source,
-                    source_pool,
-                    entry.value,
-                    &canonical_pool,
-                )) return entry.value;
+        for (self.canonical_value_segments[0..segment_count]) |segment| {
+            const entries = segment.entries.?;
+            assert(entries.len > 0);
+            assert(std.math.isPowerOfTwo(entries.len));
+            const mask = entries.len - 1;
+            var slot: usize = @intCast(mixed_hash & mask);
+            var probes: usize = 0;
+            while (probes < @min(entries.len, canonical_value_max_probe_count)) : (probes += 1) {
+                const entry = &entries[slot];
+                const entry_hash = @atomicLoad(
+                    fingerprint.Fingerprint,
+                    &entry.hash,
+                    .acquire,
+                );
+                if (entry_hash == 0) break;
+                if (entry_hash == published_hash and
+                    entry.variable_index == variable_index)
+                {
+                    var canonical_pool = self.canonical_pool_at(entry);
+                    if (Value.eql_ordered_cross_pool(
+                        source,
+                        source_pool,
+                        entry.value,
+                        &canonical_pool,
+                    ) or Value.eql_cross_pool(
+                        source,
+                        source_pool,
+                        entry.value,
+                        &canonical_pool,
+                    )) return entry.value;
+                }
+                slot = (slot + 1) & mask;
             }
-            slot = (slot + 1) & mask;
         }
         return null;
     }
@@ -3943,6 +4625,7 @@ pub const Checker = struct {
         source: Value,
         source_pool: *const ValuePool,
         variable_index: u16,
+        parent: Value,
         source_hash_cache: *SymmetryHashCache,
     ) !Value {
         switch (source) {
@@ -3950,7 +4633,7 @@ pub const Checker = struct {
             else => {},
         }
 
-        if (self.canonical_value_entries.len > 0 and source != .string_v) {
+        if (self.canonical_value_capacity_total() > 0 and source != .string_v) {
             const hash = source_hash_cache.hash_value(source_pool, source, null);
             if (self.find_canonical_value(
                 source,
@@ -3960,12 +4643,13 @@ pub const Checker = struct {
             )) |canonical| return canonical;
         }
 
-        parallel_commit_lock(parallel);
-        defer parallel_commit_unlock(parallel);
-        return self.intern_canonical_value(
+        parallel_canonical_lock(parallel);
+        defer parallel_canonical_unlock(parallel);
+        return self.intern_canonical_value_from_parent(
             source,
             source_pool,
             variable_index,
+            parent,
             source_hash_cache,
         );
     }
@@ -4024,12 +4708,7 @@ pub const Checker = struct {
     }
 
     fn fairness_needs_candidate_parent(self: *const Checker) bool {
-        if (self.fairness.len == 0) return false;
-        if (!self.fairness_markers_exact) return true;
-        for (self.fairness) |condition| {
-            if (!condition.full_vars) return true;
-        }
-        return false;
+        return self.fairness.len > 0;
     }
 
     fn candidate_fairness_angle_mask(
@@ -4058,9 +4737,7 @@ pub const Checker = struct {
         var angle_mask: u64 = 0;
         for (self.fairness, 0..) |condition, fairness_index| {
             const bit = @as(u64, 1) << @intCast(fairness_index);
-            const action_matches = if (self.fairness_markers_exact)
-                recorded_action_mask & bit != 0
-            else
+            const action_matches = recorded_action_mask & bit != 0 or
                 try self.eval_fairness_action_with_state_pool(
                     evaluator,
                     eval_pool,
@@ -4079,12 +4756,58 @@ pub const Checker = struct {
                     candidate_pool,
                 )
             else
-                !try self.eval_vars_equal_with_state_pool(
+                !try self.eval_fairness_vars_equal_with_state_pool(
                     evaluator,
                     eval_pool,
-                    condition.vars,
-                    Context.empty(),
+                    condition,
                     evaluation_parent.?,
+                    candidate,
+                    candidate_pool,
+                );
+            if (nonstuttering) angle_mask |= bit;
+        }
+        return angle_mask;
+    }
+
+    fn candidate_recorded_fairness_angle_mask(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        source_parent: *StateStore.State,
+        source_pool: *const ValuePool,
+        candidate_parent: ?StateStore.State,
+        candidate: *StateStore.State,
+        candidate_pool: *ValuePool,
+        recorded_action_mask: u64,
+    ) Error!u64 {
+        assert(self.fairness.len > 0);
+        assert(self.fairness.len <= @bitSizeOf(u64));
+        var candidate_parent_storage = candidate_parent;
+        const evaluation_parent = if (candidate_parent_storage) |*parent|
+            parent
+        else
+            null;
+        var angle_mask: u64 = 0;
+        var remaining = recorded_action_mask;
+        while (remaining != 0) {
+            const fairness_index: u6 = @intCast(@ctz(remaining));
+            const bit = @as(u64, 1) << fairness_index;
+            remaining &= ~bit;
+            if (fairness_index >= self.fairness.len) continue;
+            const condition = self.fairness[fairness_index];
+            const nonstuttering = if (condition.full_vars)
+                !states_equal_cross_pool(
+                    source_parent,
+                    source_pool,
+                    candidate,
+                    candidate_pool,
+                )
+            else
+                !try self.eval_fairness_vars_equal_with_state_pool(
+                    evaluator,
+                    eval_pool,
+                    condition,
+                    evaluation_parent orelse unreachable,
                     candidate,
                     candidate_pool,
                 );
@@ -4189,10 +4912,7 @@ pub const Checker = struct {
                 }
             },
             .box_action => |ba| {
-                // [][A]_v means that every step is either an A step or a
-                // stuttering step on v.  We evaluate A with the parent state as
-                // s0 and the child state as the next state (set by
-                // check_safety_properties), then evaluate v on both states.
+                // [A]_v = A \/ (v' = v), while <<A>>_v = A /\ (v' # v).
                 const action_holds = try evaluator.eval_expr(
                     ba.action,
                     Context.empty(),
@@ -4200,7 +4920,8 @@ pub const Checker = struct {
                     eval_pool,
                     state_pool,
                 );
-                if (action_holds.is_truthy()) return true;
+                if (action_holds.is_truthy() and ba.kind == .square) return true;
+                if (!action_holds.is_truthy() and ba.kind == .angle) return false;
                 evaluator.set_next_state(parent);
                 const vars_parent = try evaluator.eval_expr(
                     ba.vars,
@@ -4217,7 +4938,11 @@ pub const Checker = struct {
                     eval_pool,
                     state_pool,
                 );
-                return vars_parent.eql(vars_child, eval_pool);
+                const stuttering = vars_parent.eql(vars_child, eval_pool);
+                return switch (ba.kind) {
+                    .square => stuttering,
+                    .angle => !stuttering,
+                };
             },
             else => {},
         }
@@ -4762,6 +5487,7 @@ pub const Checker = struct {
 
     fn build_scc_data(self: *Checker) !SccData {
         const n = self.state_store.count;
+        try self.recompute_eventual_always_edge_masks();
         const verify_fairness_markers =
             (builtin.mode == .debug or builtin.mode == .safe) or
             std.c.getenv("TLZIG_VERIFY_FAIRNESS_MARKERS") != null;
@@ -4770,11 +5496,13 @@ pub const Checker = struct {
         // loses the transition label. Edge masks are therefore finalized as
         // <A>_v on concrete transitions before canonicalization and are only
         // replay-audited when no symmetry quotient is active.
-        if (verify_fairness_markers and
+        if ((!self.fairness_markers_exact or verify_fairness_markers) and
+            self.fairness.len > 0 and
             self.symmetry_permutations.len == 0)
         {
             try self.recompute_fairness_edge_masks();
         }
+        try self.recompute_fairness_enabled_masks();
         const allocator = std.heap.page_allocator;
         const scc_ids = try self.compute_sccs();
         errdefer allocator.free(scc_ids);
@@ -4975,13 +5703,18 @@ pub const Checker = struct {
             const scc_id: u32 = @intCast(id);
             const begin = scc_states_offsets[scc_id];
             const end = scc_states_offsets[scc_id + 1];
-            if (self.behavior_allows_stuttering or end - begin > 1) {
+            if (self.recurring_behavior_allows_stuttering() or end - begin > 1) {
                 fair_sccs[scc_id] = true;
                 continue;
             }
             assert(end - begin == 1);
             const state_index = scc_states_edges[begin];
-            for (self.successors(state_index)) |successor| {
+            const edge_begin = self.succ_offsets[state_index];
+            const edge_end = edge_begin + self.succ_counts[state_index];
+            for (edge_begin..edge_end) |edge_index_usize| {
+                const edge_index: u32 = @intCast(edge_index_usize);
+                if (!self.recurring_edge_allowed(edge_index)) continue;
+                const successor = self.succ_edges[edge_index];
                 if (successor == state_index) {
                     fair_sccs[scc_id] = true;
                     break;
@@ -5006,6 +5739,10 @@ pub const Checker = struct {
             @memset(enabled[fi], false);
             for (0..n) |s| {
                 const state_index: u32 = @intCast(s);
+                enabled[fi][s] = self.fairness_condition_enabled(
+                    fi,
+                    state_index,
+                );
                 const begin = self.succ_offsets[state_index];
                 const end = begin + self.succ_counts[state_index];
                 for (begin..end) |edge_index_usize| {
@@ -5013,10 +5750,11 @@ pub const Checker = struct {
                     const succ = self.succ_edges[edge_index];
                     const mask = self.edge_action_masks.get(edge_index);
                     if ((mask & (@as(u64, 1) << @intCast(fi))) != 0) {
-                        enabled[fi][s] = true;
                         const from_scc = scc_ids[state_index];
                         const to_scc = scc_ids[succ];
-                        if (from_scc == to_scc) {
+                        if (from_scc == to_scc and
+                            self.recurring_edge_allowed(edge_index))
+                        {
                             has_angle[fi * scc_count + from_scc] = true;
                         }
                     }
@@ -5088,11 +5826,13 @@ pub const Checker = struct {
         const parent = self.state_store.get(parent_index);
         const child = self.state_store.get(child_index);
         if (!condition.full_vars) {
-            return !try self.eval_vars_equal(
-                condition.vars,
-                Context.empty(),
+            return !try self.eval_fairness_vars_equal_with_state_pool(
+                &self.evaluator,
+                &self.eval_pool,
+                condition,
                 parent,
                 child,
+                &self.state_store.values_pool,
             );
         }
 
@@ -5162,6 +5902,234 @@ pub const Checker = struct {
                 );
             }
         }
+    }
+
+    fn fairness_condition_enabled(
+        self: *const Checker,
+        fairness_index: usize,
+        state_index: u32,
+    ) bool {
+        assert(fairness_index < self.fairness.len);
+        assert(state_index < self.state_store.count);
+        const bit = @as(u64, 1) << @intCast(fairness_index);
+        return (self.fairness_enabled_masks[state_index] & bit) != 0;
+    }
+
+    fn recompute_fairness_enabled_masks(self: *Checker) Error!void {
+        if (self.fairness.len == 0) return;
+        const verify_recorded = self.fairness_markers_exact;
+        const verify = (builtin.mode == .debug or builtin.mode == .safe) or
+            std.c.getenv("TLZIG_VERIFY_FAIRNESS_MARKERS") != null;
+        if (verify_recorded and !verify) return;
+        assert(self.fairness.len == self.fairness_actions.len);
+        assert(self.fairness_enabled_masks.len >= self.state_store.count);
+        const compose_storage = try std.heap.page_allocator.alloc(
+            u32,
+            self.max_successors,
+        );
+        defer std.heap.page_allocator.free(compose_storage);
+        var compose_states = StateBuffer{
+            .storage = compose_storage,
+            .items = compose_storage[0..0],
+        };
+        var executor = ActionExecutor{
+            .evaluator = &self.evaluator,
+            .source_state_store = &self.state_store,
+            .candidate_store = &self.candidate_store,
+            .eval_pool = &self.eval_pool,
+            .compose_states = &compose_states,
+            .diagnostics = self.diagnostics,
+        };
+
+        for (0..self.state_store.count) |state_index_usize| {
+            const state_index: u32 = @intCast(state_index_usize);
+            var enabled_mask: u64 = 0;
+            for (
+                self.fairness,
+                self.fairness_actions,
+                0..,
+            ) |condition, compiled, fairness_index| {
+                self.candidate_store.reset(self.candidate_pool_base);
+                self.eval_pool.restore(self.eval_pool_base);
+                compose_states.clear();
+                var probe_context = FairnessEnabledProbeContext{
+                    .checker = self,
+                    .condition = condition,
+                    .candidate_parent = if (condition.full_vars)
+                        null
+                    else
+                        try self.clone_parent_for_candidate_checks(
+                            &self.state_store,
+                            state_index,
+                            &self.candidate_store,
+                        ),
+                };
+                var matched = false;
+                const enabled = try executor.probe_next_with_bindings(
+                    compiled,
+                    state_index,
+                    condition.bindings,
+                    .{
+                        .matched = &matched,
+                        .context = &probe_context,
+                        .matches = FairnessEnabledProbeContext.matches,
+                    },
+                );
+                assert(enabled == matched);
+                if (enabled) {
+                    enabled_mask |= @as(u64, 1) << @intCast(fairness_index);
+                }
+            }
+            if (verify_recorded) {
+                assert(self.fairness_enabled_masks[state_index] == enabled_mask);
+            }
+            self.fairness_enabled_masks[state_index] = enabled_mask;
+        }
+        self.candidate_store.reset(self.candidate_pool_base);
+        self.eval_pool.restore(self.eval_pool_base);
+    }
+
+    fn fairness_vars_equal_in_candidate_pool(
+        self: *Checker,
+        condition: FairnessCondition,
+        parent: *StateStore.State,
+        candidate: *StateStore.State,
+    ) Error!bool {
+        assert(!condition.full_vars);
+        return self.eval_fairness_vars_equal_with_state_pool(
+            &self.candidate_evaluator,
+            &self.eval_pool,
+            condition,
+            parent,
+            candidate,
+            &self.candidate_store.values_pool,
+        );
+    }
+
+    fn eventual_always_required_mask(self: *const Checker) u64 {
+        assert(self.eventual_always.len <= @bitSizeOf(u64));
+        if (self.eventual_always.len == 0) return 0;
+        if (self.eventual_always.len == @bitSizeOf(u64)) {
+            return std.math.maxInt(u64);
+        }
+        return (@as(u64, 1) << @intCast(self.eventual_always.len)) - 1;
+    }
+
+    fn recurring_edge_allowed(self: *const Checker, edge_index: u32) bool {
+        assert(edge_index < self.succ_count);
+        const required = self.eventual_always_required_mask();
+        return (self.eventual_always_edge_masks.get(edge_index) & required) ==
+            required;
+    }
+
+    fn recurring_behavior_allows_stuttering(self: *const Checker) bool {
+        if (!self.behavior_allows_stuttering) return false;
+        for (self.eventual_always) |condition| {
+            if (condition.kind == .angle) return false;
+        }
+        return true;
+    }
+
+    fn recompute_eventual_always_edge_masks(self: *Checker) Error!void {
+        if (self.eventual_always.len == 0) return;
+        assert(self.eventual_always.len <= @bitSizeOf(u64));
+        var recurring_edge_count: u32 = 0;
+        for (0..self.state_store.count) |parent_index_usize| {
+            const parent_index: u32 = @intCast(parent_index_usize);
+            const parent = self.state_store.get(parent_index);
+            const edge_begin = self.succ_offsets[parent_index];
+            const edge_end = edge_begin + self.succ_counts[parent_index];
+            for (edge_begin..edge_end) |edge_index_usize| {
+                const edge_index: u32 = @intCast(edge_index_usize);
+                assert(edge_index < self.succ_count);
+                const child_index = self.succ_edges[edge_index];
+                assert(child_index < self.state_store.count);
+                const child = self.state_store.get(child_index);
+                var mask: u64 = 0;
+                for (self.eventual_always, 0..) |condition, index| {
+                    if (try self.eval_eventual_always_edge(
+                        condition,
+                        parent,
+                        child,
+                    )) {
+                        mask |= @as(u64, 1) << @intCast(index);
+                    }
+                }
+                self.eventual_always_edge_masks.set(edge_index, mask);
+                if (mask == self.eventual_always_required_mask()) {
+                    recurring_edge_count += 1;
+                }
+            }
+        }
+        if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+            std.debug.print(
+                "EVENTUAL_ALWAYS recurring_edges={d}/{d}\n",
+                .{ recurring_edge_count, self.succ_count },
+            );
+        }
+    }
+
+    fn eval_eventual_always_edge(
+        self: *Checker,
+        condition: EventualAlwaysCondition,
+        parent: *StateStore.State,
+        child: *StateStore.State,
+    ) Error!bool {
+        const snap = self.eval_pool.snapshot();
+        defer self.eval_pool.restore(snap);
+        self.evaluator.reset_context_pool();
+        const context_snap = self.evaluator.context_snapshot();
+        defer self.evaluator.restore_context_pool(context_snap);
+
+        const context = try fairness_context(
+            &self.evaluator,
+            &self.eval_pool,
+            &self.state_store.values_pool,
+            condition.bindings,
+        );
+
+        self.evaluator.set_next_state(child);
+        defer self.evaluator.set_next_state(null);
+        self.evaluator.begin_state_evaluation(&self.eval_pool);
+        const action_value = self.evaluator.eval_expr(
+            condition.action,
+            context,
+            parent,
+            &self.eval_pool,
+            &self.state_store.values_pool,
+        ) catch |err| {
+            self.evaluator.end_state_evaluation();
+            return err;
+        };
+        self.evaluator.end_state_evaluation();
+        const action_holds = action_value.is_truthy();
+
+        self.evaluator.begin_state_evaluation(&self.eval_pool);
+        const parent_vars = self.evaluator.eval_expr(
+            condition.vars,
+            context,
+            parent,
+            &self.eval_pool,
+            &self.state_store.values_pool,
+        ) catch |err| {
+            self.evaluator.end_state_evaluation();
+            return err;
+        };
+        self.evaluator.end_state_evaluation();
+        self.evaluator.begin_state_evaluation(&self.eval_pool);
+        defer self.evaluator.end_state_evaluation();
+        const child_vars = try self.evaluator.eval_expr(
+            condition.vars,
+            context,
+            child,
+            &self.eval_pool,
+            &self.state_store.values_pool,
+        );
+        const stuttering = parent_vars.eql(child_vars, &self.eval_pool);
+        return switch (condition.kind) {
+            .square => action_holds or stuttering,
+            .angle => action_holds and !stuttering,
+        };
     }
 
     fn recompute_fairness_edge_masks_parallel(
@@ -5322,18 +6290,12 @@ pub const Checker = struct {
         const context_snap = evaluator.context_snapshot();
         defer evaluator.restore_context_pool(context_snap);
 
-        var context = Context.empty();
-        for (condition.bindings) |binding| {
-            const local_value = try binding.value.clone(
-                &self.state_store.values_pool,
-                eval_pool,
-            );
-            context = try evaluator.extend_context(
-                context,
-                binding.name,
-                local_value,
-            );
-        }
+        const context = try fairness_context(
+            evaluator,
+            eval_pool,
+            &self.state_store.values_pool,
+            condition.bindings,
+        );
 
         evaluator.set_next_state(child);
         defer evaluator.set_next_state(null);
@@ -5483,6 +6445,53 @@ pub const Checker = struct {
         return equal;
     }
 
+    fn eval_fairness_vars_equal_with_state_pool(
+        self: *Checker,
+        evaluator: *Evaluator,
+        eval_pool: *ValuePool,
+        condition: FairnessCondition,
+        a: *StateStore.State,
+        b: *StateStore.State,
+        state_pool: *ValuePool,
+    ) Error!bool {
+        assert(!condition.full_vars);
+        const snap = eval_pool.snapshot();
+        defer eval_pool.restore(snap);
+        evaluator.reset_context_pool();
+        const context_snap = evaluator.context_snapshot();
+        defer evaluator.restore_context_pool(context_snap);
+
+        const context = try fairness_context(
+            evaluator,
+            eval_pool,
+            &self.state_store.values_pool,
+            condition.bindings,
+        );
+
+        evaluator.begin_state_evaluation(eval_pool);
+        const va = evaluator.eval_expr(
+            condition.vars,
+            context,
+            a,
+            eval_pool,
+            state_pool,
+        ) catch |err| {
+            evaluator.end_state_evaluation();
+            return err;
+        };
+        evaluator.end_state_evaluation();
+        evaluator.begin_state_evaluation(eval_pool);
+        defer evaluator.end_state_evaluation();
+        const vb = try evaluator.eval_expr(
+            condition.vars,
+            context,
+            b,
+            eval_pool,
+            state_pool,
+        );
+        return va.eql(vb, eval_pool);
+    }
+
     fn eval_temporal_operation_state(
         self: *Checker,
         evaluator: *Evaluator,
@@ -5507,6 +6516,7 @@ pub const Checker = struct {
             .box_action => |box_action| self.eval_box_action_state_with(
                 evaluator,
                 eval_pool,
+                box_action.kind,
                 box_action.action,
                 box_action.vars,
                 state_index,
@@ -5605,11 +6615,13 @@ pub const Checker = struct {
 
     fn eval_box_action_all(
         self: *Checker,
+        kind: ast.BoxAction.Kind,
         action_expr: *ast.Expr,
         vars_expr: *ast.Expr,
         results: []bool,
     ) Error!void {
         return self.eval_temporal_all(.{ .box_action = .{
+            .kind = kind,
             .action = action_expr,
             .vars = vars_expr,
         } }, results);
@@ -5647,20 +6659,12 @@ pub const Checker = struct {
         var enabled_state_count: u32 = 0;
         for (0..n) |state_index_usize| {
             const state_index: u32 = @intCast(state_index_usize);
-            const edge_begin = self.succ_offsets[state_index];
-            const edge_end = edge_begin + self.succ_counts[state_index];
-            for (edge_begin..edge_end) |edge_index_usize| {
-                const edge_index: u32 = @intCast(edge_index_usize);
-                const successor = self.succ_edges[edge_index];
-                if (!try self.edge_matches_fairness_angle(
-                    property_fairness_index_v,
-                    edge_index,
-                    state_index,
-                    successor,
-                )) continue;
+            if (self.fairness_condition_enabled(
+                property_fairness_index_v,
+                state_index,
+            )) {
                 property_enabled[state_index] = true;
                 enabled_state_count += 1;
-                break;
             }
         }
         if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
@@ -5701,7 +6705,7 @@ pub const Checker = struct {
         @memset(state_counts, 0);
         const cyclic = try allocator.alloc(bool, scc_count);
         defer allocator.free(cyclic);
-        @memset(cyclic, self.behavior_allows_stuttering);
+        @memset(cyclic, self.recurring_behavior_allows_stuttering());
         const property_any_enabled = try allocator.alloc(bool, scc_count);
         defer allocator.free(property_any_enabled);
         @memset(property_any_enabled, false);
@@ -5719,6 +6723,7 @@ pub const Checker = struct {
             for (edge_begin..edge_end) |edge_index_usize| {
                 const edge_index: u32 = @intCast(edge_index_usize);
                 const successor = self.succ_edges[edge_index];
+                if (!self.recurring_edge_allowed(edge_index)) continue;
                 const property_angle = try self.edge_matches_fairness_angle(
                     property_fairness_index_v,
                     edge_index,
@@ -5761,7 +6766,10 @@ pub const Checker = struct {
                 const state_index: u32 = @intCast(state_index_usize);
                 if (!allowed[state_index]) continue;
                 const scc_id = scc_ids[state_index];
-                var state_enabled = false;
+                const state_enabled = self.fairness_condition_enabled(
+                    assumption_index,
+                    state_index,
+                );
                 const edge_begin = self.succ_offsets[state_index];
                 const edge_end = edge_begin + self.succ_counts[state_index];
                 for (edge_begin..edge_end) |edge_index_usize| {
@@ -5773,7 +6781,7 @@ pub const Checker = struct {
                         state_index,
                         successor,
                     )) continue;
-                    state_enabled = true;
+                    if (!self.recurring_edge_allowed(edge_index)) continue;
                     if (scc_ids[successor] != scc_id) continue;
                     if (try self.edge_matches_fairness_angle(
                         property_fairness_index_v,
@@ -5996,7 +7004,12 @@ pub const Checker = struct {
                 }
             },
             .box_action => |ba| {
-                try self.eval_box_action_all(ba.action, ba.vars, results);
+                try self.eval_box_action_all(
+                    ba.kind,
+                    ba.action,
+                    ba.vars,
+                    results,
+                );
             },
             else => {
                 try self.eval_temporal_state_expression_all(prop, results);
@@ -6046,6 +7059,7 @@ pub const Checker = struct {
         self: *Checker,
         evaluator: *Evaluator,
         eval_pool: *ValuePool,
+        kind: ast.BoxAction.Kind,
         action_expr: *ast.Expr,
         vars_expr: *ast.Expr,
         state_index: u32,
@@ -6054,22 +7068,27 @@ pub const Checker = struct {
         const parent = self.state_store.get(state_index);
         for (self.successors(state_index)) |successor| {
             const child = self.state_store.get(successor);
-            if (try self.eval_action_with(
+            const action_holds = try self.eval_action_with(
                 evaluator,
                 eval_pool,
                 action_expr,
                 Context.empty(),
                 parent,
                 child,
-            )) continue;
-            if (try self.eval_vars_equal_with(
+            );
+            const stuttering = try self.eval_vars_equal_with(
                 evaluator,
                 eval_pool,
                 vars_expr,
                 Context.empty(),
                 parent,
                 child,
-            )) continue;
+            );
+            const holds = switch (kind) {
+                .square => action_holds or stuttering,
+                .angle => action_holds and !stuttering,
+            };
+            if (holds) continue;
             if (std.c.getenv("TLZIG_DUMP_LIVENESS") != null) {
                 std.debug.print(
                     "box action rejected edge {d}->{d}\n",
@@ -6275,7 +7294,12 @@ pub const Checker = struct {
             const scc_id = scc_ids[state_index];
             assert(scc_id < scc_count);
             state_counts[scc_id] += 1;
-            for (self.successors(state_index)) |successor| {
+            const edge_begin = self.succ_offsets[state_index];
+            const edge_end = edge_begin + self.succ_counts[state_index];
+            for (edge_begin..edge_end) |edge_index_usize| {
+                const edge_index: u32 = @intCast(edge_index_usize);
+                if (!self.recurring_edge_allowed(edge_index)) continue;
+                const successor = self.succ_edges[edge_index];
                 if (successor == state_index and allowed[successor]) {
                     cyclic[scc_id] = true;
                 }
@@ -6283,7 +7307,7 @@ pub const Checker = struct {
         }
         for (state_counts, 0..) |count, scc_id| {
             assert(count > 0);
-            if (self.behavior_allows_stuttering or count > 1) {
+            if (self.recurring_behavior_allows_stuttering() or count > 1) {
                 cyclic[scc_id] = true;
             }
             if (!cyclic[scc_id]) fair[scc_id] = false;
@@ -6310,14 +7334,17 @@ pub const Checker = struct {
                 if (!is_allowed) continue;
                 const state_index: u32 = @intCast(state_index_usize);
                 const scc_id = scc_ids[state_index];
-                var state_enabled = false;
+                const state_enabled = self.fairness_condition_enabled(
+                    fairness_index,
+                    state_index,
+                );
                 const edge_begin = self.succ_offsets[state_index];
                 const edge_end = edge_begin + self.succ_counts[state_index];
                 for (edge_begin..edge_end) |edge_index_usize| {
                     const edge_index: u32 = @intCast(edge_index_usize);
                     if ((self.edge_action_masks.get(edge_index) & action_mask) == 0) continue;
                     const successor = self.succ_edges[edge_index];
-                    state_enabled = true;
+                    if (!self.recurring_edge_allowed(edge_index)) continue;
                     if (allowed[successor] and scc_ids[successor] == scc_id) {
                         has_angle[scc_id] = true;
                     }
@@ -6442,6 +7469,7 @@ pub const Checker = struct {
                     const edge_index = self.succ_offsets[v] + ei;
                     assert(edge_index < self.succ_count);
                     const w = self.succ_edges[edge_index];
+                    if (!self.recurring_edge_allowed(edge_index)) continue;
                     if (excluded_fairness_index) |fairness_index| {
                         if (try self.edge_matches_fairness_angle(
                             fairness_index,
@@ -6540,6 +7568,7 @@ pub const Checker = struct {
             st,
             state_pool,
         ) orelse return true;
+        self.last_invariant_failure_name = self.invariant_names[failed_index];
         std.debug.print("Invariant false: {s}\n", .{
             self.invariant_names[failed_index],
         });
@@ -6604,6 +7633,7 @@ pub const Checker = struct {
                 return err;
             };
             if (!value.is_truthy()) {
+                self.last_invariant_failure_name = self.invariant_names[i];
                 std.debug.print("Invariant false: {s}\n", .{self.invariant_names[i]});
                 try self.print_first_false_conjunct(inv, st);
                 std.debug.print("InvariantViolated generated={d} distinct={d}\n", .{
@@ -7027,6 +8057,286 @@ fn expr_ident(arena: *Arena, name: []const u8) !*ast.Expr {
     return ptr;
 }
 
+fn resolve_zero_arity_alias(
+    evaluator: *Evaluator,
+    expression: *ast.Expr,
+) ?*ast.Expr {
+    var current = expression;
+    var path: [64]*ast.Expr = undefined;
+    var depth: usize = 0;
+    while (depth < path.len) {
+        for (path[0..depth]) |ancestor| {
+            if (ancestor == current) return null;
+        }
+        path[depth] = current;
+        depth += 1;
+        current = switch (current.*) {
+            .ident => |name| blk: {
+                const definition = evaluator.find_definition(name) orelse
+                    return current;
+                if (definition.params.len != 0) return current;
+                break :blk definition.body;
+            },
+            .apply => |application| blk: {
+                if (application.args.len != 0 or
+                    application.func.* != .ident)
+                {
+                    return current;
+                }
+                const definition = evaluator.find_definition(
+                    application.func.*.ident,
+                ) orelse return current;
+                if (definition.params.len != 0) return current;
+                break :blk definition.body;
+            },
+            else => return current,
+        };
+    }
+    return null;
+}
+
+fn eventual_always_box_action(
+    evaluator: *Evaluator,
+    expression: *ast.Expr,
+) ?*ast.BoxAction {
+    const diamond_expr = resolve_zero_arity_alias(evaluator, expression) orelse
+        return null;
+    if (diamond_expr.* != .unary or
+        diamond_expr.*.unary.op != .temporal_diamond)
+    {
+        return null;
+    }
+    const box_expr = resolve_zero_arity_alias(
+        evaluator,
+        diamond_expr.*.unary.operand,
+    ) orelse return null;
+    if (box_expr.* != .unary or
+        box_expr.*.unary.op != .temporal_box)
+    {
+        return null;
+    }
+    const subscript_expr = resolve_zero_arity_alias(
+        evaluator,
+        box_expr.*.unary.operand,
+    ) orelse return null;
+    return switch (subscript_expr.*) {
+        .box_action => |box_action| box_action,
+        else => null,
+    };
+}
+
+fn collect_eventual_always_conditions(
+    arena: *Arena,
+    evaluator: *Evaluator,
+    eval_pool: *ValuePool,
+    state_pool: *ValuePool,
+    expression: *ast.Expr,
+    bindings: []const FairnessBinding,
+    list: *std.ArrayList(EventualAlwaysCondition),
+    definition_path: *[64]*ast.Expr,
+    definition_depth: u8,
+) Error!void {
+    assert(definition_depth <= definition_path.len);
+    if (eventual_always_box_action(evaluator, expression)) |box_action| {
+        const saved_bindings = try arena.alloc(
+            FairnessBinding,
+            bindings.len,
+        );
+        @memcpy(saved_bindings, bindings);
+        try list.append(std.heap.page_allocator, .{
+            .kind = box_action.kind,
+            .action = box_action.action,
+            .vars = box_action.vars,
+            .bindings = saved_bindings,
+        });
+        return;
+    }
+
+    switch (expression.*) {
+        .ident => |name| {
+            const definition = evaluator.find_definition(name) orelse return;
+            if (definition.params.len != 0) return;
+            for (definition_path[0..definition_depth]) |ancestor| {
+                if (ancestor == definition.body) return;
+            }
+            if (definition_depth == definition_path.len) {
+                return Error.NotImplemented;
+            }
+            definition_path[definition_depth] = definition.body;
+            try collect_eventual_always_conditions(
+                arena,
+                evaluator,
+                eval_pool,
+                state_pool,
+                definition.body,
+                bindings,
+                list,
+                definition_path,
+                definition_depth + 1,
+            );
+        },
+        .apply => |application| {
+            if (application.args.len != 0 or application.func.* != .ident) {
+                return;
+            }
+            const definition = evaluator.find_definition(
+                application.func.*.ident,
+            ) orelse return;
+            if (definition.params.len != 0) return;
+            for (definition_path[0..definition_depth]) |ancestor| {
+                if (ancestor == definition.body) return;
+            }
+            if (definition_depth == definition_path.len) {
+                return Error.NotImplemented;
+            }
+            definition_path[definition_depth] = definition.body;
+            try collect_eventual_always_conditions(
+                arena,
+                evaluator,
+                eval_pool,
+                state_pool,
+                definition.body,
+                bindings,
+                list,
+                definition_path,
+                definition_depth + 1,
+            );
+        },
+        .binary => |binary| {
+            if (binary.op != .and_op) return;
+            try collect_eventual_always_conditions(
+                arena,
+                evaluator,
+                eval_pool,
+                state_pool,
+                binary.left,
+                bindings,
+                list,
+                definition_path,
+                definition_depth,
+            );
+            try collect_eventual_always_conditions(
+                arena,
+                evaluator,
+                eval_pool,
+                state_pool,
+                binary.right,
+                bindings,
+                list,
+                definition_path,
+                definition_depth,
+            );
+        },
+        .quantifier => |quantifier| {
+            if (quantifier.kind != .forall or quantifier.vars.len == 0) return;
+            try collect_quantified_eventual_always_conditions(
+                arena,
+                evaluator,
+                eval_pool,
+                state_pool,
+                quantifier,
+                0,
+                bindings,
+                list,
+                definition_path,
+                definition_depth,
+            );
+        },
+        else => {},
+    }
+}
+
+fn collect_quantified_eventual_always_conditions(
+    arena: *Arena,
+    evaluator: *Evaluator,
+    eval_pool: *ValuePool,
+    state_pool: *ValuePool,
+    quantifier: *const ast.Quantifier,
+    variable_index: usize,
+    bindings: []const FairnessBinding,
+    list: *std.ArrayList(EventualAlwaysCondition),
+    definition_path: *[64]*ast.Expr,
+    definition_depth: u8,
+) Error!void {
+    assert(quantifier.kind == .forall);
+    assert(variable_index <= quantifier.vars.len);
+    if (variable_index == quantifier.vars.len) {
+        return collect_eventual_always_conditions(
+            arena,
+            evaluator,
+            eval_pool,
+            state_pool,
+            quantifier.body,
+            bindings,
+            list,
+            definition_path,
+            definition_depth,
+        );
+    }
+
+    const variable = quantifier.vars[variable_index];
+    const domain_values = try finite_fairness_domain(
+        evaluator,
+        eval_pool,
+        state_pool,
+        variable.domain,
+        bindings,
+    );
+    defer std.heap.page_allocator.free(domain_values);
+    for (domain_values) |value| {
+        var expanded = std.ArrayList(FairnessBinding).empty;
+        defer expanded.deinit(std.heap.page_allocator);
+        try expanded.appendSlice(std.heap.page_allocator, bindings);
+        try expanded.append(std.heap.page_allocator, .{
+            .name = variable.name,
+            .value = value,
+        });
+        try collect_quantified_eventual_always_conditions(
+            arena,
+            evaluator,
+            eval_pool,
+            state_pool,
+            quantifier,
+            variable_index + 1,
+            expanded.items,
+            list,
+            definition_path,
+            definition_depth,
+        );
+    }
+}
+
+fn extract_eventual_always_conditions(
+    arena: *Arena,
+    evaluator: *Evaluator,
+    eval_pool: *ValuePool,
+    state_pool: *ValuePool,
+    spec_name: []const u8,
+) Error![]const EventualAlwaysCondition {
+    const definition = evaluator.find_definition(spec_name) orelse
+        return &[_]EventualAlwaysCondition{};
+    if (definition.params.len != 0) return &[_]EventualAlwaysCondition{};
+
+    var list = std.ArrayList(EventualAlwaysCondition).empty;
+    defer list.deinit(std.heap.page_allocator);
+    var definition_path: [64]*ast.Expr = undefined;
+    definition_path[0] = definition.body;
+    try collect_eventual_always_conditions(
+        arena,
+        evaluator,
+        eval_pool,
+        state_pool,
+        definition.body,
+        &.{},
+        &list,
+        &definition_path,
+        1,
+    );
+    const result = try arena.alloc(EventualAlwaysCondition, list.items.len);
+    @memcpy(result, list.items);
+    return result;
+}
+
 fn collect_fairness(
     arena: *Arena,
     evaluator: *Evaluator,
@@ -7037,7 +8347,7 @@ fn collect_fairness(
     list: *std.ArrayList(FairnessCondition),
     definition_path: *[64]*ast.Expr,
     definition_depth: u8,
-) !void {
+) Error!void {
     assert(definition_depth <= definition_path.len);
     switch (expr.*) {
         .ident => |name| {
@@ -7047,7 +8357,23 @@ fn collect_fairness(
                     .{ name, definition_depth },
                 );
             }
-            const definition = evaluator.find_definition(name) orelse return;
+            const definition = evaluator.find_definition(name) orelse {
+                if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+                    std.debug.print("FAIRNESS unresolved ident={s}\n", .{name});
+                }
+                return;
+            };
+            if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+                std.debug.print(
+                    "FAIRNESS resolved ident={s} body={s} source={s}:{d}\n",
+                    .{
+                        name,
+                        @tagName(definition.body.*),
+                        definition.source_path,
+                        definition.source_line,
+                    },
+                );
+            }
             if (definition.params.len != 0) return;
             for (definition_path[0..definition_depth]) |ancestor| {
                 if (ancestor == definition.body) return;
@@ -7067,6 +8393,12 @@ fn collect_fairness(
             );
         },
         .binary => |b| {
+            if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+                std.debug.print(
+                    "FAIRNESS visit binary={s} depth={d}\n",
+                    .{ @tagName(b.op), definition_depth },
+                );
+            }
             if (b.op == .and_op) {
                 try collect_fairness(
                     arena,
@@ -7093,6 +8425,12 @@ fn collect_fairness(
             }
         },
         .unary => |u| {
+            if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+                std.debug.print(
+                    "FAIRNESS visit unary={s} depth={d}\n",
+                    .{ @tagName(u.op), definition_depth },
+                );
+            }
             try collect_fairness(
                 arena,
                 evaluator,
@@ -7106,36 +8444,29 @@ fn collect_fairness(
             );
         },
         .quantifier => |quantifier| {
-            if (quantifier.kind != .forall or quantifier.vars.len != 1) return;
-            const variable = quantifier.vars[0];
-            const domain_values = try finite_fairness_domain(
+            if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+                std.debug.print(
+                    "FAIRNESS visit quantifier={s} vars={d} depth={d}\n",
+                    .{
+                        @tagName(quantifier.kind),
+                        quantifier.vars.len,
+                        definition_depth,
+                    },
+                );
+            }
+            if (quantifier.kind != .forall or quantifier.vars.len == 0) return;
+            try collect_quantified_fairness(
+                arena,
                 evaluator,
                 eval_pool,
                 state_pool,
-                variable.domain,
+                quantifier,
+                0,
                 bindings,
+                list,
+                definition_path,
+                definition_depth,
             );
-            defer std.heap.page_allocator.free(domain_values);
-            for (domain_values) |value| {
-                var expanded = std.ArrayList(FairnessBinding).empty;
-                defer expanded.deinit(std.heap.page_allocator);
-                try expanded.appendSlice(std.heap.page_allocator, bindings);
-                try expanded.append(std.heap.page_allocator, .{
-                    .name = variable.name,
-                    .value = value,
-                });
-                try collect_fairness(
-                    arena,
-                    evaluator,
-                    eval_pool,
-                    state_pool,
-                    quantifier.body,
-                    expanded.items,
-                    list,
-                    definition_path,
-                    definition_depth,
-                );
-            }
         },
         .box_action => |ba| {
             try collect_fairness(
@@ -7254,6 +8585,72 @@ fn collect_fairness(
     }
 }
 
+fn collect_quantified_fairness(
+    arena: *Arena,
+    evaluator: *Evaluator,
+    eval_pool: *ValuePool,
+    state_pool: *ValuePool,
+    quantifier: *const ast.Quantifier,
+    variable_index: usize,
+    bindings: []const FairnessBinding,
+    list: *std.ArrayList(FairnessCondition),
+    definition_path: *[64]*ast.Expr,
+    definition_depth: u8,
+) Error!void {
+    assert(quantifier.kind == .forall);
+    assert(variable_index <= quantifier.vars.len);
+    if (variable_index == quantifier.vars.len) {
+        return collect_fairness(
+            arena,
+            evaluator,
+            eval_pool,
+            state_pool,
+            quantifier.body,
+            bindings,
+            list,
+            definition_path,
+            definition_depth,
+        );
+    }
+
+    const variable = quantifier.vars[variable_index];
+    const domain_values = try finite_fairness_domain(
+        evaluator,
+        eval_pool,
+        state_pool,
+        variable.domain,
+        bindings,
+    );
+    defer std.heap.page_allocator.free(domain_values);
+    if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+        std.debug.print(
+            "FAIRNESS domain variable={s} values={d}\n",
+            .{ variable.name, domain_values.len },
+        );
+    }
+    for (domain_values) |value| {
+        var expanded = std.ArrayList(FairnessBinding).empty;
+        defer expanded.deinit(std.heap.page_allocator);
+        try expanded.appendSlice(std.heap.page_allocator, bindings);
+        try expanded.append(std.heap.page_allocator, .{
+            .name = variable.name,
+            .value = value,
+        });
+        try collect_quantified_fairness(
+            arena,
+            evaluator,
+            eval_pool,
+            state_pool,
+            quantifier,
+            variable_index + 1,
+            expanded.items,
+            list,
+            definition_path,
+            definition_depth,
+        );
+    }
+}
+
 fn finite_fairness_domain(
     evaluator: *Evaluator,
     eval_pool: *ValuePool,
@@ -7266,14 +8663,12 @@ fn finite_fairness_domain(
     const context_snap = evaluator.*.context_snapshot();
     defer evaluator.*.restore_context_pool(context_snap);
 
-    var context = Context.empty();
-    for (bindings) |binding| {
-        context = try evaluator.*.extend_context(
-            context,
-            binding.name,
-            binding.value,
-        );
-    }
+    const context = try fairness_context(
+        evaluator,
+        eval_pool,
+        state_pool,
+        bindings,
+    );
 
     const domain_value = try evaluator.*.eval_expr(
         domain,
@@ -7411,21 +8806,41 @@ fn concat_fairness(
     return result;
 }
 
+const FairnessMarkerBuild = struct {
+    markers: []const action.FairnessMarker,
+    complete: bool,
+};
+
 fn build_fairness_markers(
     arena: *Arena,
+    evaluator: *const Evaluator,
     fairness: []const FairnessCondition,
-) ![]const action.FairnessMarker {
+    next_action: ?*ast.Expr,
+) !FairnessMarkerBuild {
     assert(fairness.len <= 64);
-    if (fairness.len == 0) return &[_]action.FairnessMarker{};
+    if (fairness.len == 0) return .{
+        .markers = &[_]action.FairnessMarker{},
+        .complete = true,
+    };
     const markers = try arena.alloc(action.FairnessMarker, fairness.len);
+    var complete = next_action != null;
     for (fairness, 0..) |condition, index| {
+        const projection = if (next_action) |next|
+            fairness_marker_projection(
+                evaluator,
+                condition.action,
+                next,
+            )
+        else
+            null;
+        complete = complete and projection != null;
         markers[index] = .{
-            .action = condition.action,
+            .action = projection orelse condition.action,
             .bindings = condition.bindings,
             .bit_index = @intCast(index),
         };
     }
-    return markers;
+    return .{ .markers = markers, .complete = complete };
 }
 
 fn fairness_marker_action_shape(expr: *const ast.Expr, depth: u8) bool {
@@ -7631,23 +9046,129 @@ fn fairness_marker_action_covered(
     };
 }
 
-fn fairness_markers_cover_actions(
+fn resolve_fairness_marker_expr(
     evaluator: *const Evaluator,
-    fairness: []const FairnessCondition,
-    next_action: ?*const ast.Expr,
+    expr: *ast.Expr,
+) *ast.Expr {
+    var result = expr;
+    var depth: u8 = 0;
+    while (result.* == .ident and depth < 64) : (depth += 1) {
+        const resolved = evaluator.resolve_alias(result.ident);
+        const definition = evaluator.find_definition(resolved) orelse break;
+        if (definition.params.len != 0 or definition.body == result) break;
+        result = definition.body;
+    }
+    return result;
+}
+
+fn flatten_fairness_conjuncts(
+    expr: *ast.Expr,
+    conjuncts: *[64]*ast.Expr,
+    count: *usize,
 ) bool {
-    const next = next_action orelse return fairness.len == 0;
-    for (fairness) |condition| {
-        if (!fairness_marker_action_covered(
+    if (expr.* == .binary and expr.binary.op == .and_op) {
+        return flatten_fairness_conjuncts(
+            expr.binary.left,
+            conjuncts,
+            count,
+        ) and flatten_fairness_conjuncts(
+            expr.binary.right,
+            conjuncts,
+            count,
+        );
+    }
+    if (count.* == conjuncts.len) return false;
+    conjuncts[count.*] = expr;
+    count.* += 1;
+    return true;
+}
+
+fn fairness_marker_conjunction_projection(
+    fairness_action: *ast.Expr,
+    next_action: *ast.Expr,
+) ?*ast.Expr {
+    if (fairness_action.* != .binary or
+        fairness_action.binary.op != .and_op)
+    {
+        return fairness_action;
+    }
+
+    var next_conjuncts: [64]*ast.Expr = undefined;
+    var next_count: usize = 0;
+    if (!flatten_fairness_conjuncts(
+        next_action,
+        &next_conjuncts,
+        &next_count,
+    )) return null;
+
+    var fairness_conjuncts: [64]*ast.Expr = undefined;
+    var fairness_count: usize = 0;
+    if (!flatten_fairness_conjuncts(
+        fairness_action,
+        &fairness_conjuncts,
+        &fairness_count,
+    )) return null;
+
+    var projection: ?*ast.Expr = null;
+    for (fairness_conjuncts[0..fairness_count]) |conjunct| {
+        var guaranteed = false;
+        for (next_conjuncts[0..next_count]) |next_conjunct| {
+            if (fairness_marker_expr_equal(conjunct, next_conjunct, 0)) {
+                guaranteed = true;
+                break;
+            }
+        }
+        if (guaranteed) continue;
+        if (projection != null) return null;
+        projection = conjunct;
+    }
+    return projection;
+}
+
+fn fairness_marker_projection(
+    evaluator: *const Evaluator,
+    fairness_action: *ast.Expr,
+    next_action: *ast.Expr,
+) ?*ast.Expr {
+    if (fairness_marker_action_covered(
+        evaluator,
+        fairness_action,
+        next_action,
+        0,
+    )) return fairness_action;
+
+    const resolved_fairness = resolve_fairness_marker_expr(
+        evaluator,
+        fairness_action,
+    );
+    const resolved_next = resolve_fairness_marker_expr(
+        evaluator,
+        next_action,
+    );
+    const projection = fairness_marker_conjunction_projection(
+        resolved_fairness,
+        resolved_next,
+    ) orelse return null;
+    if (!fairness_marker_action_shape(projection, 0)) return null;
+
+    var next_conjuncts: [64]*ast.Expr = undefined;
+    var next_count: usize = 0;
+    if (!flatten_fairness_conjuncts(
+        resolved_next,
+        &next_conjuncts,
+        &next_count,
+    )) return null;
+    for (next_conjuncts[0..next_count]) |next_conjunct| {
+        if (fairness_marker_action_covered(
             evaluator,
-            condition.action,
-            next,
+            projection,
+            next_conjunct,
             0,
         )) {
-            return false;
+            return projection;
         }
     }
-    return true;
+    return null;
 }
 
 fn extract_spec_parts(module: ast.Module, spec_name: []const u8) !SpecParts {
@@ -7727,7 +9248,10 @@ fn behavior_action_expr(
     const next_depth = depth + 1;
 
     switch (expr.*) {
-        .box_action => |boxed| return boxed.action,
+        .box_action => |boxed| return if (boxed.kind == .square)
+            boxed.action
+        else
+            null,
         .unary => |unary| {
             if (unary.op != .temporal_box) return null;
             return behavior_action_expr(
@@ -8109,6 +9633,7 @@ test "spec extraction preserves a quantified next action" {
     var quantified_action = ast.Expr{ .quantifier = &quantifier };
     var subscript = ast.Expr{ .ident = "vars" };
     var box_action = ast.BoxAction{
+        .kind = .square,
         .action = &quantified_action,
         .vars = &subscript,
     };
@@ -8195,11 +9720,81 @@ test "fairness marker coverage accepts only compiler-marked action shapes" {
     ));
 }
 
+test "fairness marker projection removes shared Next constraints" {
+    var crash = ast.Expr{ .ident = "Crash" };
+    var env_tick = ast.Expr{ .ident = "EnvTick" };
+    var proc_tick = ast.Expr{ .ident = "ProcTick" };
+    var delta = ast.Expr{ .ident = "DELTAConstraint" };
+    var phi = ast.Expr{ .ident = "PHIConstraint" };
+
+    var env_or_proc = ast.Binary{
+        .op = .or_op,
+        .left = &env_tick,
+        .right = &proc_tick,
+    };
+    var env_or_proc_expr = ast.Expr{ .binary = &env_or_proc };
+    var crash_or_rest = ast.Binary{
+        .op = .or_op,
+        .left = &crash,
+        .right = &env_or_proc_expr,
+    };
+    var crash_or_rest_expr = ast.Expr{ .binary = &crash_or_rest };
+    var next_with_delta = ast.Binary{
+        .op = .and_op,
+        .left = &crash_or_rest_expr,
+        .right = &delta,
+    };
+    var next_with_delta_expr = ast.Expr{ .binary = &next_with_delta };
+    var next = ast.Binary{
+        .op = .and_op,
+        .left = &next_with_delta_expr,
+        .right = &phi,
+    };
+    var next_expr = ast.Expr{ .binary = &next };
+
+    var fairness_with_delta = ast.Binary{
+        .op = .and_op,
+        .left = &env_or_proc_expr,
+        .right = &delta,
+    };
+    var fairness_with_delta_expr = ast.Expr{ .binary = &fairness_with_delta };
+    var fairness = ast.Binary{
+        .op = .and_op,
+        .left = &fairness_with_delta_expr,
+        .right = &phi,
+    };
+    var fairness_expr = ast.Expr{ .binary = &fairness };
+
+    try std.testing.expectEqual(
+        &env_or_proc_expr,
+        fairness_marker_conjunction_projection(
+            &fairness_expr,
+            &next_expr,
+        ).?,
+    );
+
+    var unrelated = ast.Expr{ .ident = "Unrelated" };
+    var ambiguous = ast.Binary{
+        .op = .and_op,
+        .left = &fairness_expr,
+        .right = &unrelated,
+    };
+    var ambiguous_expr = ast.Expr{ .binary = &ambiguous };
+    try std.testing.expectEqual(
+        @as(?*ast.Expr, null),
+        fairness_marker_conjunction_projection(
+            &ambiguous_expr,
+            &next_expr,
+        ),
+    );
+}
+
 test "spec extraction ignores boxed actions nested in fairness" {
     var init_name_expr = ast.Expr{ .ident = "Init" };
     var next_name_expr = ast.Expr{ .ident = "Next" };
     var vars_expr = ast.Expr{ .ident = "vars" };
     var next_box = ast.BoxAction{
+        .kind = .square,
         .action = &next_name_expr,
         .vars = &vars_expr,
     };
@@ -8218,6 +9813,7 @@ test "spec extraction ignores boxed actions nested in fairness" {
 
     var fairness_action = ast.Expr{ .ident = "Gossip" };
     var fairness_box = ast.BoxAction{
+        .kind = .angle,
         .action = &fairness_action,
         .vars = &vars_expr,
     };

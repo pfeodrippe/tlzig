@@ -24,14 +24,59 @@ PATTERNS = [
         "generic EXCEPT reconstruction in action assignments",
     ),
     Pattern(
+        "variable_except_update",
+        re.compile(r"runtime\.variable_except_update\("),
+        "state-variable EXCEPT still using an updater callback",
+    ),
+    Pattern(
+        "fused_variable_except_set_insert",
+        re.compile(r"runtime\.variable_except_update_set_insert\("),
+        "syntax-proven state-variable set insertions lowered to one reconstruction",
+    ),
+    Pattern(
+        "fused_variable_except_set_remove",
+        re.compile(r"runtime\.variable_except_update_set_remove\("),
+        "syntax-proven state-variable set removals lowered to one reconstruction",
+    ),
+    Pattern(
+        "primed_except_update_callback",
+        re.compile(r"runtime\.primed_variable_except_update_path_equal_bool\("),
+        "primed EXCEPT comparisons that still invoke an updater callback",
+    ),
+    Pattern(
+        "direct_primed_except_set_insert",
+        re.compile(
+            r"runtime\.primed_variable_except_update_path_set_insert_equal_bool\("
+        ),
+        "syntax-proven primed set insertions compared without materialization",
+    ),
+    Pattern(
+        "direct_primed_except_set_remove",
+        re.compile(
+            r"runtime\.primed_variable_except_update_path_set_remove_equal_bool\("
+        ),
+        "syntax-proven primed set removals compared without materialization",
+    ),
+    Pattern(
         "variable_path",
         re.compile(r"runtime\.variable_path\("),
         "generic state path lookup instead of typed/indexed access",
     ),
     Pattern(
         "primed_variable_full_compare",
-        re.compile(r"runtime\.equal_bool\([^;\n]*runtime\.primed_variable"),
+        re.compile(
+            r"runtime\.(?:equal|not_equal)_bool\(context\.eval_pool,\s*"
+            r"try runtime\.primed_variable\(context,\s*\d+\)\s*,",
+        ),
         "whole-root next-state equality checks",
+    ),
+    Pattern(
+        "primed_variable_path_compare",
+        re.compile(
+            r"runtime\.(?:equal|not_equal)_bool\([^;\n]*"
+            r"runtime\.call\(context,\s*try runtime\.primed_variable",
+        ),
+        "indexed next-state paths evaluated through a generic function call",
     ),
     Pattern(
         "unchanged_variable",

@@ -13,6 +13,13 @@ pub const Module = struct {
     next_name: []const u8,
     invariants: []const []const u8,
     config_replacements: []const ConfigReplacement = &.{},
+    trusted_integer_facts: []const TrustedIntegerFact = &.{},
+};
+
+pub const TrustedIntegerFact = struct {
+    variable_index: u16,
+    min_int: i64,
+    max_int: i64,
 };
 
 pub const ConfigReplacement = struct {
@@ -279,8 +286,14 @@ pub const CaseExpr = struct {
 };
 
 pub const BoxAction = struct {
+    kind: Kind,
     action: *Expr,
     vars: *Expr,
+
+    pub const Kind = enum(u8) {
+        square,
+        angle,
+    };
 };
 
 pub const Lambda = struct {

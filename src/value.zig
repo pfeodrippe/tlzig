@@ -33,6 +33,11 @@ pub inline fn same_repr(a: Value, b: Value) bool {
         .diff_v => |value| b == .diff_v and
             value.left_offset == b.diff_v.left_offset and
             value.right_offset == b.diff_v.right_offset,
+        .set_delta_v => |value| b == .set_delta_v and
+            value.base_offset == b.set_delta_v.base_offset and
+            value.additions_offset == b.set_delta_v.additions_offset and
+            value.additions_len == b.set_delta_v.additions_len and
+            value.depth == b.set_delta_v.depth,
         .power_set_v => |value| b == .power_set_v and
             value.set_offset == b.power_set_v.set_offset,
         .function_set_v => |value| b == .function_set_v and
@@ -77,6 +82,7 @@ pub const ValueTag = enum(u8) {
     range_v,
     seq_set_v,
     power_set_v,
+    set_delta_v,
 };
 
 pub const Lambda = struct {
@@ -272,6 +278,29 @@ pub const BinarySet = extern struct {
     }
 };
 
+/// A finite set represented as a base plus additions proved disjoint from it.
+/// Canonicalization bounds the chain depth before constructing this value.
+pub const SetDelta = extern struct {
+    base_offset: u32,
+    additions_offset: u32,
+    additions_len: u16,
+    depth: u16,
+
+    pub fn base(self: SetDelta, pool: *const ValuePool) Value {
+        assert(self.base_offset < pool.value_count);
+        return pool.values[self.base_offset];
+    }
+
+    pub fn additions(self: SetDelta, pool: *const ValuePool) Set {
+        assert(@as(u64, self.additions_offset) + self.additions_len <=
+            pool.value_count);
+        return .{
+            .offset = self.additions_offset,
+            .len = self.additions_len,
+        };
+    }
+};
+
 pub const Range = extern struct {
     lo: i64,
     hi: i64,
@@ -316,6 +345,7 @@ pub const Value = union(ValueTag) {
     range_v: Range,
     seq_set_v: SequenceSet,
     power_set_v: UnionSet,
+    set_delta_v: SetDelta,
 
     pub fn is_truthy(self: Value) bool {
         return switch (self) {
@@ -355,6 +385,7 @@ pub const Value = union(ValueTag) {
             .range_v,
             .seq_set_v,
             .power_set_v,
+            .set_delta_v,
             => true,
             else => false,
         };
@@ -427,6 +458,8 @@ pub const Value = union(ValueTag) {
                 a.seq_set_v.element_set(pool).eql(b.seq_set_v.element_set(pool), pool),
             .power_set_v => tags_equal and
                 a.power_set_v.set(pool).eql(b.power_set_v.set(pool), pool),
+            .set_delta_v => tags_equal and
+                (finite_set_extensional_equal(a, b, pool) orelse false),
         };
     }
 
@@ -646,6 +679,12 @@ pub const Value = union(ValueTag) {
                 right.power_set_v.set(right_pool),
                 right_pool,
             ),
+            .set_delta_v => finite_set_extensional_equal_cross_pool(
+                left,
+                left_pool,
+                right,
+                right_pool,
+            ) orelse false,
             .generated_operator_v => |operator| std.meta.eql(
                 operator,
                 right.generated_operator_v,
@@ -729,6 +768,7 @@ pub const Value = union(ValueTag) {
             .diff_v,
             .seq_set_v,
             .power_set_v,
+            .set_delta_v,
             => false,
         };
     }
@@ -832,6 +872,13 @@ pub const Value = union(ValueTag) {
             .power_set_v => |ps| Value{ .power_set_v = .{
                 .set_offset = try target.push_value(try ps.set(source).clone_assume_capacity(source, target)),
             } },
+            .set_delta_v => |delta| Value{
+                .set_v = try clone_set_delta_as_set(
+                    delta,
+                    source,
+                    target,
+                ),
+            },
         };
     }
 
@@ -874,6 +921,10 @@ pub const Value = union(ValueTag) {
                 bs.right(source).clone_value_count(source),
             .seq_set_v => |ss| 1 + ss.element_set(source).clone_value_count(source),
             .power_set_v => |ps| 1 + ps.set(source).clone_value_count(source),
+            .set_delta_v => |delta| clone_set_delta_value_count(
+                delta,
+                source,
+            ),
         };
     }
 
@@ -892,6 +943,8 @@ pub const Value = union(ValueTag) {
             .range_v => |r| r.member(elem),
             .seq_set_v => |ss| sequence_set_member(pool, ss.element_set(pool), elem),
             .power_set_v => |ps| power_set_member(pool, ps.set(pool), elem),
+            .set_delta_v => |delta| delta.additions(pool).contains(pool, elem) or
+                delta.base(pool).member(pool, elem),
             else => return false,
         };
     }
@@ -977,6 +1030,16 @@ pub const Value = union(ValueTag) {
                 elem,
                 elem_pool,
             ),
+            .set_delta_v => |delta| set_contains_cross_pool(
+                delta.additions(set_pool),
+                set_pool,
+                elem,
+                elem_pool,
+            ) or delta.base(set_pool).member_cross_pool(
+                set_pool,
+                elem,
+                elem_pool,
+            ),
             else => false,
         };
     }
@@ -985,6 +1048,60 @@ pub const Value = union(ValueTag) {
 test "value representation remains compact" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(GeneratedOperator));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(Value));
+}
+
+test "canonical set delta preserves finite set semantics when cloned" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 128, 128);
+
+    const base_items = [_]Value{
+        .{ .int_v = 1 },
+        .{ .int_v = 2 },
+        .{ .int_v = 3 },
+        .{ .int_v = 4 },
+    };
+    const base_items_offset = try pool.push_values(&base_items);
+    const base = Value{ .set_v = .{
+        .offset = base_items_offset,
+        .len = base_items.len,
+    } };
+    const base_offset = try pool.push_value(base);
+    const addition_items = [_]Value{
+        .{ .int_v = 5 },
+        .{ .int_v = 6 },
+    };
+    const additions_offset = try pool.push_values(&addition_items);
+    const delta = Value{ .set_delta_v = .{
+        .base_offset = base_offset,
+        .additions_offset = additions_offset,
+        .additions_len = addition_items.len,
+        .depth = 1,
+    } };
+    const concrete_items = base_items ++ addition_items;
+    const concrete_offset = try pool.push_values(&concrete_items);
+    const concrete = Value{ .set_v = .{
+        .offset = concrete_offset,
+        .len = concrete_items.len,
+    } };
+
+    try std.testing.expect(delta.eql(concrete, &pool));
+    try std.testing.expect(concrete.eql(delta, &pool));
+    try std.testing.expect(delta.member(&pool, .{ .int_v = 6 }));
+    try std.testing.expect(!delta.member(&pool, .{ .int_v = 7 }));
+
+    var clone_arena = try Arena.init(1024 * 1024);
+    defer clone_arena.deinit();
+    var clone_pool = try ValuePool.init(&clone_arena, 128, 128);
+    const cloned = try delta.clone(&pool, &clone_pool);
+    try std.testing.expect(cloned == .set_v);
+    try std.testing.expectEqual(@as(u32, 6), cloned.set_v.len);
+    try std.testing.expect(Value.eql_cross_pool(
+        delta,
+        &pool,
+        cloned,
+        &clone_pool,
+    ));
 }
 
 fn ordered_values_eql_cross_pool(
@@ -1418,7 +1535,7 @@ fn union_member_cross_pool(
 
 fn is_symbolic_finite_set(value_v: Value) bool {
     return switch (value_v) {
-        .cup_v, .cap_v, .diff_v, .union_v => true,
+        .cup_v, .cap_v, .diff_v, .union_v, .set_delta_v => true,
         else => false,
     };
 }
@@ -1431,6 +1548,60 @@ fn finite_set_extensional_equal(
     const left_subset = finite_set_subset(left, right, pool) orelse return null;
     if (!left_subset) return false;
     return finite_set_subset(right, left, pool);
+}
+
+fn finite_set_extensional_equal_cross_pool(
+    left: Value,
+    left_pool: *const ValuePool,
+    right: Value,
+    right_pool: *const ValuePool,
+) ?bool {
+    const left_count = finite_cardinality(left_pool, left) orelse return null;
+    const right_count = finite_cardinality(right_pool, right) orelse
+        return null;
+    if (left_count != right_count) return false;
+    return finite_set_support_subset_cross_pool(
+        left,
+        left_pool,
+        right,
+        right_pool,
+    );
+}
+
+fn finite_set_support_subset_cross_pool(
+    support: Value,
+    support_pool: *const ValuePool,
+    right: Value,
+    right_pool: *const ValuePool,
+) ?bool {
+    return switch (support) {
+        .set_v => |set| blk: {
+            for (set.items(support_pool)) |item| {
+                if (!right.member_cross_pool(
+                    right_pool,
+                    item,
+                    support_pool,
+                )) break :blk false;
+            }
+            break :blk true;
+        },
+        .set_delta_v => |delta| blk: {
+            const base_subset = finite_set_support_subset_cross_pool(
+                delta.base(support_pool),
+                support_pool,
+                right,
+                right_pool,
+            ) orelse break :blk null;
+            if (!base_subset) break :blk false;
+            break :blk finite_set_support_subset_cross_pool(
+                .{ .set_v = delta.additions(support_pool) },
+                support_pool,
+                right,
+                right_pool,
+            );
+        },
+        else => null,
+    };
 }
 
 fn concrete_finite_set_equal(
@@ -1538,6 +1709,21 @@ fn finite_set_support_subset(
                 if (!nested_subset) break :blk false;
             }
             break :blk true;
+        },
+        .set_delta_v => |delta| blk: {
+            const base_subset = finite_set_support_subset(
+                container,
+                delta.base(pool),
+                right,
+                pool,
+            ) orelse break :blk null;
+            if (!base_subset) break :blk false;
+            break :blk finite_set_support_subset(
+                container,
+                .{ .set_v = delta.additions(pool) },
+                right,
+                pool,
+            );
         },
         else => null,
     };
@@ -1748,6 +1934,17 @@ fn finite_cardinality(pool: *const ValuePool, set: Value) ?u64 {
             ) orelse return null;
             return finite_power(2, base_count);
         },
+        .set_delta_v => |delta| {
+            const base_count = finite_cardinality(
+                pool,
+                delta.base(pool),
+            ) orelse return null;
+            return std.math.add(
+                u64,
+                base_count,
+                delta.additions_len,
+            ) catch return null;
+        },
         else => return null,
     }
 }
@@ -1829,6 +2026,12 @@ pub const Set = extern struct {
 
 fn dense_contains_probe(items: []const Value, value: Value) ?bool {
     if (items.len == 0) return false;
+    if (dense_value_index(items, value)) |_| return true;
+    return null;
+}
+
+fn dense_value_index(items: []const Value, value: Value) ?usize {
+    if (items.len == 0) return null;
     const index = switch (value) {
         .int_v => |value_int| blk: {
             if (items[0] != .int_v) return null;
@@ -1847,7 +2050,7 @@ fn dense_contains_probe(items: []const Value, value: Value) ?bool {
     if (index >= items.len) return null;
     const index_u: usize = @intCast(index);
     if (!same_repr(items[index_u], value)) return null;
-    return true;
+    return index_u;
 }
 
 pub const Function = extern struct {
@@ -1865,8 +2068,10 @@ pub const Function = extern struct {
         assert(self.offset + self.len <= pool.value_count);
         const keys = self.domain.items(pool);
         assert(keys.len == self.len);
+        const entries_v = self.entries(pool);
+        if (dense_value_index(keys, key)) |index| return entries_v[index];
         for (keys, 0..) |k, i| {
-            if (k.eql(key, pool)) return self.entries(pool)[i];
+            if (k.eql(key, pool)) return entries_v[i];
         }
         return null;
     }
@@ -1875,9 +2080,21 @@ pub const Function = extern struct {
         assert(self.offset + self.len <= pool.value_count);
         assert(other.offset + other.len <= pool.value_count);
         if (self.len != other.len) return false;
+        const self_keys = self.domain.items(pool);
+        const self_entries = self.entries(pool);
         const other_keys = other.domain.items(pool);
         const other_entries = other.entries(pool);
-        for (self.domain.items(pool), self.entries(pool)) |left_key, left_entry| {
+
+        for (self_keys, other_keys) |self_key, other_key| {
+            if (!self_key.eql(other_key, pool)) break;
+        } else {
+            for (self_entries, other_entries) |self_entry, other_entry| {
+                if (!self_entry.eql(other_entry, pool)) return false;
+            }
+            return true;
+        }
+
+        for (self_keys, self_entries) |left_key, left_entry| {
             var found = false;
             for (other_keys, other_entries) |right_key, right_entry| {
                 if (!left_key.eql(right_key, pool)) continue;
@@ -2026,6 +2243,99 @@ fn clone_slice_value_count(values: []const Value, source: *const ValuePool) u64 
     var count: u64 = values.len;
     for (values) |v| count += v.clone_value_count(source);
     return count;
+}
+
+fn clone_set_delta_value_count(
+    delta: SetDelta,
+    source: *const ValuePool,
+) u64 {
+    return clone_finite_set_items_value_count(
+        .{ .set_delta_v = delta },
+        source,
+    );
+}
+
+fn clone_finite_set_items_value_count(
+    set_value: Value,
+    source: *const ValuePool,
+) u64 {
+    return switch (set_value) {
+        .set_v => |set| clone_slice_value_count(set.items(source), source),
+        .set_delta_v => |delta| clone_finite_set_items_value_count(
+            delta.base(source),
+            source,
+        ) + clone_slice_value_count(
+            delta.additions(source).items(source),
+            source,
+        ),
+        else => unreachable,
+    };
+}
+
+fn clone_set_delta_as_set(
+    delta: SetDelta,
+    source: *const ValuePool,
+    target: *ValuePool,
+) error{ OutOfMemory, NotImplemented }!Set {
+    const count_u64 = finite_cardinality(
+        source,
+        .{ .set_delta_v = delta },
+    ) orelse unreachable;
+    if (count_u64 > std.math.maxInt(u32)) return error.OutOfMemory;
+    const count: u32 = @intCast(count_u64);
+    const target_items = try target.alloc_values(count);
+    const offset: u32 = @intCast(
+        (@intFromPtr(target_items.ptr) - @intFromPtr(target.values.ptr)) /
+            @sizeOf(Value),
+    );
+    var target_index: u32 = 0;
+    try clone_finite_set_items(
+        .{ .set_delta_v = delta },
+        source,
+        target,
+        target_items,
+        &target_index,
+    );
+    assert(target_index == count);
+    return .{ .offset = offset, .len = count };
+}
+
+fn clone_finite_set_items(
+    set_value: Value,
+    source: *const ValuePool,
+    target: *ValuePool,
+    target_items: []Value,
+    target_index: *u32,
+) error{ OutOfMemory, NotImplemented }!void {
+    switch (set_value) {
+        .set_v => |set| {
+            for (set.items(source)) |item| {
+                assert(target_index.* < target_items.len);
+                target_items[target_index.*] = try item.clone_assume_capacity(
+                    source,
+                    target,
+                );
+                target_index.* += 1;
+            }
+        },
+        .set_delta_v => |nested| {
+            try clone_finite_set_items(
+                nested.base(source),
+                source,
+                target,
+                target_items,
+                target_index,
+            );
+            try clone_finite_set_items(
+                .{ .set_v = nested.additions(source) },
+                source,
+                target,
+                target_items,
+                target_index,
+            );
+        },
+        else => unreachable,
+    }
 }
 
 fn values_are_pool_independent(values: []const Value) bool {
@@ -2351,6 +2661,103 @@ test "set contains dense probe falls back for sparse and unsorted sets" {
     try std.testing.expect(set_value.contains(&pool, .{ .int_v = 1 }));
     try std.testing.expect(set_value.contains(&pool, .{ .int_v = 5 }));
     try std.testing.expect(!set_value.contains(&pool, .{ .int_v = 4 }));
+}
+
+test "function apply handles dense and sparse domains" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 32, 64);
+
+    const dense_keys = try pool.push_values(&.{
+        .{ .int_v = 4 },
+        .{ .int_v = 5 },
+        .{ .int_v = 6 },
+    });
+    const dense_entries = try pool.push_values(&.{
+        .{ .int_v = 40 },
+        .{ .int_v = 50 },
+        .{ .int_v = 60 },
+    });
+    const dense = Function{
+        .domain = .{ .offset = dense_keys, .len = 3 },
+        .offset = dense_entries,
+        .len = 3,
+    };
+    try std.testing.expectEqual(
+        Value{ .int_v = 50 },
+        dense.apply(&pool, .{ .int_v = 5 }).?,
+    );
+    try std.testing.expectEqual(
+        @as(?Value, null),
+        dense.apply(&pool, .{ .int_v = 7 }),
+    );
+
+    const sparse_keys = try pool.push_values(&.{
+        .{ .int_v = 6 },
+        .{ .int_v = 4 },
+    });
+    const sparse_entries = try pool.push_values(&.{
+        .{ .int_v = 60 },
+        .{ .int_v = 40 },
+    });
+    const sparse = Function{
+        .domain = .{ .offset = sparse_keys, .len = 2 },
+        .offset = sparse_entries,
+        .len = 2,
+    };
+    try std.testing.expectEqual(
+        Value{ .int_v = 40 },
+        sparse.apply(&pool, .{ .int_v = 4 }).?,
+    );
+}
+
+test "function equality handles ordered and reordered domains" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 64, 64);
+
+    const left_keys = try pool.push_values(&.{
+        .{ .int_v = 1 },
+        .{ .int_v = 2 },
+    });
+    const left_entries = try pool.push_values(&.{
+        .{ .int_v = 10 },
+        .{ .int_v = 20 },
+    });
+    const ordered_keys = try pool.push_values(&.{
+        .{ .int_v = 1 },
+        .{ .int_v = 2 },
+    });
+    const ordered_entries = try pool.push_values(&.{
+        .{ .int_v = 10 },
+        .{ .int_v = 20 },
+    });
+    const reordered_keys = try pool.push_values(&.{
+        .{ .int_v = 2 },
+        .{ .int_v = 1 },
+    });
+    const reordered_entries = try pool.push_values(&.{
+        .{ .int_v = 20 },
+        .{ .int_v = 10 },
+    });
+
+    const left = Function{
+        .domain = .{ .offset = left_keys, .len = 2 },
+        .offset = left_entries,
+        .len = 2,
+    };
+    const ordered = Function{
+        .domain = .{ .offset = ordered_keys, .len = 2 },
+        .offset = ordered_entries,
+        .len = 2,
+    };
+    const reordered = Function{
+        .domain = .{ .offset = reordered_keys, .len = 2 },
+        .offset = reordered_entries,
+        .len = 2,
+    };
+    try std.testing.expect(left.eql(ordered, &pool));
+    try std.testing.expect(left.eql(reordered, &pool));
 }
 
 test "symbolic finite set equality is extensional" {

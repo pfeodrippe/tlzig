@@ -162,6 +162,8 @@ fn hash_value_inner_aggregate_impl(
         SequenceLayout.not_sequence;
     const tag = if (sequence_layout != .not_sequence)
         value_tag_tuple
+    else if (v == .set_delta_v)
+        value_tag_set
     else
         @backingInt(v);
     h = hash_byte(h, tag);
@@ -181,6 +183,18 @@ fn hash_value_inner_aggregate_impl(
                     ),
                 );
             }
+            h = hash_combine(h, unordered_hash_finish(unordered));
+        },
+        .set_delta_v => {
+            var unordered = unordered_hash_init();
+            hash_set_delta_elements_impl(
+                bounded,
+                pool,
+                v,
+                permutation,
+                bounded_state,
+                &unordered,
+            );
             h = hash_combine(h, unordered_hash_finish(unordered));
         },
         .tuple_v => |t| {
@@ -479,6 +493,52 @@ pub fn hash_value_unseeded_bounded(
 }
 
 const value_tag_tuple: u8 = @backingInt(@import("value.zig").ValueTag.tuple_v);
+const value_tag_set: u8 = @backingInt(@import("value.zig").ValueTag.set_v);
+
+fn hash_set_delta_elements_impl(
+    comptime bounded: bool,
+    pool: *const ValuePool,
+    set_value: Value,
+    permutation: ?[]const u32,
+    bounded_state: *BoundedHashState,
+    unordered: *UnorderedHash,
+) void {
+    switch (set_value) {
+        .set_v => |set| {
+            for (set.items(pool)) |item| {
+                unordered_hash_add(
+                    unordered,
+                    hash_value_inner_impl(
+                        bounded,
+                        pool,
+                        item,
+                        permutation,
+                        bounded_state,
+                    ),
+                );
+            }
+        },
+        .set_delta_v => |delta| {
+            hash_set_delta_elements_impl(
+                bounded,
+                pool,
+                delta.base(pool),
+                permutation,
+                bounded_state,
+                unordered,
+            );
+            hash_set_delta_elements_impl(
+                bounded,
+                pool,
+                .{ .set_v = delta.additions(pool) },
+                permutation,
+                bounded_state,
+                unordered,
+            );
+        },
+        else => unreachable,
+    }
+}
 
 const SequenceLayout = enum {
     not_sequence,
@@ -682,6 +742,47 @@ test "bounded value hashing matches the canonical fingerprint in one pass" {
             aggregate,
             &insufficient_nodes,
         ),
+    );
+}
+
+test "canonical set delta hashes as its concrete finite set" {
+    const Arena = @import("arena.zig").Arena;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var pool = try ValuePool.init(&arena, 128, 128);
+
+    const base_items = [_]Value{
+        .{ .int_v = 1 },
+        .{ .int_v = 2 },
+        .{ .int_v = 3 },
+        .{ .int_v = 4 },
+    };
+    const base_items_offset = try pool.push_values(&base_items);
+    const base_offset = try pool.push_value(.{ .set_v = .{
+        .offset = base_items_offset,
+        .len = base_items.len,
+    } });
+    const addition_items = [_]Value{
+        .{ .int_v = 5 },
+        .{ .int_v = 6 },
+    };
+    const additions_offset = try pool.push_values(&addition_items);
+    const delta = Value{ .set_delta_v = .{
+        .base_offset = base_offset,
+        .additions_offset = additions_offset,
+        .additions_len = addition_items.len,
+        .depth = 1,
+    } };
+    const concrete_items = base_items ++ addition_items;
+    const concrete_offset = try pool.push_values(&concrete_items);
+    const concrete = Value{ .set_v = .{
+        .offset = concrete_offset,
+        .len = concrete_items.len,
+    } };
+
+    try std.testing.expectEqual(
+        hash_value_unseeded(&pool, concrete),
+        hash_value_unseeded(&pool, delta),
     );
 }
 

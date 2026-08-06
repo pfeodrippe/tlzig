@@ -609,6 +609,7 @@ fn inline_expr(
         .box_action => |ba| {
             const bap = try arena.alloc_object(ast.BoxAction);
             bap.* = .{
+                .kind = ba.kind,
                 .action = try inline_expr(arena, ba.action, params, args),
                 .vars = try inline_expr(arena, ba.vars, params, args),
             };
@@ -940,6 +941,18 @@ pub const CandidateSink = struct {
     target: *StateBuffer,
     context: *anyopaque,
     consume: *const fn (*anyopaque, *StateBuffer) Error!void,
+};
+
+pub const CandidateProbe = struct {
+    matched: *bool,
+    context: *anyopaque,
+    matches: *const fn (
+        *anyopaque,
+        *StateStore.State,
+        *StateStore.State,
+        *StateStore,
+        *StateStore,
+    ) Error!bool,
 };
 
 pub const StateBuffer = struct {
@@ -2333,6 +2346,7 @@ pub const ActionExecutor = struct {
     fairness_markers: []const FairnessMarker = &.{},
     edge_action_masks: ?[]u64 = null,
     enabled_probe: ?*bool = null,
+    candidate_probe: ?CandidateProbe = null,
     candidate_sink: ?CandidateSink = null,
     diagnostics: bool = false,
 
@@ -2366,6 +2380,53 @@ pub const ActionExecutor = struct {
         self.evaluator.begin_action_evaluation();
         defer self.evaluator.end_action_evaluation();
         try self.execute_steps(compiled.steps, null, Context.empty(), s0, out_states, false, 0);
+    }
+
+    pub fn probe_next_with_bindings(
+        self: *const ActionExecutor,
+        compiled: CompiledNext,
+        s0_idx: u32,
+        bindings: []const FairnessBinding,
+        probe: CandidateProbe,
+    ) !bool {
+        assert(!probe.matched.*);
+        const s0 = self.source_state_store.get(s0_idx);
+        const pool_snapshot = self.eval_pool.snapshot();
+        defer self.eval_pool.restore(pool_snapshot);
+        self.evaluator.reset_context_pool();
+        self.evaluator.begin_action_evaluation();
+        defer self.evaluator.end_action_evaluation();
+
+        var context = Context.empty();
+        for (bindings) |binding| {
+            const value_v = try binding.value.clone(
+                &self.source_state_store.values_pool,
+                self.eval_pool,
+            );
+            context = try self.evaluator.extend_context(
+                context,
+                binding.name,
+                value_v,
+            );
+        }
+        var probe_executor = self.*;
+        probe_executor.candidate_probe = probe;
+        var storage: [1]u32 = undefined;
+        var candidates = StateBuffer{
+            .storage = &storage,
+            .items = storage[0..0],
+        };
+        try probe_executor.execute_steps(
+            compiled.steps,
+            null,
+            context,
+            s0,
+            &candidates,
+            false,
+            0,
+        );
+        assert(candidates.items.len == 0);
+        return probe.matched.*;
     }
 
     pub fn top_level_action_count(
@@ -3795,6 +3856,9 @@ pub const ActionExecutor = struct {
             if (self.enabled_probe) |probe| {
                 if (probe.*) return;
             }
+            if (self.candidate_probe) |probe| {
+                if (probe.matched.*) return;
+            }
             if (current_steps.len == 0) {
                 if (current_cont) |next| {
                     if (next.return_context) |caller_context| {
@@ -4590,6 +4654,19 @@ pub const ActionExecutor = struct {
                     &self.candidate_store.values_pool,
                 ));
             }
+        }
+        if (self.candidate_probe) |probe| {
+            assert(s0 != null);
+            if (try probe.matches(
+                probe.context,
+                s0.?,
+                new_state,
+                self.source_state_store,
+                self.candidate_store,
+            )) {
+                probe.matched.* = true;
+            }
+            return;
         }
         if (self.edge_action_masks) |masks| {
             assert(out_states.items.len < masks.len);

@@ -131,10 +131,10 @@ pub fn build(b: *std.Build) void {
         run_bench.addArg("--include-long");
     }
     if (benchmark_tlzig_only) {
-        run_bench.addArgs(&.{
-            "--tlzig-only",
-            "--write-tlzig-baseline",
-        });
+        run_bench.addArg("--tlzig-only");
+        if (generated_model_path == null) {
+            run_bench.addArg("--write-tlzig-baseline");
+        }
     }
     if (generated_model_path == null and !benchmark_tlzig_only) {
         run_bench.addArg("--tlc-baseline-prefer-generated");
@@ -302,6 +302,21 @@ pub fn build(b: *std.Build) void {
                 .filter = "EnvironmentControllerN2Safety",
             },
             .{
+                .name = "benchmark_environment_controller_n2_temporal_aot",
+                .model_path = "generated_models/environment_controller_n2_temporal.zig",
+                .tla = "vendor/tlaplus-examples/specifications/detector_chan96/EnvironmentController.tla",
+                .cfg = "benchmark_configs/EnvironmentControllerN2Temporal.cfg",
+                .filter = "EnvironmentControllerN2Temporal",
+            },
+            .{
+                .name = "benchmark_environment_controller_n3_aot",
+                .model_path = "generated_models/environment_controller.zig",
+                .tla = "vendor/tlaplus-examples/specifications/detector_chan96/EnvironmentController.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/detector_chan96/EnvironmentController.cfg",
+                .filter = "EnvironmentControllerN3",
+                .default_enabled = false,
+            },
+            .{
                 .name = "benchmark_mc_kvs_safety_small_aot",
                 .model_path = "generated_models/mc_kvs_safety_small.zig",
                 .tla = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVS.tla",
@@ -322,6 +337,20 @@ pub fn build(b: *std.Build) void {
                 .tla = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVsnap.tla",
                 .cfg = "benchmark_configs/MCKVsnap_no_sym.cfg",
                 .filter = "MCKVsnap",
+            },
+            .{
+                .name = "benchmark_mccrdt_aot",
+                .model_path = "generated_models/mccrdt.zig",
+                .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCCRDT.cfg",
+                .filter = "MCCRDT",
+            },
+            .{
+                .name = "benchmark_mc_replicated_log_aot",
+                .model_path = "generated_models/mc_replicated_log.zig",
+                .tla = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.tla",
+                .cfg = "vendor/tlaplus-examples/specifications/FiniteMonotonic/MCReplicatedLog.cfg",
+                .filter = "MCReplicatedLog",
             },
             .{
                 .name = "benchmark_btree_aot",

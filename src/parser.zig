@@ -1719,7 +1719,7 @@ pub const Parser = struct {
                 // [A]_v stuttering action
                 if (self.match(.underscore)) {
                     const vars_expr = try self.parse_primary();
-                    return try self.expr_box_action(expr, vars_expr);
+                    return try self.expr_box_action(.square, expr, vars_expr);
                 }
                 return try self.parse_suffixes(expr);
             },
@@ -1731,7 +1731,14 @@ pub const Parser = struct {
                 const expr = try self.parse_tuple();
                 if (self.match(.underscore)) {
                     const vars_expr = try self.parse_primary();
-                    return try self.expr_box_action(expr, vars_expr);
+                    if (expr.* != .tuple or expr.tuple.len != 1) {
+                        return error.SyntaxError;
+                    }
+                    return try self.expr_box_action(
+                        .angle,
+                        expr.tuple[0],
+                        vars_expr,
+                    );
                 }
                 return try self.parse_suffixes(expr);
             },
@@ -2146,7 +2153,7 @@ pub const Parser = struct {
         try self.expect(.rbracket);
         if (self.match(.underscore)) {
             const vars_expr = try self.parse_primary();
-            return try self.expr_box_action(func, vars_expr);
+            return try self.expr_box_action(.square, func, vars_expr);
         }
         return func;
     }
@@ -2683,9 +2690,14 @@ pub const Parser = struct {
         return ptr;
     }
 
-    fn expr_box_action(self: *Parser, action: *ast.Expr, vars: *ast.Expr) !*ast.Expr {
+    fn expr_box_action(
+        self: *Parser,
+        kind: ast.BoxAction.Kind,
+        action: *ast.Expr,
+        vars: *ast.Expr,
+    ) !*ast.Expr {
         const bptr = try self.arena.alloc_object(ast.BoxAction);
-        bptr.* = ast.BoxAction{ .action = action, .vars = vars };
+        bptr.* = .{ .kind = kind, .action = action, .vars = vars };
         const ptr = try self.arena.alloc_object(ast.Expr);
         ptr.* = ast.Expr{ .box_action = bptr };
         return ptr;

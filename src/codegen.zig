@@ -72,23 +72,39 @@ pub fn emit_module_with_roots(
 
 pub fn emit_module_with_options(
     allocator: std.mem.Allocator,
-    module: ast.Module,
+    module_input: ast.Module,
     options: Options,
 ) !Result {
     var output = std.ArrayList(u8).empty;
     errdefer output.deinit(allocator);
+    const type_facts = try collect_type_facts(
+        allocator,
+        module_input,
+        options.type_invariants,
+    );
+    defer allocator.free(type_facts);
+    const trusted_integer_facts = try allocator.alloc(
+        ast.TrustedIntegerFact,
+        type_facts.len,
+    );
+    defer allocator.free(trusted_integer_facts);
+    for (type_facts, trusted_integer_facts) |fact, *trusted_fact| {
+        std.debug.assert(fact.variable_index <= std.math.maxInt(u16));
+        std.debug.assert(fact.min_int <= fact.max_int);
+        trusted_fact.* = .{
+            .variable_index = @intCast(fact.variable_index),
+            .min_int = fact.min_int,
+            .max_int = fact.max_int,
+        };
+    }
+    var module = module_input;
+    module.trusted_integer_facts = trusted_integer_facts;
     const reachable = try compute_reachable(
         allocator,
         module,
         options.extra_roots,
     );
     defer allocator.free(reachable);
-    const type_facts = try collect_type_facts(
-        allocator,
-        module,
-        options.type_invariants,
-    );
-    defer allocator.free(type_facts);
     try append(&output, allocator,
         \\const std = @import("std");
         \\const tlzig = @import("tlzig");
@@ -519,6 +535,9 @@ fn definition_kind(
         is_native_override(definition.name) or
         direct_native_name(module, definition.name) != null)
     {
+        return .native;
+    }
+    if (definition_uses_native_action_composition(module, definition)) {
         return .native;
     }
     if (expr_is_temporal(module, definition.body, 0)) return .native;
@@ -1375,6 +1394,14 @@ fn collect_type_facts(
             &facts,
         );
     }
+    var index: usize = 0;
+    while (index < facts.items.len) {
+        if (facts.items[index].min_int > facts.items[index].max_int) {
+            _ = facts.swapRemove(index);
+        } else {
+            index += 1;
+        }
+    }
     return facts.toOwnedSlice(allocator);
 }
 
@@ -1400,8 +1427,13 @@ fn collect_type_facts_from_expr(
         return;
     }
     const fact = type_fact_from_expr(module, expr) orelse return;
-    for (facts.items) |existing| {
-        if (existing.variable_index == fact.variable_index) return;
+    for (facts.items) |*existing| {
+        if (existing.variable_index != fact.variable_index) continue;
+        existing.min_int = @max(existing.min_int, fact.min_int);
+        existing.max_int = @min(existing.max_int, fact.max_int);
+        // Keep a contradiction as a poisoned interval until collection ends.
+        // Later conjuncts must not accidentally re-enable this variable.
+        return;
     }
     try facts.append(allocator, fact);
 }
@@ -1428,6 +1460,7 @@ fn int_range_expr(expr: *const ast.Expr) ?IntRange {
     if (expr.* != .binary or expr.binary.op != .range) return null;
     const min = int_literal_value(expr.binary.left) orelse return null;
     const max = int_literal_value(expr.binary.right) orelse return null;
+    if (min > max) return null;
     return .{
         .min = min,
         .max = max,
@@ -1447,6 +1480,183 @@ fn int_literal_value(expr: *const ast.Expr) ?i64 {
         },
         else => null,
     };
+}
+
+fn trusted_integer_variable_range(
+    module: ast.Module,
+    index: usize,
+) ?IntRange {
+    for (module.trusted_integer_facts) |fact| {
+        if (fact.variable_index == index) return .{
+            .min = fact.min_int,
+            .max = fact.max_int,
+        };
+    }
+    return null;
+}
+
+fn trusted_integer_expr_range(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    params: []const []const u8,
+) ?IntRange {
+    return switch (expr.*) {
+        .int_literal => |value| .{ .min = value, .max = value },
+        .ident => |name| if (param_index(params, name) != null)
+            null
+        else if (variable_index(module, name)) |index|
+            trusted_integer_variable_range(module, index)
+        else
+            null,
+        // A partial successor does not satisfy a state invariant until the
+        // complete action and invariant checks accept it.
+        .primed => null,
+        .unary => |unary| blk: {
+            if (unary.op != .neg) break :blk null;
+            const operand = trusted_integer_expr_range(
+                module,
+                unary.operand,
+                params,
+            ) orelse break :blk null;
+            break :blk .{
+                .min = std.math.negate(operand.max) catch break :blk null,
+                .max = std.math.negate(operand.min) catch break :blk null,
+            };
+        },
+        .binary => |binary| switch (binary.op) {
+            .plus, .minus, .times => trusted_integer_binary_range(
+                module,
+                binary,
+                params,
+            ),
+            else => null,
+        },
+        else => null,
+    };
+}
+
+fn trusted_integer_binary_range(
+    module: ast.Module,
+    binary: *const ast.Binary,
+    params: []const []const u8,
+) ?IntRange {
+    const left = trusted_integer_expr_range(
+        module,
+        binary.left,
+        params,
+    ) orelse return null;
+    const right = trusted_integer_expr_range(
+        module,
+        binary.right,
+        params,
+    ) orelse return null;
+    return switch (binary.op) {
+        .plus => .{
+            .min = std.math.add(i64, left.min, right.min) catch return null,
+            .max = std.math.add(i64, left.max, right.max) catch return null,
+        },
+        .minus => .{
+            .min = std.math.sub(i64, left.min, right.max) catch return null,
+            .max = std.math.sub(i64, left.max, right.min) catch return null,
+        },
+        .times => blk: {
+            const products = [4]i64{
+                std.math.mul(i64, left.min, right.min) catch break :blk null,
+                std.math.mul(i64, left.min, right.max) catch break :blk null,
+                std.math.mul(i64, left.max, right.min) catch break :blk null,
+                std.math.mul(i64, left.max, right.max) catch break :blk null,
+            };
+            break :blk .{
+                .min = @min(@min(products[0], products[1]), @min(products[2], products[3])),
+                .max = @max(@max(products[0], products[1]), @max(products[2], products[3])),
+            };
+        },
+        else => unreachable,
+    };
+}
+
+fn expr_is_trusted_integer(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    params: []const []const u8,
+) bool {
+    return trusted_integer_expr_range(module, expr, params) != null;
+}
+
+fn trusted_integer_comparison(op: ast.BinaryOp) bool {
+    return switch (op) {
+        .eq, .ne, .lt, .le, .gt, .ge => true,
+        else => false,
+    };
+}
+
+fn emit_trusted_integer_expr(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    expr: *const ast.Expr,
+    params: []const []const u8,
+) error{OutOfMemory}!void {
+    std.debug.assert(expr_is_trusted_integer(module, expr, params));
+    switch (expr.*) {
+        .int_literal => |value| {
+            const text = try std.fmt.allocPrint(allocator, "{d}", .{value});
+            defer allocator.free(text);
+            try append(output, allocator, text);
+        },
+        .ident => |name| {
+            const index = variable_index(module, name).?;
+            const text = try std.fmt.allocPrint(
+                allocator,
+                "try runtime.trusted_variable_int(context, {d})",
+                .{index},
+            );
+            defer allocator.free(text);
+            try append(output, allocator, text);
+        },
+        .primed => unreachable,
+        .unary => |unary| {
+            std.debug.assert(unary.op == .neg);
+            try append(output, allocator, "-(");
+            try emit_trusted_integer_expr(
+                output,
+                allocator,
+                module,
+                unary.operand,
+                params,
+            );
+            try append(output, allocator, ")");
+        },
+        .binary => |binary| {
+            try append(output, allocator, "(");
+            try emit_trusted_integer_expr(
+                output,
+                allocator,
+                module,
+                binary.left,
+                params,
+            );
+            try append(
+                output,
+                allocator,
+                switch (binary.op) {
+                    .plus => ") + (",
+                    .minus => ") - (",
+                    .times => ") * (",
+                    else => unreachable,
+                },
+            );
+            try emit_trusted_integer_expr(
+                output,
+                allocator,
+                module,
+                binary.right,
+                params,
+            );
+            try append(output, allocator, ")");
+        },
+        else => unreachable,
+    }
 }
 
 fn expr_is_temporal(
@@ -1655,6 +1865,91 @@ fn set_union_operands(expr: *const ast.Expr) ?SetUnionOperands {
         else
             null,
         else => null,
+    };
+}
+
+const ExceptSetMutation = struct {
+    element: *const ast.Expr,
+    runtime_function: []const u8,
+};
+
+fn except_set_mutation(
+    except_value: *const ast.Except,
+) ?ExceptSetMutation {
+    if (set_union_operands(except_value.value)) |operands| {
+        if (expression_is_except_update_source(
+            operands.left,
+            except_value,
+        ) and operands.right.* == .set_enum and operands.right.set_enum.len == 1) {
+            return .{
+                .element = operands.right.set_enum[0],
+                .runtime_function = "variable_except_update_set_insert",
+            };
+        }
+        if (expression_is_except_update_source(
+            operands.right,
+            except_value,
+        ) and operands.left.* == .set_enum and operands.left.set_enum.len == 1) {
+            return .{
+                .element = operands.left.set_enum[0],
+                .runtime_function = "variable_except_update_set_insert",
+            };
+        }
+    }
+    if (set_difference_operands(except_value.value)) |operands| {
+        if (expression_is_except_update_source(
+            operands.left,
+            except_value,
+        ) and operands.right.* == .set_enum and operands.right.set_enum.len == 1) {
+            return .{
+                .element = operands.right.set_enum[0],
+                .runtime_function = "variable_except_update_set_remove",
+            };
+        }
+    }
+    return null;
+}
+
+fn set_difference_operands(expr: *const ast.Expr) ?SetUnionOperands {
+    return switch (expr.*) {
+        .binary => |binary| if (binary.op == .set_difference)
+            .{ .left = binary.left, .right = binary.right }
+        else
+            null,
+        .set_binary => |binary| if (binary.op == .difference_op)
+            .{ .left = binary.left, .right = binary.right }
+        else
+            null,
+        else => null,
+    };
+}
+
+fn expression_is_except_update_source(
+    expr: *const ast.Expr,
+    except_value: *const ast.Except,
+) bool {
+    return expr.* == .at or expression_matches_except_path(
+        expr,
+        except_value.func,
+        except_value.steps,
+    );
+}
+
+fn expression_matches_except_path(
+    expr: *const ast.Expr,
+    root: *const ast.Expr,
+    steps: []const ast.AccessStep,
+) bool {
+    if (steps.len == 0) return expressions_equal(expr, root);
+    const prefix = steps[0 .. steps.len - 1];
+    return switch (steps[steps.len - 1]) {
+        .field => |name| expr.* == .field and
+            std.mem.eql(u8, expr.field.name, name) and
+            expression_matches_except_path(expr.field.expr, root, prefix),
+        .index => |index_expr| expr.* == .apply and
+            expr.apply.args.len == 1 and
+            expressions_equal(expr.apply.args[0], index_expr) and
+            expression_matches_except_path(expr.apply.func, root, prefix),
     };
 }
 
@@ -2290,6 +2585,12 @@ fn emit_boolean_expr(
         },
         .apply => |application| {
             if (application.func.* == .ident) {
+                if (param_index(params, application.func.ident) != null) {
+                    try append(output, allocator, "try runtime.boolean(");
+                    try emit_expr(output, allocator, module, expr, params);
+                    try append(output, allocator, ")");
+                    return;
+                }
                 if (application.args.len == 1) {
                     if (direct_native_name(
                         module,
@@ -2403,6 +2704,41 @@ fn emit_boolean_expr(
             try append(output, allocator, ")");
         },
         .binary => |binary| {
+            if (trusted_integer_comparison(binary.op) and
+                expr_is_trusted_integer(module, binary.left, params) and
+                expr_is_trusted_integer(module, binary.right, params))
+            {
+                try append(output, allocator, "(");
+                try emit_trusted_integer_expr(
+                    output,
+                    allocator,
+                    module,
+                    binary.left,
+                    params,
+                );
+                try append(
+                    output,
+                    allocator,
+                    switch (binary.op) {
+                        .eq => ") == (",
+                        .ne => ") != (",
+                        .lt => ") < (",
+                        .le => ") <= (",
+                        .gt => ") > (",
+                        .ge => ") >= (",
+                        else => unreachable,
+                    },
+                );
+                try emit_trusted_integer_expr(
+                    output,
+                    allocator,
+                    module,
+                    binary.right,
+                    params,
+                );
+                try append(output, allocator, ")");
+                return;
+            }
             switch (binary.op) {
                 .and_op, .or_op, .implies, .equiv => {
                     if (binary.op == .implies) {
@@ -2494,6 +2830,13 @@ fn emit_boolean_expr(
                     )) return;
                     if (binary.op == .eq or binary.op == .ne) {
                         if (try emit_primed_except_update_comparison(
+                            output,
+                            allocator,
+                            module,
+                            binary,
+                            params,
+                        )) return;
+                        if (try emit_primed_variable_comparison(
                             output,
                             allocator,
                             module,
@@ -2807,6 +3150,18 @@ fn emit_expr(
     expr: *const ast.Expr,
     params: []const []const u8,
 ) error{OutOfMemory}!void {
+    if (expr_is_trusted_integer(module, expr, params)) {
+        try append(output, allocator, "Value{ .int_v = ");
+        try emit_trusted_integer_expr(
+            output,
+            allocator,
+            module,
+            expr,
+            params,
+        );
+        try append(output, allocator, " }");
+        return;
+    }
     switch (expr.*) {
         .bool_literal => |value| try append(
             output,
@@ -3516,6 +3871,34 @@ fn emit_expr(
                 else => null,
             };
             if (direct_variable_index) |index| {
+                if (except_set_mutation(except_value)) |mutation| {
+                    const prefix = try std.fmt.allocPrint(
+                        allocator,
+                        "try runtime.{s}(context, {d}, &[_]Value{{",
+                        .{ mutation.runtime_function, index },
+                    );
+                    defer allocator.free(prefix);
+                    try append(output, allocator, prefix);
+                    try emit_except_update_steps(
+                        output,
+                        allocator,
+                        module,
+                        except_value.steps,
+                        params,
+                    );
+                    try append(output, allocator, "}, ");
+                    try emit_expr(
+                        output,
+                        allocator,
+                        module,
+                        mutation.element,
+                        params,
+                    );
+                    try append(output, allocator, ")");
+                    return;
+                }
+            }
+            if (direct_variable_index) |index| {
                 const prefix = try std.fmt.allocPrint(
                     allocator,
                     "try runtime.variable_except_update(context, args, {d}",
@@ -3890,6 +4273,29 @@ fn emit_expr(
         },
         .apply => |application| {
             if (application.func.* == .ident) {
+                if (param_index(params, application.func.ident)) |index| {
+                    const prefix = try std.fmt.allocPrint(
+                        allocator,
+                        "try runtime.call(context, try runtime.force(context, args[{d}]), &[_]Value{{",
+                        .{index},
+                    );
+                    defer allocator.free(prefix);
+                    try append(output, allocator, prefix);
+                    for (application.args, 0..) |argument, argument_index| {
+                        if (argument_index > 0) {
+                            try append(output, allocator, ", ");
+                        }
+                        try emit_expr(
+                            output,
+                            allocator,
+                            module,
+                            argument,
+                            params,
+                        );
+                    }
+                    try append(output, allocator, "})");
+                    return;
+                }
                 if (constant_substitution_name(
                     module,
                     application.func.*.ident,
@@ -4435,8 +4841,81 @@ fn definition_kind_shallow(
     {
         return .native;
     }
+    if (definition_uses_native_action_composition(module, definition)) {
+        return .native;
+    }
     if (direct_native_name(module, definition.name) != null) return .native;
     return .generated;
+}
+
+fn definition_uses_native_action_composition(
+    module: ast.Module,
+    definition: ast.Definition,
+) bool {
+    var active: [64][]const u8 = undefined;
+    active[0] = definition.name;
+    return expr_uses_native_action_composition(
+        module,
+        definition.body,
+        definition_body_params(definition),
+        &active,
+        1,
+    );
+}
+
+fn expr_uses_native_action_composition(
+    module: ast.Module,
+    expr: *const ast.Expr,
+    shadowed: []const []const u8,
+    active: *[64][]const u8,
+    active_len: usize,
+) bool {
+    if (active_len >= active.len) return false;
+    if (expression_references_identifier(expr, "\\cdot")) return true;
+
+    for (module.config_replacements) |replacement| {
+        if (name_in_slice(shadowed, replacement.name) or
+            !expression_references_identifier(expr, replacement.name))
+        {
+            continue;
+        }
+        const symbol = resolved_config_symbol(module, replacement.name) orelse
+            continue;
+        const resolved = switch (symbol) {
+            .constant => continue,
+            .name => |name| name,
+        };
+        const dependency = find_definition(module, resolved) orelse continue;
+        if (active_definition_contains(active, active_len, dependency.name)) {
+            continue;
+        }
+        active[active_len] = dependency.name;
+        if (expr_uses_native_action_composition(
+            module,
+            dependency.body,
+            definition_body_params(dependency),
+            active,
+            active_len + 1,
+        )) return true;
+    }
+
+    for (module.definitions) |dependency| {
+        if (name_in_slice(shadowed, dependency.name) or
+            active_definition_contains(active, active_len, dependency.name) or
+            !expression_references_identifier(expr, dependency.name))
+        {
+            continue;
+        }
+        active[active_len] = dependency.name;
+        if (expr_uses_native_action_composition(
+            module,
+            dependency.body,
+            definition_body_params(dependency),
+            active,
+            active_len + 1,
+        )) return true;
+    }
+    return false;
 }
 
 fn module_native_override_name(definition: ast.Definition) ?[]const u8 {
@@ -4785,6 +5264,21 @@ fn expr_supported_active(
             break :blk true;
         },
         .apply => |application| blk: {
+            if (application.func.* == .ident and
+                param_index(params, application.func.ident) != null)
+            {
+                for (application.args) |argument| {
+                    if (!expr_supported_active(
+                        module,
+                        argument,
+                        params,
+                        depth,
+                        active,
+                        active_len,
+                    )) break :blk false;
+                }
+                break :blk true;
+            }
             if (application.func.* == .ident and
                 constant_substitution_name(
                     module,
@@ -12165,6 +12659,33 @@ fn emit_one_sided_primed_except_update_comparison(
     if (variable != updated_variable) return false;
 
     if (operator == .ne) try append(output, allocator, "!(");
+    if (except_set_mutation(except_value)) |mutation| {
+        const prefix = try std.fmt.allocPrint(
+            allocator,
+            "try runtime.primed_variable_except_update_path_{s}_equal_bool(context, {d}, &[_]runtime.PathKey{{",
+            .{ if (std.mem.eql(u8, mutation.runtime_function, "variable_except_update_set_insert")) "set_insert" else "set_remove", variable },
+        );
+        defer allocator.free(prefix);
+        try append(output, allocator, prefix);
+        try emit_except_update_path_steps(
+            output,
+            allocator,
+            module,
+            except_value.steps,
+            params,
+        );
+        try append(output, allocator, "}, ");
+        try emit_expr(
+            output,
+            allocator,
+            module,
+            mutation.element,
+            params,
+        );
+        try append(output, allocator, ")");
+        if (operator == .ne) try append(output, allocator, ")");
+        return true;
+    }
     const prefix = try std.fmt.allocPrint(
         allocator,
         "try runtime.primed_variable_except_update_path_equal_bool(context, args, {d}, &[_]runtime.PathKey{{",
@@ -12410,6 +12931,121 @@ fn emit_variable_comparison(
         );
     }
     return false;
+}
+
+fn emit_primed_variable_comparison(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    binary: *const ast.Binary,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    std.debug.assert(binary.op == .eq or binary.op == .ne);
+    const left_primed = primed_variable_index(module, binary.left);
+    const right_primed = primed_variable_index(module, binary.right);
+    if (left_primed != null and right_primed != null) {
+        const function_name = if (binary.op == .eq)
+            "primed_variables_equal_bool"
+        else
+            "primed_variables_not_equal_bool";
+        const call = try std.fmt.allocPrint(
+            allocator,
+            "try runtime.{s}(context, {d}, {d})",
+            .{ function_name, left_primed.?, right_primed.? },
+        );
+        defer allocator.free(call);
+        try append(output, allocator, call);
+        return true;
+    }
+
+    if (left_primed) |primed_index| {
+        if (direct_state_variable_index(module, binary.right, params)) |current_index| {
+            try emit_primed_variable_variable_comparison(
+                output,
+                allocator,
+                binary.op,
+                primed_index,
+                current_index,
+            );
+            return true;
+        }
+        return try emit_one_sided_primed_variable_comparison(
+            output,
+            allocator,
+            module,
+            binary.op,
+            primed_index,
+            binary.right,
+            params,
+        );
+    }
+    if (right_primed) |primed_index| {
+        if (direct_state_variable_index(module, binary.left, params)) |current_index| {
+            try emit_primed_variable_variable_comparison(
+                output,
+                allocator,
+                binary.op,
+                primed_index,
+                current_index,
+            );
+            return true;
+        }
+        return try emit_one_sided_primed_variable_comparison(
+            output,
+            allocator,
+            module,
+            binary.op,
+            primed_index,
+            binary.left,
+            params,
+        );
+    }
+    return false;
+}
+
+fn emit_primed_variable_variable_comparison(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    operator: ast.BinaryOp,
+    primed_index: u32,
+    current_index: u32,
+) error{OutOfMemory}!void {
+    const function_name = if (operator == .eq)
+        "primed_variable_variable_equal_bool"
+    else
+        "primed_variable_variable_not_equal_bool";
+    const call = try std.fmt.allocPrint(
+        allocator,
+        "try runtime.{s}(context, {d}, {d})",
+        .{ function_name, primed_index, current_index },
+    );
+    defer allocator.free(call);
+    try append(output, allocator, call);
+}
+
+fn emit_one_sided_primed_variable_comparison(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    module: ast.Module,
+    operator: ast.BinaryOp,
+    primed_index: u32,
+    other: *ast.Expr,
+    params: []const []const u8,
+) error{OutOfMemory}!bool {
+    const function_name = if (operator == .eq)
+        "primed_variable_equal_bool"
+    else
+        "primed_variable_not_equal_bool";
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "try runtime.{s}(context, {d}, ",
+        .{ function_name, primed_index },
+    );
+    defer allocator.free(prefix);
+    try append(output, allocator, prefix);
+    try emit_expr(output, allocator, module, other, params);
+    try append(output, allocator, ")");
+    return true;
 }
 
 fn direct_state_variable_index(
@@ -12947,6 +13583,44 @@ test "emit enabled actions and quantified fairness without fallbacks" {
         u8,
         result.source,
         "runtime.enabled_bool(context)",
+    ) != null);
+}
+
+test "strict generation handles local operator shadowing and action composition" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedComposition ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Max(a, b) == a + b
+        \\Base(n) == x' = n
+        \\Reduction == x' = x
+        \\Composed(n) == Base(n) \cdot Reduction
+        \\Next == Composed(1)
+        \\Local(n) ==
+        \\    LET Max(a, b) == IF a > b THEN a ELSE b IN
+        \\    x' = Max(n, 0)
+        \\==========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Next", "Local" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expectEqual(@as(usize, 0), result.unsupported.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.call(context, try runtime.force(context, args[1])",
     ) != null);
 }
 
@@ -13693,6 +14367,90 @@ test "state variable EXCEPT lowers to a cross-pool update" {
     var tree = try std.zig.Ast.parse(std.testing.allocator, source_z, .{});
     defer tree.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+}
+
+test "state variable EXCEPT set insertion uses one cross-pool update" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedVariableExceptInsert ----------------------
+        \\VARIABLE f
+        \\Insert(i, x) == [f EXCEPT ![i] = f[i] \cup {x}]
+        \\InsertAt(i, x) == [f EXCEPT ![i] = @ \cup {x}]
+        \\Remove(i, x) == [f EXCEPT ![i] = f[i] \ {x}]
+        \\RemoveAt(i, x) == [f EXCEPT ![i] = @ \ {x}]
+        \\=========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Insert", "InsertAt", "Remove", "RemoveAt" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 4), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.variable_except_update_set_insert(context, 0",
+    ) != null);
+    try std.testing.expect(std.mem.count(
+        u8,
+        result.source,
+        "runtime.variable_except_update_set_insert(context, 0",
+    ) >= 2);
+    try std.testing.expect(std.mem.count(
+        u8,
+        result.source,
+        "runtime.variable_except_update_set_remove(context, 0",
+    ) >= 2);
+}
+
+test "primed EXCEPT set mutations compare without updater callbacks" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE GeneratedPrimedExceptSetMutation ----------------------
+        \\VARIABLE f
+        \\Insert(i, x) == f' = [f EXCEPT ![i] = @ \cup {x}]
+        \\Remove(i, x) == f' = [f EXCEPT ![i] = f[i] \ {x}]
+        \\=========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Insert", "Remove" },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.generated_count);
+    try std.testing.expectEqual(@as(u32, 0), result.fallback_count);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.primed_variable_except_update_path_set_insert_equal_bool",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.primed_variable_except_update_path_set_remove_equal_bool",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.primed_variable_except_update_path_equal_bool",
+    ) == null);
 }
 
 test "self-recursive operators are generated without fallbacks" {
@@ -14474,7 +15232,7 @@ test "generated CASE expressions work inside function literals" {
     );
 }
 
-test "selected type invariant emits integer range type facts" {
+test "selected type invariant lowers trusted integer operations" {
     const Arena = @import("arena.zig").Arena;
     const parser = @import("parser.zig");
     const source =
@@ -14484,6 +15242,12 @@ test "selected type invariant emits integer range type facts" {
         \\          /\ y \in -1..1
         \\Init == TypeOK
         \\Next == UNCHANGED <<x, y>>
+        \\Sum == x + y
+        \\Ordered == x + 1 < y
+        \\Advance == x' = x + 1
+        \\Pair == x' = y
+        \\PairPrime == x' = y'
+        \\Separate == x' # y
         \\==============================================================
         \\
     ;
@@ -14495,7 +15259,17 @@ test "selected type invariant emits integer range type facts" {
         std.testing.allocator,
         module,
         .{
-            .extra_roots = &.{ "Init", "Next", "TypeOK" },
+            .extra_roots = &.{
+                "Init",
+                "Next",
+                "TypeOK",
+                "Sum",
+                "Ordered",
+                "Advance",
+                "Pair",
+                "PairPrime",
+                "Separate",
+            },
             .type_invariants = &.{"TypeOK"},
         },
     );
@@ -14511,4 +15285,124 @@ test "selected type invariant emits integer range type facts" {
         result.source,
         ".{ .variable_index = 1, .min_int = -1, .max_int = 1 }",
     ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.trusted_variable_int(context, 0)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.trusted_primed_variable_int",
+    ) == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.primed_variable_equal_bool(context, 0",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.primed_variable_variable_equal_bool(context, 0, 1)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.primed_variables_equal_bool(context, 0, 1)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.primed_variable_variable_not_equal_bool(context, 0, 1)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.add(",
+    ) == null);
+
+    const untrusted = try emit_module_with_roots(
+        std.testing.allocator,
+        module,
+        &.{ "Sum", "Ordered", "Advance" },
+    );
+    defer untrusted.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        untrusted.source,
+        "runtime.trusted_variable_int",
+    ) == null);
+}
+
+test "selected type invariant does not lower overflowing integer arithmetic" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE TypeFactOverflow ----------------------
+        \\VARIABLE x
+        \\TypeOK == x \in 9223372036854775807..9223372036854775807
+        \\Init == TypeOK
+        \\Next == UNCHANGED x
+        \\Overflow == x + 1
+        \\=====================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_options(
+        std.testing.allocator,
+        module,
+        .{
+            .extra_roots = &.{ "Init", "Next", "Overflow" },
+            .type_invariants = &.{"TypeOK"},
+        },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.trusted_variable_int(context, 0)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "try runtime.add(",
+    ) != null);
+}
+
+test "contradictory type facts cannot be re-enabled by later conjuncts" {
+    const Arena = @import("arena.zig").Arena;
+    const parser = @import("parser.zig");
+    const source =
+        \\---------------------- MODULE ContradictoryTypeFacts ----------------------
+        \\VARIABLE x
+        \\TypeOK == /\\ x \in 0..0
+        \\          /\\ x \in 1..1
+        \\          /\\ x \in -100..100
+        \\Read == x + 1
+        \\==========================================================================
+        \\
+    ;
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+    var module_parser = parser.Parser.init(&arena, source);
+    const module = try module_parser.parse_module();
+    const result = try emit_module_with_options(
+        std.testing.allocator,
+        module,
+        .{
+            .extra_roots = &.{ "TypeOK", "Read" },
+            .type_invariants = &.{"TypeOK"},
+        },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.source,
+        "runtime.trusted_variable_int",
+    ) == null);
 }

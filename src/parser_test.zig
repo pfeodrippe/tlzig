@@ -439,6 +439,53 @@ test "hereditary power-set membership streams initial states" {
     try std.testing.expectEqual(@as(u64, 1024), result.distinct);
 }
 
+test "canonical aggregate interner grows in bounded segments" {
+    const source =
+        \\---------------------- MODULE TestCanonicalSegments ----------------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x \in {<<i>> : i \in 0..1000}
+        \\Next == FALSE
+        \\==============================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = null,
+        .init_name = "Init",
+        .next_name = "Next",
+        .invariants = &.{},
+        .properties = &.{},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        1100,
+        32 * 1024,
+        256,
+        8192,
+        1024,
+        8 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 1001), result.distinct);
+    const stats = model_checker.canonical_value_stats();
+    try std.testing.expectEqual(@as(u8, 2), stats.segments);
+    try std.testing.expectEqual(@as(usize, 2048), stats.capacity);
+    try std.testing.expectEqual(@as(u32, 1001), stats.entries);
+}
+
 test "parse SimpleRegular-style Init" {
     const source =
         \\---------------------- MODULE TestInit ----------------------
@@ -1318,6 +1365,59 @@ test "liveness resolves fairness through a specification alias" {
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
 }
 
+test "eventually-always action assumptions constrain recurring edges" {
+    const source =
+        \\---------------- MODULE TestEventuallyAlwaysAssumption ----------------
+        \\EXTENDS Naturals
+        \\VARIABLE x
+        \\Init == x = 0
+        \\Toggle == x \in {0, 1} /\ x' = 1 - x
+        \\Escape == x \in {0, 1} /\ x' = 2
+        \\Stay == x = 2 /\ UNCHANGED x
+        \\Next == Toggle \/ Escape \/ Stay
+        \\EventuallyStay == <>[][Stay]_x
+        \\Spec == Init /\ [][Next]_x /\ WF_x(Toggle) /\ EventuallyStay
+        \\Prop == <>(x = 2)
+        \\=======================================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Prop"},
+        .constants = &.{},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        model_checker.eventual_always.len,
+    );
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 3), result.distinct);
+}
+
 test "liveness supports tuple-subscript weak fairness" {
     const source =
         \\---------------------- MODULE TestTupleFairness ----------------------
@@ -1368,13 +1468,15 @@ test "liveness expands fairness over symbolic record sets" {
         \\---------------------- MODULE TestRecordSetFairness ----------------------
         \\VARIABLE x
         \\Calls == [floor : {1, 2}, direction : {"Up", "Down"}]
+        \\Groups == {[calls |-> Calls]}
         \\Init == x = 0
         \\Step(call) == x' = x
         \\Next == \E call \in Calls : Step(call)
         \\Spec ==
         \\    /\ Init
         \\    /\ [][Next]_x
-        \\    /\ \A call \in Calls : WF_x(Step(call))
+        \\    /\ \A group \in Groups :
+        \\        \A call \in group.calls : WF_x(Step(call))
         \\Prop == <>TRUE
         \\==============================================================
         \\
@@ -1411,6 +1513,62 @@ test "liveness expands fairness over symbolic record sets" {
     try std.testing.expectEqual(@as(usize, 4), model_checker.fairness.len);
     const result = try model_checker.check();
     try std.testing.expectEqual(@as(u64, 1), result.distinct);
+}
+
+test "quantified fairness subscript retains its binding" {
+    const source =
+        \\---------------- MODULE TestBoundFairnessSubscript ----------------
+        \\EXTENDS Naturals
+        \\CONSTANT P
+        \\VARIABLE x
+        \\vars == <<x>>
+        \\Init == x = [p \in P |-> 0]
+        \\Step(p) == x' = [x EXCEPT ![p] = 1 - x[p]]
+        \\Next == \E p \in P : Step(p)
+        \\Live == <>TRUE
+        \\Spec ==
+        \\    /\ Init
+        \\    /\ [][Next]_vars
+        \\    /\ (\A p \in P : WF_<<x[p]>>(Step(p)))
+        \\==================================================================
+        \\
+    ;
+    var arena = try Arena.init(16 * 1024 * 1024);
+    defer arena.deinit();
+    var p = parser.Parser.init(&arena, source);
+    const module = try p.parse_module();
+    const cfg = config.Config{
+        .spec_name = "Spec",
+        .init_name = null,
+        .next_name = null,
+        .invariants = &.{},
+        .properties = &.{"Live"},
+        .constants = &.{.{
+            .name = "P",
+            .expr = "{1, 2}",
+            .is_substitution = false,
+        }},
+        .constraints = &.{},
+        .action_constraints = &.{},
+        .check_deadlock = false,
+    };
+    var model_checker = try checker.Checker.init(
+        &arena,
+        module,
+        cfg,
+        8,
+        4096,
+        1024,
+        4096,
+        1024,
+        4 * 1024 * 1024,
+        overrides.OverrideContext.default(),
+        1,
+    );
+    defer model_checker.deinit();
+    try std.testing.expectEqual(@as(usize, 2), model_checker.fairness.len);
+    const result = try model_checker.check();
+    try std.testing.expectEqual(@as(u64, 4), result.distinct);
 }
 
 test "weak fairness evaluates conjunctive action semantics on graph edges" {
@@ -3900,6 +4058,8 @@ test "loaded MCCRDT retains every ReductionNext branch" {
     );
     const reduction_next = evaluator.find_definition("ReductionNext") orelse
         return error.UndefinedSymbol;
+    _ = evaluator.find_definition("Fairness") orelse
+        return error.UndefinedSymbol;
     try std.testing.expect(reduction_next.body.* == .quantifier);
 
     var branches: u32 = 1;
@@ -3909,6 +4069,23 @@ test "loaded MCCRDT retains every ReductionNext branch" {
         expression = expression.binary.left;
     }
     try std.testing.expectEqual(@as(u32, 4), branches);
+}
+
+test "action subscripts preserve square and angle semantics" {
+    var arena = try Arena.init(1024 * 1024);
+    defer arena.deinit();
+
+    const square = try parser.Parser.parse_expr_string(&arena, "[Next]_vars");
+    try std.testing.expect(square.* == .box_action);
+    try std.testing.expectEqual(ast.BoxAction.Kind.square, square.box_action.kind);
+    try std.testing.expect(square.box_action.action.* == .ident);
+    try std.testing.expectEqualStrings("Next", square.box_action.action.ident);
+
+    const angle = try parser.Parser.parse_expr_string(&arena, "<<Next>>_vars");
+    try std.testing.expect(angle.* == .box_action);
+    try std.testing.expectEqual(ast.BoxAction.Kind.angle, angle.box_action.kind);
+    try std.testing.expect(angle.box_action.action.* == .ident);
+    try std.testing.expectEqualStrings("Next", angle.box_action.action.ident);
 }
 
 test "parameterized namespace call flattens instance and operator arguments" {

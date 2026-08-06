@@ -426,9 +426,10 @@ pub fn main(init: std.process.Init.Minimal) void {
                 },
             );
         }
-        std.debug.print(" -- generated={d} distinct={d}\n", .{
+        std.debug.print(" -- generated={d} distinct={d} queued={d}\n", .{
             ch.successor_attempts,
             ch.distinct,
+            ch.queued_state_count(),
         });
         if (diagnostics) {
             if (@errorReturnTrace()) |trace| {

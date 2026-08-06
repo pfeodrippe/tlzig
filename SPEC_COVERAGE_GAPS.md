@@ -1,6 +1,6 @@
 # TLA+ Specification Coverage
 
-Last updated: 2026-08-04
+Last updated: 2026-08-05
 
 ## Goal
 
@@ -74,20 +74,30 @@ Completed benchmark/semantic audits provide exact evidence for three more:
 (`5,502,547` distinct), and `MCInnerSerial` (`195` distinct). The conservative
 reconciliation now also includes the exact Slush Medium benchmark and the
 2026-08-03 exhaustive LCS Medium and Elevator Safety Medium runs. The
-unresolved finite exhaustive-evidence backlog is therefore **8 configurations**:
+unresolved finite exhaustive-evidence backlog is therefore **7 configurations**:
 
 - `KeyValueStore/MCKVSSafetyLarge.cfg`
 - `TLC/TestMCReachability.cfg`
 - `c1cs/APc1cs.cfg`
 - `c1cs/c1cs.cfg`
 - `dag-consensus/TLCSailfish2.cfg`
-- `detector_chan96/EnvironmentController.cfg`
 - `diskpaxos/MC_HDiskSynod.cfg`
 - `ewd998/EWD998.cfg`
 
 These are bounded evidence gaps, not known compatibility failures. They must
 remain open until both engines finish with matching successful distinct counts
 or matching configured violation/deadlock outcomes.
+
+The 2026-08-05 default MultiShardTxn ReleaseFast filter passes all eight rows.
+Seven upstream configurations terminate at a valid deadlock under Java TLC;
+they are now represented as expected-deadlock rows rather than the previously
+incorrect generic expected-violation label. Fresh one-worker TLC confirms the
+MCM snapshot deadlock at `31,328/10,776` generated/distinct states. All strict
+AOT artifacts have zero fallback, match TLC's outcome, and are faster in the
+filtered all-core run; representative TLC/AOT timings are MCM snapshot
+`1.655s/0.232s`, Storage `1.487s/0.215s`, and RC snapshot `2.333s/0.313s`.
+As required by the acceptance rules, first-deadlock counts are retained but
+not treated as completed graph sizes.
 
 The KeyValueStore safety family now has two exact strict-AOT anchors. Small
 completes in both engines at `56,349,379/3,409,605` generated/distinct states;
@@ -131,7 +141,13 @@ Java has reached `367,297,806/32,849,147` generated/distinct states with
 `426,483,296/40,000,000` in `76.02s`, with `20,314,356` queued. This is
 `1.92x` higher distinct throughput and `1.83x` higher generated throughput,
 while RSS is 8.02 GB versus TLC's observed 11.55 GB. Both queues are growing,
-so Large remains in the eight-row backlog rather than being mislabeled exact.
+so Large remains in the seven-row backlog rather than being mislabeled exact.
+
+A later unchanged strict-AOT ReleaseFast run extends that evidence to the
+explicit 100-million-distinct-state boundary in `210.95s`, at
+`1,237,477,213/100,000,000` generated/distinct states and `19.70 GB` peak RSS.
+No invariant fails, but `43,838,449` states remain queued and the queue is
+still growing. This is therefore deeper bounded evidence, not completion.
 
 `SlushLarge.cfg` now has substantially deeper strict-AOT evidence. The
 unmodified model generates 35 operators with one standard native definition
@@ -228,6 +244,24 @@ about `1.39x` higher average distinct-state throughput for tlzig over the
 bounded runs, but neither engine completed, so this is not exhaustive
 correctness evidence.
 
+A larger strict-AOT run reaches `2,042,435,079/78,542,540`
+generated/distinct states in `610.94s`, with more than 44 million states still
+queued and no invariant failure. It stops at the explicit 192-million
+canonical-value storage limit rather than completing the graph. Peak RSS is
+`20.94 GB`. The fixed canonical interner had stopped accepting new entries at
+25 million states; the resulting aggregate cloning is a generic scalability
+target, not an APc1cs semantic failure or exhaustive evidence.
+
+The generic canonical interner now grows through at most four bounded,
+non-relocating segments instead of silently ceasing to intern after the first
+segment reaches 75% load. In a controlled strict-AOT run, unchanged upstream
+`APc1cs.cfg` reached its exact 30-million-state bound in `192.96s` at
+`695,469,000/30,000,000` generated/distinct states, with `17,536,217` states
+still queued and no invariant failure. Three published segments contained
+`14,840,054` entries, and peak RSS was `8.61 GB`. This validates the new
+storage path but does not close APc1cs and is not reported as a speedup because
+there is no identical pre-change 30-million-state timing.
+
 `c1cs.cfg` remains open. A 300-second all-core audit reached a TLC periodic
 temporal checkpoint over a reported `8,862,895`-state current graph; that line
 was not a completed base-state count, and neither engine completed within the
@@ -242,6 +276,43 @@ temporal runs; a larger strict-AOT run reached
 `6,661,257` queued, only `27,464,951` canonical values, and `5.00 GB` peak
 RSS. This is a major general representation improvement, but the expanding
 frontier remains bounded rather than exact.
+
+The post-publication strict-AOT frontier now reaches
+`671,673,538/30,000,000` generated/distinct states in `341.22s`, with roughly
+17 million states still queued, no semantic failure, and `9.94 GB` peak RSS.
+An all-worker profile shows c1cs is compute-bound in aggregate comparison,
+fingerprinting, cloning, and EXCEPT reconstruction rather than blocked on the
+graph publication locks. A generic syntax-directed lowering now fuses
+`[f EXCEPT ![path] = f[path] \\cup {x}]` into one cross-pool reconstruction.
+On a controlled same-revision 12-million-state A/B, ordinary lowering takes
+`114.35s` and `26.50T` instructions; fused lowering takes `111.45s` and
+`25.94T` instructions, a `2.6%` wall-time and `2.1%` instruction improvement.
+Primed assignments with the same proven set-mutation shape now compare the
+changed leaf directly, without materializing a set or invoking an updater
+callback. The final separated implementation reaches the same 12-million-state
+boundary in `103.06s`, with `24.38T` instructions and `3.66 GiB` peak RSS. That
+is `7.5%` faster than the preceding `111.45s` result and `9.9%` faster than the
+original ordinary path. The ReleaseSafe suite passes `266/266`, and the strict
+artifact retains zero fallback. The post-change full default ReleaseFast
+benchmark passes every configured outcome and count contract. The
+30-million-state queue is still expanding, so c1cs remains open.
+
+The same generic lowering also recognizes TLA+'s canonical updater spelling
+`![path] = @ \\cup {x}`. MCKVSSafetySmall exercises three such sites and still
+completes at exact `56,349,379/3,409,605` generated/distinct parity. On two
+alternating all-core runs, ordinary and fused code both have a `7.33s` median;
+fused code retires about 2.5% fewer instructions and 3% fewer cycles. This is
+recorded as a CPU-work reduction rather than a wall-time claim on a seven-second
+sample.
+
+Syntax-proven set removal now uses the same single-reconstruction path for
+`![path] = f[path] \\ {x}` and `![path] = @ \\ {x}`. Assertion tests cover
+present and absent elements. The complete default MultiShardTxn filter passes
+all eight paired outcome contracts after regeneration, with zero fallback and
+faster AOT time on every row. The post-gate generated-pattern audit records 50
+fused insertions, 19 fused removals, and 1,478 remaining callback-based
+variable EXCEPT sites across 74 strict generated artifacts. It also records
+189 direct primed set-insertion comparisons and 136 direct removals.
 
 `EWD840_anim.cfg` is closed in its manifest-declared simulation mode. With 100
 traces, depth 100, and seed `6074329268192498505`, both engines find `AnimInv`.
@@ -272,6 +343,13 @@ the identical 30-million-state command lowers peak RSS from `11.79 GB` to
 after the complete benchmark exposed a `Barrier` semantic regression. The row
 therefore remains bounded rather than being mislabeled exact.
 
+The current strict-AOT runtime reproduces that frontier and extends it to the
+explicit 100-million-distinct-state boundary in `535.65s`, with
+`1,319,842,293` generated transitions, `22.25 GB` maximum RSS, and no
+invariant failure. The queue still contains `24,755,885` states at the
+90-million checkpoint, so the run remains bounded and does not justify a
+larger blind allocation.
+
 `TLCSailfish2.cfg` remains open after a strict zero-fallback AOT audit. Its
 36 generated operators and one native temporal definition now reach the
 two-million-state cap at `3,784,909/2,000,000` in `23.62s`; TLC reached
@@ -281,6 +359,18 @@ recursive canonical subvalue sharing, this boundary stored about 400 million
 stores `60,180,882` values and uses `2.70 GB` peak RSS, reductions of about
 85% and 80%, respectively. The model still has `1,590,436` states queued, so
 this remains bounded rather than exhaustive parity.
+
+The unchanged configuration now also reaches an exact ten-million-distinct
+state boundary. A generic canonical finite-set delta representation reduced
+the controlled ReleaseFast run from `152.07s`, `10.62 GB` peak RSS,
+`332,777,367` canonical values, `33.951T` instructions, and `6.973T` cycles to
+`146.72s`, `3.64 GB`, about `41.8M` canonical values, `33.205T` instructions,
+and `6.872T` cycles. This is a 3.5% wall-time improvement, 65.8% lower RSS,
+and 87.4% fewer canonical values at the same artificial state boundary. The
+representation is selected only after proving an ordered finite-set prefix,
+uses a bounded chain, and otherwise materializes the ordinary set; it contains
+no model or operator names. The frontier is still expanding, so Sailfish2
+remains in the seven-row exhaustive backlog.
 
 `APCRDT.cfg` and `APReplicatedLog.cfg` both generate strict AOT with eight
 generated operators, one standard native operator, and zero fallback. For
@@ -293,6 +383,22 @@ distinct states after 300 seconds with `69,456,028` queued. These are expected
 nonterminating frontiers. Exact finite companion configurations close the
 shared semantic paths: `MCCRDT.cfg` completes at `25,000` distinct states and
 `MCReplicatedLog.cfg` at `1,363` in both engines.
+
+Focused ReleaseFast all-core runs after the finite-set delta change show that
+the small full-suite timing inversions were contention noise: Sailfish1 strict
+AOT completes in `2.608s` versus TLC-auto `3.646s` at exact `109,604`
+distinct states, and MCCRDT strict AOT completes in `1.281s` versus TLC-auto
+`1.592s` at exact `25,000` distinct states.
+
+The all-core `MCReplicatedLog.cfg` gate exposed nondeterministic temporal
+results despite identical `11,617/1,363` tlzig counts. Replaying final graph
+edges found thousands of extra fairness bits: markers reached inside action
+composition described an intermediate transition, not necessarily the final
+composed edge. Composition-derived masks are now classified as non-exact and
+recomputed on the completed concrete graph. The old code failed 6 of 50
+identical 16-worker runs; the corrected ReleaseFast build passes 100 of 100,
+and the paired interpreted/AOT benchmark passes at exact `1,363` distinct
+states (`0.065s` interpreted auto and `0.045s` AOT in the full gate).
 
 Both APInnerFIFO variants generate strict AOT with `16` generated operators,
 one standard native operator, and zero fallback. Fresh five-million-state runs
@@ -355,12 +461,34 @@ with `2,830,058` queued and `11.80 GB` peak RSS. CPU work was within 0.6% of
 the larger-table repeat, but the historical `247.00s` wall sample remains
 faster; no performance win is claimed for this low-density row.
 
+A clean original N=3 Java TLC run used Java 21 ParallelGC, final liveness
+checking, fingerprint polynomial 50, and seed `-8028679693072963904`. It
+reaches the same age-43 `TypeOK` violation at State 140 after
+`469,054,489/47,087,565` generated/distinct states, with `363,760` queued and
+complete-search depth 140. The strict zero-fallback AOT run reports `TypeOK`
+at level 139, which is the same 139-transition trace, after
+`456,440,700/47,087,918` generated/distinct states. The distinct frontiers
+differ by only 353 states (`0.000750%`) under parallel early termination. The
+maintained row enforces the exact failure class and name plus a 100,000-state
+distinct tolerance (`0.212%` of TLC's frontier).
+
+The current recorded full-process times are TLC `10,171.93s` and tlzig
+`387.280s`, a `26.27x` speedup. TLC used `7,977,959,424` bytes maximum RSS;
+tlzig used `21,310,930,944` bytes (`2.67x` more). The TLC wall sample overlapped
+low-priority Zig builds and tests, so it is conclusive correctness evidence
+but not a pristine isolated Java performance sample. Its durable log is
+`benchmark_results/long_runs/environment_controller_n3_tlc_fp50.log`. An
+earlier recovery with fingerprint polynomial 128 mixed incompatible raw
+fingerprints and remains quarantined; none of its post-recovery counts are
+evidence. The paired harness now always pins `-fp 0 -seed 0` so future runs
+and recoveries are reproducible.
+
 Direct action lowering now recognizes bounded `SUBSET` choices without
 materializing the complete power set, and conservatively pushes a leading
 element-local universal guard into the base set. On the identical N=3 strict
 AOT four-million-state boundary, wall time falls from `307.24s` to `18.48s`
 (`16.63x`) and retired instructions from `62.399T` to `2.779T` (`22.46x`).
-The optimized N=3 run then exposes a real upstream `TypeOK` violation at
+The first optimized N=3 run then exposed a real upstream `TypeOK` violation at
 approximately `456,440,685/47,087,903` generated/distinct states: a message
 addressed to a failed process reaches age `43` although `maxAge` is `42`.
 
@@ -370,10 +498,40 @@ same age-43 `TypeOK` violation. The default ReleaseFast benchmark records TLC
 at `592,015/126,903` in `1.393s` and tlzig at `490,665/106,399` in `0.185s`,
 a `7.53x` tlzig speedup; the 16.2% distinct-count difference is expected from
 parallel early-stop scheduling and is bounded by an explicit 30,000-state
-regression tolerance. The original N=3 cfg remains in the finite backlog:
-its direct Java run was interrupted at `31,408,710/5,093,688` after `544.63s`
-before reaching a verdict, so reduced paired evidence is not presented as an
-exhaustive N=3 closure.
+regression tolerance. The full N=3 pair above supersedes the earlier
+interrupted Java attempts and closes that finite row.
+
+The unmodified N=3 configuration is now also registered as the opt-in
+`EnvironmentControllerN3` strict-AOT benchmark. Its generated artifact covers
+the complete configured spec, invariant, and both temporal properties with
+zero fallback. The default gate keeps the reduced exact-outcome regression;
+the full pair is opt-in because Java's search takes hours while the existing
+ReleaseFast tlzig run reaches the TypeOK violation at level 139 after
+`456,440,700/47,087,918` generated/distinct states in `387.280s` checker time
+(`387.69s` full process, `5,080.61s` user, `153.63s` system,
+`21,310,930,944` bytes maximum RSS). This current sample is 11.61% slower than
+the earlier valid `346.98s` run, while still 26.27x faster than recorded TLC.
+The old `25.46s` value was only the tool wrapper's final-output wait and is not
+a benchmark result. The completed Java reference establishes the same
+`TypeOK` operator, source-level witness, and transition depth, so
+EnvironmentController is no longer in the finite backlog.
+
+The temporal edge-marker path now conservatively projects fairness actions
+whose residual conjuncts are shared top-level `Next` constraints. Recorded
+matching edges avoid re-evaluating the complete action; unrecorded edges still
+evaluate it to catch semantic overlap between different action branches. A
+discarded pre-projection diagnostic remained in full fairness-action
+evaluation for more than 50 minutes. The optimized repeat restores a
+conclusive six-minute result without reverting overlap correctness. The N=2
+temporal regression exercises the same path and reaches `TypeOK` at
+approximately 126,775 distinct states in 0.430s under strict zero-fallback
+AOT.
+
+Expected-violation benchmark rows now require semantic failure-class parity:
+an invariant violation cannot match a temporal/property or assertion failure.
+When TLC identifies an invariant operator, tlzig must report that same
+operator. This closes the prior loophole where two unrelated failures could
+both be accepted under the generic `violation` outcome.
 
 `TestMCReachability.cfg` now passes initialization through strict AOT. The
 generated compiler previously evaluated the TLA body of the Community Modules
@@ -385,6 +543,32 @@ TLC `376,820/252,366` before its 60-second timeout and strict zero-fallback
 tlzig's explicit ten-million-state cap at `15,719,199/10,000,000` in
 `32.783s`. The semantic rejection is fixed; the row remains bounded because
 both frontiers are incomplete.
+
+The identical strict-AOT 30-million-state command was repeated after a generic
+large-temporal interner policy change. The prior run reached
+38,869,569/30,000,000 generated/distinct states in 97.13s, consumed
+181,188,336 canonical values, and peaked at 12.60 GB RSS after its
+2-Mi-entry interner saturated. The new run reached
+38,577,718/30,000,000 in 101.38s, consumed 71,581,704 canonical values,
+and peaked at 10.08 GB RSS with an unsaturated 8-Mi-entry table. This is a
+60.5% canonical-storage and 20.0% RSS reduction, but a 4.4% wall-time
+regression, so no speed claim is made and the expanding frontier remains open.
+
+The unchanged row was subsequently extended to an explicit 60-million-state
+bound. Strict zero-fallback AOT reaches `78,191,317/60,000,000`
+generated/distinct states in `216.29s`, with `31,370,416` states still queued,
+`152,004,894` canonical values, and no invariant or temporal failure. Peak RSS
+is `20.26 GB`, so this remains bounded evidence.
+
+Profiling an identical 20-million-state ReleaseFast command showed that the
+temporal graph's single publication mutex dominated worker samples. A generic
+fast path now separates canonical-value publication from state/fingerprint/
+graph publication, performs lock-free canonical lookups, and canonicalizes
+only misses. Deterministic VIEW and ENABLED-invariant models retain the old
+serialized path. The identical command falls from `67.70s` to `32.91s`, a
+`2.06x` speedup, without model-specific operators or runtime semantics. The
+ReleaseSafe suite passes `263/263`, the full default ReleaseFast benchmark
+passes, and completed temporal regressions retain exact distinct-state parity.
 
 `MultiPaxos_MC.cfg` is closed exhaustively. Fresh strict AOT emits `60`
 generated operators, one standard native definition, and zero fallback. TLC
@@ -483,7 +667,13 @@ the long rows, including:
 | RC/with-prepare-block exhaustive | 15,738,792 | 155.452s | 75.65s | 2.05x |
 | RC/snapshot exhaustive | 67,629,092 | 697.495s | 314.422s | 2.218x |
 | SingleLog MCMDBProps | 269,881 | 1,434.504s | 99.42s | 14.4x |
-| SingleShardTxn ShardTxn | 5,502,547 | 179.117s | 24.286s | 7.38x |
+| SingleShardTxn ShardTxn (sound no-symmetry temporal baseline) | 10,430,809 | 268.363s | 27.987s | 9.59x |
+
+The older `5,502,547`-state SingleShardTxn result uses the upstream symmetry
+quotient. It remains valid safety evidence, but it is not used for liveness:
+plain orbit-state symmetry can change temporal semantics. The sound no-symmetry
+pair above has exact `25,821,172/10,430,809` generated/distinct parity and
+checks the full configured temporal property in both engines.
 
 The current 2026-08-04 strict-AOT rerun also closes Storage exhaustive at
 exactly `1,078,623` distinct states: TLC takes `32.756s` and tlzig takes
@@ -764,8 +954,9 @@ order can reach different valid witnesses and partial state counts.
 
 ## Remaining Work
 
-- [ ] Run opt-in exhaustive paired checks for the remaining bounded primary
-  rows.
+- [ ] Run opt-in exhaustive paired checks for the seven remaining bounded
+  primary rows. `TestMCReachability.cfg` currently has a clean 60-million-state
+  strict-AOT frontier, but still has more than 31 million states queued.
 - [x] Complete the extended paired runs for upstream `MCMDBProps` and
   `ShardTxn`. Exact completed evidence is `3,101,918/269,881` and
   `79,141,749/5,502,547` generated/distinct states, respectively; the old
@@ -773,14 +964,41 @@ order can reach different valid witnesses and partial state counts.
 - [ ] Audit ordinary non-TLAPS model fixtures under `vendor/tlaplus` separately
   from Java-extension, distributed-TLC, trace, and malformed-input fixtures.
 - [ ] Continue generic typed AOT lowering from trusted TypeOK facts and
-  measured profile data. PGO observations may select optimizations, but cannot
-  silently assume semantics not guaranteed by the model/configuration.
-- [ ] Lower the measured generated-code backlog generically: 25,548 nested
-  helper chains, 5,073 variable paths, 1,233 whole-root primed comparisons,
-  557 mapped sets, 435 unchanged expressions, 234 EXCEPT reconstructions, and
-  176 materialized function ranges. Clone, fingerprint, action execution, and
+  measured profile data. Selected integer intervals are retained through code
+  generation, and direct integer arithmetic is emitted only when interval
+  propagation proves the result fits `i64`. PGO observations may select
+  optimizations, but cannot silently assume semantics not guaranteed by the
+  model/configuration.
+- [ ] Lower the measured generated-code backlog generically: 42,947 nested
+  helper chains, 7,396 variable paths, 1,199 whole-root primed comparisons,
+  189 indexed primed-path comparisons, 856 mapped sets, 639 unchanged
+  expressions, 856 EXCEPT reconstructions, 1,472 callback-based variable
+  EXCEPT updates, and 182 materialized function ranges. Clone, fingerprint,
+  action execution, and
   aggregate movement dominate the current profile; SIMD should follow typed
   contiguous lowering rather than pack recursive `Value` trees at runtime.
+
+  The whole-root primed-comparison item is implemented in source and covered
+  by ReleaseSafe tests: generated equality/inequality now compares borrowed
+  values across pools without cloning the primed root. The regenerated full
+  EnvironmentController artifact uses the helper at 40 call sites. All seven
+  remaining finite-row artifacts now contain no direct root materialization
+  comparison and retain zero fallback. Older stored artifacts still need
+  regeneration; indexed `x'[k]` paths are tracked separately because they
+  require a distinct lowering.
+
+- [ ] Compact canonical top-level state tuples. The current tagged `Value` is
+  24 bytes, so large safety rows spend most resident memory on repeated
+  top-level descriptors even when the underlying immutable values intern to a
+  few thousand entries. The sound design stores bounded `u32` handles in the
+  canonical state table and decodes parent/child views into separate
+  worker-local buffers; candidate construction remains full-width. This is a
+  representation change only and must not infer types or encode model-specific
+  semantics.
+
+  The final 74-artifact audit after regenerating the two 100-million-state
+  frontier models reports 56 fused set insertions, 19 fused removals, 214
+  direct primed set insertions, and 136 direct removals.
 
 ## Reproduction
 

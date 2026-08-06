@@ -345,6 +345,16 @@ fn resolve_primed_variable(
     return resolve_current_variable(context, index, source_pool);
 }
 
+pub inline fn trusted_variable_int(
+    context: *CallContext,
+    index: u32,
+) Error!i64 {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const value = try resolve_current_variable(context, index, &source_pool);
+    std.debug.assert(value == .int_v);
+    return value.int_v;
+}
+
 pub fn variable_equal_bool(
     context: *CallContext,
     index: u32,
@@ -364,6 +374,84 @@ pub fn variable_not_equal_bool(
     rhs: Value,
 ) Error!bool {
     return !try variable_equal_bool(context, index, rhs);
+}
+
+pub fn primed_variable_equal_bool(
+    context: *CallContext,
+    index: u32,
+    rhs: Value,
+) Error!bool {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const value = try resolve_primed_variable(context, index, &source_pool);
+    return Value.eql_cross_pool(value, source_pool, rhs, context.eval_pool);
+}
+
+pub fn primed_variable_not_equal_bool(
+    context: *CallContext,
+    index: u32,
+    rhs: Value,
+) Error!bool {
+    return !try primed_variable_equal_bool(context, index, rhs);
+}
+
+pub fn primed_variables_equal_bool(
+    context: *CallContext,
+    left_index: u32,
+    right_index: u32,
+) Error!bool {
+    var left_pool: *const ValuePool = context.eval_pool;
+    const left = try resolve_primed_variable(
+        context,
+        left_index,
+        &left_pool,
+    );
+    var right_pool: *const ValuePool = context.eval_pool;
+    const right = try resolve_primed_variable(
+        context,
+        right_index,
+        &right_pool,
+    );
+    return Value.eql_cross_pool(left, left_pool, right, right_pool);
+}
+
+pub fn primed_variables_not_equal_bool(
+    context: *CallContext,
+    left_index: u32,
+    right_index: u32,
+) Error!bool {
+    return !try primed_variables_equal_bool(context, left_index, right_index);
+}
+
+pub fn primed_variable_variable_equal_bool(
+    context: *CallContext,
+    primed_index: u32,
+    variable_index: u32,
+) Error!bool {
+    var primed_pool: *const ValuePool = context.eval_pool;
+    const primed = try resolve_primed_variable(
+        context,
+        primed_index,
+        &primed_pool,
+    );
+    var variable_pool: *const ValuePool = context.eval_pool;
+    const other = try resolve_variable(
+        context,
+        variable_index,
+        &variable_pool,
+    );
+    return Value.eql_cross_pool(primed, primed_pool, other, variable_pool);
+}
+
+pub fn primed_variable_variable_not_equal_bool(
+    context: *CallContext,
+    primed_index: u32,
+    variable_index: u32,
+) Error!bool {
+    return !try primed_variable_variable_equal_bool(
+        context,
+        primed_index,
+        variable_index,
+    );
 }
 
 pub fn variables_equal_bool(
@@ -536,6 +624,64 @@ pub fn primed_variable_except_update_path_equal_bool(
         path,
         0,
         updater,
+    );
+}
+
+pub fn primed_variable_except_update_path_set_insert_equal_bool(
+    context: *CallContext,
+    index: u32,
+    path: []const PathKey,
+    element: Value,
+) Error!bool {
+    return primed_variable_except_update_path_set_mutation_equal_bool(
+        context,
+        index,
+        path,
+        element,
+        .insert,
+    );
+}
+
+pub fn primed_variable_except_update_path_set_remove_equal_bool(
+    context: *CallContext,
+    index: u32,
+    path: []const PathKey,
+    element: Value,
+) Error!bool {
+    return primed_variable_except_update_path_set_mutation_equal_bool(
+        context,
+        index,
+        path,
+        element,
+        .remove,
+    );
+}
+
+fn primed_variable_except_update_path_set_mutation_equal_bool(
+    context: *CallContext,
+    index: u32,
+    path: []const PathKey,
+    element: Value,
+    kind: SetMutationKind,
+) Error!bool {
+    var current_pool: *const ValuePool = context.eval_pool;
+    const current = try resolve_current_variable(
+        context,
+        index,
+        &current_pool,
+    );
+    var next_pool: *const ValuePool = context.eval_pool;
+    const next = try resolve_primed_variable(context, index, &next_pool);
+    return equal_except_set_mutation_path_keys(
+        context,
+        next,
+        next_pool,
+        current,
+        current_pool,
+        path,
+        0,
+        element,
+        kind,
     );
 }
 
@@ -2834,6 +2980,216 @@ fn equal_except_update_path_keys(
         },
         else => return Error.TypeError,
     }
+}
+
+fn equal_except_set_mutation_path_keys(
+    context: *CallContext,
+    next: Value,
+    next_pool: *const ValuePool,
+    current: Value,
+    current_pool: *const ValuePool,
+    path: []const PathKey,
+    path_index: usize,
+    element: Value,
+    kind: SetMutationKind,
+) Error!bool {
+    std.debug.assert(path_index <= path.len);
+    if (path_index == path.len) {
+        return equal_set_mutation_cross_pool(
+            context,
+            next,
+            next_pool,
+            current,
+            current_pool,
+            element,
+            kind,
+        );
+    }
+
+    const key = path[path_index];
+    switch (current) {
+        .function_v => |current_function| {
+            if (next != .function_v) return false;
+            const next_function = next.function_v;
+            if (current_function.len != next_function.len) return false;
+            const current_keys = current_function.domain.items(current_pool);
+            const current_entries = current_function.entries(current_pool);
+            var matched = false;
+            for (current_keys, current_entries) |current_key, current_entry| {
+                const next_entry = function_lookup_cross_pool(
+                    next_function,
+                    next_pool,
+                    current_key,
+                    current_pool,
+                ) orelse return false;
+                if (path_key_matches_value(
+                    key,
+                    current_key,
+                    current_pool,
+                    context.eval_pool,
+                )) {
+                    matched = true;
+                    if (!try equal_except_set_mutation_path_keys(
+                        context,
+                        next_entry,
+                        next_pool,
+                        current_entry,
+                        current_pool,
+                        path,
+                        path_index + 1,
+                        element,
+                        kind,
+                    )) return false;
+                } else if (!Value.eql_cross_pool(
+                    next_entry,
+                    next_pool,
+                    current_entry,
+                    current_pool,
+                )) return false;
+            }
+            if (!matched) return false;
+            return true;
+        },
+        .tuple_v => |current_tuple| {
+            if (next != .tuple_v) return false;
+            const next_tuple = next.tuple_v;
+            if (current_tuple.len != next_tuple.len) return false;
+            const raw_index = path_key_int(key) orelse return Error.TypeError;
+            if (raw_index < 1 or raw_index > current_tuple.len) return false;
+            const update_index: usize = @intCast(raw_index - 1);
+            const current_items = current_tuple.items(current_pool);
+            const next_items = next_tuple.items(next_pool);
+            for (current_items, next_items, 0..) |current_item, next_item, item_index| {
+                if (item_index == update_index) {
+                    if (!try equal_except_set_mutation_path_keys(
+                        context,
+                        next_item,
+                        next_pool,
+                        current_item,
+                        current_pool,
+                        path,
+                        path_index + 1,
+                        element,
+                        kind,
+                    )) return false;
+                } else if (!Value.eql_cross_pool(
+                    next_item,
+                    next_pool,
+                    current_item,
+                    current_pool,
+                )) return false;
+            }
+            return true;
+        },
+        .record_v => |current_record| {
+            if (next != .record_v) return false;
+            const next_record = next.record_v;
+            if (current_record.len != next_record.len) return false;
+            const key_name = path_key_field(key, context.eval_pool) orelse
+                return Error.TypeError;
+            const current_fields = current_record.fields(current_pool);
+            var matched = false;
+            var field_index: u32 = 0;
+            while (field_index < current_record.len) : (field_index += 1) {
+                const field_name = current_fields[field_index * 2].string_v;
+                const field_name_bytes = field_name.slice(current_pool);
+                const current_field = current_fields[field_index * 2 + 1];
+                const next_field = next_record.lookup(
+                    next_pool,
+                    field_name_bytes,
+                ) orelse return false;
+                if (std.mem.eql(u8, field_name_bytes, key_name)) {
+                    matched = true;
+                    if (!try equal_except_set_mutation_path_keys(
+                        context,
+                        next_field,
+                        next_pool,
+                        current_field,
+                        current_pool,
+                        path,
+                        path_index + 1,
+                        element,
+                        kind,
+                    )) return false;
+                } else if (!Value.eql_cross_pool(
+                    next_field,
+                    next_pool,
+                    current_field,
+                    current_pool,
+                )) return false;
+            }
+            if (!matched) return false;
+            return true;
+        },
+        else => return Error.TypeError,
+    }
+}
+
+fn equal_set_mutation_cross_pool(
+    context: *CallContext,
+    next: Value,
+    next_pool: *const ValuePool,
+    current: Value,
+    current_pool: *const ValuePool,
+    element: Value,
+    kind: SetMutationKind,
+) Error!bool {
+    if (current != .set_v or next != .set_v) {
+        const snapshot = context.eval_pool.snapshot();
+        defer restore_eval_pool(context, snapshot);
+        const expected = try set_mutation_cross_pool(
+            context,
+            current,
+            current_pool,
+            element,
+            kind,
+        );
+        return Value.eql_cross_pool(
+            next,
+            next_pool,
+            expected,
+            context.eval_pool,
+        );
+    }
+
+    const current_items = current.set_v.items(current_pool);
+    const element_present = try set_member_cross_pool(
+        current,
+        current_pool,
+        element,
+        context.eval_pool,
+    );
+    if (kind == .insert and !element_present and
+        current.set_v.len == std.math.maxInt(u32))
+    {
+        return Error.OutOfMemory;
+    }
+    const expected_len = switch (kind) {
+        .insert => current.set_v.len + @intFromBool(!element_present),
+        .remove => current.set_v.len - @intFromBool(element_present),
+    };
+    if (next.set_v.len != expected_len) return false;
+
+    for (current_items) |item| {
+        if (kind == .remove and element_present and Value.eql_cross_pool(
+            item,
+            current_pool,
+            element,
+            context.eval_pool,
+        )) continue;
+        if (!try set_member_cross_pool(next, next_pool, item, current_pool)) {
+            return false;
+        }
+    }
+    if (kind == .insert and !element_present) {
+        return set_member_cross_pool(
+            next,
+            next_pool,
+            element,
+            context.eval_pool,
+        );
+    }
+    return true;
 }
 
 fn equal_double_except_update_path_keys(
@@ -6705,6 +7061,65 @@ pub fn variable_except_update(
     );
 }
 
+pub fn variable_except_update_set_insert(
+    context: *CallContext,
+    variable_index: u32,
+    path: []const Value,
+    element: Value,
+) Error!Value {
+    return variable_except_update_set_mutation(
+        context,
+        variable_index,
+        path,
+        element,
+        .insert,
+    );
+}
+
+pub fn variable_except_update_set_remove(
+    context: *CallContext,
+    variable_index: u32,
+    path: []const Value,
+    element: Value,
+) Error!Value {
+    return variable_except_update_set_mutation(
+        context,
+        variable_index,
+        path,
+        element,
+        .remove,
+    );
+}
+
+fn variable_except_update_set_mutation(
+    context: *CallContext,
+    variable_index: u32,
+    path: []const Value,
+    element: Value,
+    kind: SetMutationKind,
+) Error!Value {
+    var source_pool: *const ValuePool = context.eval_pool;
+    const original = if (context.read_primed)
+        try resolve_primed_variable(context, variable_index, &source_pool)
+    else
+        try resolve_current_variable(context, variable_index, &source_pool);
+    const update = ExceptUpdate{ .set_mutation = .{
+        .element = element,
+        .kind = kind,
+    } };
+    if (source_pool == context.eval_pool) {
+        return except_recursive(context, original, path, 0, update);
+    }
+    return except_recursive_cross_pool(
+        context,
+        original,
+        source_pool,
+        path,
+        0,
+        update,
+    );
+}
+
 pub fn range(left: Value, right: Value) Error!Value {
     return .{ .range_v = .{
         .lo = try integer(left),
@@ -7337,6 +7752,72 @@ fn contains_value(
     return false;
 }
 
+fn set_mutation_cross_pool(
+    context: *CallContext,
+    original: Value,
+    source_pool: *const ValuePool,
+    element: Value,
+    kind: SetMutationKind,
+) Error!Value {
+    if (original != .set_v) {
+        const original_local = if (source_pool == context.eval_pool)
+            original
+        else
+            try original.clone(source_pool, context.eval_pool);
+        const singleton = try set(context, &.{element});
+        return switch (kind) {
+            .insert => set_union(context, original_local, singleton),
+            .remove => set_difference(context, original_local, singleton),
+        };
+    }
+
+    const original_set = original.set_v;
+    const source_items = original_set.items(source_pool);
+    var match_index: ?usize = null;
+    for (source_items, 0..) |item, index| {
+        if (Value.eql_cross_pool(
+            item,
+            source_pool,
+            element,
+            context.eval_pool,
+        )) {
+            match_index = index;
+            break;
+        }
+    }
+    if (kind == .insert and match_index == null and
+        original_set.len == std.math.maxInt(u32))
+    {
+        return Error.OutOfMemory;
+    }
+
+    const result_len = switch (kind) {
+        .insert => original_set.len + @intFromBool(match_index == null),
+        .remove => original_set.len - @intFromBool(match_index != null),
+    };
+    const result = try context.eval_pool.alloc_values(result_len);
+    const result_offset = value_offset(context.eval_pool, result.ptr);
+    var result_index: usize = 0;
+    for (source_items, 0..) |item, index| {
+        if (kind == .remove and match_index == index) continue;
+        context.eval_pool.values[result_offset + result_index] =
+            if (source_pool == context.eval_pool)
+                item
+            else
+                try item.clone(source_pool, context.eval_pool);
+        result_index += 1;
+    }
+    if (kind == .insert and match_index == null) {
+        context.eval_pool.values[result_offset + result_index] = element;
+        result_index += 1;
+    }
+    std.debug.assert(result_index == result_len);
+    return .{ .set_v = .{
+        .offset = result_offset,
+        .len = result_len,
+    } };
+}
+
 fn except_recursive(
     context: *CallContext,
     original: Value,
@@ -7352,6 +7833,13 @@ fn except_recursive(
                 function.operator_args,
                 &.{original},
                 function.updater,
+            ),
+            .set_mutation => |mutation| set_mutation_cross_pool(
+                context,
+                original,
+                context.eval_pool,
+                mutation.element,
+                mutation.kind,
             ),
         };
     }
@@ -7461,17 +7949,20 @@ fn except_recursive_cross_pool(
     update: ExceptUpdate,
 ) Error!Value {
     if (depth == path.len) {
-        const original_local = try original.clone(
-            source_pool,
-            context.eval_pool,
-        );
         return switch (update) {
             .value => |replacement| replacement,
             .function => |function| call_bound(
                 context,
                 function.operator_args,
-                &.{original_local},
+                &.{try original.clone(source_pool, context.eval_pool)},
                 function.updater,
+            ),
+            .set_mutation => |mutation| set_mutation_cross_pool(
+                context,
+                original,
+                source_pool,
+                mutation.element,
+                mutation.kind,
             ),
         };
     }
@@ -7606,8 +8097,14 @@ fn except_recursive_cross_pool(
     };
 }
 
+const SetMutationKind = enum { insert, remove };
+
 const ExceptUpdate = union(enum) {
     value: Value,
+    set_mutation: struct {
+        element: Value,
+        kind: SetMutationKind,
+    },
     function: struct {
         operator_args: []const Value,
         updater: OperatorFn,
@@ -8156,6 +8653,14 @@ test "fused EXCEPT equality localizes nested updater operands" {
         .max_seq_len = 4,
     };
 
+    const comparison_snapshot = eval_pool.snapshot();
+    try std.testing.expect(try primed_variables_equal_bool(&context, 0, 0));
+    try std.testing.expect(!try primed_variable_variable_equal_bool(
+        &context,
+        0,
+        0,
+    ));
+    try std.testing.expectEqual(comparison_snapshot, eval_pool.snapshot());
     try std.testing.expect(try primed_variable_except_update_path_equal_bool(
         &context,
         &.{person},
@@ -8163,6 +8668,126 @@ test "fused EXCEPT equality localizes nested updater operands" {
         &.{.{ .value = person }},
         test_nested_record_updater,
     ));
+}
+
+test "fused EXCEPT set insertion clones the source set once" {
+    const Arena = @import("arena.zig").Arena;
+    var state_arena = try Arena.init(1024 * 1024);
+    defer state_arena.deinit();
+    var eval_arena = try Arena.init(1024 * 1024);
+    defer eval_arena.deinit();
+    var state_pool = try ValuePool.init(&state_arena, 128, 64);
+    var eval_pool = try ValuePool.init(&eval_arena, 128, 64);
+    var models = try ModelTable.init(&state_arena, 4);
+    var generated_cache = [_]?Value{};
+
+    const key = Value{ .model_v = try models.intern("key") };
+    const old_item = Value{ .string_v = try state_pool.push_string("old") };
+    const set_offset = try state_pool.push_values(&.{old_item});
+    const domain_offset = try state_pool.push_values(&.{key});
+    const entries_offset = try state_pool.push_values(&.{Value{ .set_v = .{
+        .offset = set_offset,
+        .len = 1,
+    } }});
+    var state_values = [_]Value{.{ .function_v = .{
+        .domain = .{ .offset = domain_offset, .len = 1 },
+        .offset = entries_offset,
+        .len = 1,
+    } }};
+    var current_state = State{
+        .level = 0,
+        .pred = 0,
+        .changed_mask = 0,
+        .borrowed_pool = null,
+        .values = &state_values,
+    };
+    var context = CallContext{
+        .eval_pool = &eval_pool,
+        .state_pool = &state_pool,
+        .state = &current_state,
+        .next_state = null,
+        .partial_mask = 0,
+        .partial_values = &.{},
+        .partial_value_pools = &.{},
+        .read_primed = false,
+        .constants = &.{},
+        .constant_slots = &.{},
+        .generated_cache = &generated_cache,
+        .generated_cache_pool = &eval_pool,
+        .generated_cache_frozen = false,
+        .models = &models,
+        .native_context = undefined,
+        .native_call = test_native_call,
+        .max_seq_len = 4,
+    };
+
+    const new_item = try string(&context, "new");
+    const updated = try variable_except_update_set_insert(
+        &context,
+        0,
+        &.{key},
+        new_item,
+    );
+    const updated_set = updated.function_v.apply(&eval_pool, key).?;
+    try std.testing.expectEqual(@as(u32, 2), updated_set.set_v.len);
+    const old_local = try string(&context, "old");
+    try std.testing.expect(try member_bool(&context, old_local, updated_set));
+    try std.testing.expect(try member_bool(&context, new_item, updated_set));
+    var partial_values = [_]Value{updated};
+    var partial_pools = [_]?*const ValuePool{&eval_pool};
+    context.partial_values = &partial_values;
+    context.partial_value_pools = &partial_pools;
+    context.partial_mask = 1;
+    const compare_snapshot = eval_pool.snapshot();
+    try std.testing.expect(
+        try primed_variable_except_update_path_set_insert_equal_bool(
+            &context,
+            0,
+            &.{.{ .value = key }},
+            new_item,
+        ),
+    );
+    try std.testing.expectEqual(compare_snapshot, eval_pool.snapshot());
+
+    const removed = try variable_except_update_set_remove(
+        &context,
+        0,
+        &.{key},
+        old_local,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        removed.function_v.apply(&eval_pool, key).?.set_v.len,
+    );
+    partial_values[0] = removed;
+    const remove_compare_snapshot = eval_pool.snapshot();
+    try std.testing.expect(
+        try primed_variable_except_update_path_set_remove_equal_bool(
+            &context,
+            0,
+            &.{.{ .value = key }},
+            old_local,
+        ),
+    );
+    try std.testing.expectEqual(remove_compare_snapshot, eval_pool.snapshot());
+    const absent = try variable_except_update_set_remove(
+        &context,
+        0,
+        &.{key},
+        new_item,
+    );
+    const unchanged_set = absent.function_v.apply(&eval_pool, key).?;
+    try std.testing.expectEqual(@as(u32, 1), unchanged_set.set_v.len);
+    try std.testing.expect(try member_bool(&context, old_local, unchanged_set));
+    partial_values[0] = absent;
+    try std.testing.expect(
+        try primed_variable_except_update_path_set_remove_equal_bool(
+            &context,
+            0,
+            &.{.{ .value = key }},
+            new_item,
+        ),
+    );
 }
 
 fn test_nested_record_updater(
@@ -8236,6 +8861,36 @@ test "generated finite values use only the value pool" {
     };
     context.state = &current_state;
     context.next_state = &next_state;
+    try std.testing.expect(try primed_variable_equal_bool(
+        &context,
+        0,
+        .{ .int_v = 1 },
+    ));
+    try std.testing.expect(!try primed_variable_equal_bool(
+        &context,
+        0,
+        .{ .int_v = 2 },
+    ));
+    try std.testing.expect(!try primed_variables_equal_bool(&context, 0, 1));
+    try std.testing.expect(try primed_variable_variable_equal_bool(
+        &context,
+        1,
+        1,
+    ));
+    next_values[1] = .{ .int_v = 3 };
+    try std.testing.expect(!try primed_variable_variable_equal_bool(
+        &context,
+        1,
+        1,
+    ));
+    context.read_primed = true;
+    try std.testing.expect(try primed_variable_variable_equal_bool(
+        &context,
+        1,
+        1,
+    ));
+    context.read_primed = false;
+    next_values[1] = .{ .int_v = 2 };
     try std.testing.expect(try unchanged_variables(&context, &.{ 0, 1 }));
     next_state.changed_mask = @as(u64, 1) << 1;
     try std.testing.expect(try unchanged_variable(&context, 1));
@@ -8250,6 +8905,16 @@ test "generated finite values use only the value pool" {
     context.partial_mask = @as(u64, 1) << 1;
     context.partial_values = &partial_values;
     context.partial_value_pools = &.{ null, null };
+    try std.testing.expect(try primed_variable_equal_bool(
+        &context,
+        1,
+        .{ .int_v = 4 },
+    ));
+    try std.testing.expect(!try primed_variable_variable_equal_bool(
+        &context,
+        1,
+        1,
+    ));
     try std.testing.expect(!try unchanged_variable(&context, 1));
     context.partial_mask = 0;
     context.partial_values = &.{};

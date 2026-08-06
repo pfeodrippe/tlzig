@@ -9,6 +9,9 @@ const overrides = tlzig.overrides;
 const generated_runtime = tlzig.generated_runtime;
 const generated_model = @import("generated_model");
 
+const tlc_fingerprint_index = "0";
+const tlc_seed = "0";
+
 comptime {
     if (!@hasDecl(generated_model, "abi_version")) {
         @compileError("generated model is stale; regenerate it with tlzig --emit-zig");
@@ -41,6 +44,9 @@ const Spec = struct {
     state_value_cap: ?u32 = null,
     scratch_growable: bool = false,
     expected_violation: bool = false,
+    expected_deadlock: bool = false,
+    expected_violation_kind: ?ViolationKind = null,
+    expected_violation_name: ?[]const u8 = null,
     distinct_tolerance: u64 = 0,
     expected_distinct_tolerance: ?u64 = null,
     compare_generated: bool = true,
@@ -66,8 +72,8 @@ const specs = [_]Spec{
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/HourClock/HourClock.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/HourClock/HourClock.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/AsynchInterface.cfg" },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/Channel.tla", .cfg = "vendor/tlaplus-examples/specifications/SpecifyingSystems/AsynchronousInterface/Channel.cfg" },
-    .{ .tla = "vendor/tlaplus-examples/specifications/DieHard/DieHard.tla", .cfg = "vendor/tlaplus-examples/specifications/DieHard/DieHard.cfg", .expected_violation = true },
-    .{ .tla = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla", .cfg = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.cfg", .expected_violation = true },
+    .{ .tla = "vendor/tlaplus-examples/specifications/DieHard/DieHard.tla", .cfg = "vendor/tlaplus-examples/specifications/DieHard/DieHard.cfg", .expected_violation = true, .expected_violation_kind = .invariant, .expected_violation_name = "NotSolved" },
+    .{ .tla = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla", .cfg = "vendor/tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.cfg", .expected_violation = true, .expected_violation_kind = .invariant, .expected_violation_name = "Solution" },
     .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/CigaretteSmokers.cfg", .max_states = 5000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.tla", .cfg = "vendor/tlaplus-examples/specifications/CigaretteSmokers/APCigaretteSmokers.cfg", .max_states = 5000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla", .cfg = "vendor/tlaplus-examples/specifications/CoffeeCan/CoffeeCan100Beans.cfg", .default_enabled = false, .one_core_default = false, .max_states = 100_000, .max_nat = 1000, .min_int = -1000, .max_int = 1000 },
@@ -93,7 +99,7 @@ const specs = [_]Spec{
     // Full 37-million-state quotient graph. TLC retains 10,668 additional
     // duplicate action witnesses, so require exact distinct-state parity.
     .{ .label = "MultiPaxos", .tla = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.tla", .cfg = "vendor/tlaplus-examples/specifications/MultiPaxos-SMR/MultiPaxos_MC.cfg", .default_enabled = false, .one_core_default = false, .max_states = 40_000_000, .max_successors = 4_096, .state_values_per_state = 2, .state_value_cap = 80_000_000, .compare_generated = false, .prefer_generated = true, .java_heap = "-Xmx24g" },
-    .{ .tla = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.tla", .cfg = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.cfg", .max_states = 500_000, .expected_violation = true },
+    .{ .tla = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.tla", .cfg = "vendor/tlaplus-examples/specifications/chang_roberts/MCChangRoberts.cfg", .max_states = 500_000 },
     .{ .tla = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.tla", .cfg = "vendor/tlaplus-examples/specifications/SpanningTree/SpanTree.cfg", .default_enabled = false, .one_core_default = false, .max_states = 500_000, .expected_violation = true },
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd840/SyncTerminationDetection.cfg", .max_states = 500_000, .compare_generated = false },
     .{ .tla = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.tla", .cfg = "vendor/tlaplus-examples/specifications/ewd998/AsyncTerminationDetection.cfg", .max_states = 200_000, .compare_generated = false },
@@ -167,7 +173,14 @@ const specs = [_]Spec{
     // The upstream N=3 configuration violates TypeOK because messages to a
     // failed process can age beyond maxAge. This reduced model reaches the
     // same age-43 counterexample quickly and exercises direct SUBSET actions.
-    .{ .label = "EnvironmentControllerN2Safety", .tla = "vendor/tlaplus-examples/specifications/detector_chan96/EnvironmentController.tla", .cfg = "benchmark_configs/EnvironmentControllerN2Safety.cfg", .one_core_default = false, .max_states = 200_000, .state_values_per_state = 160, .expected_violation = true, .expected_distinct_tolerance = 30_000, .compare_generated = false, .prefer_generated = true },
+    .{ .label = "EnvironmentControllerN2Safety", .tla = "vendor/tlaplus-examples/specifications/detector_chan96/EnvironmentController.tla", .cfg = "benchmark_configs/EnvironmentControllerN2Safety.cfg", .one_core_default = false, .max_states = 200_000, .state_values_per_state = 160, .expected_violation = true, .expected_violation_kind = .invariant, .expected_violation_name = "TypeOK", .expected_distinct_tolerance = 30_000, .compare_generated = false, .prefer_generated = true },
+    // Same reduced constants with the original temporal properties enabled.
+    // This keeps fairness-edge labeling on the routine ReleaseFast path.
+    .{ .label = "EnvironmentControllerN2Temporal", .tla = "vendor/tlaplus-examples/specifications/detector_chan96/EnvironmentController.tla", .cfg = "benchmark_configs/EnvironmentControllerN2Temporal.cfg", .one_core_default = false, .max_states = 200_000, .state_values_per_state = 160, .expected_violation = true, .expected_violation_kind = .invariant, .expected_violation_name = "TypeOK", .expected_distinct_tolerance = 30_000, .compare_generated = false, .prefer_generated = true },
+    // Unmodified upstream N=3 safety and temporal configuration. Keep this
+    // expected-violation pair opt-in: tlzig reaches the age-43 TypeOK witness
+    // after about 47 million distinct states, while Java TLC takes hours.
+    .{ .label = "EnvironmentControllerN3", .tla = "vendor/tlaplus-examples/specifications/detector_chan96/EnvironmentController.tla", .cfg = "vendor/tlaplus-examples/specifications/detector_chan96/EnvironmentController.cfg", .default_enabled = false, .one_core_default = false, .max_states = 80_000_000, .state_values_per_state = 160, .state_value_cap = 192_000_000, .scratch_growable = true, .expected_violation = true, .expected_violation_kind = .invariant, .expected_violation_name = "TypeOK", .expected_distinct_tolerance = 100_000, .compare_generated = false, .prefer_generated = true, .java_heap = "-Xmx12g" },
     // Exact no-symmetry safety graph with two invariants and more than 56
     // million generated transitions. It stays in the default performance gate.
     .{ .label = "MCKVSSafetySmall", .tla = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVS.tla", .cfg = "vendor/tlaplus-examples/specifications/KeyValueStore/MCKVSSafetySmall.cfg", .one_core_default = false, .max_states = 4_000_000, .state_values_per_state = 16, .prefer_generated = true, .java_heap = "-Xmx8g" },
@@ -209,8 +222,7 @@ const specs = [_]Spec{
         .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
         .cfg = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.cfg",
         .max_states = 100_000,
-        .expected_violation = true,
-        .distinct_tolerance = 16,
+        .expected_deadlock = true,
         .compare_generated = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -221,8 +233,7 @@ const specs = [_]Spec{
         .tla = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn.tla",
         .cfg = "vendor/MDBTLA/MultiShardTxn/MCMultiShardTxn_rc_local.cfg",
         .max_states = 20_000,
-        .expected_violation = true,
-        .distinct_tolerance = 16,
+        .expected_deadlock = true,
         .compare_generated = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -233,7 +244,7 @@ const specs = [_]Spec{
         .tla = "vendor/MDBTLA/MultiShardTxn/Storage.tla",
         .cfg = "vendor/MDBTLA/MultiShardTxn/Storage.cfg",
         .max_states = 100_000,
-        .expected_violation = true,
+        .expected_deadlock = true,
         .compare_generated = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -257,8 +268,7 @@ const specs = [_]Spec{
         .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block.cfg",
         .max_states = 20_000,
         .state_values_per_state = 120,
-        .expected_violation = true,
-        .distinct_tolerance = 32,
+        .expected_deadlock = true,
         .compare_generated = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -270,8 +280,7 @@ const specs = [_]Spec{
         .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_no_prepare_block_or_ww.cfg",
         .max_states = 20_000,
         .state_values_per_state = 120,
-        .expected_violation = true,
-        .distinct_tolerance = 32,
+        .expected_deadlock = true,
         .compare_generated = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -283,8 +292,7 @@ const specs = [_]Spec{
         .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_snapshot.cfg",
         .max_states = 100_000,
         .state_values_per_state = 300,
-        .expected_violation = true,
-        .distinct_tolerance = 32,
+        .expected_deadlock = true,
         .compare_generated = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -296,8 +304,7 @@ const specs = [_]Spec{
         .cfg = "vendor/MDBTLA/MultiShardTxn/models/MCMultiShardTxn_RC_with_prepare_block.cfg",
         .max_states = 20_000,
         .state_values_per_state = 120,
-        .expected_violation = true,
-        .distinct_tolerance = 32,
+        .expected_deadlock = true,
         .compare_generated = false,
         .prefer_generated = true,
         .java_classpath = "vendor/MDBTLA/MultiShardTxn/lib/tla2tools-v1.8.jar:" ++
@@ -593,6 +600,8 @@ fn run_comparison(
         true,
     );
     defer tlzig_auto.deinit(allocator);
+    if (tlzig_one) |result| try validate_expected_outcome(spec, result);
+    try validate_expected_outcome(spec, tlzig_auto);
     const spec_java_cp = spec.java_classpath orelse java_cp;
     const tlc_one: ?RunResult = if (run_one_core and !tlzig_only)
         try run_tlc(allocator, io, spec_java_cp, spec, "1")
@@ -604,6 +613,8 @@ fn run_comparison(
     else
         null;
     defer if (tlc_auto) |result| result.deinit(allocator);
+    if (tlc_one) |result| try validate_expected_outcome(spec, result);
+    if (tlc_auto) |result| try validate_expected_outcome(spec, result);
 
     const basename = spec.label orelse std.fs.path.basename(spec.tla);
     const display_name = if (label_suffix.len == 0)
@@ -689,7 +700,9 @@ fn run_comparison(
 
     const one_core_mismatch = if (run_one_core)
         tlc_one.?.outcome != tlzig_one.?.outcome or
-            tlc_one.?.outcome != tlc_auto.?.outcome
+            tlc_one.?.outcome != tlc_auto.?.outcome or
+            violation_metadata_mismatch(tlc_one.?, tlzig_one.?) or
+            violation_metadata_mismatch(tlc_one.?, tlc_auto.?)
     else
         false;
     const expected_distinct_mismatch = if (spec.expected_distinct_tolerance) |tolerance|
@@ -706,7 +719,8 @@ fn run_comparison(
         false;
     const mismatch = one_core_mismatch or
         tlc_auto.?.outcome != tlzig_auto.outcome or
-        (if (spec.expected_violation)
+        violation_metadata_mismatch(tlc_auto.?, tlzig_auto) or
+        (if (expected_failure(spec))
             expected_distinct_mismatch
         else
             (spec.compare_generated and
@@ -769,6 +783,7 @@ fn run_tlc_baseline(
     const spec_java_cp = spec.java_classpath orelse java_cp;
     const result = try run_tlc(allocator, io, spec_java_cp, spec, "auto");
     defer result.deinit(allocator);
+    try validate_expected_outcome(spec, result);
     const display_name = spec.label orelse std.fs.path.basename(spec.tla);
     std.debug.print(
         "{s:32} {s:>10} {d:>10.3} {s:>10} {s:>10} {d:>9}/{d:<8} {s:>18}\n",
@@ -798,14 +813,75 @@ fn distinct_within_tolerance(
     return delta <= tolerance;
 }
 
+fn violation_metadata_mismatch(expected: RunResult, actual: RunResult) bool {
+    if (expected.outcome != .violation or actual.outcome != .violation) {
+        return false;
+    }
+    if (expected.violation_kind != actual.violation_kind) return true;
+    const expected_name = expected.violation_name orelse return false;
+    const actual_name = actual.violation_name orelse
+        return expected.violation_kind == .invariant;
+    return !std.mem.eql(u8, expected_name, actual_name);
+}
+
+fn validate_expected_outcome(spec: Spec, result: RunResult) !void {
+    if (!expected_outcome_mismatch(spec, result)) return;
+    std.debug.print(
+        "  EXPECTED OUTCOME MISMATCH: expected={s}/{s} actual={s}/{s}/{s}\n",
+        .{
+            if (spec.expected_deadlock)
+                "deadlock"
+            else if (spec.expected_violation_kind) |kind|
+                @tagName(kind)
+            else
+                "violation",
+            spec.expected_violation_name orelse "-",
+            @tagName(result.outcome),
+            if (result.violation_kind) |kind| @tagName(kind) else "-",
+            result.violation_name orelse "-",
+        },
+    );
+    return error.StateMismatch;
+}
+
+fn expected_outcome_mismatch(spec: Spec, result: RunResult) bool {
+    std.debug.assert(!(spec.expected_violation and spec.expected_deadlock));
+    if (spec.expected_deadlock) return result.outcome != .deadlock;
+    if (!spec.expected_violation) return false;
+    const kind_mismatch = if (spec.expected_violation_kind) |kind|
+        result.violation_kind != kind
+    else
+        false;
+    const name_mismatch = if (spec.expected_violation_name) |name|
+        result.violation_name == null or
+            !std.mem.eql(u8, name, result.violation_name.?)
+    else
+        false;
+    if (result.outcome == .violation and
+        !kind_mismatch and
+        !name_mismatch)
+    {
+        return false;
+    }
+    return true;
+}
+
+fn expected_failure(spec: Spec) bool {
+    std.debug.assert(!(spec.expected_violation and spec.expected_deadlock));
+    return spec.expected_violation or spec.expected_deadlock;
+}
+
 const RunResult = struct {
     elapsed_ms: u64,
     generated: u64,
     distinct: u64,
     outcome: Outcome,
+    violation_kind: ?ViolationKind,
+    violation_name: ?[]const u8,
     output: []const u8,
 
     fn deinit(self: RunResult, allocator: std.mem.Allocator) void {
+        if (self.violation_name) |name| allocator.free(name);
         allocator.free(self.output);
     }
 };
@@ -816,10 +892,19 @@ const Outcome = enum {
     deadlock,
 };
 
+const ViolationKind = enum {
+    invariant,
+    property,
+    assertion,
+    other,
+};
+
 const BaselineResult = struct {
     generated: u64,
     distinct: u64,
     outcome: Outcome,
+    violation_kind: ?ViolationKind,
+    violation_name_hash: ?u64,
 };
 
 fn compare_tlzig_baseline(
@@ -829,7 +914,15 @@ fn compare_tlzig_baseline(
 ) !void {
     const baseline = try read_tlzig_baseline(allocator, spec);
     const mismatch = baseline.outcome != actual.outcome or
-        (!spec.expected_violation and
+        (if (baseline.violation_kind) |kind|
+            actual.violation_kind != kind
+        else
+            false) or
+        (if (baseline.violation_name_hash) |hash|
+            violation_name_hash(actual.violation_name) != hash
+        else
+            false) or
+        (!expected_failure(spec) and
             spec.compare_generated and
             baseline.generated != actual.generated) or
         (if (spec.expected_distinct_tolerance) |tolerance|
@@ -839,7 +932,7 @@ fn compare_tlzig_baseline(
                 tolerance,
             )
         else
-            !spec.expected_violation and
+            !expected_failure(spec) and
                 spec.compare_distinct and
                 !distinct_within_tolerance(
                     baseline.distinct,
@@ -869,11 +962,34 @@ fn write_tlzig_baseline(
 ) !void {
     const path = try tlzig_baseline_path(allocator, spec);
     defer allocator.free(path);
-    const contents = try std.fmt.allocPrint(
-        allocator,
-        "{d} {d} {s}\n",
-        .{ result.generated, result.distinct, @tagName(result.outcome) },
-    );
+    const violation_kind = if (result.violation_kind) |kind|
+        @tagName(kind)
+    else
+        "-";
+    const violation_hash = violation_name_hash(result.violation_name);
+    const contents = if (violation_hash) |hash|
+        try std.fmt.allocPrint(
+            allocator,
+            "{d} {d} {s} {s} {x}\n",
+            .{
+                result.generated,
+                result.distinct,
+                @tagName(result.outcome),
+                violation_kind,
+                hash,
+            },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "{d} {d} {s} {s} -\n",
+            .{
+                result.generated,
+                result.distinct,
+                @tagName(result.outcome),
+                violation_kind,
+            },
+        );
     defer allocator.free(contents);
     try write_file(path, contents);
 }
@@ -897,13 +1013,31 @@ fn read_tlzig_baseline(
     const generated_text = tokens.next() orelse return error.InvalidBaseline;
     const distinct_text = tokens.next() orelse return error.InvalidBaseline;
     const outcome_text = tokens.next() orelse return error.InvalidBaseline;
+    const violation_kind_text = tokens.next();
+    const violation_hash_text = tokens.next();
     const generated = try std.fmt.parseInt(u64, generated_text, 10);
     const distinct = try std.fmt.parseInt(u64, distinct_text, 10);
     const outcome = parse_outcome_tag(outcome_text) orelse return error.InvalidBaseline;
+    const violation_kind = if (violation_kind_text) |text|
+        if (std.mem.eql(u8, text, "-"))
+            null
+        else
+            parse_violation_kind_tag(text) orelse return error.InvalidBaseline
+    else
+        null;
+    const violation_name_hash_v = if (violation_hash_text) |text|
+        if (std.mem.eql(u8, text, "-"))
+            null
+        else
+            try std.fmt.parseInt(u64, text, 16)
+    else
+        null;
     return .{
         .generated = generated,
         .distinct = distinct,
         .outcome = outcome,
+        .violation_kind = violation_kind,
+        .violation_name_hash = violation_name_hash_v,
     };
 }
 
@@ -912,6 +1046,19 @@ fn parse_outcome_tag(tag: []const u8) ?Outcome {
     if (std.mem.eql(u8, tag, "violation")) return .violation;
     if (std.mem.eql(u8, tag, "deadlock")) return .deadlock;
     return null;
+}
+
+fn parse_violation_kind_tag(tag: []const u8) ?ViolationKind {
+    if (std.mem.eql(u8, tag, "invariant")) return .invariant;
+    if (std.mem.eql(u8, tag, "property")) return .property;
+    if (std.mem.eql(u8, tag, "assertion")) return .assertion;
+    if (std.mem.eql(u8, tag, "other")) return .other;
+    return null;
+}
+
+fn violation_name_hash(name: ?[]const u8) ?u64 {
+    const value = name orelse return null;
+    return std.hash.Wyhash.hash(0x5649_4f4c_4154_494f, value);
 }
 
 fn tlzig_baseline_path(
@@ -1054,6 +1201,26 @@ fn run_tlzig_internal(
             err == error.PropertyViolated or
             err == error.Deadlock)
         {
+            const violation_kind: ?ViolationKind = switch (err) {
+                error.InvariantViolated => .invariant,
+                error.PropertyViolated => .property,
+                error.Deadlock => null,
+                else => unreachable,
+            };
+            const failure_name = switch (err) {
+                error.InvariantViolated => ch.invariant_failure_name(),
+                error.PropertyViolated => if (cfg.properties.len == 1)
+                    cfg.properties[0]
+                else
+                    null,
+                error.Deadlock => null,
+                else => unreachable,
+            };
+            const owned_failure_name = if (failure_name) |name|
+                try allocator.dupe(u8, name)
+            else
+                null;
+            errdefer if (owned_failure_name) |name| allocator.free(name);
             const output = try std.fmt.allocPrint(
                 allocator,
                 "generated={d} distinct={d} error={any}",
@@ -1067,6 +1234,8 @@ fn run_tlzig_internal(
                     .deadlock
                 else
                     .violation,
+                .violation_kind = violation_kind,
+                .violation_name = owned_failure_name,
                 .output = output,
             };
         }
@@ -1103,6 +1272,8 @@ fn run_tlzig_internal(
         .generated = result.generated,
         .distinct = result.distinct,
         .outcome = .completed,
+        .violation_kind = null,
+        .violation_name = null,
         .output = output,
     };
 }
@@ -1202,6 +1373,10 @@ fn run_tlc(
         classpath,
         "-Dtlc2.tool.impl.Tool.cdot=true",
         "tlc2.TLC",
+        "-fp",
+        tlc_fingerprint_index,
+        "-seed",
+        tlc_seed,
         "-metadir",
         metadir,
         "-workers",
@@ -1264,11 +1439,28 @@ fn run_tlc(
         print_tlc_failure(spec, workers, result);
         return error.TlcFailed;
     };
+    const parsed_violation: ?ParsedViolation = if (outcome == .violation)
+        parse_tlc_violation(result.stdout) orelse .{
+            .kind = .other,
+            .name = null,
+        }
+    else
+        null;
+    const violation_name = if (parsed_violation) |violation|
+        if (violation.name) |name| try allocator.dupe(u8, name) else null
+    else
+        null;
+    errdefer if (violation_name) |name| allocator.free(name);
     return RunResult{
         .elapsed_ms = elapsed,
         .generated = generated,
         .distinct = distinct,
         .outcome = outcome,
+        .violation_kind = if (parsed_violation) |violation|
+            violation.kind
+        else
+            null,
+        .violation_name = violation_name,
         .output = result.stdout,
     };
 }
@@ -1301,6 +1493,54 @@ fn parse_tlc_outcome(
     };
     for (violation_markers) |marker| {
         if (std.mem.indexOf(u8, output, marker) != null) return .violation;
+    }
+    return null;
+}
+
+const ParsedViolation = struct {
+    kind: ViolationKind,
+    name: ?[]const u8,
+};
+
+fn parse_tlc_violation(output: []const u8) ?ParsedViolation {
+    const named_markers = [_]struct {
+        prefix: []const u8,
+        suffix: []const u8,
+        kind: ViolationKind,
+    }{
+        .{ .prefix = "Error: Invariant ", .suffix = " is violated", .kind = .invariant },
+        .{ .prefix = "Error: Temporal property ", .suffix = " is violated", .kind = .property },
+        .{ .prefix = "Error: Temporal property ", .suffix = " was violated", .kind = .property },
+        .{ .prefix = "Error: Action property ", .suffix = " is violated", .kind = .property },
+    };
+    for (named_markers) |marker| {
+        const prefix_index = std.mem.indexOf(u8, output, marker.prefix) orelse
+            continue;
+        const name_start = prefix_index + marker.prefix.len;
+        const suffix_index = std.mem.indexOfPos(
+            u8,
+            output,
+            name_start,
+            marker.suffix,
+        ) orelse continue;
+        if (suffix_index == name_start) continue;
+        return .{
+            .kind = marker.kind,
+            .name = output[name_start..suffix_index],
+        };
+    }
+    if (std.mem.indexOf(
+        u8,
+        output,
+        "The first argument of Assert evaluated to FALSE",
+    ) != null) return .{ .kind = .assertion, .name = null };
+    if (std.mem.indexOf(u8, output, "Temporal propert") != null or
+        std.mem.indexOf(u8, output, "Action property") != null)
+    {
+        return .{ .kind = .property, .name = null };
+    }
+    if (std.mem.indexOf(u8, output, "Invariant ") != null) {
+        return .{ .kind = .invariant, .name = null };
     }
     return null;
 }
@@ -1339,6 +1579,68 @@ test "TLC outcome classification rejects non-semantic process failures" {
         @as(?Outcome, null),
         parse_tlc_outcome("", .{ .signal = .KILL }),
     );
+
+    const invariant = parse_tlc_violation(
+        "Error: Invariant TypeOK is violated.",
+    ).?;
+    try std.testing.expectEqual(ViolationKind.invariant, invariant.kind);
+    try std.testing.expectEqualStrings("TypeOK", invariant.name.?);
+    const property = parse_tlc_violation(
+        "Error: Temporal property Live was violated.",
+    ).?;
+    try std.testing.expectEqual(ViolationKind.property, property.kind);
+    try std.testing.expectEqualStrings("Live", property.name.?);
+}
+
+test "expected violation validates class and configured operator" {
+    const spec = Spec{
+        .tla = "Test.tla",
+        .cfg = "Test.cfg",
+        .expected_violation = true,
+        .expected_violation_kind = .invariant,
+        .expected_violation_name = "TypeOK",
+    };
+    const matching = RunResult{
+        .elapsed_ms = 0,
+        .generated = 1,
+        .distinct = 1,
+        .outcome = .violation,
+        .violation_kind = .invariant,
+        .violation_name = "TypeOK",
+        .output = "",
+    };
+    try validate_expected_outcome(spec, matching);
+    var wrong_kind = matching;
+    wrong_kind.violation_kind = .property;
+    try std.testing.expect(expected_outcome_mismatch(spec, wrong_kind));
+    var wrong_name = matching;
+    wrong_name.violation_name = "OtherInvariant";
+    try std.testing.expect(expected_outcome_mismatch(spec, wrong_name));
+}
+
+test "expected deadlock rejects other outcomes" {
+    const spec = Spec{
+        .tla = "Test.tla",
+        .cfg = "Test.cfg",
+        .expected_deadlock = true,
+    };
+    const deadlock = RunResult{
+        .elapsed_ms = 0,
+        .generated = 1,
+        .distinct = 1,
+        .outcome = .deadlock,
+        .violation_kind = null,
+        .violation_name = null,
+        .output = "",
+    };
+    try validate_expected_outcome(spec, deadlock);
+    var completed = deadlock;
+    completed.outcome = .completed;
+    try std.testing.expect(expected_outcome_mismatch(spec, completed));
+    var violation = deadlock;
+    violation.outcome = .violation;
+    violation.violation_kind = .invariant;
+    try std.testing.expect(expected_outcome_mismatch(spec, violation));
 }
 
 fn parse_before_keyword(output: []const u8, keyword: []const u8) ?u64 {

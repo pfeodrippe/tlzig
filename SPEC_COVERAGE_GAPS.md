@@ -143,6 +143,13 @@ Java has reached `367,297,806/32,849,147` generated/distinct states with
 while RSS is 8.02 GB versus TLC's observed 11.55 GB. Both queues are growing,
 so Large remains in the seven-row backlog rather than being mislabeled exact.
 
+After compact canonical state handles, the same unchanged model reaches the
+exact 100-million-distinct-state boundary in `205.43s` at
+`1,210,220,622` generated successors, `45,112,924` queued, and
+`9,072,164,864` bytes maximum RSS. The previous 100-million tlzig boundary was
+`210.95s` and `19.70 GB` RSS. No invariant fails, but the frontier is still
+growing, so this remains bounded evidence rather than exhaustive closure.
+
 A later unchanged strict-AOT ReleaseFast run extends that evidence to the
 explicit 100-million-distinct-state boundary in `210.95s`, at
 `1,237,477,213/100,000,000` generated/distinct states and `19.70 GB` peak RSS.
@@ -972,7 +979,7 @@ order can reach different valid witnesses and partial state counts.
 - [ ] Lower the measured generated-code backlog generically: 42,947 nested
   helper chains, 7,396 variable paths, 1,199 whole-root primed comparisons,
   189 indexed primed-path comparisons, 856 mapped sets, 639 unchanged
-  expressions, 856 EXCEPT reconstructions, 1,472 callback-based variable
+  expressions, 856 EXCEPT reconstructions, 1,465 callback-based variable
   EXCEPT updates, and 182 materialized function ranges. Clone, fingerprint,
   action execution, and
   aggregate movement dominate the current profile; SIMD should follow typed
@@ -987,17 +994,17 @@ order can reach different valid witnesses and partial state counts.
   regeneration; indexed `x'[k]` paths are tracked separately because they
   require a distinct lowering.
 
-- [ ] Compact canonical top-level state tuples. The current tagged `Value` is
-  24 bytes, so large safety rows spend most resident memory on repeated
-  top-level descriptors even when the underlying immutable values intern to a
-  few thousand entries. The sound design stores bounded `u32` handles in the
-  canonical state table and decodes parent/child views into separate
-  worker-local buffers; candidate construction remains full-width. This is a
-  representation change only and must not infer types or encode model-specific
-  semantics.
+- [x] Compact canonical top-level state tuples. Persistent canonical states now
+  store bounded `u32` handles into the immutable value pool; candidate and
+  evaluator states retain full 24-byte `Value`s. Generic accessors resolve
+  handles without allocation, unchanged variables copy handles directly, and
+  a segmented 16-byte-entry interner is released before temporal analysis.
+  MDBTLA Storage exhaustive retains exact `8,723,634/1,078,623` counts and runs
+  in `7.705-7.719s` at `524,746,752-526,696,448` bytes peak RSS versus
+  TLC-auto `36.836s`.
 
   The final 74-artifact audit after regenerating the two 100-million-state
-  frontier models reports 56 fused set insertions, 19 fused removals, 214
+  frontier models reports 63 fused set insertions, 19 fused removals, 221
   direct primed set insertions, and 136 direct removals.
 
 ## Reproduction

@@ -615,7 +615,8 @@ pub fn hash_state_indexed(
     state: anytype,
 ) Fingerprint {
     var hash = hash_init();
-    for (state.values, 0..) |value, variable_index| {
+    for (0..state.values.len()) |variable_index| {
+        const value = state.value(@intCast(variable_index), default_pool);
         hash +%= state_component_from_value_hash(
             hash_value_unseeded(
                 state.value_pool(@intCast(variable_index), default_pool),
@@ -671,11 +672,10 @@ pub fn hash_state_tuple_projection(
     assert(default_pool.value_count <= default_pool.value_cap);
     var hash = hash_byte(hash_init(), value_tag_tuple);
     for (variable_indices, 0..) |variable_index, item_index| {
-        assert(variable_index < state.values.len);
         hash +%= state_component_from_value_hash(
             hash_value_inner(
                 state.value_pool(variable_index, default_pool),
-                state.values[variable_index],
+                state.value(variable_index, default_pool),
                 permutation,
             ),
             @intCast(item_index),
@@ -801,6 +801,16 @@ test "state tuple projection hashes values from mixed pools without cloning" {
                 self.borrowed_pool
             else
                 default_pool;
+        }
+
+        fn value(
+            self: *const @This(),
+            variable_index: u32,
+            default_pool: *const ValuePool,
+        ) Value {
+            _ = default_pool;
+            assert(variable_index < self.values.len);
+            return self.values[variable_index];
         }
     };
 

@@ -4290,11 +4290,48 @@ allocation-free Zig operator overrides, and
   and HDisk: 56 fused insertions, 19 fused removals, 214 direct primed
   insertions, 136 direct removals, and 1,472 remaining callback-based variable
   EXCEPT updates.
-- [ ] Replace canonical top-level `Value` tuples with bounded `u32` handles to
-  interned immutable values, decoded into worker-local state views. `Value` is
-  currently 24 bytes, so a seven-variable safety state spends 168 bytes on its
-  top-level tuple before metadata and fingerprint storage. A handle tuple would
-  use 28 bytes. Keep mutable candidate states on full `Value` storage, provide
-  two independent decode buffers for parent/child comparisons, and require the
-  complete ReleaseSafe plus exact/outcome benchmark gates before enabling the
-  compact representation by default.
+- [x] Replace canonical top-level `Value` tuples with bounded `u32` handles to
+  interned immutable values. `Value` remains 24 bytes for mutable candidate and
+  evaluator states, while persistent canonical tuples use four bytes per
+  variable and resolve through the immutable canonical pool. Unchanged values
+  copy handles directly. The representation boundary rejects full/compact
+  misuse with assertions and needs no decoded worker buffer or hot allocation.
+
+## 2026-08-10 Compact Canonical State Handles
+
+- [x] Introduce an explicit full/compact state-value descriptor while keeping
+  `State` at 40 bytes and bounding every state to at most 64 variables. A
+  seven-variable canonical tuple falls from 168 bytes to 28 bytes (`6x` less
+  payload); candidates remain full-width so action generation is unchanged.
+- [x] Add a generic segmented handle interner keyed by semantic fingerprint
+  and verified canonical representation. Entries are 16 bytes, misses publish
+  under the existing canonical lock, unchanged variables copy their parent's
+  handle, and the temporary table is released before temporal analysis. No
+  model/operator/field names or user semantics are encoded.
+- [x] Pass the complete ReleaseSafe assertion gate (`270/270`), including
+  compact resolution, storage-width, interner-growth, and handle-count tests.
+  The complete default ReleaseFast benchmark also passes every configured
+  outcome/count contract; all strict generated models retain zero fallback.
+- [x] Measure MDBTLA Storage exhaustive at exact
+  `8,723,634/1,078,623` generated/distinct states. TLC-auto takes `36.836s`;
+  strict AOT tlzig takes `7.705s` and `7.719s` in two direct
+  `/usr/bin/time -l` runs, retires `1.5756-1.5764T` instructions, and peaks at
+  `524,746,752-526,696,448` bytes RSS. The previous
+  retained Storage runs were around `10.0-10.9s` and `1.7155T` instructions,
+  so this is a general representation-level improvement, not a model override.
+- [x] Recheck structurally different exact rows: Sailfish1 strict AOT is
+  `2.498s` at `109,604` distinct versus TLC-auto `3.557s`; MCCRDT strict AOT is
+  `1.388s` at `25,000` distinct versus TLC-auto `1.628s`; cf1s folklore is
+  `5.878s` at `2,057,174` distinct versus TLC-auto `13.786s`.
+- [x] Refresh the 74-artifact audit and no-spec-semantics gate. All artifacts
+  declare zero fallback, and production `src` contains none of the audited
+  MDBTLA/primary-model identifiers outside test fixtures.
+- [x] Repeat the unchanged `MCKVSSafetyLarge.cfg` 100-million-state boundary
+  with the compact representation. It reaches
+  `1,210,220,622/100,000,000` generated/distinct states in `205.43s`, with
+  `45,112,924` queued and no invariant failure. Maximum RSS falls from the
+  prior `19.70 GB` to `9,072,164,864` bytes (`9.07 GB`, about `54%` lower);
+  the canonical pool contains only `81,442/192,000,000` descriptors at the
+  last progress sample. The generated and queued counts at an artificial
+  parallel cutoff are scheduling-dependent; the exact distinct boundary is
+  the comparison contract.

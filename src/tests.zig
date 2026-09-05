@@ -14,6 +14,7 @@ comptime {
     _ = @import("config.zig");
     _ = @import("generated_runtime.zig");
     _ = @import("parser_test.zig");
+    _ = @import("run.zig");
 }
 
 fn make_test_arena() !Arena {
@@ -71,14 +72,14 @@ test "incremental state fingerprint matches full recomputation" {
         .pred = 0,
         .changed_mask = 0,
         .borrowed_pool = null,
-        .values = &old_values,
+        .values = StateStore.StateValues.init_full(&old_values),
     };
     const new_state = StateStore.State{
         .level = 1,
         .pred = 0,
         .changed_mask = 1 << 1,
         .borrowed_pool = null,
-        .values = &new_values,
+        .values = StateStore.StateValues.init_full(&new_values),
     };
 
     const old_hash = fingerprint.hash_state_indexed(&pool, &old_state);

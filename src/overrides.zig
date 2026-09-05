@@ -13,6 +13,8 @@ pub const OverrideContext = struct {
     min_int: i64,
     max_int: i64,
     environ: ?std.process.Environ = null,
+    benchmark_diagnostics: bool = false,
+    action_steps_diagnostics: bool = false,
 
     pub fn default() OverrideContext {
         return .{

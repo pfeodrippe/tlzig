@@ -28,7 +28,26 @@ pub const ModuleLoader = struct {
 
     pub fn load(self: ModuleLoader, path: []const u8) !ast.Module {
         const raw = try self.read_file(path);
-        const source = try self.translate_source(path, raw);
+        return self.load_owned_source(path, raw);
+    }
+
+    /// Loads a module from caller-provided source. `path` is retained only as
+    /// source-location metadata and as the base directory for EXTENDS/INSTANCE.
+    pub fn load_source(
+        self: ModuleLoader,
+        path: []const u8,
+        raw: []const u8,
+    ) !ast.Module {
+        const owned_raw = try self.arena.dup(raw);
+        return self.load_owned_source(path, owned_raw);
+    }
+
+    fn load_owned_source(
+        self: ModuleLoader,
+        path: []const u8,
+        owned_raw: []const u8,
+    ) !ast.Module {
+        const source = try self.translate_source(path, owned_raw);
         var scoped = self;
         scoped.embedded_source = source;
         var p = parser.Parser.init(self.arena, source);

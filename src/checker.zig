@@ -11,6 +11,7 @@ const ActionCompiler = action.ActionCompiler;
 const ActionExecutor = action.ActionExecutor;
 const StateBuffer = action.StateBuffer;
 const StateStore = @import("state.zig").StateStore;
+const CompactValue = StateStore.CompactValue;
 const StateQueue = @import("queue.zig").StateQueue;
 const FpSet = @import("fp_set.zig").FpSet;
 const fingerprint = @import("fingerprint.zig");
@@ -748,7 +749,7 @@ test "symmetry fingerprints use private caches for both value pools" {
         .pred = 0,
         .changed_mask = 0b10,
         .borrowed_pool = &canonical_pool,
-        .values = &values,
+        .values = StateStore.StateValues.init_full(&values),
     };
     try std.testing.expectEqual(
         &canonical_pool,
@@ -855,18 +856,19 @@ fn symmetry_fingerprint(
     state_v: *const StateStore.State,
     permutations: []const []const u32,
 ) fingerprint.Fingerprint {
-    const values = state_v.values;
+    const value_count = state_v.values.len();
     if (permutations.len == 0) {
         return fingerprint.hash_state_indexed(default_pool, state_v);
     }
-    assert(values.len <= 64);
+    assert(value_count <= 64);
 
     var best_permutation: ?[]const u32 = null;
     var best_hashes: [64]fingerprint.Fingerprint = undefined;
     var best_hash_valid: [64]bool = @splat(false);
 
     for (permutations) |candidate_permutation| {
-        for (values, 0..) |value_v, variable_index| {
+        for (0..value_count) |variable_index| {
+            const value_v = state_v.value(@intCast(variable_index), default_pool);
             const value_pool = state_v.value_pool(
                 @intCast(variable_index),
                 default_pool,
@@ -904,7 +906,8 @@ fn symmetry_fingerprint(
     }
 
     var hash = fingerprint.hash_init();
-    for (values, 0..) |value_v, variable_index| {
+    for (0..value_count) |variable_index| {
+        const value_v = state_v.value(@intCast(variable_index), default_pool);
         const value_pool = state_v.value_pool(
             @intCast(variable_index),
             default_pool,
@@ -1253,10 +1256,10 @@ fn view_projection_fingerprint(
 ) fingerprint.Fingerprint {
     return switch (projection) {
         .variable => |index| blk: {
-            assert(index < state.values.len);
+            assert(index < state.values.len());
             break :blk fingerprint.hash_value_permuted(
                 state.value_pool(index, default_pool),
-                state.values[index],
+                state.value(index, default_pool),
                 permutation,
             );
         },
@@ -1268,6 +1271,18 @@ fn view_projection_fingerprint(
         ),
     };
 }
+
+pub const DebugOptions = struct {
+    action_steps: bool = false,
+    retain_fingerprints: bool = false,
+    dump_graph: bool = false,
+    dump_initial_states: bool = false,
+    dump_fairness: bool = false,
+    verify_fingerprints: bool = false,
+    verify_fairness_markers: bool = false,
+    benchmark_diagnostics: bool = false,
+    dump_liveness: bool = false,
+};
 
 pub const Checker = struct {
     const FairnessEnabledProbeContext = struct {
@@ -1406,6 +1421,7 @@ pub const Checker = struct {
     view_name: ?[]const u8,
     view_projection: ?ViewProjection,
     verify_fingerprints: bool,
+    debug_options: DebugOptions,
 
     pub fn init(
         arena: *Arena,
@@ -1436,6 +1452,7 @@ pub const Checker = struct {
             null,
             &.{},
             &.{},
+            .{},
         );
     }
 
@@ -1470,6 +1487,7 @@ pub const Checker = struct {
             null,
             generated,
             generated_expressions,
+            .{},
         );
     }
 
@@ -1505,6 +1523,7 @@ pub const Checker = struct {
             null,
             generated,
             generated_expressions,
+            .{},
         );
     }
 
@@ -1525,6 +1544,44 @@ pub const Checker = struct {
         generated: []const generated_runtime.Operator,
         generated_expressions: []const generated_runtime.Expression,
     ) !Checker {
+        return init_generated_with_resource_limits_and_debug(
+            arena,
+            module,
+            cfg,
+            max_states,
+            max_successors,
+            eval_value_cap,
+            eval_string_cap,
+            state_value_cap,
+            state_string_cap,
+            eval_arena_bytes,
+            override_ctx,
+            worker_count,
+            max_graph_edges,
+            generated,
+            generated_expressions,
+            .{},
+        );
+    }
+
+    pub fn init_generated_with_resource_limits_and_debug(
+        arena: *Arena,
+        module: ast.Module,
+        cfg: Config,
+        max_states: u32,
+        max_successors: u32,
+        max_graph_edges: ?u32,
+        eval_value_cap: u32,
+        eval_string_cap: u32,
+        state_value_cap: u32,
+        state_string_cap: u32,
+        eval_arena_bytes: u64,
+        override_ctx: overrides.OverrideContext,
+        worker_count: u16,
+        generated: []const generated_runtime.Operator,
+        generated_expressions: []const generated_runtime.Expression,
+        debug_options: DebugOptions,
+    ) !Checker {
         return init_internal(
             arena,
             module,
@@ -1541,6 +1598,7 @@ pub const Checker = struct {
             max_graph_edges,
             generated,
             generated_expressions,
+            debug_options,
         );
     }
 
@@ -1560,13 +1618,14 @@ pub const Checker = struct {
         max_graph_edges: ?u32,
         generated: []const generated_runtime.Operator,
         generated_expressions: []const generated_runtime.Expression,
+        debug_options: DebugOptions,
     ) !Checker {
         assert(worker_count > 0);
         assert(max_successors > 0);
         assert(max_successors <= max_states);
         var exploration_arena = try Arena.init(16 * 1024 * 1024);
         errdefer exploration_arena.deinit();
-        var state_store = try StateStore.init(
+        var state_store = try StateStore.init_compact(
             arena,
             module.variables,
             max_states,
@@ -1606,7 +1665,7 @@ pub const Checker = struct {
             )
         else
             null;
-        if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null) {
+        if (debug_options.action_steps) {
             for (aliases) |alias| {
                 std.debug.print("CONFIG alias {s} -> {s}\n", .{
                     alias.from,
@@ -1621,6 +1680,7 @@ pub const Checker = struct {
 
         const eval_arena = try arena.alloc_object(Arena);
         eval_arena.* = try Arena.init(eval_arena_bytes);
+        errdefer eval_arena.deinit();
         var eval_pool = try ValuePool.init(eval_arena, eval_value_cap, eval_string_cap);
         evaluator.set_definition_memo_pool(&eval_pool);
         for (module.assumptions, 0..) |assumption, assumption_index| {
@@ -1714,6 +1774,7 @@ pub const Checker = struct {
 
         const candidate_arena = try arena.alloc_object(Arena);
         candidate_arena.* = try Arena.init(@max(eval_arena_bytes / 4, 16 * 1024 * 1024));
+        errdefer candidate_arena.deinit();
         var candidate_store = try StateStore.init(
             candidate_arena,
             module.variables,
@@ -1781,7 +1842,7 @@ pub const Checker = struct {
                     std.debug.print("undefined next def: {s}\n", .{resolved_name});
                     return Error.UndefinedSymbol;
                 };
-                if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null) {
+                if (debug_options.action_steps) {
                     std.debug.print(
                         "NEXT root {s} -> {s} body={s}\n",
                         .{
@@ -1901,8 +1962,8 @@ pub const Checker = struct {
         };
 
         const graph_enabled = properties.len > 0 or
-            std.c.getenv("TLZIG_DUMP_GRAPH") != null or
-            std.c.getenv("TLZIG_DUMP_INITIAL_STATES") != null;
+            debug_options.dump_graph or
+            debug_options.dump_initial_states;
         const canonical_value_entries = try exploration_arena.alloc(
             CanonicalValueEntry,
             canonical_value_capacity(max_states, graph_enabled),
@@ -1936,6 +1997,7 @@ pub const Checker = struct {
                     &eval_pool,
                     &state_store.values_pool,
                     sn,
+                    debug_options.dump_fairness,
                 )
             else
                 &[_]FairnessCondition{}
@@ -1948,6 +2010,7 @@ pub const Checker = struct {
                 &eval_pool,
                 &state_store.values_pool,
                 properties,
+                debug_options.dump_fairness,
             )
         else
             &[_]FairnessCondition{};
@@ -1987,7 +2050,7 @@ pub const Checker = struct {
                 !action.steps_contain_composition(next.steps)
             else
                 true;
-        if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+        if (debug_options.dump_fairness) {
             std.debug.print(
                 "FAIRNESS markers={d} complete={}\n",
                 .{ fairness_markers.len, fairness_markers_exact },
@@ -2006,7 +2069,7 @@ pub const Checker = struct {
                 &[_]EventualAlwaysCondition{}
         else
             &[_]EventualAlwaysCondition{};
-        if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+        if (debug_options.dump_fairness) {
             std.debug.print(
                 "EVENTUAL_ALWAYS specification={s} conditions={d}\n",
                 .{ spec_name_v orelse "<none>", eventual_always.len },
@@ -2090,9 +2153,8 @@ pub const Checker = struct {
             .symmetry_permutations = symmetry_permutations,
             .view_name = cfg.view_name,
             .view_projection = view_projection,
-            .verify_fingerprints = std.c.getenv(
-                "TLZIG_VERIFY_FINGERPRINTS",
-            ) != null,
+            .verify_fingerprints = debug_options.verify_fingerprints,
+            .debug_options = debug_options,
         };
     }
 
@@ -2108,7 +2170,7 @@ pub const Checker = struct {
     fn release_exploration_storage_for_temporal(self: *Checker) void {
         assert(!self.exploration_storage_released);
         assert(self.queue.is_empty());
-        if (std.c.getenv("TLZIG_DUMP_FINGERPRINTS") != null) return;
+        if (self.debug_options.retain_fingerprints) return;
         const released_bytes = self.exploration_arena.used();
         self.exploration_arena.deinit();
         self.exploration_storage_released = true;
@@ -2626,16 +2688,16 @@ pub const Checker = struct {
     ) bool {
         const left = self.state_store.get(left_index);
         const right = self.state_store.get(right_index);
-        assert(left.values.len == right.values.len);
-        for (left.values, right.values, 0..) |left_value, right_value, index| {
+        assert(left.values.len() == right.values.len());
+        for (0..left.values.len()) |index| {
             const variable_index: u32 = @intCast(index);
             if (!Value.eql_ordered_cross_pool(
-                left_value,
+                left.value(variable_index, &self.state_store.values_pool),
                 left.value_pool(
                     variable_index,
                     &self.state_store.values_pool,
                 ),
-                right_value,
+                right.value(variable_index, &self.state_store.values_pool),
                 right.value_pool(
                     variable_index,
                     &self.state_store.values_pool,
@@ -3211,23 +3273,29 @@ pub const Checker = struct {
             var canonical = self.fp_set.find(state_fingerprint);
             var is_new = false;
             if (canonical == null) {
-                assert(candidate.values.len <= 64);
-                var canonical_values: [64]Value = undefined;
-                for (candidate.values, 0..) |source, variable_index| {
+                assert(candidate.values.len() <= 64);
+                var canonical_values: [64]CompactValue = undefined;
+                const parent = self.state_store.get(parent_idx);
+                for (candidate.values.full_const(), 0..) |source, variable_index| {
                     const changed = candidate.changed_mask &
                         (@as(u64, 1) << @intCast(variable_index)) != 0;
-                    canonical_values[variable_index] = if (changed)
-                        try self.intern_canonical_value_parallel(
+                    canonical_values[variable_index] = if (changed) blk: {
+                        const canonical_value = try self.intern_canonical_value_parallel(
                             parallel,
                             source,
                             &candidate_store.values_pool,
                             @intCast(variable_index),
-                            self.state_store.get(parent_idx)
-                                .values[variable_index],
+                            parent.value(
+                                @intCast(variable_index),
+                                &self.state_store.values_pool,
+                            ),
                             candidate_hash_cache,
-                        )
-                    else
-                        self.state_store.get(parent_idx).values[variable_index];
+                        );
+                        break :blk try self.compact_canonical_value_parallel(
+                            parallel,
+                            canonical_value,
+                        );
+                    } else parent.compact_value(@intCast(variable_index));
                 }
 
                 parallel_commit_lock(parallel);
@@ -3235,7 +3303,7 @@ pub const Checker = struct {
                 if (canonical == null) {
                     const permanent_idx = self.store_prepared_candidate_state(
                         candidate,
-                        canonical_values[0..candidate.values.len],
+                        canonical_values[0..candidate.values.len()],
                     ) catch |err| {
                         parallel_commit_unlock(parallel);
                         return err;
@@ -3333,23 +3401,29 @@ pub const Checker = struct {
             else
                 false;
             if (canonical == null or candidate_may_replace) {
-                assert(candidate.values.len <= 64);
-                var canonical_values: [64]Value = undefined;
-                for (candidate.values, 0..) |source, variable_index| {
+                assert(candidate.values.len() <= 64);
+                var canonical_values: [64]CompactValue = undefined;
+                const parent = self.state_store.get(parent_idx);
+                for (candidate.values.full_const(), 0..) |source, variable_index| {
                     const changed = candidate.changed_mask &
                         (@as(u64, 1) << @intCast(variable_index)) != 0;
-                    canonical_values[variable_index] = if (changed)
-                        self.intern_canonical_value_parallel(
+                    canonical_values[variable_index] = if (changed) blk: {
+                        const canonical_value = self.intern_canonical_value_parallel(
                             parallel,
                             source,
                             &candidate_store.values_pool,
                             @intCast(variable_index),
-                            self.state_store.get(parent_idx)
-                                .values[variable_index],
+                            parent.value(
+                                @intCast(variable_index),
+                                &self.state_store.values_pool,
+                            ),
                             candidate_hash_cache,
-                        ) catch |err| return err
-                    else
-                        self.state_store.get(parent_idx).values[variable_index];
+                        ) catch |err| return err;
+                        break :blk self.compact_canonical_value_parallel(
+                            parallel,
+                            canonical_value,
+                        ) catch |err| return err;
+                    } else parent.compact_value(@intCast(variable_index));
                 }
 
                 parallel_commit_lock(parallel);
@@ -3357,7 +3431,7 @@ pub const Checker = struct {
                 if (canonical == null) {
                     const permanent_idx = self.store_prepared_candidate_state(
                         candidate,
-                        canonical_values[0..candidate.values.len],
+                        canonical_values[0..candidate.values.len()],
                     ) catch |err| {
                         parallel_commit_unlock(parallel);
                         return err;
@@ -3392,7 +3466,7 @@ pub const Checker = struct {
                     self.replace_prepared_candidate_state(
                         canonical.?,
                         candidate,
-                        canonical_values[0..candidate.values.len],
+                        canonical_values[0..candidate.values.len()],
                     );
                     @atomicStore(
                         u64,
@@ -3430,16 +3504,18 @@ pub const Checker = struct {
     fn store_prepared_candidate_state(
         self: *Checker,
         candidate: *const StateStore.State,
-        canonical_values: []const Value,
+        canonical_values: []const CompactValue,
     ) !u32 {
-        assert(candidate.values.len == canonical_values.len);
+        assert(candidate.values.len() == canonical_values.len);
         const state_idx = try self.state_store.alloc_state();
         const state = self.state_store.get(state_idx);
         state.level = candidate.level;
         state.pred = candidate.pred;
         state.changed_mask = candidate.changed_mask;
         state.borrowed_pool = null;
-        @memcpy(state.values, canonical_values);
+        for (canonical_values, 0..) |canonical, variable_index| {
+            state.set_compact(@intCast(variable_index), canonical);
+        }
         return state_idx;
     }
 
@@ -3447,15 +3523,17 @@ pub const Checker = struct {
         self: *Checker,
         state_index: u32,
         candidate: *const StateStore.State,
-        canonical_values: []const Value,
+        canonical_values: []const CompactValue,
     ) void {
         const state_v = self.state_store.get(state_index);
         assert(state_v.level == candidate.level);
-        assert(state_v.values.len == canonical_values.len);
+        assert(state_v.values.len() == canonical_values.len);
         state_v.pred = candidate.pred;
         state_v.changed_mask = candidate.changed_mask;
         state_v.borrowed_pool = null;
-        @memcpy(state_v.values, canonical_values);
+        for (canonical_values, 0..) |canonical, variable_index| {
+            state_v.set_compact(@intCast(variable_index), canonical);
+        }
     }
 
     fn replace_candidate_state(
@@ -3468,25 +3546,25 @@ pub const Checker = struct {
     ) !void {
         const state_v = self.state_store.get(state_index);
         assert(state_v.level == candidate.level);
-        assert(state_v.values.len == candidate.values.len);
+        assert(state_v.values.len() == candidate.values.len());
         const parent = self.state_store.get(parent_index);
-        for (
-            candidate.values,
-            state_v.values,
-            0..,
-        ) |source, *target, variable_index| {
+        for (candidate.values.full_const(), 0..) |source, variable_index| {
             const changed = candidate.changed_mask &
                 (@as(u64, 1) << @intCast(variable_index)) != 0;
-            target.* = if (changed)
-                try self.intern_canonical_value_from_parent(
+            const compact_value = if (changed) blk: {
+                const canonical = try self.intern_canonical_value_from_parent(
                     source,
                     &candidate_store.values_pool,
                     @intCast(variable_index),
-                    parent.values[variable_index],
+                    parent.value(
+                        @intCast(variable_index),
+                        &self.state_store.values_pool,
+                    ),
                     candidate_hash_cache,
-                )
-            else
-                parent.values[variable_index];
+                );
+                break :blk try self.compact_canonical_value(canonical);
+            } else parent.compact_value(@intCast(variable_index));
+            state_v.set_compact(@intCast(variable_index), compact_value);
         }
         state_v.pred = candidate.pred;
         state_v.changed_mask = candidate.changed_mask;
@@ -3791,7 +3869,10 @@ pub const Checker = struct {
                                             variable_index,
                                             &candidate_store.values_pool,
                                         ),
-                                        candidate.values[variable_index],
+                                        candidate.value(
+                                            variable_index,
+                                            &candidate_store.values_pool,
+                                        ),
                                         null,
                                     );
                                 }
@@ -3820,12 +3901,18 @@ pub const Checker = struct {
                                             @intCast(item_index),
                                             canonical_hash_cache.hash_value(
                                                 parent_pool,
-                                                parent.values[variable_index],
+                                                parent.value(
+                                                    variable_index,
+                                                    canonical_pool,
+                                                ),
                                                 null,
                                             ),
                                             candidate_hash_cache.hash_value(
                                                 candidate_pool,
-                                                candidate.values[variable_index],
+                                                candidate.value(
+                                                    variable_index,
+                                                    &candidate_store.values_pool,
+                                                ),
                                                 null,
                                             ),
                                         );
@@ -3925,8 +4012,8 @@ pub const Checker = struct {
         while (changed != 0) {
             const variable_index: u32 = @intCast(@ctz(changed));
             changed &= changed - 1;
-            assert(variable_index < parent.values.len);
-            assert(variable_index < candidate.values.len);
+            assert(variable_index < parent.values.len());
+            assert(variable_index < candidate.values.len());
             const parent_pool = parent.value_pool(
                 variable_index,
                 canonical_pool,
@@ -3935,23 +4022,28 @@ pub const Checker = struct {
                 variable_index,
                 &candidate_store.values_pool,
             );
-            if (candidate.values[variable_index] == .generated_operator_v) {
+            const parent_value = parent.value(variable_index, canonical_pool);
+            const candidate_value = candidate.value(
+                variable_index,
+                &candidate_store.values_pool,
+            );
+            if (candidate_value == .generated_operator_v) {
                 std.debug.print(
                     "generated operator escaped into state variable {d}: {any}\n",
-                    .{ variable_index, candidate.values[variable_index] },
+                    .{ variable_index, candidate_value },
                 );
                 @panic("generated operator escaped into canonical state");
             }
             const old_value_hash = if (parent_pool == canonical_pool)
                 canonical_hash_cache.hash_value(
                     parent_pool,
-                    parent.values[variable_index],
+                    parent_value,
                     null,
                 )
             else
                 fingerprint.hash_value_unseeded(
                     parent_pool,
-                    parent.values[variable_index],
+                    parent_value,
                 );
             hash = fingerprint.replace_state_value_hashes(
                 hash,
@@ -3959,7 +4051,7 @@ pub const Checker = struct {
                 old_value_hash,
                 candidate_hash_cache.hash_value(
                     candidate_pool,
-                    candidate.values[variable_index],
+                    candidate_value,
                     null,
                 ),
             );
@@ -4079,31 +4171,46 @@ pub const Checker = struct {
         state.pred = candidate.pred;
         state.changed_mask = candidate.changed_mask;
         state.borrowed_pool = null;
-        for (candidate.values, state.values, 0..) |source, *target, variable_index| {
+        assert(candidate.values.storage == .full);
+        assert(state.values.storage == .compact);
+        for (candidate.values.full_const(), 0..) |source, variable_index| {
             const changed = parent_idx == null or
                 (candidate.changed_mask &
                     (@as(u64, 1) << @intCast(variable_index))) != 0;
             if (changed) {
-                target.* = try self.intern_canonical_value_from_parent(
+                const canonical = try self.intern_canonical_value_from_parent(
                     source,
                     &candidate_store.values_pool,
                     @intCast(variable_index),
                     if (parent_idx) |index|
-                        self.state_store.get(index).values[variable_index]
+                        self.state_store.get(index).value(
+                            @intCast(variable_index),
+                            &self.state_store.values_pool,
+                        )
                     else
                         null,
                     candidate_hash_cache,
                 );
+                const compact_value = try self.compact_canonical_value(canonical);
+                state.set_compact(@intCast(variable_index), compact_value);
                 if (builtin.mode == .debug or builtin.mode == .safe) {
                     assert(Value.eql_cross_pool(
                         source,
                         &candidate_store.values_pool,
-                        target.*,
+                        state.value(
+                            @intCast(variable_index),
+                            &self.state_store.values_pool,
+                        ),
                         &self.state_store.values_pool,
                     ));
                 }
             } else {
-                target.* = self.state_store.get(parent_idx.?).values[variable_index];
+                state.set_compact(
+                    @intCast(variable_index),
+                    self.state_store.get(parent_idx.?).compact_value(
+                        @intCast(variable_index),
+                    ),
+                );
             }
         }
         return state_idx;
@@ -4301,6 +4408,27 @@ pub const Checker = struct {
             limit += canonical_value_load_limit(segment.entries.?.len);
         }
         return limit;
+    }
+
+    fn compact_canonical_value(
+        self: *Checker,
+        canonical: Value,
+    ) Error!CompactValue {
+        if (CompactValue.init(canonical)) |compact| return compact;
+        const handle = try self.state_store.values_pool.push_value(canonical);
+        assert(handle < self.state_store.values_pool.value_count);
+        return CompactValue.init_indirect(handle);
+    }
+
+    fn compact_canonical_value_parallel(
+        self: *Checker,
+        parallel: *ParallelState,
+        canonical: Value,
+    ) Error!CompactValue {
+        if (CompactValue.init(canonical)) |compact| return compact;
+        parallel_canonical_lock(parallel);
+        defer parallel_canonical_unlock(parallel);
+        return self.compact_canonical_value(canonical);
     }
 
     const canonical_set_delta_min_length: u32 = 4;
@@ -4690,11 +4818,18 @@ pub const Checker = struct {
         _ = self;
         const source = source_store.get(parent_idx);
         const values = try candidate_store.values_pool.alloc_values(
-            @intCast(source.values.len),
+            source.values.len(),
         );
-        for (source.values, values) |value, *target| {
-            target.* = try value.clone(
+        for (values, 0..) |*target, variable_index| {
+            const source_value = source.value(
+                @intCast(variable_index),
                 &source_store.values_pool,
+            );
+            target.* = try source_value.clone(
+                source.value_pool(
+                    @intCast(variable_index),
+                    &source_store.values_pool,
+                ),
                 &candidate_store.values_pool,
             );
         }
@@ -4703,7 +4838,7 @@ pub const Checker = struct {
             .pred = source.pred,
             .changed_mask = 0,
             .borrowed_pool = null,
-            .values = values,
+            .values = StateStore.StateValues.init_full(values),
         };
     }
 
@@ -4724,7 +4859,7 @@ pub const Checker = struct {
     ) Error!u64 {
         assert(self.fairness.len > 0);
         assert(self.fairness.len <= @bitSizeOf(u64));
-        assert(source_parent.values.len == candidate.values.len);
+        assert(source_parent.values.len() == candidate.values.len());
         var candidate_parent_storage = candidate_parent;
         const evaluation_parent = if (candidate_parent_storage) |*parent|
             parent
@@ -4822,16 +4957,16 @@ pub const Checker = struct {
         right: *const StateStore.State,
         right_default_pool: *const ValuePool,
     ) bool {
-        assert(left.values.len == right.values.len);
+        assert(left.values.len() == right.values.len());
         var changed = right.changed_mask;
         while (changed != 0) {
             const variable_index: u32 = @intCast(@ctz(changed));
             changed &= changed - 1;
-            assert(variable_index < left.values.len);
+            assert(variable_index < left.values.len());
             if (!Value.eql_cross_pool(
-                left.values[variable_index],
+                left.value(variable_index, left_default_pool),
                 left.value_pool(variable_index, left_default_pool),
-                right.values[variable_index],
+                right.value(variable_index, right_default_pool),
                 right.value_pool(variable_index, right_default_pool),
             )) return false;
         }
@@ -5490,7 +5625,7 @@ pub const Checker = struct {
         try self.recompute_eventual_always_edge_masks();
         const verify_fairness_markers =
             (builtin.mode == .debug or builtin.mode == .safe) or
-            std.c.getenv("TLZIG_VERIFY_FAIRNESS_MARKERS") != null;
+            self.debug_options.verify_fairness_markers;
         // A symmetry quotient can rename the concrete child represented by an
         // edge. Re-evaluating A against independently chosen representatives
         // loses the transition label. Edge masks are therefore finalized as
@@ -5760,7 +5895,7 @@ pub const Checker = struct {
                     }
                 }
             }
-            if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+            if (self.debug_options.dump_fairness) {
                 var enabled_count: u32 = 0;
                 for (enabled[fi]) |is_enabled| {
                     if (is_enabled) enabled_count += 1;
@@ -5836,8 +5971,16 @@ pub const Checker = struct {
             );
         }
 
-        assert(parent.values.len == child.values.len);
-        for (parent.values, child.values) |parent_value, child_value| {
+        assert(parent.values.len() == child.values.len());
+        for (0..parent.values.len()) |variable_index| {
+            const parent_value = parent.value(
+                @intCast(variable_index),
+                &self.state_store.values_pool,
+            );
+            const child_value = child.value(
+                @intCast(variable_index),
+                &self.state_store.values_pool,
+            );
             if (!parent_value.eql(child_value, &self.state_store.values_pool)) {
                 return true;
             }
@@ -5865,7 +6008,7 @@ pub const Checker = struct {
         assert(self.fairness.len <= @bitSizeOf(u64));
         const verify_markers = self.fairness_markers_exact and
             ((builtin.mode == .debug or builtin.mode == .safe) or
-                std.c.getenv("TLZIG_VERIFY_FAIRNESS_MARKERS") != null);
+                self.debug_options.verify_fairness_markers);
         var stats = FairnessMarkerStats{};
         if (self.worker_count == 1 or self.state_store.count < 256) {
             for (0..self.state_store.count) |parent_index| {
@@ -5894,7 +6037,7 @@ pub const Checker = struct {
                 },
             );
         }
-        if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+        if (self.debug_options.dump_fairness) {
             for (self.fairness, 0..) |_, fairness_index| {
                 std.debug.print(
                     "FAIRNESS[{d}] exact matching edges={d}\n",
@@ -5919,7 +6062,7 @@ pub const Checker = struct {
         if (self.fairness.len == 0) return;
         const verify_recorded = self.fairness_markers_exact;
         const verify = (builtin.mode == .debug or builtin.mode == .safe) or
-            std.c.getenv("TLZIG_VERIFY_FAIRNESS_MARKERS") != null;
+            self.debug_options.verify_fairness_markers;
         if (verify_recorded and !verify) return;
         assert(self.fairness.len == self.fairness_actions.len);
         assert(self.fairness_enabled_masks.len >= self.state_store.count);
@@ -6061,7 +6204,7 @@ pub const Checker = struct {
                 }
             }
         }
-        if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+        if (self.debug_options.dump_fairness) {
             std.debug.print(
                 "EVENTUAL_ALWAYS recurring_edges={d}/{d}\n",
                 .{ recurring_edge_count, self.succ_count },
@@ -6214,7 +6357,7 @@ pub const Checker = struct {
                     parent,
                     child,
                 ) catch |err| {
-                    if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                    if (self.debug_options.benchmark_diagnostics) {
                         std.debug.print(
                             "fairness action evaluation failed: index={d} parent={d} child={d} action={s} bindings={d} error={any}\n",
                             .{
@@ -6403,7 +6546,6 @@ pub const Checker = struct {
         b: *StateStore.State,
         state_pool: *ValuePool,
     ) Error!bool {
-        _ = self;
         const snap = eval_pool.snapshot();
         defer eval_pool.restore(snap);
         evaluator.reset_context_pool();
@@ -6431,7 +6573,7 @@ pub const Checker = struct {
             state_pool,
         );
         const equal = va.eql(vb, eval_pool);
-        if (!equal and std.c.getenv("TLZIG_DUMP_LIVENESS") != null) {
+        if (!equal and self.debug_options.dump_liveness) {
             std.debug.print("stuttering expression differs: before={any} after={any}\n", .{ va, vb });
             if (va == .tuple_v and vb == .tuple_v) {
                 for (va.tuple_v.items(eval_pool), vb.tuple_v.items(eval_pool), 0..) |before, after, index| {
@@ -6667,7 +6809,7 @@ pub const Checker = struct {
                 enabled_state_count += 1;
             }
         }
-        if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+        if (self.debug_options.dump_fairness) {
             std.debug.print(
                 "FAIRNESS[{d}] property kind={s} enabled_states={d}\n",
                 .{
@@ -6919,7 +7061,7 @@ pub const Checker = struct {
                         for (0..n) |i| {
                             results[i] = left[i] and right[i];
                         }
-                        if (std.c.getenv("TLZIG_DUMP_LIVENESS") != null and
+                        if (self.debug_options.dump_liveness and
                             n > 0 and !results[0])
                         {
                             std.debug.print(
@@ -7089,7 +7231,7 @@ pub const Checker = struct {
                 .angle => action_holds and !stuttering,
             };
             if (holds) continue;
-            if (std.c.getenv("TLZIG_DUMP_LIVENESS") != null) {
+            if (self.debug_options.dump_liveness) {
                 std.debug.print(
                     "box action rejected edge {d}->{d}\n",
                     .{ state_index, successor },
@@ -7368,7 +7510,7 @@ pub const Checker = struct {
             const scc_id = scc_ids[state_index];
             if (fair[scc_id]) seeds[state_index] = true;
         }
-        if (std.c.getenv("TLZIG_DUMP_LIVENESS") != null) {
+        if (self.debug_options.dump_liveness) {
             for (fair, 0..) |is_fair, scc_id| {
                 if (!is_fair) continue;
                 std.debug.print(
@@ -7379,9 +7521,13 @@ pub const Checker = struct {
                     if (!is_allowed or scc_ids[state_index] != scc_id) continue;
                     const state = self.state_store.get(@intCast(state_index));
                     std.debug.print("  state {d}:", .{state_index});
-                    for (self.state_store.variable_names, state.values) |name, value| {
+                    for (self.state_store.variable_names, 0..) |name, variable_index| {
+                        const value_v = state.value(
+                            @intCast(variable_index),
+                            &self.state_store.values_pool,
+                        );
                         std.debug.print(" {s}=", .{name});
-                        self.print_value(value, 0);
+                        self.print_value(value_v, 0);
                     }
                     std.debug.print(" ->", .{});
                     var previous_successor: ?u32 = null;
@@ -7684,7 +7830,11 @@ pub const Checker = struct {
         while (remaining > 0) : (remaining -= 1) {
             const st = self.state_store.get(idx);
             std.debug.print("State {d} (level {d}):\n", .{ idx, st.level });
-            for (self.state_store.variable_names, st.values) |name, value| {
+            for (self.state_store.variable_names, 0..) |name, variable_index| {
+                const value = st.value(
+                    @intCast(variable_index),
+                    &self.state_store.values_pool,
+                );
                 std.debug.print("  {s} = ", .{name});
                 self.print_value(value, 0);
                 std.debug.print("\n", .{});
@@ -7779,9 +7929,13 @@ pub const Checker = struct {
         const writer = DumpWriter{ .file = file };
         for (self.state_store.states[0..self.state_store.count], 0..) |*state_v, state_index| {
             try writer.print("State {d}:\n", .{state_index + 1});
-            for (self.state_store.variable_names, state_v.values) |name, value| {
+            for (self.state_store.variable_names, 0..) |name, variable_index| {
+                const value_v = state_v.value(
+                    @intCast(variable_index),
+                    &self.state_store.values_pool,
+                );
                 try writer.print("/\\ {s} = ", .{name});
-                try self.dump_value(writer, value, 0);
+                try self.dump_value(writer, value_v, 0);
                 try writer.writeByte('\n');
             }
             try writer.writeByte('\n');
@@ -8347,23 +8501,24 @@ fn collect_fairness(
     list: *std.ArrayList(FairnessCondition),
     definition_path: *[64]*ast.Expr,
     definition_depth: u8,
+    dump_fairness: bool,
 ) Error!void {
     assert(definition_depth <= definition_path.len);
     switch (expr.*) {
         .ident => |name| {
-            if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+            if (dump_fairness) {
                 std.debug.print(
                     "FAIRNESS visit ident={s} depth={d}\n",
                     .{ name, definition_depth },
                 );
             }
             const definition = evaluator.find_definition(name) orelse {
-                if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+                if (dump_fairness) {
                     std.debug.print("FAIRNESS unresolved ident={s}\n", .{name});
                 }
                 return;
             };
-            if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+            if (dump_fairness) {
                 std.debug.print(
                     "FAIRNESS resolved ident={s} body={s} source={s}:{d}\n",
                     .{
@@ -8390,10 +8545,11 @@ fn collect_fairness(
                 list,
                 definition_path,
                 definition_depth + 1,
+                dump_fairness,
             );
         },
         .binary => |b| {
-            if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+            if (dump_fairness) {
                 std.debug.print(
                     "FAIRNESS visit binary={s} depth={d}\n",
                     .{ @tagName(b.op), definition_depth },
@@ -8410,6 +8566,7 @@ fn collect_fairness(
                     list,
                     definition_path,
                     definition_depth,
+                    dump_fairness,
                 );
                 try collect_fairness(
                     arena,
@@ -8421,11 +8578,12 @@ fn collect_fairness(
                     list,
                     definition_path,
                     definition_depth,
+                    dump_fairness,
                 );
             }
         },
         .unary => |u| {
-            if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+            if (dump_fairness) {
                 std.debug.print(
                     "FAIRNESS visit unary={s} depth={d}\n",
                     .{ @tagName(u.op), definition_depth },
@@ -8441,10 +8599,11 @@ fn collect_fairness(
                 list,
                 definition_path,
                 definition_depth,
+                dump_fairness,
             );
         },
         .quantifier => |quantifier| {
-            if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+            if (dump_fairness) {
                 std.debug.print(
                     "FAIRNESS visit quantifier={s} vars={d} depth={d}\n",
                     .{
@@ -8466,6 +8625,7 @@ fn collect_fairness(
                 list,
                 definition_path,
                 definition_depth,
+                dump_fairness,
             );
         },
         .box_action => |ba| {
@@ -8479,10 +8639,11 @@ fn collect_fairness(
                 list,
                 definition_path,
                 definition_depth,
+                dump_fairness,
             );
         },
         .apply => |ap| {
-            if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null and
+            if (dump_fairness and
                 ap.func.* == .ident)
             {
                 std.debug.print(
@@ -8578,6 +8739,7 @@ fn collect_fairness(
                     list,
                     definition_path,
                     definition_depth + 1,
+                    dump_fairness,
                 );
             }
         },
@@ -8596,6 +8758,7 @@ fn collect_quantified_fairness(
     list: *std.ArrayList(FairnessCondition),
     definition_path: *[64]*ast.Expr,
     definition_depth: u8,
+    dump_fairness: bool,
 ) Error!void {
     assert(quantifier.kind == .forall);
     assert(variable_index <= quantifier.vars.len);
@@ -8610,6 +8773,7 @@ fn collect_quantified_fairness(
             list,
             definition_path,
             definition_depth,
+            dump_fairness,
         );
     }
 
@@ -8622,7 +8786,7 @@ fn collect_quantified_fairness(
         bindings,
     );
     defer std.heap.page_allocator.free(domain_values);
-    if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+    if (dump_fairness) {
         std.debug.print(
             "FAIRNESS domain variable={s} values={d}\n",
             .{ variable.name, domain_values.len },
@@ -8647,6 +8811,7 @@ fn collect_quantified_fairness(
             list,
             definition_path,
             definition_depth,
+            dump_fairness,
         );
     }
 }
@@ -8725,11 +8890,12 @@ fn extract_fairness(
     eval_pool: *ValuePool,
     state_pool: *ValuePool,
     spec_name: []const u8,
+    dump_fairness: bool,
 ) ![]const FairnessCondition {
     var list = std.ArrayList(FairnessCondition).empty;
     defer list.deinit(std.heap.page_allocator);
     const definition = evaluator.find_definition(spec_name) orelse {
-        if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+        if (dump_fairness) {
             std.debug.print(
                 "FAIRNESS specification definition not found: {s}\n",
                 .{spec_name},
@@ -8751,8 +8917,9 @@ fn extract_fairness(
         &list,
         &definition_path,
         1,
+        dump_fairness,
     );
-    if (std.c.getenv("TLZIG_DUMP_FAIRNESS") != null) {
+    if (dump_fairness) {
         std.debug.print(
             "FAIRNESS specification={s} body={s} conditions={d}\n",
             .{ spec_name, @tagName(body.*), list.items.len },
@@ -8769,6 +8936,7 @@ fn extract_fairness_exprs(
     eval_pool: *ValuePool,
     state_pool: *ValuePool,
     expressions: []const *ast.Expr,
+    dump_fairness: bool,
 ) ![]const FairnessCondition {
     var list = std.ArrayList(FairnessCondition).empty;
     defer list.deinit(std.heap.page_allocator);
@@ -8785,6 +8953,7 @@ fn extract_fairness_exprs(
             &list,
             &definition_path,
             1,
+            dump_fairness,
         );
     }
     const result = try arena.alloc(FairnessCondition, list.items.len);

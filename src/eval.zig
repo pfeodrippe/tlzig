@@ -440,6 +440,7 @@ const ContextPool = struct {
     state_trail: [64]u6,
     state_restore_floor: u8,
     pin_depth: u16,
+    benchmark_diagnostics: bool,
 
     fn init(arena: *Arena) !ContextPool {
         return .{
@@ -450,6 +451,7 @@ const ContextPool = struct {
             .state_trail = undefined,
             .state_restore_floor = 0,
             .pin_depth = 0,
+            .benchmark_diagnostics = false,
         };
     }
 
@@ -541,7 +543,7 @@ const ContextPool = struct {
         if (variable_index >= self.state.values.len or
             self.state.count >= self.state.values.len)
         {
-            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            if (self.benchmark_diagnostics) {
                 std.debug.print(
                     "context state trail exhausted: {d}/{d}\n",
                     .{ self.state.count, self.state.values.len },
@@ -586,7 +588,7 @@ const ContextPool = struct {
             assert(context.state == &self.state);
         }
         if (self.count >= self.bindings.len) {
-            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            if (self.benchmark_diagnostics) {
                 std.debug.print(
                     "context local bindings exhausted: {d}/{d}\n",
                     .{ self.count, self.bindings.len },
@@ -1062,6 +1064,7 @@ pub const Evaluator = struct {
         @memset(late_generated_cache, null);
         const context_pool = try arena.alloc_object(ContextPool);
         context_pool.* = try ContextPool.init(arena);
+        context_pool.benchmark_diagnostics = override_ctx.benchmark_diagnostics;
         const materialize_scratch = try MaterializeScratch.init(arena);
         const constant_slots = try arena.alloc(?Value, module.constants.len);
         @memset(constant_slots, null);
@@ -1110,6 +1113,14 @@ pub const Evaluator = struct {
 
     pub fn set_treat_unknown_as_model(self: *Evaluator, enable: bool) void {
         self.treat_unknown_as_model = enable;
+    }
+
+    pub inline fn benchmark_diagnostics(self: *const Evaluator) bool {
+        return self.override_registry.ctx.benchmark_diagnostics;
+    }
+
+    pub inline fn action_steps_diagnostics(self: *const Evaluator) bool {
+        return self.override_registry.ctx.action_steps_diagnostics;
     }
 
     pub fn fork(self: Evaluator, arena: *Arena) !Evaluator {
@@ -1166,6 +1177,7 @@ pub const Evaluator = struct {
         @memset(late_generated_cache, null);
         const context_pool = try arena.alloc_object(ContextPool);
         context_pool.* = try ContextPool.init(arena);
+        context_pool.benchmark_diagnostics = self.benchmark_diagnostics();
         const materialize_scratch = try MaterializeScratch.init(arena);
         const constant_slots = try arena.alloc(
             ?Value,
@@ -1265,7 +1277,7 @@ pub const Evaluator = struct {
                 self.generated_cache_pool.restore(cache_snapshot);
                 self.err_ctx.* = .{};
             }
-            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            if (self.benchmark_diagnostics()) {
                 std.debug.print(
                     "generated cache warm {s}: admitted={} values={d} strings={d}\n",
                     .{ operator.name, admitted, cache_values, cache_strings },
@@ -1359,7 +1371,7 @@ pub const Evaluator = struct {
         }
         self.generated_cache_pool = local_pool;
         self.generated_cache_frozen = true;
-        if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+        if (self.benchmark_diagnostics()) {
             std.debug.print(
                 "generated cache localized values={d} strings={d}\n",
                 .{
@@ -1722,7 +1734,7 @@ pub const Evaluator = struct {
             state_pool,
             expression.uses_primed,
         ) catch |err| {
-            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            if (self.benchmark_diagnostics()) {
                 std.debug.print(
                     "generated expression {d} failed with {any}; args={any}\n",
                     .{ expression.identity, err, expression.arg_names },
@@ -1791,7 +1803,7 @@ pub const Evaluator = struct {
             state_pool,
             expression.uses_primed,
         ) catch |err| {
-            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            if (self.benchmark_diagnostics()) {
                 std.debug.print(
                     "generated expression {d} failed with {any}; args={any}\n",
                     .{ expression.identity, err, expression.arg_names },
@@ -1870,7 +1882,7 @@ pub const Evaluator = struct {
             state_pool,
             expression.uses_primed,
         ) catch |err| {
-            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            if (self.benchmark_diagnostics()) {
                 std.debug.print(
                     "generated boolean expression {d} failed with {any}; args={any}\n",
                     .{ expression.identity, err, expression.arg_names },
@@ -1952,7 +1964,7 @@ pub const Evaluator = struct {
             state_pool,
             expression.uses_primed,
         ) catch |err| {
-            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            if (self.benchmark_diagnostics()) {
                 std.debug.print(
                     "generated boolean expression {d} failed with {any}; args={any}\n",
                     .{ expression.identity, err, expression.arg_names },
@@ -2153,14 +2165,14 @@ pub const Evaluator = struct {
                 }
                 if (s0) |st| {
                     if (self.find_variable(name)) |idx| {
-                        return try st.values[idx].clone(
+                        return try st.value(idx, state_pool).clone(
                             st.value_pool(idx, state_pool),
                             eval_pool,
                         );
                     }
                     if (!std.mem.eql(u8, aliased, name)) {
                         if (self.find_variable(aliased)) |idx| {
-                            return try st.values[idx].clone(
+                            return try st.value(idx, state_pool).clone(
                                 st.value_pool(idx, state_pool),
                                 eval_pool,
                             );
@@ -2317,7 +2329,7 @@ pub const Evaluator = struct {
                 const ns = self.next_state;
                 if (ns) |nst| {
                     if (self.find_variable(aliased)) |idx| {
-                        return try nst.values[idx].clone(
+                        return try nst.value(idx, state_pool).clone(
                             nst.value_pool(idx, state_pool),
                             eval_pool,
                         );
@@ -2335,7 +2347,7 @@ pub const Evaluator = struct {
                 }
                 if (s0) |st| {
                     if (self.find_variable(aliased)) |idx| {
-                        return try st.values[idx].clone(
+                        return try st.value(idx, state_pool).clone(
                             st.value_pool(idx, state_pool),
                             eval_pool,
                         );
@@ -2482,9 +2494,9 @@ pub const Evaluator = struct {
                 for (names) |name| {
                     if (self.find_variable(name)) |idx| {
                         if (!Value.eql_cross_pool(
-                            parent.values[idx],
+                            parent.value(idx, state_pool),
                             parent.value_pool(idx, state_pool),
-                            child.values[idx],
+                            child.value(idx, state_pool),
                             child.value_pool(idx, state_pool),
                         )) {
                             return Value{ .bool_v = false };
@@ -2779,7 +2791,7 @@ pub const Evaluator = struct {
             eval_pool,
             state_pool,
         ) catch |err| {
-            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            if (self.benchmark_diagnostics()) {
                 std.debug.print(
                     "binary operand failed: side={s} op={s} node={s}",
                     .{ side, @tagName(binary.op), @tagName(operand.*) },
@@ -4603,8 +4615,8 @@ pub const Evaluator = struct {
                 &group_count,
             ) and !ctx.has_local_binding(root_name)) {
                 if (self.find_variable(root_name)) |variable_index| {
-                    assert(variable_index < state_v.values.len);
-                    var current = state_v.values[variable_index];
+                    assert(variable_index < state_v.values.len());
+                    var current = state_v.value(variable_index, state_pool);
                     const current_pool = state_v.value_pool(
                         variable_index,
                         state_pool,
@@ -4734,7 +4746,7 @@ pub const Evaluator = struct {
                     state_pool,
                     s0,
                 ) catch |err| {
-                    if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                    if (self.benchmark_diagnostics()) {
                         std.debug.print(
                             "local application failed: {s} value={s} args={d}: {any}\n",
                             .{ name, @tagName(local_function), values.len, err },
@@ -5007,7 +5019,7 @@ pub const Evaluator = struct {
             &argument_storage,
         );
         return self.apply_values(func, values, eval_pool, state_pool, s0) catch |err| {
-            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            if (self.benchmark_diagnostics()) {
                 std.debug.print(
                     "value application failed: func-expr={s} func-value={s} args={d}",
                     .{ @tagName(ap.func.*), @tagName(func), values.len },
@@ -5060,17 +5072,16 @@ pub const Evaluator = struct {
         const next_values = try eval_pool.alloc_values(
             @intCast(self.module.variables.len),
         );
-        for (next_values, current.values, 0..) |
-            *next_value,
-            current_value,
-            variable_index,
-        | {
+        for (next_values, 0..) |*next_value, variable_index| {
             next_value.* = if (ctx.lookup_state(
                 @intCast(variable_index),
             )) |assigned| blk: {
                 const source_pool = assigned.value_pool orelse eval_pool;
                 break :blk try assigned.value.clone(source_pool, eval_pool);
-            } else try current_value.clone(
+            } else try current.value(
+                @intCast(variable_index),
+                state_pool,
+            ).clone(
                 current.value_pool(
                     @intCast(variable_index),
                     state_pool,
@@ -5083,7 +5094,7 @@ pub const Evaluator = struct {
             .pred = current.pred,
             .changed_mask = 0,
             .borrowed_pool = null,
-            .values = next_values,
+            .values = StateStore.StateValues.init_full(next_values),
         };
 
         var constant_scratch: [256]Constant = undefined;
@@ -5455,7 +5466,7 @@ pub const Evaluator = struct {
     fn apply_value(self: *const Evaluator, func: Value, arg: Value, eval_pool: *ValuePool, state_pool: *ValuePool, s0: ?*StateStore.State) Error!Value {
         switch (func) {
             .function_v => |f| return f.apply(eval_pool, arg) orelse {
-                if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+                if (self.benchmark_diagnostics()) {
                     std.debug.print(
                         "function lookup missed: arg={s}",
                         .{@tagName(arg)},
@@ -5583,7 +5594,7 @@ pub const Evaluator = struct {
         if (ctx.has_local_binding(root_name)) return null;
         const variable_index = self.find_variable(root_name) orelse
             return null;
-        assert(variable_index < state_v.values.len);
+        assert(variable_index < state_v.values.len());
 
         var group_var_indices: [8]u8 = undefined;
         for (groups[0..group_count], 0..) |group, group_index| {
@@ -5627,7 +5638,7 @@ pub const Evaluator = struct {
             domains[0..q.vars.len],
             0,
             &assignments,
-            state_v.values[variable_index],
+            state_v.value(variable_index, state_pool),
             state_v.value_pool(variable_index, state_pool),
             groups[0..group_count],
             group_var_indices[0..group_count],
@@ -6166,9 +6177,9 @@ pub const Evaluator = struct {
         if (s0) |state_v| {
             if (e.func.* == .ident) {
                 if (self.find_variable(e.func.*.ident)) |variable_index| {
-                    assert(variable_index < state_v.values.len);
+                    assert(variable_index < state_v.values.len());
                     return try self.except_steps_cross_pool(
-                        state_v.values[variable_index],
+                        state_v.value(variable_index, state_pool),
                         state_v.value_pool(variable_index, state_pool),
                         e.steps,
                         0,

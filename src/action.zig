@@ -1030,7 +1030,7 @@ pub const ActionCompiler = struct {
         const compiled = CompiledInit{
             .steps = try self.dup_slice(ActionStep, steps.items),
         };
-        if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null) {
+        if (self.evaluator.action_steps_diagnostics()) {
             dump_action_steps("INIT", compiled.steps, 0);
         }
         return compiled;
@@ -1043,7 +1043,7 @@ pub const ActionCompiler = struct {
         const compiled = CompiledNext{
             .steps = try self.dup_slice(ActionStep, steps.items),
         };
-        if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null) {
+        if (self.evaluator.action_steps_diagnostics()) {
             dump_action_steps("NEXT", compiled.steps, 0);
         }
         return compiled;
@@ -1229,7 +1229,7 @@ pub const ActionCompiler = struct {
                     return is_init != target.primed;
                 }
                 const resolved = self.evaluator.resolve_alias(name);
-                if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null and
+                if (self.evaluator.action_steps_diagnostics() and
                     !std.mem.eql(u8, name, resolved))
                 {
                     std.debug.print("NEXT alias {s} -> {s}\n", .{ name, resolved });
@@ -1376,7 +1376,7 @@ pub const ActionCompiler = struct {
                 });
             },
             .binary => |b| {
-                if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null) {
+                if (self.evaluator.action_steps_diagnostics()) {
                     std.debug.print("NEXT binary {s}\n", .{@tagName(b.op)});
                 }
                 if (b.op == .and_op) {
@@ -1502,7 +1502,7 @@ pub const ActionCompiler = struct {
                 }
             },
             .quantifier => |q| {
-                if (std.c.getenv("TLZIG_DUMP_ACTION_STEPS") != null) {
+                if (self.evaluator.action_steps_diagnostics()) {
                     std.debug.print("NEXT quantifier body {s}\n", .{
                         @tagName(q.body.*),
                     });
@@ -3225,7 +3225,7 @@ pub const ActionExecutor = struct {
             self.eval_pool,
             &self.source_state_store.values_pool,
         ) catch |err| {
-            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            if (self.evaluator.benchmark_diagnostics()) {
                 std.debug.print(
                     "generated expression {d} failed with {any}; args={any}\n",
                     .{ generated.identity, err, generated.arg_names },
@@ -3248,7 +3248,7 @@ pub const ActionExecutor = struct {
             self.eval_pool,
             &self.source_state_store.values_pool,
         ) catch |err| {
-            if (std.c.getenv("TLZIG_BENCH_DIAGNOSTICS") != null) {
+            if (self.evaluator.benchmark_diagnostics()) {
                 std.debug.print(
                     "generated boolean expression {d} failed with {any}; args={any}\n",
                     .{ generated.identity, err, generated.arg_names },
@@ -4338,7 +4338,7 @@ pub const ActionExecutor = struct {
                 .unchanged => |unchanged| {
                     if (s0 == null) return Error.TypeError;
                     const source_state = s0.?;
-                    assert(unchanged.var_index < source_state.values.len);
+                    assert(unchanged.var_index < source_state.values.len());
                     const source_pool = source_state.value_pool(
                         unchanged.var_index,
                         &self.source_state_store.values_pool,
@@ -4348,7 +4348,10 @@ pub const ActionExecutor = struct {
                         if (!Value.eql_cross_pool(
                             assigned.value,
                             assigned_pool,
-                            source_state.values[unchanged.var_index],
+                            source_state.value(
+                                unchanged.var_index,
+                                &self.source_state_store.values_pool,
+                            ),
                             source_pool,
                         )) return;
                         current_steps = rest;
@@ -4358,7 +4361,10 @@ pub const ActionExecutor = struct {
                         current_ctx,
                         unchanged.var_name,
                         unchanged.var_index,
-                        source_state.values[unchanged.var_index],
+                        source_state.value(
+                            unchanged.var_index,
+                            &self.source_state_store.values_pool,
+                        ),
                         source_pool,
                         .unchanged,
                     );
@@ -4594,7 +4600,16 @@ pub const ActionExecutor = struct {
         else
             0;
         if (s0) |parent| {
-            @memcpy(new_state.values, parent.values);
+            assert(new_state.values.len() == parent.values.len());
+            for (0..new_state.values.len()) |variable_index| {
+                new_state.set_value(
+                    @intCast(variable_index),
+                    parent.value(
+                        @intCast(variable_index),
+                        &self.source_state_store.values_pool,
+                    ),
+                );
+            }
             if (self.source_state_store == self.candidate_store) {
                 new_state.borrowed_pool = parent.borrowed_pool;
             } else {
@@ -4602,7 +4617,7 @@ pub const ActionExecutor = struct {
                 assert(parent.borrowed_pool == null);
             }
         } else {
-            @memset(new_state.values, Value{ .bool_v = false });
+            @memset(new_state.values.full(), Value{ .bool_v = false });
             new_state.borrowed_pool = null;
         }
 
@@ -4610,15 +4625,15 @@ pub const ActionExecutor = struct {
         while (assignments.next()) |indexed| {
             const variable_index = indexed.variable_index;
             const assigned = indexed.value;
-            assert(variable_index < new_state.values.len);
+            assert(variable_index < new_state.values.len());
             const variable_bit = @as(u64, 1) << @intCast(variable_index);
             if (assigned.assignment != .changed) {
                 if (s0 != null) continue;
                 const source_pool = assigned.value_pool orelse self.eval_pool;
-                new_state.values[variable_index] = try assigned.value.clone(
+                new_state.set_value(variable_index, try assigned.value.clone(
                     source_pool,
                     &self.candidate_store.values_pool,
-                );
+                ));
                 continue;
             }
 
@@ -4636,21 +4651,27 @@ pub const ActionExecutor = struct {
                     if (Value.eql_ordered_cross_pool(
                         assigned.value,
                         source_pool,
-                        parent.values[variable_index],
+                        parent.value(
+                            variable_index,
+                            &self.source_state_store.values_pool,
+                        ),
                         parent_pool,
                     )) continue;
                 }
             }
             new_state.changed_mask |= variable_bit;
-            new_state.values[variable_index] = try assigned.value.clone(
+            new_state.set_value(variable_index, try assigned.value.clone(
                 source_pool,
                 &self.candidate_store.values_pool,
-            );
+            ));
             if (builtin.mode == .debug or builtin.mode == .safe) {
                 assert(Value.eql_cross_pool(
                     assigned.value,
                     source_pool,
-                    new_state.values[variable_index],
+                    new_state.value(
+                        variable_index,
+                        &self.candidate_store.values_pool,
+                    ),
                     &self.candidate_store.values_pool,
                 ));
             }
@@ -4815,10 +4836,10 @@ test "action compiler enumerates bounded power-set choices directly" {
         64,
     );
     const initial_index = try store.alloc_state();
-    store.get(initial_index).values[0] = .{ .set_v = .{
+    store.get(initial_index).set_value(0, .{ .set_v = .{
         .offset = 0,
         .len = 0,
-    } };
+    } });
     var eval_arena = try Arena.init(1024 * 1024);
     defer eval_arena.deinit();
     var eval_pool = try ValuePool.init(&eval_arena, 1024, 64);
@@ -4968,7 +4989,7 @@ test "simulation action prefixes descend through LET and constant calls" {
         64,
     );
     const initial_index = try store.alloc_state();
-    store.get(initial_index).values[0] = .{ .int_v = 0 };
+    store.get(initial_index).set_value(0, .{ .int_v = 0 });
     var eval_arena = try Arena.init(1024 * 1024);
     defer eval_arena.deinit();
     var eval_pool = try ValuePool.init(&eval_arena, 1024, 64);
@@ -4994,7 +5015,7 @@ test "simulation action prefixes descend through LET and constant calls" {
             &out,
         );
         try std.testing.expectEqual(@as(usize, 1), out.items.len);
-        const selected = store.get(out.items[0]).values[0].int_v;
+        const selected = store.get_value(out.items[0], 0).int_v;
         try std.testing.expect(selected == 1 or selected == 2);
         seen |= @as(u2, 1) << @intCast(selected - 1);
     }

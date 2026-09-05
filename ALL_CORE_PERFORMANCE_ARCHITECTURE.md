@@ -697,3 +697,36 @@ On the full `MultiPaxos_MC.cfg` quotient graph, exact distinct-state parity is
 `37,078,209`. The change lowers strict ReleaseFast tlzig from `312.16s` to
 `254.14s`, instructions from `58.84T` to `48.02T`, and cycles from `14.00T` to
 `11.43T`. TLC takes `292.63s`, making tlzig `1.15x` faster after the repair.
+
+## Compact Canonical State Tuples
+
+Canonical and candidate states now have deliberately different storage.
+Mutable candidate/evaluator states retain full 24-byte `Value` descriptors;
+persistent canonical states store four-byte handles into the immutable
+canonical pool. A tagged descriptor records the storage kind and length, and
+all checker/evaluator reads cross one asserted accessor. A seven-variable
+state therefore uses 28 bytes for its canonical tuple instead of 168 bytes.
+
+Changed values pass through the existing generic canonicalizer and then a
+bounded segmented handle interner. The interner uses semantic fingerprints,
+verifies the canonical representation before reuse, publishes misses under the
+canonical lock, and allocates only when publishing a new fixed-size segment.
+Unchanged variables copy the parent's handle directly. Candidate generation,
+TLA+ semantics, generated operators, and built-in overrides are unaffected;
+the implementation contains no model-specific dispatch.
+
+The complete ReleaseSafe suite passes `270/270`, and the full default
+ReleaseFast benchmark passes every outcome/count contract with zero generated
+fallback. A direct all-core strict-AOT MDBTLA Storage exhaustive measurement
+completes exact `8,723,634/1,078,623` generated/distinct states in two repeats
+of `7.705s` and `7.719s`, retires `1.5756-1.5764T` instructions, and peaks at
+`524,746,752-526,696,448` bytes RSS. The
+previous retained Storage range was approximately `10.0-10.9s` with a
+`1.7155T` instruction reference; TLC-auto takes `36.836s` on the paired row.
+
+The memory effect scales to the open KVS frontier. On unchanged
+`MCKVSSafetyLarge.cfg`, strict AOT reaches exactly 100 million distinct states
+in `205.43s`, with `45,112,924` queued and no invariant failure. Maximum RSS is
+`9,072,164,864` bytes, down from `19.70 GB` on the pre-compaction 100-million
+run. Runtime also improves from `210.95s`. The growing queue means this is a
+representation/performance result, not an exhaustive correctness claim.

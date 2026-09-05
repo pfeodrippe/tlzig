@@ -911,10 +911,10 @@ test "action if false branch commits done state" {
     const s0_idx = try store.alloc_state();
     const done = try store.values_pool.push_string("a");
     const s0 = store.get(s0_idx);
-    s0.values[0] = .{ .int_v = 5 };
-    s0.values[1] = .{ .int_v = 4 };
-    s0.values[2] = .{ .int_v = 0 };
-    s0.values[3] = .{ .string_v = done };
+    s0.set_value(0, .{ .int_v = 5 });
+    s0.set_value(1, .{ .int_v = 4 });
+    s0.set_value(2, .{ .int_v = 0 });
+    s0.set_value(3, .{ .string_v = done });
 
     var eval_arena = try Arena.init(1024 * 1024);
     defer eval_arena.deinit();
@@ -929,10 +929,13 @@ test "action if false branch commits done state" {
     try executor.execute_next(compiled, s0_idx, &out);
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
     const next = store.get(out.items[0]);
-    try std.testing.expectEqual(@as(i64, 5), next.values[0].int_v);
-    try std.testing.expectEqual(@as(i64, 4), next.values[1].int_v);
-    try std.testing.expectEqual(@as(i64, 0), next.values[2].int_v);
-    try std.testing.expectEqualStrings("Done", next.values[3].string_v.slice(&store.values_pool));
+    try std.testing.expectEqual(@as(i64, 5), next.value(0, &store.values_pool).int_v);
+    try std.testing.expectEqual(@as(i64, 4), next.value(1, &store.values_pool).int_v);
+    try std.testing.expectEqual(@as(i64, 0), next.value(2, &store.values_pool).int_v);
+    try std.testing.expectEqualStrings(
+        "Done",
+        next.value(3, &store.values_pool).string_v.slice(&store.values_pool),
+    );
 }
 
 test "multi-variable existential action expands every binding" {
@@ -961,8 +964,8 @@ test "multi-variable existential action expands every binding" {
     var store = try @import("state.zig").StateStore.init(&arena, module.variables, 16, 256, 64);
     const s0_idx = try store.alloc_state();
     const s0 = store.get(s0_idx);
-    s0.values[0] = .{ .int_v = 0 };
-    s0.values[1] = .{ .int_v = 0 };
+    s0.set_value(0, .{ .int_v = 0 });
+    s0.set_value(1, .{ .int_v = 0 });
 
     var eval_arena = try Arena.init(1024 * 1024);
     defer eval_arena.deinit();
@@ -984,8 +987,8 @@ test "multi-variable existential action expands every binding" {
     var seen: u4 = 0;
     for (out.items) |state_idx| {
         const next = store.get(state_idx);
-        const x: u2 = @intCast(next.values[0].int_v - 1);
-        const y: u2 = @intCast(next.values[1].int_v - 3);
+        const x: u2 = @intCast(next.value(0, &store.values_pool).int_v - 1);
+        const y: u2 = @intCast(next.value(1, &store.values_pool).int_v - 3);
         seen |= @as(u4, 1) << @intCast(x * 2 + y);
     }
     try std.testing.expectEqual(@as(u4, 0b1111), seen);
@@ -1001,8 +1004,8 @@ test "multi-variable existential action expands every binding" {
         );
         try std.testing.expectEqual(@as(usize, 1), out.items.len);
         const next = store.get(out.items[0]);
-        const x: u2 = @intCast(next.values[0].int_v - 1);
-        const y: u2 = @intCast(next.values[1].int_v - 3);
+        const x: u2 = @intCast(next.value(0, &store.values_pool).int_v - 1);
+        const y: u2 = @intCast(next.value(1, &store.values_pool).int_v - 3);
         selected_seen |= @as(u4, 1) << @intCast(x * 2 + y);
     }
     try std.testing.expectEqual(@as(u4, 0b1111), selected_seen);
@@ -1030,7 +1033,7 @@ test "parameterized LET operator remains in action scope" {
 
     var store = try @import("state.zig").StateStore.init(&arena, module.variables, 4, 128, 64);
     const s0_idx = try store.alloc_state();
-    store.get(s0_idx).values[0] = .{ .int_v = 0 };
+    store.get(s0_idx).set_value(0, .{ .int_v = 0 });
     var eval_arena = try Arena.init(1024 * 1024);
     defer eval_arena.deinit();
     var eval_pool = try value.ValuePool.init(&eval_arena, 256, 64);
@@ -1043,7 +1046,10 @@ test "parameterized LET operator remains in action scope" {
     var out = try action.StateBuffer.init(&arena, 32);
     try executor.execute_next(compiled, s0_idx, &out);
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
-    try std.testing.expectEqual(@as(i64, 2), store.get(out.items[0]).values[0].int_v);
+    try std.testing.expectEqual(
+        @as(i64, 2),
+        store.get(out.items[0]).value(0, &store.values_pool).int_v,
+    );
 }
 
 test "CASE action executes first matching branch" {
@@ -1067,7 +1073,7 @@ test "CASE action executes first matching branch" {
 
     var store = try @import("state.zig").StateStore.init(&arena, module.variables, 4, 128, 64);
     const s0_idx = try store.alloc_state();
-    store.get(s0_idx).values[0] = .{ .int_v = 0 };
+    store.get(s0_idx).set_value(0, .{ .int_v = 0 });
     var eval_arena = try Arena.init(1024 * 1024);
     defer eval_arena.deinit();
     var eval_pool = try value.ValuePool.init(&eval_arena, 256, 64);
@@ -1080,7 +1086,10 @@ test "CASE action executes first matching branch" {
     var out = try action.StateBuffer.init(&arena, 32);
     try executor.execute_next(compiled, s0_idx, &out);
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
-    try std.testing.expectEqual(@as(i64, 1), store.get(out.items[0]).values[0].int_v);
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        store.get(out.items[0]).value(0, &store.values_pool).int_v,
+    );
 }
 
 test "spec-shaped temporal property is checked from initial states" {
@@ -2383,7 +2392,10 @@ test "action inlining avoids capture by LET definitions" {
     try std.testing.expectEqual(@as(u64, 2), result.distinct);
     try std.testing.expectEqual(
         @as(i64, 3),
-        model_checker.state_store.get(1).values[0].int_v,
+        model_checker.state_store.get(1).value(
+            0,
+            &model_checker.state_store.values_pool,
+        ).int_v,
     );
 }
 
@@ -3934,7 +3946,7 @@ test "TLCGet level follows the current state depth" {
     const state_index = try state_store.alloc_state();
     const state = state_store.get(state_index);
     state.level = 4;
-    state.values[0] = .{ .int_v = 0 };
+    state.set_value(0, .{ .int_v = 0 });
     const current_level = evaluator.find_definition("CurrentLevel") orelse
         return error.UndefinedSymbol;
     const result = try evaluator.eval_expr(
@@ -4591,7 +4603,10 @@ test "action LET observes pre-state when constructing a record" {
     while (state_index < model_checker.state_store.count) : (state_index += 1) {
         const state = model_checker.state_store.get(state_index);
         if (state.level != 1) continue;
-        const root = state.values[requests_index].function_v.apply(
+        const root = state.value(
+            requests_index,
+            &model_checker.state_store.values_pool,
+        ).function_v.apply(
             &model_checker.state_store.values_pool,
             .{ .string_v = try model_checker.state_store.values_pool.push_string(
                 "s1",

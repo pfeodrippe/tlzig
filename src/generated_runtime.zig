@@ -6,7 +6,8 @@ const Set = @import("value.zig").Set;
 const BinarySet = @import("value.zig").BinarySet;
 const Function = @import("value.zig").Function;
 const Record = @import("value.zig").Record;
-const State = @import("state.zig").StateStore.State;
+const StateStore = @import("state.zig").StateStore;
+const State = StateStore.State;
 const Error = @import("err.zig").Error;
 
 pub const generated_model_abi_version: u32 = 2;
@@ -293,9 +294,9 @@ fn resolve_current_variable(
         }
         return Error.TypeError;
     };
-    if (index >= current.values.len) return Error.TypeError;
+    if (index >= current.values.len()) return Error.TypeError;
     source_pool.* = current.value_pool(index, context.state_pool);
-    return current.values[index];
+    return current.value(index, context.state_pool);
 }
 
 pub fn primed_variable(context: *CallContext, index: u32) Error!Value {
@@ -338,9 +339,9 @@ fn resolve_primed_variable(
         return context.partial_values[index];
     }
     if (context.next_state) |next| {
-        if (index >= next.values.len) return Error.TypeError;
+        if (index >= next.values.len()) return Error.TypeError;
         source_pool.* = next.value_pool(index, context.state_pool);
-        return next.values[index];
+        return next.value(index, context.state_pool);
     }
     return resolve_current_variable(context, index, source_pool);
 }
@@ -3562,20 +3563,20 @@ fn resolve_variable(
             }
             return value;
         } else if (context.next_state) |next| {
-            if (index >= next.values.len) return Error.TypeError;
+            if (index >= next.values.len()) return Error.TypeError;
             source_pool.* = next.value_pool(index, context.state_pool);
-            return next.values[index];
+            return next.value(index, context.state_pool);
         } else if (context.state) |current| {
-            if (index >= current.values.len) return Error.TypeError;
+            if (index >= current.values.len()) return Error.TypeError;
             source_pool.* = current.value_pool(index, context.state_pool);
-            return current.values[index];
+            return current.value(index, context.state_pool);
         } else {
             return Error.TypeError;
         }
     } else if (context.state) |current| {
-        if (index >= current.values.len) return Error.TypeError;
+        if (index >= current.values.len()) return Error.TypeError;
         source_pool.* = current.value_pool(index, context.state_pool);
-        return current.values[index];
+        return current.value(index, context.state_pool);
     } else {
         return current_variable(context, index);
     }
@@ -8215,7 +8216,7 @@ test "materialized variable cache follows value-pool restores" {
         .pred = 0,
         .changed_mask = 0,
         .borrowed_pool = null,
-        .values = &state_values,
+        .values = StateStore.StateValues.init_full(&state_values),
     };
     var context = CallContext{
         .eval_pool = &eval_pool,
@@ -8334,7 +8335,7 @@ test "state path operators apply without cloning intermediate functions" {
         .pred = 0,
         .changed_mask = 0,
         .borrowed_pool = null,
-        .values = &state_values,
+        .values = StateStore.StateValues.init_full(&state_values),
     };
     var context = CallContext{
         .eval_pool = &eval_pool,
@@ -8414,7 +8415,7 @@ test "power set membership accepts symbolic range state values across pools" {
         .pred = 0,
         .changed_mask = 0,
         .borrowed_pool = null,
-        .values = &state_values,
+        .values = StateStore.StateValues.init_full(&state_values),
     };
     var context = CallContext{
         .eval_pool = &eval_pool,
@@ -8624,14 +8625,14 @@ test "fused EXCEPT equality localizes nested updater operands" {
         .pred = 0,
         .changed_mask = 0,
         .borrowed_pool = null,
-        .values = &current_values,
+        .values = StateStore.StateValues.init_full(&current_values),
     };
     var next_state = State{
         .level = 1,
         .pred = 0,
         .changed_mask = 1,
         .borrowed_pool = null,
-        .values = &next_values,
+        .values = StateStore.StateValues.init_full(&next_values),
     };
     var context = CallContext{
         .eval_pool = &eval_pool,
@@ -8699,7 +8700,7 @@ test "fused EXCEPT set insertion clones the source set once" {
         .pred = 0,
         .changed_mask = 0,
         .borrowed_pool = null,
-        .values = &state_values,
+        .values = StateStore.StateValues.init_full(&state_values),
     };
     var context = CallContext{
         .eval_pool = &eval_pool,
@@ -8850,14 +8851,14 @@ test "generated finite values use only the value pool" {
         .pred = 0,
         .changed_mask = 0,
         .borrowed_pool = null,
-        .values = current_values[0..],
+        .values = StateStore.StateValues.init_full(current_values[0..]),
     };
     var next_state = State{
         .level = 1,
         .pred = 0,
         .changed_mask = 0,
         .borrowed_pool = null,
-        .values = next_values[0..],
+        .values = StateStore.StateValues.init_full(next_values[0..]),
     };
     context.state = &current_state;
     context.next_state = &next_state;
